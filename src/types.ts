@@ -87,6 +87,13 @@ export interface RoleDefinition {
   filePath: string;
 }
 
+export interface WorkflowJobReference {
+  runId: string;
+  agentIndex: number;
+  label: string;
+  phase?: string;
+}
+
 export interface SpawnRequest {
   role: string;
   task: string;
@@ -95,6 +102,8 @@ export interface SpawnRequest {
   backend?: BackendName;
   tier?: ModelTier;
   depth?: number;
+  /** Internal ownership metadata supplied by the workflow runtime, never by a backend. */
+  workflow?: WorkflowJobReference;
 }
 
 export interface ToolTrace {
@@ -120,4 +129,5 @@ export interface JobSnapshot {
   truncated: boolean;
   usage: Usage;
   tools: ToolTrace[];
+  workflow?: WorkflowJobReference;
 }

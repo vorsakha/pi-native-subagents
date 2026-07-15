@@ -154,7 +154,8 @@ class DashboardOverlay {
   private renderJob(job: JobSnapshot, selected: boolean): string {
     const status = this.status(job);
     const marker = selected ? this.theme.fg("accent", "›") : " ";
-    const label = `${status.glyph} ${job.status.padEnd(9)} ${shortId(sanitizeText(job.id))} ${sanitizeInline(job.role)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)} · ${formatElapsed(job, this.#now())}`;
+    const owner = job.workflow ? ` · wf:${sanitizeInline(job.workflow.label)}` : "";
+    const label = `${status.glyph} ${job.status.padEnd(9)} ${shortId(sanitizeText(job.id))} ${sanitizeInline(job.role)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)}${owner} · ${formatElapsed(job, this.#now())}`;
     return marker + " " + this.theme.fg(status.color, label);
   }
 
@@ -182,6 +183,10 @@ class DashboardOverlay {
       this.theme.fg(status.color, `${status.glyph} ${chosen.status}`) + this.theme.fg("dim", ` · ${formatElapsed(chosen, this.#now())}`),
       this.theme.fg("dim", sanitizeInline(chosen.task) || "(no task description)"),
     ];
+    if (chosen.workflow) {
+      const phase = chosen.workflow.phase ? ` · ${sanitizeInline(chosen.workflow.phase)}` : "";
+      lines.push(this.theme.fg("muted", `Workflow ${shortId(chosen.workflow.runId)} · ${sanitizeInline(chosen.workflow.label)}${phase}`));
+    }
     // Always reserve a label and at least one transcript row, so every bounded output is reachable.
     if (chosen.error && lines.length < rows - 2) lines.push(this.theme.fg("error", sanitizeInline(chosen.error)));
     const toolRows = Math.max(0, Math.min(2, rows - lines.length - 2));

@@ -1,7 +1,7 @@
 {
   "name": "@vorsakha/pi-native-subagents",
   "version": "0.1.0",
-  "description": "Standalone native multi-backend subagent lifecycle extension for Pi.",
+  "description": "Native multi-backend subagents and sandboxed workflows for Pi.",
   "type": "module",
   "main": "extensions/subagents/index.ts",
   "license": "MIT",
@@ -11,6 +11,7 @@
     "pi",
     "pi-extension",
     "subagents",
+    "workflows",
     "claude-code",
     "codex"
   ],

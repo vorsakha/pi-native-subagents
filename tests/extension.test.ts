@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   configuredBackendFromEnv,
   normalizeBackend,
@@ -28,6 +31,8 @@ function fakePi() {
   const handlers = new Map<string, (...args: any[]) => any>();
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
+  const messageRenderers = new Map<string, any>();
+  const messages: unknown[] = [];
   return {
     api: {
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
@@ -39,11 +44,15 @@ function fakePi() {
         if (commands.has(name)) throw new Error(`duplicate command: ${name}`);
         commands.set(name, command);
       },
+      registerMessageRenderer(name: string, renderer: any) { messageRenderers.set(name, renderer); },
+      sendMessage(message: unknown) { messages.push(message); },
       appendEntry() {},
     } as any,
     handlers,
     tools,
     commands,
+    messageRenderers,
+    messages,
   };
 }
 
@@ -78,12 +87,14 @@ test("extension registers once and spawn uses role default while foreground uses
   const pi = fakePi();
   const registry = {};
   const backends = [new ImmediateBackend("pi"), new ImmediateBackend("claude"), new ImmediateBackend("codex")];
-  registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends });
+  const workflowArtifactRoot = join(await mkdtemp(join(tmpdir(), "extension-workflows-")), "runs");
+  registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot });
 
   assert.deepEqual([...pi.tools.keys()].sort(), [
-    "subagent", "subagent_cancel", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait",
+    "subagent", "subagent_cancel", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
   ]);
-  assert.deepEqual([...pi.commands.keys()].sort(), ["subagents", "subagents-config"]);
+  assert.deepEqual([...pi.commands.keys()].sort(), ["subagents", "subagents-config", "workflows"]);
+  assert.ok(pi.messageRenderers.has("native-workflow-result"));
   assert.throws(() => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }), /loaded more than once/);
 
   const ctx = context([{ type: "custom", customType: "subagents-profile", data: { profile: "pi" } }]);

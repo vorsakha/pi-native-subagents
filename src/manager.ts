@@ -19,7 +19,12 @@ interface InternalJob {
 }
 
 function clone(snapshot: JobSnapshot): JobSnapshot {
-  return { ...snapshot, usage: { ...snapshot.usage }, tools: snapshot.tools.map((tool) => ({ ...tool })) };
+  return {
+    ...snapshot,
+    usage: { ...snapshot.usage },
+    tools: snapshot.tools.map((tool) => ({ ...tool })),
+    workflow: snapshot.workflow ? { ...snapshot.workflow } : undefined,
+  };
 }
 
 const MAX_RETAINED_JOBS = 100;
@@ -66,6 +71,7 @@ export class JobManager {
       truncated: false,
       usage: emptyUsage(),
       tools: [],
+      workflow: request.workflow ? { ...request.workflow } : undefined,
     };
     this.#jobs.set(id, { snapshot, role, request, policy });
     this.#queue.push(id);

@@ -65,3 +65,28 @@ The same card renders live partial tool updates (`onUpdate` polling in `subagent
 - `subagent_spawn` / `subagent_check` / `subagent_cancel`: one-line `renderCall` (`tool name` + accent identifier + dim detail) and a job card `renderResult`.
 - `subagent_list`: `renderResult` shows a header count line plus capped rows (8 collapsed / 20 expanded) with a `+N more — see /subagents` note when the session has more jobs than fit.
 - All tool text is sanitized (`sanitizeText`/`sanitizeInline`): ANSI/OSC/DCS escape sequences and C0/C1 control characters are stripped before rendering, matching the dashboard's transcript sanitation.
+
+## Workflow experience
+
+Workflows reuse the subagent system rather than presenting a separate visual language. `workflow` call and result renderers use the same semantic colors, glyphs, sanitizers, width-safe line component, **≤10 collapsed / ≤36 expanded** budgets, configured expand hint, and one `/workflows` disclosure pointer.
+
+### Workflow card anatomy
+1. Status glyph, workflow name, short run id, foreground/background mode, status, and elapsed time.
+2. Optional description.
+3. Current phase and phase position.
+4. Aggregate agent counts and the active/latest agent when collapsed; bounded phase and agent rows when expanded.
+5. Aggregate usage across member jobs.
+6. Bounded active or final result preview and error state.
+7. A single `/workflows` footer; live cards say `updating…` rather than emitting repeated progress blocks.
+
+### `/workflows` dashboard
+- Uses the same focused double-border and unfocused rounded-border frame as `/subagents`.
+- Up/Down or `j`/`k` selects runs; Left/Right or `h`/`l` selects phases; Tab cycles agents in the selected phase.
+- Shift+Up/Down and Page Up/Down scroll wrapped bounded results. Long logical lines remain reachable.
+- `x` cancels only active workflows. Escape and the configured cancel binding always close.
+- Selected detail prioritizes workflow → phase → agent hierarchy, then usage/error/result. Artifact paths and raw scripts are not shown in the dashboard.
+
+### Sandboxed execution
+The JavaScript sandbox is a control-plane component, not a new permission authority. It has no filesystem, network, subprocess, import, environment, or credential access. It communicates over authenticated size-bounded IPC and can only announce phases, request agents, and return JSON. `WorkflowManager` validates every request and delegates it to the shared `JobManager`, preserving project trust, role access, routing, nesting depth, cancellation, and the global four-job cap.
+
+Workflow artifacts are private operational state under the Pi agent directory, never project UI content or configuration backup material. Foreground runs stay inside one updating tool card. Explicitly backgrounded runs deliver one bounded follow-up result when settled; session shutdown aborts runs without delivery.

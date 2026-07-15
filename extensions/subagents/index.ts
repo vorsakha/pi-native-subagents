@@ -20,6 +20,7 @@ import {
 } from "./render.ts";
 import { loadRoles, parseAllowedRoles } from "../../src/roles.ts";
 import type { Backend, BackendName, JobSnapshot, ModelTier, SendBehavior } from "../../src/types.ts";
+import { registerWorkflows } from "../workflows/index.ts";
 
 /** The configured expand-key hint (e.g. "ctrl+o to expand"), threaded into render options so render.ts stays testable without live keybinding state. */
 function expandHint(): string {
@@ -39,6 +40,7 @@ interface RegistrationOptions {
   registry?: object;
   legacyRoot?: string | false;
   backends?: Backend[];
+  workflowArtifactRoot?: string;
 }
 
 export default function nativeSubagents(pi: ExtensionAPI): void {
@@ -69,6 +71,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     backends: options.backends ?? [new PiRpcBackend(), new ClaudeBackend(), new CodexAppServerBackend()],
   });
   const getManager = () => manager ??= createManager();
+  const workflows = registerWorkflows(pi, { roleNames, artifactRoot: options.workflowArtifactRoot });
 
   pi.on("session_start", (_event, ctx) => {
     manager = createManager();
@@ -113,6 +116,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
     });
     updateStatus(ctx, sessionManager, activeBackend);
+    workflows.sessionStart(ctx, sessionManager);
   });
 
   pi.on("session_shutdown", async () => {
@@ -121,7 +125,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     if (noticeTimer) clearTimeout(noticeTimer);
     noticeTimer = undefined;
     notices = [];
-    try { await manager?.shutdown(); }
+    try {
+      await workflows.sessionShutdown();
+      await manager?.shutdown();
+    }
     finally {
       manager = undefined;
       releaseInstall();

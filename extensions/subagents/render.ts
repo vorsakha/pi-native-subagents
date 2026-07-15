@@ -155,6 +155,10 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
 
   const task = sanitizeInline(job.task);
   if (task) lines.push(theme.fg("dim", task));
+  if (job.workflow) {
+    const phase = job.workflow.phase ? ` · ${sanitizeInline(job.workflow.phase)}` : "";
+    lines.push(theme.fg("muted", `↳ workflow ${shortId(sanitizeText(job.workflow.runId))} · ${sanitizeInline(job.workflow.label)}${phase}`));
+  }
 
   if (job.error) {
     const errorLines = sanitizeText(job.error).split("\n").map(sanitizeInline).filter(Boolean);

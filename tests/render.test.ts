@@ -208,6 +208,8 @@ function fakePi() {
       on() {},
       registerTool(toolDef: any) { tools.set(toolDef.name, toolDef); },
       registerCommand() {},
+      registerMessageRenderer() {},
+      sendMessage() {},
       appendEntry() {},
     } as any,
     tools,
@@ -222,7 +224,8 @@ test("every subagent tool defines and invokes humanized custom renderers", () =>
   const expected = [
     "subagent", "subagent_cancel", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait",
   ];
-  assert.deepEqual([...pi.tools.keys()].sort(), expected);
+  assert.deepEqual([...pi.tools.keys()].filter((name) => name !== "workflow").sort(), expected);
+  assert.ok(pi.tools.has("workflow"));
   const args: Record<string, Record<string, unknown>> = {
     subagent_spawn: { role: "worker", task: "\u001b[31mdo work\u001b[0m", backend: "codex" },
     subagent_check: { jobId: "\u001b[31m123456789\u001b[0m" },

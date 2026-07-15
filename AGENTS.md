@@ -13,12 +13,14 @@ Build a standalone, independently installable Pi extension that provides first-c
   - Codex through the installed Codex CLI app-server so ChatGPT subscription authentication is preserved.
 - Normalize backend events behind one manager API.
 - Provide background spawn, wait, check, cancel, and list operations plus a compatibility foreground `subagent` operation.
+- Provide sandboxed JavaScript workflows with phases, sequential/bounded-parallel role-based agents, foreground/background execution, private durable artifacts, automatic background result delivery, and `/workflows` inspection.
+- Workflow scripts must never bypass project trust, role access, routing, nesting depth, subscription-auth safeguards, the shared four-job cap, or process-tree cleanup.
 - Workers/general agents run autonomously with full access and no per-command prompts in trusted workspaces.
 - Reviewers/scouts remain automatically read-only without prompting.
 - Never inherit API-key environment variables into subscription-authenticated Claude/Codex children when that could silently switch billing modes.
 - Default-deny untrusted project execution or require the parent Pi trust decision.
 - Enforce concurrency limits, nested delegation depth, bounded output, bounded shutdown, and process-tree cleanup.
-- Keep full transcripts private and out of Git.
+- Keep full transcripts private and out of Git. Workflow artifacts belong under the private Pi agent directory, never the project or configuration backup repository.
 
 ## Engineering constraints
 
