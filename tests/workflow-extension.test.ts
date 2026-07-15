@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
@@ -66,49 +66,7 @@ async function setup() {
   return { root, pi };
 }
 
-const script = `
-  export const meta = { name: "Meta name", description: "Meta description" };
-  export default async () => {
-    phase("Build");
-    const built = await agent("implement", { role: "worker", label: "implementation" });
-    phase("Review");
-    const reviewed = await agent(built.output, { role: "reviewer", label: "review" });
-    return { built: built.ok, reviewed: reviewed.ok, output: reviewed.output };
-  };
-`;
-
-test("workflow tool runs role-based agents, persists artifacts, and returns structured renderer details", async () => {
-  const { root, pi } = await setup();
-  const { ctx, statuses } = context();
-  pi.handlers.get("session_start")?.({}, ctx);
-  const tool = pi.tools.get("workflow");
-  assert.equal(typeof tool.renderCall, "function");
-  assert.equal(typeof tool.renderResult, "function");
-  assert.ok(pi.commands.has("workflows"));
-  assert.ok(pi.renderers.has("native-workflow-result"));
-
-  const result = await tool.execute("wf", {
-    name: "Implement and review",
-    description: "Two phases",
-    script,
-    args: JSON.stringify({ ticket: "SIS-1" }),
-  }, new AbortController().signal, () => {}, ctx);
-
-  assert.equal(result.details.workflow.status, "completed");
-  assert.equal(result.details.workflow.name, "Meta name");
-  assert.deepEqual(result.details.workflow.result, { built: true, reviewed: true, output: "reviewer:worker:implement" });
-  assert.equal(result.details.workflow.agents.length, 2);
-  assert.equal(result.details.workflow.agents[0].output, undefined, "tool details must not embed full child transcripts");
-  assert.match(result.content[0].text, /Artifacts:/);
-  assert.match(statuses.get("native-workflows") ?? "", /1✓/);
-
-  const persisted = JSON.parse(await readFile(join(root, result.details.workflow.runId, "workflow.json"), "utf8"));
-  assert.equal(persisted.status, "completed");
-  assert.equal(persisted.agents.length, 2);
-  await pi.handlers.get("session_shutdown")?.();
-});
-
-test("background workflow returns immediately and delivers one follow-up result", async () => {
+test("background workflows return immediately and deliver one follow-up result for success or failure", async () => {
   const { pi } = await setup();
   const { ctx } = context();
   pi.handlers.get("session_start")?.({}, ctx);
@@ -128,24 +86,22 @@ test("background workflow returns immediately and delivers one follow-up result"
   assert.equal(pi.messages[0]?.options.triggerTurn, true);
   assert.equal(pi.messages[0]?.message.details.workflow.status, "completed");
   await pi.handlers.get("session_shutdown")?.();
-});
 
-test("failed background workflow still delivers exactly one failure follow-up", async () => {
-  const { pi } = await setup();
-  const { ctx } = context();
-  pi.handlers.get("session_start")?.({}, ctx);
-  await pi.tools.get("workflow").execute("wf", {
+  const failed = await setup();
+  const failedContext = context();
+  failed.pi.handlers.get("session_start")?.({}, failedContext.ctx);
+  await failed.pi.tools.get("workflow").execute("wf", {
     name: "Background failure",
     script: `export default async () => { throw new Error("script exploded") }`,
     background: true,
-  }, new AbortController().signal, undefined, ctx);
-  for (let index = 0; index < 50 && pi.messages.length === 0; index++) {
+  }, new AbortController().signal, undefined, failedContext.ctx);
+  for (let index = 0; index < 50 && failed.pi.messages.length === 0; index++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.equal(pi.messages.length, 1);
-  assert.equal(pi.messages[0]?.message.details.workflow.status, "failed");
-  assert.match(pi.messages[0]?.message.details.workflow.error ?? "", /script exploded/);
-  await pi.handlers.get("session_shutdown")?.();
+  assert.equal(failed.pi.messages.length, 1);
+  assert.equal(failed.pi.messages[0]?.message.details.workflow.status, "failed");
+  assert.match(failed.pi.messages[0]?.message.details.workflow.error ?? "", /script exploded/);
+  await failed.pi.handlers.get("session_shutdown")?.();
 });
 
 test("workflow tool rejects invalid JSON args and untrusted projects", async () => {

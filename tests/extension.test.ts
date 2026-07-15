@@ -3,12 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  configuredBackendFromEnv,
-  normalizeBackend,
-  registerNativeSubagents,
-  resolveBackendOverride,
-} from "../extensions/subagents/index.ts";
+import { registerNativeSubagents } from "../extensions/subagents/index.ts";
 import type { Backend, BackendEvent, BackendName, BackendRequest, BackendRun } from "../src/types.ts";
 
 class ImmediateBackend implements Backend {
@@ -20,7 +15,7 @@ class ImmediateBackend implements Backend {
     emit({ type: "completed", output: `${this.name}-ok` });
     return {
       completed: Promise.resolve(),
-      async send() {},
+      send: async (message: string) => { emit({ type: "completed", output: `${this.name}-${message}` }); },
       async cancel() {},
       async close() {},
     };
@@ -61,6 +56,7 @@ function context(branch: unknown[] = []) {
     cwd: process.cwd(),
     mode: "rpc",
     isProjectTrusted: () => true,
+    isIdle: () => false,
     sessionManager: { getBranch: () => branch },
     ui: {
       setStatus() {},
@@ -68,20 +64,6 @@ function context(branch: unknown[] = []) {
     },
   } as any;
 }
-
-test("routing helpers preserve role defaults except for compatibility foreground overrides", () => {
-  assert.equal(resolveBackendOverride(undefined, undefined), undefined);
-  assert.equal(resolveBackendOverride(undefined, undefined, "claude"), "claude");
-  assert.equal(resolveBackendOverride("pi", undefined, "claude"), "pi");
-  assert.equal(resolveBackendOverride("pi", "quality", "claude"), undefined);
-});
-
-test("legacy backend flags, environment profile, and session profile normalize", () => {
-  assert.equal(normalizeBackend("--use-codex"), "codex");
-  assert.equal(normalizeBackend("--use-claude"), "claude");
-  assert.equal(configuredBackendFromEnv({ PI_SUBAGENTS_PROFILE: "claude" }), "claude");
-  assert.equal(configuredBackendFromEnv({ PI_NATIVE_SUBAGENTS_BACKEND: "pi", PI_SUBAGENTS_PROFILE: "claude" }), "pi");
-});
 
 test("extension registers once and spawn uses role default while foreground uses legacy session profile", async () => {
   const pi = fakePi();
@@ -95,6 +77,7 @@ test("extension registers once and spawn uses role default while foreground uses
   ]);
   assert.deepEqual([...pi.commands.keys()].sort(), ["subagents", "subagents-config", "workflows"]);
   assert.ok(pi.messageRenderers.has("native-workflow-result"));
+  assert.ok(pi.messageRenderers.has("native-subagent-result"));
   assert.throws(() => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }), /loaded more than once/);
 
   const ctx = context([{ type: "custom", customType: "subagents-profile", data: { profile: "pi" } }]);
@@ -102,6 +85,18 @@ test("extension registers once and spawn uses role default while foreground uses
 
   const background = await pi.tools.get("subagent_spawn").execute("spawn", { role: "researcher", task: "background" }, undefined, undefined, ctx);
   assert.equal(background.details.job.backend, "claude", "background spawn must preserve researcher.defaultBackend");
+  await new Promise((resolve) => setImmediate(resolve));
+  pi.handlers.get("agent_settled")?.();
+  assert.equal((pi.messages[0] as any)?.customType, "native-subagent-result", "unconsumed background result is delivered once");
+
+  const consumed = await pi.tools.get("subagent_spawn").execute("spawn", { role: "researcher", task: "consumed" }, undefined, undefined, ctx);
+  await pi.tools.get("subagent_wait").execute("wait", { jobId: consumed.details.job.id }, undefined, undefined, ctx);
+  pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.length, 1, "wait consumes deferred delivery without duplication");
+  await pi.tools.get("subagent_send").execute("send", { jobId: consumed.details.job.id, message: "second generation", behavior: "followUp" }, undefined, undefined, ctx);
+  await new Promise((resolve) => setImmediate(resolve));
+  pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.length, 2, "consumption is scoped to one generation; reused-session output still delivers once");
 
   const foreground = await pi.tools.get("subagent").execute("foreground", { agent: "researcher", task: "foreground" }, undefined, undefined, ctx);
   assert.equal(foreground.details.job.backend, "pi", "compatibility foreground uses the restored session profile");

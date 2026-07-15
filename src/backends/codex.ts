@@ -38,20 +38,25 @@ export class CodexAppServerBackend implements Backend {
     const followUps: string[] = [];
     let resolveCompleted!: () => void;
     const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
-    const runTimer = setTimeout(() => {
-      finish({ type: "failed", error: `Codex run timed out after ${this.#runTimeoutMs}ms` });
-      void peer.close();
-    }, this.#runTimeoutMs);
+    let runTimer: NodeJS.Timeout | undefined;
+    const armRunTimer = () => {
+      if (runTimer) clearTimeout(runTimer);
+      runTimer = setTimeout(() => {
+        finish({ type: "failed", error: `Codex run timed out after ${this.#runTimeoutMs}ms` });
+        void peer.close();
+      }, this.#runTimeoutMs);
+    };
     const finish = (event: BackendEvent) => {
       if (settled) return;
       settled = true;
-      clearTimeout(runTimer);
+      if (runTimer) clearTimeout(runTimer);
       emit(event);
       resolveCompleted();
     };
     const input = (text: string) => [{ type: "text", text }];
     const startTurn = async (text: string): Promise<void> => {
       turnOutput = "";
+      emit({ type: "user_message", text });
       const turnResult = asObject(await peer.request("turn/start", {
         threadId,
         input: input(text),
@@ -76,6 +81,8 @@ export class CodexAppServerBackend implements Backend {
           const delta = String(params.delta ?? "");
           turnOutput = boundedOutput(turnOutput, delta);
           emit({ type: "text_delta", text: delta });
+        } else if (method === "item/reasoning/summaryTextDelta" || method === "item/reasoning/textDelta") {
+          emit({ type: "thinking_delta", text: String(params.delta ?? "") });
         } else if (method === "item/started") {
           const item = asObject(params.item);
           const type = String(item.type ?? "item");
@@ -83,8 +90,13 @@ export class CodexAppServerBackend implements Backend {
         } else if (method === "item/completed") {
           const item = asObject(params.item);
           const type = String(item.type ?? "item");
-          if (type === "agentMessage" && typeof item.text === "string") turnOutput = boundedOutput("", item.text);
-          else if (type !== "reasoning") emit({ type: "tool_end", id: String(item.id ?? type), name: type, error: item.status === "failed" });
+          if (type === "agentMessage" && typeof item.text === "string") {
+            turnOutput = boundedOutput("", item.text);
+            emit({ type: "message", text: turnOutput });
+          } else if (type === "reasoning") {
+            const reasoning = [...stringArray(item.summary), ...stringArray(item.content)].join("\n");
+            if (reasoning) emit({ type: "thinking_message", text: reasoning });
+          } else emit({ type: "tool_end", id: String(item.id ?? type), name: type, output: itemOutput(item), error: item.status === "failed" });
         } else if (method === "thread/tokenUsage/updated") {
           const tokenUsage = asObject(params.tokenUsage ?? params.usage);
           const usage = asObject(tokenUsage.last ?? tokenUsage);
@@ -98,6 +110,7 @@ export class CodexAppServerBackend implements Backend {
             output = appendTurn(output, turnOutput);
             emit({ type: "usage", usage: { turns: 1 } });
             const next = followUps.shift();
+            emit({ type: "queue_changed", messages: followUps.map((text) => ({ text, behavior: "followUp" })) });
             if (next !== undefined) {
               void startTurn(next).catch((error) => finish({ type: "failed", error: error instanceof Error ? error.message : String(error) }));
             } else {
@@ -109,6 +122,7 @@ export class CodexAppServerBackend implements Backend {
       },
     });
 
+    armRunTimer();
     let startupAbortTeardown: Promise<void> | undefined;
     const abortStartup = () => {
       closing = true;
@@ -150,7 +164,7 @@ export class CodexAppServerBackend implements Backend {
         }
         threadId = String(thread.id ?? "");
         if (!threadId) throw new Error("Codex thread/start returned no thread id");
-        emit({ type: "started", backendSessionId: threadId });
+        emit({ type: "started", backendSessionId: threadId, sessionFile: typeof thread.path === "string" ? thread.path : undefined });
         await startTurn(`Task: ${request.task}`);
       } catch (error) {
         if (!closing) finish({ type: "failed", error: error instanceof Error ? error.message : String(error) });
@@ -166,14 +180,25 @@ export class CodexAppServerBackend implements Backend {
 
     const send = async (message: string, behavior: SendBehavior = "steer") => {
       await initialization;
-      if (settled || closing) throw new Error("Codex run is already settled");
+      if (closing) throw new Error("Codex session is closed");
       if (!threadId) throw new Error("Codex thread failed to initialize");
+      if (settled) {
+        settled = false;
+        output = "";
+        armRunTimer();
+        emit({ type: "started" });
+        await startTurn(message);
+        return;
+      }
       if (behavior === "followUp") {
         followUps.push(message);
+        emit({ type: "queue_changed", messages: followUps.map((text) => ({ text, behavior: "followUp" })) });
         return;
       }
       if (!turnId) throw new Error("Codex has no active turn to steer");
       await peer.request("turn/steer", { threadId, expectedTurnId: turnId, input: input(message) }, this.#requestTimeoutMs);
+      emit({ type: "user_message", text: message });
+      emit({ type: "queue_changed", messages: [{ text: message, behavior: "steer" }] });
     };
 
     return {
@@ -217,4 +242,12 @@ function num(value: unknown): number { return typeof value === "number" && Numbe
 function itemSummary(item: Record<string, unknown>): string {
   const candidate = item.command ?? item.path ?? item.query ?? item.name ?? "";
   return String(candidate).replace(/\s+/g, " ").slice(0, 160);
+}
+function stringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+function itemOutput(item: Record<string, unknown>): string {
+  const candidate = item.aggregatedOutput ?? item.output ?? item.result ?? item.error ?? "";
+  if (typeof candidate === "string") return candidate.slice(0, 4_096);
+  try { return JSON.stringify(candidate).slice(0, 4_096); } catch { return ""; }
 }

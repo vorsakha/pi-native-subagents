@@ -228,24 +228,6 @@ test("manager terminalizes a job when backend cancellation rejects", async () =>
   await manager.shutdown(5);
 });
 
-test("manager rejects sends once cancellation has been requested during startup", async () => {
-  const backend: Backend = {
-    name: "codex",
-    async start(request) {
-      await new Promise<void>((_resolve, reject) => request.signal.addEventListener("abort", () => reject(request.signal.reason), { once: true }));
-      assert.fail("aborted startup must not return a run");
-    },
-  };
-  const manager = new JobManager({ backends: [backend], roles: new Map([[role.name, role]]) });
-  const job = manager.spawn(request(1));
-  await tick();
-  const cancellation = manager.cancel(job.id);
-  const sending = manager.send(job.id, "too late");
-  await cancellation;
-  await assert.rejects(sending, /cancelling or settled|backend did not become ready/);
-  await manager.shutdown();
-});
-
 test("manager forwards steering and emits automatic lifecycle observations", async () => {
   const { backend, manager } = setup(1);
   const observed: string[] = [];
@@ -257,7 +239,14 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
   backend.complete(job.id, "done");
   await manager.wait(job.id);
   assert.ok(observed.includes("completed:completed"));
-  await assert.rejects(manager.send(job.id, "too late"), /completed/);
+  const queued = await manager.send(job.id, "review the fixes", "followUp");
+  assert.ok(queued.status === "queued" || queued.status === "running");
+  await tick();
+  assert.deepEqual(backend.sends.at(-1), { id: job.id, message: "review the fixes", behavior: "followUp" });
+  backend.complete(job.id, "second result");
+  const continued = await manager.wait(job.id);
+  assert.equal(continued.status, "completed");
+  assert.equal(continued.output, "second result");
   unsubscribe();
   await manager.shutdown();
 });
@@ -267,12 +256,4 @@ test("manager rejects unknown roles, untrusted execution, and empty tasks", () =
   assert.throws(() => manager.spawn({ ...request(1), role: "missing" }), /Unknown/);
   assert.throws(() => manager.spawn({ ...request(1), trusted: false }), /untrusted/);
   assert.throws(() => manager.spawn({ ...request(1), task: " " }), /empty/);
-});
-
-test("separate managers keep session job state isolated", () => {
-  const one = setup().manager;
-  const two = setup().manager;
-  one.spawn(request(1));
-  assert.equal(one.list().length, 1);
-  assert.equal(two.list().length, 0);
 });

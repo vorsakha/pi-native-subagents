@@ -16,6 +16,8 @@ interface InternalJob {
   deferredCancellation?: Extract<BackendEvent, { type: "cancelled" }>;
   runWaiters?: Set<(run?: BackendRun) => void>;
   startupController?: AbortController;
+  pendingRestart?: { message: string; behavior: SendBehavior };
+  idleTimer?: NodeJS.Timeout;
 }
 
 function clone(snapshot: JobSnapshot): JobSnapshot {
@@ -23,11 +25,14 @@ function clone(snapshot: JobSnapshot): JobSnapshot {
     ...snapshot,
     usage: { ...snapshot.usage },
     tools: snapshot.tools.map((tool) => ({ ...tool })),
+    transcript: snapshot.transcript.map((entry) => ({ ...entry })),
+    queuedMessages: snapshot.queuedMessages.map((message) => ({ ...message })),
     workflow: snapshot.workflow ? { ...snapshot.workflow } : undefined,
   };
 }
 
 const MAX_RETAINED_JOBS = 100;
+const REUSABLE_SESSION_TTL_MS = 15 * 60_000;
 
 export class JobManager {
   readonly #backends: Map<string, Backend>;
@@ -66,11 +71,15 @@ export class JobManager {
       task: request.task,
       cwd: request.cwd,
       status: "queued",
+      generation: 0,
       createdAt: Date.now(),
       output: "",
       truncated: false,
       usage: emptyUsage(),
       tools: [],
+      transcript: [],
+      liveThinking: "",
+      queuedMessages: [],
       workflow: request.workflow ? { ...request.workflow } : undefined,
     };
     this.#jobs.set(id, { snapshot, role, request, policy });
@@ -98,7 +107,32 @@ export class JobManager {
     if (!message.trim()) throw new Error("Subagent message must not be empty");
     const job = this.#jobs.get(id);
     if (!job) throw new Error(`Unknown job: ${id}`);
-    if (isTerminal(job.snapshot.status)) throw new Error(`Cannot send to ${id}: job is ${job.snapshot.status}`);
+    if (job.snapshot.status === "failed" || job.snapshot.status === "cancelled") {
+      throw new Error(`Cannot reuse ${id}: job is ${job.snapshot.status}`);
+    }
+    if (job.snapshot.status === "completed") {
+      if (!job.run) throw new Error(`Cannot reuse ${id}: native session retention expired`);
+      if (job.pendingRestart) throw new Error(`Cannot reuse ${id}: a follow-up is already queued`);
+      if (job.idleTimer) clearTimeout(job.idleTimer);
+      job.idleTimer = undefined;
+      job.pendingRestart = { message, behavior: "followUp" };
+      job.snapshot = {
+        ...job.snapshot,
+        status: "queued",
+        generation: job.snapshot.generation + 1,
+        endedAt: undefined,
+        error: undefined,
+        output: "",
+        truncated: false,
+        tools: [],
+        liveThinking: "",
+        queuedMessages: [{ text: message, behavior: "followUp" }],
+      };
+      this.#queue.push(id);
+      this.#publish(job, { type: "queue_changed", messages: job.snapshot.queuedMessages });
+      this.#pump();
+      return clone(job.snapshot);
+    }
     const run = job.run ?? await new Promise<BackendRun | undefined>((resolve) => {
       const waiters = job.runWaiters ??= new Set();
       const ready = (value?: BackendRun) => { clearTimeout(timer); waiters.delete(ready); resolve(value); };
@@ -149,7 +183,12 @@ export class JobManager {
     if (job.snapshot.status === "queued") {
       const index = this.#queue.indexOf(id);
       if (index >= 0) this.#queue.splice(index, 1);
+      job.pendingRestart = undefined;
       this.#emit(job, { type: "cancelled", reason });
+      if (job.run) {
+        await this.#serialize(job, () => job.run!.close()).catch(() => undefined);
+        job.run = undefined;
+      }
     } else {
       job.cancelRequested ??= reason;
       job.startupController?.abort(new Error(job.cancelRequested));
@@ -168,6 +207,8 @@ export class JobManager {
     this.#closed = true;
     const operations: Promise<unknown>[] = [];
     for (const job of this.#jobs.values()) {
+      if (job.idleTimer) clearTimeout(job.idleTimer);
+      job.idleTimer = undefined;
       operations.push((async () => {
         if (!isTerminal(job.snapshot.status)) await this.cancel(job.snapshot.id, "Session shutdown");
         const run = job.run;
@@ -205,6 +246,8 @@ export class JobManager {
       .sort((a, b) => a.snapshot.createdAt - b.snapshot.createdAt);
     while (this.#jobs.size >= MAX_RETAINED_JOBS && terminal.length > 0) {
       const job = terminal.shift()!;
+      if (job.idleTimer) clearTimeout(job.idleTimer);
+      if (job.run) void job.run.close().catch(() => undefined);
       this.#jobs.delete(job.snapshot.id);
       this.#waiters.delete(job.snapshot.id);
     }
@@ -217,7 +260,7 @@ export class JobManager {
       const job = id ? this.#jobs.get(id) : undefined;
       if (!job || job.snapshot.status !== "queued") continue;
       this.#active++;
-      const launch = this.#launch(job);
+      const launch = job.run && job.pendingRestart ? this.#restart(job) : this.#launch(job);
       this.#launches.add(launch);
       void launch.finally(() => this.#launches.delete(launch));
     }
@@ -258,11 +301,64 @@ export class JobManager {
       job.startupController = undefined;
       this.#resolveRunWaiters(job);
       const run = job.run;
-      if (run) await this.#serialize(job, () => run.close()).catch(() => undefined);
-      job.run = undefined;
+      if (job.snapshot.status === "completed" && run && !job.cancelRequested && !job.snapshot.workflow) {
+        this.#scheduleIdleClose(job, run);
+      } else {
+        if (run) await this.#serialize(job, () => run.close()).catch(() => undefined);
+        job.run = undefined;
+      }
       this.#active--;
       this.#pump();
     }
+  }
+
+  async #restart(job: InternalJob): Promise<void> {
+    const run = job.run;
+    const pending = job.pendingRestart;
+    job.pendingRestart = undefined;
+    if (!run || !pending) {
+      this.#emit(job, { type: "failed", error: "Native session is no longer available" });
+      this.#active--;
+      this.#pump();
+      return;
+    }
+    try {
+      this.#emit(job, { type: "started" });
+      await this.#serialize(job, () => run.send(pending.message, pending.behavior));
+      await this.#waitForTerminal(job);
+    } catch (error) {
+      if (!isTerminal(job.snapshot.status)) this.#emit(job, { type: "failed", error: error instanceof Error ? error.message : String(error) });
+    } finally {
+      if (job.snapshot.status === "completed" && job.run === run && !job.snapshot.workflow) this.#scheduleIdleClose(job, run);
+      else {
+        await this.#serialize(job, () => run.close()).catch(() => undefined);
+        if (job.run === run) job.run = undefined;
+      }
+      this.#active--;
+      this.#pump();
+    }
+  }
+
+  #waitForTerminal(job: InternalJob): Promise<void> {
+    if (isTerminal(job.snapshot.status)) return Promise.resolve();
+    return new Promise((resolve) => {
+      const waiter = () => resolve();
+      const set = this.#waiters.get(job.snapshot.id) ?? new Set<() => void>();
+      set.add(waiter);
+      this.#waiters.set(job.snapshot.id, set);
+    });
+  }
+
+  #scheduleIdleClose(job: InternalJob, run: BackendRun): void {
+    if (job.idleTimer) clearTimeout(job.idleTimer);
+    job.idleTimer = setTimeout(() => {
+      job.idleTimer = undefined;
+      if (job.run !== run || job.snapshot.status !== "completed") return;
+      void this.#serialize(job, () => run.close()).finally(() => {
+        if (job.run === run) job.run = undefined;
+      });
+    }, REUSABLE_SESSION_TTL_MS);
+    job.idleTimer.unref();
   }
 
   #handleBackendEvent(job: InternalJob, event: BackendEvent): void {
@@ -301,14 +397,18 @@ export class JobManager {
   #emit(job: InternalJob, event: BackendEvent): void {
     if (isTerminal(job.snapshot.status)) return;
     job.snapshot = reduceJob(job.snapshot, event);
-    const snapshot = clone(job.snapshot);
-    for (const listener of this.#listeners) {
-      try { listener(snapshot, event); } catch { /* observers cannot break lifecycle */ }
-    }
+    this.#publish(job, event);
     if (isTerminal(job.snapshot.status)) {
       this.#resolveRunWaiters(job);
       for (const waiter of this.#waiters.get(job.snapshot.id) ?? []) waiter();
       this.#waiters.delete(job.snapshot.id);
+    }
+  }
+
+  #publish(job: InternalJob, event: BackendEvent): void {
+    const snapshot = clone(job.snapshot);
+    for (const listener of this.#listeners) {
+      try { listener(snapshot, event); } catch { /* observers cannot break lifecycle */ }
     }
   }
 

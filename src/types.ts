@@ -14,11 +14,15 @@ export interface Usage {
 }
 
 export type BackendEvent =
-  | { type: "started"; backendSessionId?: string; at?: number }
+  | { type: "started"; backendSessionId?: string; sessionFile?: string; at?: number }
+  | { type: "user_message"; text: string; at?: number }
   | { type: "text_delta"; text: string; at?: number }
+  | { type: "thinking_delta"; text: string; at?: number }
+  | { type: "thinking_message"; text: string; at?: number }
   | { type: "message"; text: string; at?: number }
+  | { type: "queue_changed"; messages: QueuedMessage[]; at?: number }
   | { type: "tool_start"; id: string; name: string; summary?: string; at?: number }
-  | { type: "tool_end"; id: string; name?: string; error?: boolean; at?: number }
+  | { type: "tool_end"; id: string; name?: string; output?: string; error?: boolean; at?: number }
   | { type: "usage"; usage: Partial<Usage>; at?: number }
   | { type: "completed"; output?: string; at?: number }
   | { type: "failed"; error: string; at?: number }
@@ -52,6 +56,17 @@ export interface BackendRequest {
 }
 
 export type SendBehavior = "steer" | "followUp";
+
+export interface QueuedMessage {
+  text: string;
+  behavior: SendBehavior;
+}
+
+export type TranscriptEntry =
+  | { kind: "user"; text: string; at?: number }
+  | { kind: "assistant"; text: string; at?: number }
+  | { kind: "thinking"; text: string; at?: number }
+  | { kind: "tool"; toolId: string; name: string; text?: string; error?: boolean; at?: number };
 
 export interface BackendRun {
   completed: Promise<void>;
@@ -121,6 +136,8 @@ export interface JobSnapshot {
   task: string;
   cwd: string;
   status: JobStatus;
+  /** Increments each time a retained native session starts another turn. */
+  generation: number;
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
@@ -129,5 +146,10 @@ export interface JobSnapshot {
   truncated: boolean;
   usage: Usage;
   tools: ToolTrace[];
+  transcript: TranscriptEntry[];
+  liveThinking: string;
+  queuedMessages: QueuedMessage[];
+  backendSessionId?: string;
+  sessionFile?: string;
   workflow?: WorkflowJobReference;
 }

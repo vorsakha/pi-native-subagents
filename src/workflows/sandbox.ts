@@ -10,6 +10,7 @@ const MAX_RESULT_BYTES = MIB;
 const MAX_IPC_BYTES = 512 * KIB;
 const MAX_AGENT_CALLS = 32;
 const TERMINATION_GRACE_MS = 250;
+const AGENT_DRAIN_GRACE_MS = 1_000;
 
 export interface WorkflowAgentResult {
   ok: boolean;
@@ -17,6 +18,7 @@ export interface WorkflowAgentResult {
   jobId?: string;
   error?: string;
   usage?: unknown;
+  structured?: unknown;
 }
 
 export interface WorkflowSandboxOptions {
@@ -148,6 +150,7 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
     let resultChunks: string[] | undefined;
     let resultBytes = 0;
     const agentControllers = new Map<number, AbortController>();
+    const agentTasks = new Set<Promise<unknown>>();
     let stderr = "";
 
     const clear = () => {
@@ -166,7 +169,14 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
       settled = true;
       clear();
       abortAgents();
-      void terminate(child).then(() => reject(error), () => reject(error));
+      const boundedDrain = Promise.race([
+        Promise.allSettled([...agentTasks]).then(() => undefined),
+        new Promise<void>((resolveDrain) => {
+          const timer = setTimeout(resolveDrain, AGENT_DRAIN_GRACE_MS);
+          timer.unref();
+        }),
+      ]);
+      void Promise.allSettled([terminate(child), boundedDrain]).then(() => reject(error), () => reject(error));
     };
     const succeed = (value: WorkflowSandboxResult) => {
       if (settled) return;
@@ -213,7 +223,7 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
         }
         const controller = new AbortController();
         agentControllers.set(message.id, controller);
-        void Promise.resolve()
+        const task = Promise.resolve()
           .then(() => options.onAgent(message.prompt, message.options, controller.signal))
           .catch(safeAgentFailure)
           .then((result) => {
@@ -235,6 +245,8 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
               });
             }
           });
+        agentTasks.add(task);
+        void task.finally(() => agentTasks.delete(task));
         return;
       }
       if (message.type === "result-start") {

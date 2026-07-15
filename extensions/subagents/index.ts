@@ -33,6 +33,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const AGENTS_DIR = resolve(ROOT, "agents");
 const STATE_ENTRY = "native-subagents-profile";
 const LEGACY_STATE_ENTRY = "subagents-profile";
+const SUBAGENT_RESULT_MESSAGE = "native-subagent-result";
 const BACKENDS = ["codex", "claude", "pi"] as const;
 const TIERS = ["economy", "balanced", "quality"] as const;
 
@@ -61,8 +62,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   let activeBackend = configuredBackend;
   let manager: JobManager | undefined;
   let unsubscribeManager: (() => void) | undefined;
-  let noticeTimer: NodeJS.Timeout | undefined;
-  let notices: Array<{ text: string; level: "info" | "warning" | "error" }> = [];
+  let sessionContext: { isIdle(): boolean } | undefined;
+  const deferredResults = new Map<string, JobSnapshot>();
+  const waitInterest = new Map<string, number>();
+  const consumedResults = new Set<string>();
+  const resultKey = (id: string, generation: number) => `${id}:${generation}`;
 
   const createManager = () => new JobManager({
     roles,
@@ -73,8 +77,62 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const getManager = () => manager ??= createManager();
   const workflows = registerWorkflows(pi, { roleNames, artifactRoot: options.workflowArtifactRoot });
 
+  pi.registerMessageRenderer(SUBAGENT_RESULT_MESSAGE, (message, { expanded }, theme) => {
+    const job = (message.details as { job?: JobSnapshot } | undefined)?.job;
+    if (!job) return renderToolCallLine(theme, "Inspect", "subagent result unavailable");
+    return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint() });
+  });
+
+  const deliverResult = (job: JobSnapshot) => {
+    const compact = compactJob(job);
+    pi.sendMessage({
+      customType: SUBAGENT_RESULT_MESSAGE,
+      content: terminalText(job),
+      display: true,
+      details: { job: compact },
+    }, { deliverAs: "followUp", triggerTurn: true });
+  };
+  const flushDeferredResults = () => {
+    for (const [id, job] of deferredResults) {
+      deferredResults.delete(id);
+      try { deliverResult(job); } catch { /* session may be shutting down */ }
+    }
+  };
+  const deferResult = (job: JobSnapshot) => {
+    const key = resultKey(job.id, job.generation);
+    if (job.workflow || consumedResults.has(key) || (waitInterest.get(key) ?? 0) > 0) return;
+    deferredResults.set(key, job);
+    if (sessionContext?.isIdle()) flushDeferredResults();
+  };
+  const beginResultConsumption = (id: string): number => {
+    const generation = manager?.check(id).generation ?? 0;
+    const key = resultKey(id, generation);
+    waitInterest.set(key, (waitInterest.get(key) ?? 0) + 1);
+    deferredResults.delete(key);
+    return generation;
+  };
+  const endResultConsumption = (id: string, generation: number, consumed: boolean) => {
+    const key = resultKey(id, generation);
+    const count = (waitInterest.get(key) ?? 1) - 1;
+    if (count <= 0) waitInterest.delete(key);
+    else waitInterest.set(key, count);
+    if (consumed) {
+      consumedResults.add(key);
+      if (consumedResults.size > 200) consumedResults.delete(consumedResults.values().next().value!);
+    } else {
+      try {
+        const current = manager?.check(id);
+        if (current && current.generation === generation && isTerminal(current.status)) deferResult(current);
+      } catch { /* job may have been evicted */ }
+    }
+  };
+
   pi.on("session_start", (_event, ctx) => {
     manager = createManager();
+    sessionContext = ctx;
+    deferredResults.clear();
+    waitInterest.clear();
+    consumedResults.clear();
     activeBackend = configuredBackend;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom") continue;
@@ -89,42 +147,23 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     const sessionManager = manager;
     unsubscribeManager = sessionManager.subscribe((job, event) => {
       updateStatus(ctx, sessionManager, activeBackend);
-      const terminal = event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown");
-      if (!terminal) return;
-      // A foreground wait already renders the completion in-place. Only announce
-      // successful background completions while the parent is idle; failures and
-      // cancellations remain visible regardless. Batch near-simultaneous finishes
-      // into one notification instead of spraying one toast per agent.
-      if (event.type === "completed" && !ctx.isIdle()) return;
-      const glyph = event.type === "failed" ? "×" : event.type === "cancelled" ? "■" : "✓";
-      const level = event.type === "failed" ? "error" : event.type === "cancelled" ? "warning" : "info";
-      notices.push({ text: `${glyph} ${job.role} ${job.status} · ${job.id.slice(0, 8)}`, level });
-      if (!noticeTimer) {
-        noticeTimer = setTimeout(() => {
-          noticeTimer = undefined;
-          const pending = notices;
-          notices = [];
-          if (!pending.length) return;
-          const visible = pending.slice(0, 4).map((item) => item.text);
-          if (pending.length > visible.length) visible.push(`+${pending.length - visible.length} more`);
-          const notifyLevel = pending.some((item) => item.level === "error")
-            ? "error"
-            : pending.some((item) => item.level === "warning") ? "warning" : "info";
-          ctx.ui.notify(visible.join("\n"), notifyLevel);
-        }, 180);
-        noticeTimer.unref();
+      if (event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown")) {
+        deferResult(job);
       }
     });
     updateStatus(ctx, sessionManager, activeBackend);
     workflows.sessionStart(ctx, sessionManager);
   });
 
+  pi.on("agent_settled", flushDeferredResults);
+
   pi.on("session_shutdown", async () => {
     unsubscribeManager?.();
     unsubscribeManager = undefined;
-    if (noticeTimer) clearTimeout(noticeTimer);
-    noticeTimer = undefined;
-    notices = [];
+    sessionContext = undefined;
+    deferredResults.clear();
+    waitInterest.clear();
+    consumedResults.clear();
     try {
       await workflows.sessionShutdown();
       await manager?.shutdown();
@@ -176,7 +215,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   pi.registerTool({
     name: "subagent_spawn",
     label: "Spawn Subagent",
-    description: `Spawn a native background subagent. Roles: ${roleNames.join(", ") || "none"}. Maximum four jobs run concurrently.`,
+    description: `Spawn a native background subagent. Roles: ${roleNames.join(", ") || "none"}. Maximum four jobs run concurrently. Unconsumed results are delivered automatically as one follow-up.`,
     promptSnippet: "Spawn a native Pi, Claude Code, or Codex subagent in the background",
     parameters: spawnParameters,
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -224,16 +263,20 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     }),
     async execute(_id, params, signal, onUpdate) {
       const manager = getManager();
+      const generation = beginResultConsumption(params.jobId);
+      let consumed = false;
       const timer = setInterval(() => {
         const current = manager.check(params.jobId);
-        onUpdate?.({ content: [{ type: "text", text: statusLine(current) }], details: { job: current } });
+        onUpdate?.({ content: [{ type: "text", text: statusLine(current) }], details: { job: compactJob(current) } });
       }, 500);
       timer.unref();
       try {
         const snapshot = await manager.wait(params.jobId, { timeoutMs: params.timeoutMs ?? 600_000, signal });
+        consumed = isTerminal(snapshot.status);
         return result(snapshot, terminalText(snapshot));
       } finally {
         clearInterval(timer);
+        endResultConsumption(params.jobId, generation, consumed);
       }
     },
     renderCall(args, theme) {
@@ -285,8 +328,15 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     description: "Cancel a queued or running background subagent and tear down its process tree.",
     parameters: Type.Object({ jobId: Type.String() }),
     async execute(_id, params) {
-      const snapshot = await getManager().cancel(params.jobId);
-      return result(snapshot, statusLine(snapshot));
+      const generation = beginResultConsumption(params.jobId);
+      let consumed = false;
+      try {
+        const snapshot = await getManager().cancel(params.jobId);
+        consumed = isTerminal(snapshot.status);
+        return result(snapshot, statusLine(snapshot));
+      } finally {
+        endResultConsumption(params.jobId, generation, consumed);
+      }
     },
     renderCall(args, theme) {
       return renderToolCallLine(theme, "Cancel", shortId(args.jobId));
@@ -306,7 +356,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     async execute() {
       const jobs = getManager().list();
       const text = jobs.length ? jobs.map(statusLine).join("\n") : "No subagent jobs in this session.";
-      return { content: [{ type: "text", text }], details: { jobs } };
+      return { content: [{ type: "text", text }], details: { jobs: jobs.map(compactJob) } };
     },
     renderCall(_args, theme) {
       return renderToolCallLine(theme, "List", "session jobs");
@@ -340,14 +390,17 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         role: params.agent, task: params.task, cwd: params.cwd,
         backend: params.backend ?? params.modelProfile, modelTier: params.modelTier,
       }, ctx.cwd, ctx.isProjectTrusted(), activeBackend);
+      const generation = beginResultConsumption(snapshot.id);
+      let consumed = false;
       const timer = setInterval(() => {
         const current = getManager().check(snapshot.id);
-        onUpdate?.({ content: [{ type: "text", text: statusLine(current) }], details: { job: current } });
+        onUpdate?.({ content: [{ type: "text", text: statusLine(current) }], details: { job: compactJob(current) } });
       }, 500);
       timer.unref();
       try {
         const final = await getManager().wait(snapshot.id, { signal });
         if (!isTerminal(final.status)) throw new Error("Subagent wait ended before completion");
+        consumed = true;
         if (final.status === "failed") throw new Error(final.error ?? "Subagent failed");
         return result(final, terminalText(final));
       } catch (error) {
@@ -355,6 +408,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         throw error;
       } finally {
         clearInterval(timer);
+        endResultConsumption(snapshot.id, generation, consumed);
       }
     },
     renderCall(args, theme) {
@@ -443,8 +497,11 @@ function terminalText(job: JobSnapshot): string {
   if (job.status === "failed" || job.status === "cancelled") return `${statusLine(job)}\n${job.error ?? ""}`.trim();
   return statusLine(job);
 }
+function compactJob(job: JobSnapshot): JobSnapshot {
+  return { ...job, transcript: [], liveThinking: "", queuedMessages: [] };
+}
 function result(job: JobSnapshot, text: string) {
-  return { content: [{ type: "text" as const, text }], details: { job } };
+  return { content: [{ type: "text" as const, text }], details: { job: compactJob(job) } };
 }
 function jobOf(res: { details?: unknown }): JobSnapshot | undefined {
   return (res.details as { job?: JobSnapshot } | undefined)?.job;

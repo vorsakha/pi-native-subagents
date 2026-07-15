@@ -10,10 +10,13 @@ import {
   rm,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
+import type { TranscriptEntry } from "../types.ts";
 import type { WorkflowSnapshot } from "./types.ts";
 
 const RUN_ID_PATTERN = /^wf_[a-f0-9]+$/;
 const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
+const TRANSCRIPT_ENTRY_BYTES = 4 * 1_024;
+const TRANSCRIPT_AGENT_BYTES = 32 * 1_024;
 
 export interface WorkflowSerializationLimits {
   maxDepth: number;
@@ -223,6 +226,37 @@ async function atomicWriteJson(
   await atomicWrite(path, JSON.stringify(serialized));
 }
 
+function boundedTranscript(entries: TranscriptEntry[] = []): TranscriptEntry[] {
+  const bounded = entries.map((entry) => ({
+    ...entry,
+    text: entry.text === undefined ? undefined : truncateUtf8(entry.text, TRANSCRIPT_ENTRY_BYTES),
+    name: entry.kind === "tool" ? truncateUtf8(entry.name, 512) : undefined,
+  })) as TranscriptEntry[];
+  const size = (items: TranscriptEntry[]) => Buffer.byteLength(JSON.stringify(items));
+  if (size(bounded) <= TRANSCRIPT_AGENT_BYTES) return bounded;
+  const first = bounded[0];
+  const tail: TranscriptEntry[] = [];
+  for (let index = bounded.length - 1; index > 0; index--) {
+    const candidate = [
+      ...(first ? [first] : []),
+      { kind: "tool", toolId: "transcript", name: "transcript", text: "[older transcript entries omitted]" } as TranscriptEntry,
+      ...[...tail].reverse(),
+      bounded[index]!,
+    ];
+    if (size(candidate) > TRANSCRIPT_AGENT_BYTES) break;
+    tail.push(bounded[index]!);
+  }
+  return [
+    ...(first ? [first] : []),
+    { kind: "tool", toolId: "transcript", name: "transcript", text: "[older transcript entries omitted]" },
+    ...tail.reverse(),
+  ];
+}
+
+function transcriptArtifact(snapshot: WorkflowSnapshot): Record<string, TranscriptEntry[]> {
+  return Object.fromEntries(snapshot.agents.slice(0, 32).map((agent) => [String(agent.index), boundedTranscript(agent.transcript)]));
+}
+
 /** Keep the workflow summary structurally valid even when 32 agents each
  * produce their maximum retained output. Full native transcripts remain in
  * backend session files; workflow.json is an inspectable bounded summary. */
@@ -232,6 +266,8 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
     name: truncateUtf8(snapshot.name, 1_000),
     description: truncateUtf8(snapshot.description, 4_000),
     error: snapshot.error ? truncateUtf8(snapshot.error, 4_000) : undefined,
+    transcriptArtifact: "transcripts.json",
+    reportArtifact: snapshot.reportArtifact,
     result: serializeWorkflowValue(snapshot.result, { maxNodes: 4_000, maxStringBytes: 16 * 1024, maxTotalBytes: 64 * 1024 }),
     phases: snapshot.phases.slice(0, 64).map((phase) => ({
       ...phase,
@@ -247,6 +283,8 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
       role: truncateUtf8(agent.role, 1_000),
       preview: agent.preview ? truncateUtf8(agent.preview, 1_000) : undefined,
       output: serializeWorkflowValue(agent.output, { maxNodes: 256, maxStringBytes: 4 * 1024, maxTotalBytes: 6 * 1024 }),
+      structured: serializeWorkflowValue(agent.structured, { maxNodes: 512, maxStringBytes: 8 * 1024, maxTotalBytes: 16 * 1024 }),
+      transcript: undefined,
       error: agent.error ? truncateUtf8(agent.error, 2_000) : undefined,
     })),
   }, {
@@ -304,6 +342,7 @@ export async function createWorkflowArtifacts(
   try {
     await atomicWrite(join(artifactDir, "script.js"), input.script);
     await atomicWriteJson(join(artifactDir, "args.json"), input.args, input.limits);
+    await atomicWriteJson(join(artifactDir, "transcripts.json"), transcriptArtifact(workflow), { maxTotalBytes: 2 * 1024 * 1024 });
     await atomicWriteJson(join(artifactDir, "workflow.json"), workflow, input.limits);
     await atomicWriteJson(join(artifactDir, "result.json"), workflow.result ?? null, input.limits);
     return workflow;
@@ -319,7 +358,8 @@ export async function checkpointWorkflow(
   limits: Partial<WorkflowSerializationLimits> = {},
 ): Promise<void> {
   const directory = await requireRunDirectory(root, snapshot.runId);
-  const normalized: WorkflowSnapshot = { ...snapshot, artifactDir: directory };
+  const normalized: WorkflowSnapshot = { ...snapshot, artifactDir: directory, transcriptArtifact: "transcripts.json" };
+  await atomicWriteJson(join(directory, "transcripts.json"), transcriptArtifact(normalized), { maxTotalBytes: 2 * 1024 * 1024 });
   // Never let a caller's tiny serialization override collapse the whole
   // summary into a truncation marker; structural validity outranks verbosity.
   const durable = durableWorkflowSnapshot(normalized);
@@ -337,6 +377,54 @@ export async function writeWorkflowResult(
 ): Promise<void> {
   const directory = await requireRunDirectory(root, runId);
   await atomicWriteJson(join(directory, "result.json"), result, limits);
+}
+
+export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapshot): Promise<void> {
+  const directory = await requireRunDirectory(root, snapshot.runId);
+  const usage = snapshot.agents.reduce((total, agent) => ({
+    input: total.input + agent.usage.input,
+    output: total.output + agent.usage.output,
+    cost: total.cost + agent.usage.cost,
+    turns: total.turns + agent.usage.turns,
+  }), { input: 0, output: 0, cost: 0, turns: 0 });
+  const lines = [
+    `# ${snapshot.name}`,
+    "",
+    snapshot.description,
+    "",
+    `- Run: \`${snapshot.runId}\``,
+    `- Status: **${snapshot.status}**`,
+    `- Agents: ${snapshot.agents.length}`,
+    `- Usage: ${usage.input} input / ${usage.output} output tokens · ${usage.turns} turns · $${usage.cost.toFixed(4)}`,
+    "",
+    "## Phases",
+    ...snapshot.phases.map((phase) => `- ${phase.name}: ${phase.status} (${phase.agents.length} agents)`),
+    "",
+    "## Agents",
+    ...snapshot.agents.map((agent) => `### ${agent.label}\n\n- Role: ${agent.role}\n- Status: ${agent.state}\n- Route: ${agent.backend ?? "?"}/${agent.model ?? "?"}\n\n${truncateUtf8(String(agent.output ?? agent.preview ?? agent.error ?? "(no output)"), 8 * 1024)}\n`),
+    "## Result",
+    "",
+    "```json",
+    JSON.stringify(serializeWorkflowValue(snapshot.result, { maxTotalBytes: 128 * 1024 }), null, 2),
+    "```",
+    "",
+  ];
+  await atomicWrite(join(directory, "report.md"), lines.join("\n"));
+}
+
+function normalizeTranscript(value: unknown): TranscriptEntry[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const entries: TranscriptEntry[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const entry = item as Record<string, unknown>;
+    if (entry.kind === "user" || entry.kind === "assistant" || entry.kind === "thinking") {
+      if (typeof entry.text === "string") entries.push({ kind: entry.kind, text: entry.text, at: typeof entry.at === "number" ? entry.at : undefined });
+    } else if (entry.kind === "tool" && typeof entry.toolId === "string" && typeof entry.name === "string") {
+      entries.push({ kind: "tool", toolId: entry.toolId, name: entry.name, text: typeof entry.text === "string" ? entry.text : undefined, error: entry.error === true, at: typeof entry.at === "number" ? entry.at : undefined });
+    }
+  }
+  return boundedTranscript(entries);
 }
 
 function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
@@ -401,6 +489,18 @@ export async function loadWorkflowSummaries(
       const parsed: unknown = JSON.parse(await readFile(join(directory, "workflow.json"), "utf8"));
       if (!isWorkflowSnapshot(parsed) || parsed.runId !== entry.name) continue;
       let snapshot: WorkflowSnapshot = { ...parsed, artifactDir: directory };
+      if (snapshot.transcriptArtifact) {
+        try {
+          const rawTranscripts = JSON.parse(await readFile(join(directory, snapshot.transcriptArtifact), "utf8")) as Record<string, unknown>;
+          snapshot = {
+            ...snapshot,
+            agents: snapshot.agents.map((agent) => ({
+              ...agent,
+              transcript: normalizeTranscript(rawTranscripts[String(agent.index)]),
+            })),
+          };
+        } catch { /* transcript artifact is optional; summary remains usable */ }
+      }
       const aborted = abortStaleWorkflow(snapshot, now, staleAfterMs);
       if (aborted !== snapshot) {
         snapshot = aborted;

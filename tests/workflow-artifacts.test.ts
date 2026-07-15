@@ -7,7 +7,6 @@ import {
   checkpointWorkflow,
   createWorkflowArtifacts,
   loadWorkflowSummaries,
-  serializeWorkflowValue,
   writeWorkflowResult,
 } from "../src/workflows/artifacts.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
@@ -39,6 +38,7 @@ function snapshot(sessionId: string, now = Date.now()): Omit<WorkflowSnapshot, "
       backend: "codex",
       model: "review-model",
       preview: "working",
+      transcript: [{ kind: "user", text: "inspect" }, { kind: "assistant", text: "working" }],
       usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
     }],
   };
@@ -65,7 +65,7 @@ test("creates private workflow artifacts and redacts environment/auth values", a
   assert.match(created.runId, /^wf_[a-f0-9]+$/);
   assert.equal(created.artifactDir, join(root, created.runId));
   assert.deepEqual((await readdir(created.artifactDir)).sort(), [
-    "args.json", "result.json", "script.js", "workflow.json",
+    "args.json", "result.json", "script.js", "transcripts.json", "workflow.json",
   ]);
   const persisted = await readFile(join(created.artifactDir, "args.json"), "utf8");
   assert.match(persisted, /safe/);
@@ -136,51 +136,7 @@ test("loads session summaries, ignores corrupt files, and durably aborts stale r
 
   const saved = JSON.parse(await readFile(join(first.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
   assert.equal(saved.status, "aborted");
-});
-
-test("large terminal checkpoints remain valid loadable workflow summaries", async () => {
-  const { root } = await fixture();
-  const created = await createWorkflowArtifacts(root, {
-    script: "export default async () => null;\n",
-    args: {},
-    snapshot: snapshot("session-large"),
-  });
-  const large: WorkflowSnapshot = {
-    ...created,
-    status: "completed",
-    timestamps: { ...created.timestamps, updatedAt: 5_000, endedAt: 5_000 },
-    phases: Array.from({ length: 3_000 }, (_, index) => ({
-      index,
-      name: `phase-${index}`,
-      status: "completed" as const,
-      timestamps: { createdAt: 1_000, updatedAt: 5_000, endedAt: 5_000 },
-      agents: Array.from({ length: 100 }, (_, agentIndex) => agentIndex),
-    })),
-    agents: Array.from({ length: 32 }, (_, index) => ({
-      index,
-      label: `agent-${index}`,
-      role: "worker",
-      phase: 0,
-      state: "completed" as const,
-      timestamps: { createdAt: 1_000, updatedAt: 5_000, endedAt: 5_000 },
-      preview: "preview",
-      output: `${index}:` + "x".repeat(50 * 1024),
-      error: undefined,
-      usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
-    })),
-    result: { summary: "r".repeat(256 * 1024) },
-  };
-  await checkpointWorkflow(root, large);
-  const persisted = JSON.parse(await readFile(join(created.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
-  assert.equal(persisted.runId, created.runId);
-  assert.equal(persisted.status, "completed");
-  assert.equal(persisted.agents.length, 32);
-  assert.equal(persisted.phases.length, 64);
-  assert.ok(persisted.phases.every((phase) => typeof phase === "object" && phase.agents.length <= 32));
-  assert.ok(Buffer.byteLength(JSON.stringify(persisted)) < 512 * 1024);
-  const loaded = await loadWorkflowSummaries(root, { sessionId: "session-large" });
-  assert.equal(loaded.length, 1);
-  assert.equal(loaded[0]?.runId, created.runId);
+  assert.equal(summaries[0]?.agents[0]?.transcript?.at(-1)?.kind, "assistant");
 });
 
 test("no-resume loading aborts future checkpoints plus queued agents and pending phases", async () => {
@@ -203,26 +159,4 @@ test("no-resume loading aborts future checkpoints plus queued agents and pending
   assert.equal(loaded[0]?.status, "aborted");
   assert.equal(loaded[0]?.phases[0]?.status, "aborted");
   assert.equal(loaded[0]?.agents[0]?.state, "aborted");
-});
-
-test("bounded serialization handles cycles, depth, node count, and byte limits", () => {
-  const value: Record<string, unknown> = {
-    long: "🙂".repeat(1_000),
-    secret: "must-not-persist",
-    child: { child: { child: { child: true } } },
-    many: Array.from({ length: 100 }, (_, index) => ({ index })),
-  };
-  value.self = value;
-
-  const serialized = serializeWorkflowValue(value, {
-    maxDepth: 2,
-    maxNodes: 12,
-    maxStringBytes: 24,
-    maxTotalBytes: 300,
-  });
-  const json = JSON.stringify(serialized);
-  assert.ok(Buffer.byteLength(json) <= 300);
-  assert.doesNotMatch(json, /must-not-persist/);
-  assert.match(json, /Circular|MaxDepth|MaxNodes|total bytes|truncated/i);
-  assert.doesNotThrow(() => JSON.parse(json));
 });

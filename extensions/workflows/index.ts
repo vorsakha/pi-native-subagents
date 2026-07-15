@@ -40,6 +40,7 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
     agents: snapshot.agents.map((agent) => ({
       ...structuredClone(agent),
       output: undefined,
+      transcript: undefined,
       preview: agent.preview?.slice(-500),
     })),
   };
@@ -115,7 +116,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   pi.registerTool({
     name: "workflow",
     label: "Workflow",
-    description: `Run sandboxed JavaScript orchestration over native role-based subagents. Available roles: ${options.roleNames.join(", ") || "none"}. Scripts export a default async function and may call phase(title), agent(prompt,{role,label?,backend?,modelTier?,phase?}), and parallel(tasks,{concurrency?}).`,
+    description: `Run sandboxed JavaScript orchestration over native role-based subagents. Available roles: ${options.roleNames.join(", ") || "none"}. Scripts export a default async function and may call phase(title), agent(prompt,{role,label?,backend?,modelTier?,phase?,schema?}), and parallel(tasks,{concurrency?}). Optional workflow budgets cap reported tokens, turns, and cost.`,
     promptSnippet: "Run a sandboxed multi-agent workflow with phases and bounded parallelism",
     promptGuidelines: [
       "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls.",
@@ -123,6 +124,8 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       "Scripts cannot access files, network, environment variables, subprocesses, imports, or credentials; only agent, parallel, phase, and JSON args are available.",
       "Use background=true for independent long work; completion is delivered automatically as a follow-up.",
       "Keep workflow results JSON-serializable and branch explicitly on each agent result's ok field.",
+      "Use agent schema for validated JSON output when downstream phases need structure; schema cannot change role permissions.",
+      "Use workflow budgets for expensive or open-ended runs; parallel members already running may cause bounded overshoot.",
     ],
     parameters: Type.Object({
       name: Type.String({ minLength: 1, maxLength: 160 }),
@@ -131,6 +134,12 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       args: Type.Optional(Type.String({ maxLength: 128 * 1024, description: "JSON passed to the script as args" })),
       background: Type.Optional(Type.Boolean()),
       timeoutMs: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 2 * 60 * 60 * 1_000 })),
+      budget: Type.Optional(Type.Object({
+        maxInputTokens: Type.Optional(Type.Integer({ minimum: 1 })),
+        maxOutputTokens: Type.Optional(Type.Integer({ minimum: 1 })),
+        maxTurns: Type.Optional(Type.Integer({ minimum: 1 })),
+        maxCost: Type.Optional(Type.Number({ minimum: 0 })),
+      })),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const workflows = getManager();
@@ -146,6 +155,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         cwd: ctx.cwd,
         trusted: ctx.isProjectTrusted(),
         depth,
+        budget: params.budget,
       };
       const started = await workflows.start(request);
       const runGeneration = generation;

@@ -276,7 +276,11 @@ export class WorkflowsDashboardOverlay {
     else if (rows >= 4) lines.push(this.theme.fg("dim", "Phase · waiting for the first phase"));
     if (agent && rows >= 5) lines.push(this.renderAgent(agent, agents.length));
     else if (rows >= 5) lines.push(this.theme.fg("dim", "Agent · none in this phase"));
-    if (usage && rows >= 7) lines.push(this.theme.fg("dim", `Usage · ${usage}`));
+    if (usage && rows >= 7) {
+      const budget = run.budget;
+      const limits = budget ? [budget.maxInputTokens && `↑≤${budget.maxInputTokens}`, budget.maxOutputTokens && `↓≤${budget.maxOutputTokens}`, budget.maxTurns && `${budget.maxTurns}t`, budget.maxCost !== undefined && `$${budget.maxCost.toFixed(2)}`].filter(Boolean).join("/") : "";
+      lines.push(this.theme.fg("dim", `Usage · ${usage}${limits ? ` · budget ${limits}` : ""}`));
+    }
 
     const error = sanitizeInline(agent?.error ?? phase?.error ?? run.error ?? "");
     if (error && lines.length < rows - 2) lines.push(this.theme.fg("error", error));
@@ -323,7 +327,13 @@ export class WorkflowsDashboardOverlay {
     phase: WorkflowPhase | undefined,
     agent: WorkflowAgentRecord | undefined,
   ): { text: string; truncated: boolean } {
-    const value = agent?.output ?? agent?.preview ?? phase?.result ?? run.result;
+    const transcript = agent?.transcript?.map((entry) => {
+      if (entry.kind === "user") return `> ${entry.text}`;
+      if (entry.kind === "thinking") return `~ ${entry.text}`;
+      if (entry.kind === "assistant") return entry.text;
+      return `${entry.error ? "×" : "→"} ${entry.name}${entry.text ? ` · ${entry.text}` : ""}`;
+    }).join("\n\n");
+    const value = transcript || agent?.output || agent?.preview || phase?.result || run.result;
     if (value === undefined || value === null || value === "") {
       return { text: run.status === "running" || run.status === "pending" ? "(no result yet)" : "(no result)", truncated: false };
     }

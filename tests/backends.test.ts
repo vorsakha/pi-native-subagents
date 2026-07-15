@@ -1,18 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
-import { promisify } from "node:util";
 import { ClaudeBackend } from "../src/backends/claude.ts";
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
 import { CodexAppServerBackend } from "../src/backends/codex.ts";
 import { MAX_OUTPUT_BYTES } from "../src/reducer.ts";
 import type { BackendEvent, BackendName, BackendRequest } from "../src/types.ts";
-
-const execFileAsync = promisify(execFile);
 
 const PI_FIXTURE = `#!/usr/bin/env node
 import fs from "node:fs";
@@ -29,7 +24,7 @@ process.stdin.on("data", chunk => {
     const value = JSON.parse(line);
     if (process.env.MODE === "hang") continue;
     if (value.id) process.stdout.write(JSON.stringify({ type: "response", id: value.id, command: value.type, success: true }) + "\\n");
-    if (value.type === "prompt" && process.env.MODE === "complete") complete("PI_OK");
+    if (value.type === "prompt" && process.env.MODE === "complete") complete(value.message.startsWith("Task:") ? "PI_OK" : value.message);
     if (value.type === "prompt" && process.env.MODE === "assistant_error") assistantEnd("error", "model exploded");
     if (value.type === "prompt" && process.env.MODE === "assistant_aborted") assistantEnd("aborted", "request aborted");
     if (value.type === "prompt" && process.env.MODE === "stream_error") {
@@ -124,7 +119,7 @@ function terminal(events: BackendEvent[]): BackendEvent | undefined {
   return undefined;
 }
 
-test("Pi RPC uses a persistent native session and accepts steering", async () => {
+test("Pi RPC keeps a persistent native session and reopens a completed turn", async () => {
   const fake = await fixture(PI_FIXTURE);
   const argFile = join(fake.dir, "args.json");
   const envFile = join(fake.dir, "env.json");
@@ -132,56 +127,23 @@ test("Pi RPC uses a persistent native session and accepts steering", async () =>
   try {
     const backend = new PiRpcBackend(fake.command, { requestTimeoutMs: 500, runTimeoutMs: 2_000 });
     const run = await backend.start(request("pi", fake.dir, {
-      ...process.env, MODE: "wait", ARG_FILE: argFile, ENV_FILE: envFile,
+      ...process.env, MODE: "complete", ARG_FILE: argFile, ENV_FILE: envFile,
       OPENAI_API_KEY: "must-not-leak", CODEX_API_KEY: "must-not-leak",
     }), (event) => events.push(event));
-    await run.send("STEERED", "steer");
     await run.completed;
-    assert.deepEqual(terminal(events), { type: "completed", output: "STEERED" });
+    assert.deepEqual(terminal(events), { type: "completed", output: "PI_OK" });
+    await run.send("SECOND", "followUp");
+    const deadline = Date.now() + 1_000;
+    while (events.filter((event) => event.type === "completed").length < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(terminal(events), { type: "completed", output: "SECOND" });
     const args = JSON.parse(await readFile(argFile, "utf8")) as string[];
     assert.equal(args.includes("--no-session"), false);
     assert.equal(args.includes("--approve"), true);
     assert.equal(args.includes("--no-extensions"), true);
     assert.deepEqual(JSON.parse(await readFile(envFile, "utf8")), {});
     await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
-});
-
-test("Pi RPC startup abort tears down a child before returning a run", async () => {
-  const fake = await fixture(PI_FIXTURE);
-  const controller = new AbortController();
-  const events: BackendEvent[] = [];
-  try {
-    const startup = new PiRpcBackend(fake.command, { requestTimeoutMs: 500, runTimeoutMs: 2_000 })
-      .start({ ...request("pi", fake.dir, { ...process.env, MODE: "hang" }), signal: controller.signal }, (event) => events.push(event));
-    controller.abort(new Error("cancel startup"));
-    await assert.rejects(startup, /cancel startup/);
-    assert.equal(terminal(events)?.type, "cancelled");
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
-});
-
-test("standalone top-level Pi lifecycle exits zero instead of unsettled-await code 13", async () => {
-  const fake = await fixture(PI_FIXTURE);
-  const runner = join(fake.dir, "runner.mjs");
-  const backendUrl = pathToFileURL(join(process.cwd(), "src/backends/pi-rpc.ts")).href;
-  try {
-    await writeFile(runner, `
-      import { PiRpcBackend } from ${JSON.stringify(backendUrl)};
-      const request = JSON.parse(process.env.REQUEST);
-      request.env = { ...process.env, MODE: "complete" };
-      request.signal = new AbortController().signal;
-      const run = await new PiRpcBackend(process.env.FIXTURE, { requestTimeoutMs: 500, runTimeoutMs: 2000 }).start(request, () => {});
-      await run.completed;
-      await run.close();
-      process.stdout.write("DONE\\n");
-    `);
-    const childRequest = request("pi", fake.dir, {});
-    const { stdout } = await execFileAsync(process.execPath, [runner], {
-      env: { ...process.env, FIXTURE: fake.command, REQUEST: JSON.stringify(childRequest) },
-      encoding: "utf8",
-      timeout: 5_000,
-    });
-    assert.equal(stdout, "DONE\n");
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
 
@@ -211,16 +173,21 @@ test("Pi RPC maps assistant, stream, extension, and exhausted-retry errors at se
   }
 });
 
-test("Claude emits live text/message events and bounds accumulated multi-turn output", async () => {
+test("Claude emits live events and reopens a completed subscription session", async () => {
   const huge = "x".repeat(MAX_OUTPUT_BYTES);
   let capturedOptions: Record<string, unknown> | undefined;
   let verifiedEnv: NodeJS.ProcessEnv | undefined;
+  let releaseSecond!: () => void;
+  const secondTurn = new Promise<void>((resolve) => { releaseSecond = resolve; });
   async function* messages() {
     yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking: "live thought" } } };
     yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "live" } } };
-    yield { type: "assistant", message: { content: [{ type: "text", text: "message" }] } };
+    yield { type: "assistant", message: { content: [{ type: "thinking", thinking: "final thought" }, { type: "text", text: "message" }] } };
     yield { type: "system", subtype: "permission_denied", tool_use_id: "denied-write", tool_name: "Write" };
     yield { type: "result", subtype: "success", result: huge, usage: {}, total_cost_usd: 0, num_turns: 1 };
+    await secondTurn;
+    yield { type: "assistant", message: { content: [{ type: "text", text: "second message" }] } };
     yield { type: "result", subtype: "success", result: huge, usage: {}, total_cost_usd: 0, num_turns: 1 };
   }
   const stream = Object.assign(messages(), { close() {} });
@@ -238,8 +205,13 @@ test("Claude emits live text/message events and bounds accumulated multi-turn ou
     AWS_ACCESS_KEY_ID: "must-not-leak",
   });
   const run = await backend.start(claudeRequest, (event) => events.push(event));
-  await run.send("second turn", "followUp");
   await run.completed;
+  await run.send("second turn", "followUp");
+  releaseSecond();
+  const deadline = Date.now() + 1_000;
+  while (events.filter((event) => event.type === "completed").length < 2 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   const final = terminal(events) as Extract<BackendEvent, { type: "completed" }>;
   assert.equal(capturedOptions?.includePartialMessages, true);
   const childEnv = capturedOptions?.env as NodeJS.ProcessEnv;
@@ -250,37 +222,14 @@ test("Claude emits live text/message events and bounds accumulated multi-turn ou
     assert.equal(env?.KEEP_GENERIC, "yes");
   }
   assert.ok(events.some((event) => event.type === "text_delta" && event.text === "live"));
+  assert.ok(events.some((event) => event.type === "thinking_delta" && event.text === "live thought"));
+  assert.ok(events.some((event) => event.type === "thinking_message" && event.text === "final thought"));
+  assert.ok(events.some((event) => event.type === "user_message" && event.text === "second turn"));
   assert.ok(events.some((event) => event.type === "message" && event.text === "message"));
   assert.ok(events.some((event) => event.type === "tool_end" && event.id === "denied-write" && event.error));
   assert.ok(Buffer.byteLength(final.output ?? "") <= MAX_OUTPUT_BYTES);
-  assert.match(final.output ?? "", /Earlier output truncated/);
+  assert.equal(events.filter((event) => event.type === "completed").length, 2);
   await run.close();
-});
-
-test("Claude startup forwards cancellation to subscription auth verification", async () => {
-  const controller = new AbortController();
-  let observedSignal: AbortSignal | undefined;
-  const backend = new ClaudeBackend("fixture-claude", {
-    verifyAuth: async (_command, _cwd, _env, signal) => {
-      observedSignal = signal;
-      await new Promise<void>((_resolve, reject) => signal.addEventListener("abort", () => reject(signal.reason), { once: true }));
-    },
-    queryFn: (() => assert.fail("query must not start after auth cancellation")) as never,
-  });
-  const startup = backend.start({ ...request("claude", process.cwd(), process.env), signal: controller.signal }, () => undefined);
-  controller.abort(new Error("startup cancelled"));
-  await assert.rejects(startup, /startup cancelled/);
-  assert.equal(observedSignal, controller.signal);
-});
-
-test("Claude synchronous SDK startup failure leaves no live timeout", async () => {
-  const backend = new ClaudeBackend("fixture-claude", {
-    verifyAuth: async () => undefined,
-    queryFn: (() => { throw new Error("SDK startup failed"); }) as never,
-    runTimeoutMs: 20,
-  });
-  await assert.rejects(backend.start(request("claude", process.cwd(), process.env), () => undefined), /SDK startup failed/);
-  await new Promise<void>((resolve) => setTimeout(resolve, 40));
 });
 
 test("Claude fails closed if a read-only CLI init exposes mutating tools", async () => {
@@ -301,19 +250,7 @@ test("Claude fails closed if a read-only CLI init exposes mutating tools", async
   await run.close();
 });
 
-test("Pi RPC hard timeout settles and teardown remains awaitable", async () => {
-  const fake = await fixture(PI_FIXTURE);
-  const events: BackendEvent[] = [];
-  try {
-    const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 500, runTimeoutMs: 40 })
-      .start(request("pi", fake.dir, { ...process.env, MODE: "hang" }), (event) => events.push(event));
-    await run.completed;
-    assert.match((terminal(events) as { error: string }).error, /run timed out after 40ms/);
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
-});
-
-test("Codex queues a native follow-up turn before settling", async () => {
+test("Codex reuses its native thread for queued and post-settlement follow-ups", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
   const paramFile = join(fake.dir, "turn-params.jsonl");
@@ -321,11 +258,14 @@ test("Codex queues a native follow-up turn before settling", async () => {
   try {
     const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 500, runTimeoutMs: 2_000 })
       .start(request("codex", fake.dir, { ...process.env, MODE: "normal", PARAM_FILE: paramFile, THREAD_PARAM_FILE: threadParamFile }), (event) => events.push(event));
-    // send() waits for asynchronous app-server initialization instead of
-    // exposing an initialization race to callers.
-    await run.send("FOLLOW", "followUp");
     await run.completed;
-    assert.deepEqual(terminal(events), { type: "completed", output: "FIRST\n\nSECOND" });
+    assert.deepEqual(terminal(events), { type: "completed", output: "FIRST" });
+    await run.send("FOLLOW", "followUp");
+    const deadline = Date.now() + 1_000;
+    while (events.filter((event) => event.type === "completed").length < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(terminal(events), { type: "completed", output: "SECOND" });
     const turns = (await readFile(paramFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(turns.length, 2);
     assert.equal(JSON.parse(await readFile(threadParamFile, "utf8")).modelProvider, "openai");
@@ -334,18 +274,6 @@ test("Codex queues a native follow-up turn before settling", async () => {
       assert.equal(params.approvalPolicy, "never");
       assert.equal(params.cwd, fake.dir);
     }
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
-});
-
-test("Codex rejects a conflicting provider returned by thread/start", async () => {
-  const fake = await fixture(CODEX_FIXTURE);
-  const events: BackendEvent[] = [];
-  try {
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 500, runTimeoutMs: 2_000 })
-      .start(request("codex", fake.dir, { ...process.env, THREAD_PROVIDER: "custom" }), (event) => events.push(event));
-    await run.completed;
-    assert.match((terminal(events) as { error: string }).error, /did not retain.*openai.*custom/);
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });

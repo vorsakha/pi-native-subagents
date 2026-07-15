@@ -2,10 +2,11 @@ import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-a
 import { Key, type KeybindingsManager, matchesKey, truncateToWidth, type TUI, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { sanitizeInline, sanitizeText } from "./render.ts";
+import { openSubagentTakeover } from "./takeover.ts";
 import type { JobSnapshot, SendBehavior } from "../../src/types.ts";
 
 type DashboardAction =
-  | { type: "steer" | "followUp" | "cancel"; jobId: string }
+  | { type: "steer" | "followUp" | "cancel" | "takeover"; jobId: string }
   | { type: "close" };
 
 type DashboardManager = Pick<JobManager, "list">;
@@ -106,7 +107,7 @@ class DashboardOverlay {
 
     lines.push(separator());
     const actionHint = chosen && !isTerminal(chosen.status) ? " · s steer · f follow-up · x cancel" : "";
-    lines.push(row(this.theme.fg("dim", `Esc close${actionHint}`)));
+    lines.push(row(this.theme.fg("dim", `Enter takeover · Esc close${actionHint}`)));
     lines.push(bottom());
     return lines;
   }
@@ -126,6 +127,10 @@ class DashboardOverlay {
     else if (matchesKey(data, Key.shift(Key.down))) this.scrollTranscript(1);
     else if (matchesKey(data, Key.pageUp)) this.scrollTranscript(-Math.max(1, this.#transcriptRows - 1));
     else if (matchesKey(data, Key.pageDown)) this.scrollTranscript(Math.max(1, this.#transcriptRows - 1));
+    else if (this.keybindings.matches(data, "tui.select.confirm")) {
+      const job = jobs[this.#selected];
+      if (job) return this.finish({ type: "takeover", jobId: job.id });
+    }
     else if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectJob(Math.max(0, this.#selected - 1), jobs);
     else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(Math.min(Math.max(0, jobs.length - 1), this.#selected + 1), jobs);
     else {
@@ -248,6 +253,10 @@ export async function openSubagentsDashboard(ctx: ExtensionCommandContext, manag
     if (!action || action.type === "close") return;
     if (action.type === "cancel") {
       await manager.cancel(action.jobId, "Cancelled from /subagents dashboard");
+      continue;
+    }
+    if (action.type === "takeover") {
+      await openSubagentTakeover(ctx, manager, action.jobId);
       continue;
     }
     const behavior: SendBehavior = action.type;

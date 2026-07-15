@@ -8,10 +8,10 @@ Standalone Pi package for native Pi, Claude Code, and Codex subagents plus sandb
 - Session-scoped `JobManager` with a hard concurrency cap of four.
 - Background `subagent_spawn`, `subagent_wait`, `subagent_check`, `subagent_send`, `subagent_cancel`, and `subagent_list` tools.
 - Compatibility foreground `subagent` tool plus native steering/follow-up control.
-- `/subagents` TUI dashboard with live job status, transcript tails, cancellation, steering, and queued follow-ups.
-- Sandboxed `workflow` orchestration with phases, sequential and bounded-parallel role-based agents, foreground/background execution, durable artifacts, automatic background result delivery, and `/workflows` inspection.
-- Automatic terminal notifications and compact footer status; ordinary subagents do not inject completions into model context, while explicitly backgrounded workflows deliver one bounded follow-up result.
-- Bounded in-memory subagent state. Workflow scripts, checkpoints, and bounded results are stored privately under `~/.pi/agent/workflows/`, never in the project tree.
+- `/subagents` TUI dashboard with live job status, cancellation, steering, queued follow-ups, and Enter-to-open interactive takeover with normalized user/assistant/thinking/tool state.
+- Sandboxed `workflow` orchestration with phases, sequential and bounded-parallel role-based agents, structured schemas, usage budgets, foreground/background execution, durable artifacts, automatic background result delivery, and `/workflows` inspection.
+- Unconsumed ordinary background results are delivered once as bounded parent follow-ups; `subagent_wait`, foreground runs, and workflow-owned jobs consume or suppress duplicate delivery.
+- Bounded in-memory subagent state. Workflow scripts, checkpoints, results, normalized transcripts, and generated reports are stored privately under `~/.pi/agent/workflows/`, never in the project tree.
 - Process-group teardown with TERM/KILL escalation.
 - Markdown role loader, backend routing, model tiers, nested-agent allowlists, and policy compiler.
 - Native backends:
@@ -89,7 +89,7 @@ Open the interactive dashboard with `/subagents`. Switch the compatibility tool'
 
 The argument-taking `/subagents` forms remain compatible, including legacy `/subagents --use-codex` and `/subagents --use-claude`; `/subagents-config` is the explicit configuration command. During migration, legacy `PI_SUBAGENTS_PROFILE` is accepted when `PI_NATIVE_SUBAGENTS_BACKEND` is unset, and session entries of custom type `subagents-profile` with `{ profile }` are restored. New writes use `native-subagents-profile` with `{ backend }`.
 
-The session backend is a compatibility default for the foreground `subagent` tool only. `subagent_spawn` with no `backend` preserves the selected role's `defaultBackend`; an explicit per-call `backend` overrides it, and `modelTier` forces the native Codex route.
+The session backend is a compatibility default for the foreground `subagent` tool only. `subagent_spawn` with no `backend` preserves the selected role's `defaultBackend`; an explicit per-call `backend` overrides it, and `modelTier` forces the native Codex route. Successfully completed ordinary jobs retain their native Pi/Claude/Codex session for 15 minutes: `subagent_send(..., behavior: "followUp")` or takeover input reopens another turn on the same job and native session. Failed, cancelled, expired, evicted, and workflow-owned sessions are not reusable.
 
 ## Workflows
 
@@ -116,9 +116,11 @@ export default async function () {
 }
 ```
 
-`agent()` always resolves to `{ ok, output, jobId?, error?, usage? }`; scripts branch explicitly on `ok`. Each call requires a role. Optional `backend`, `modelTier`, `label`, and `phase` cannot loosen that role's policy. `parallel()` accepts task functions and enforces concurrency 1–4 while the shared `JobManager` remains the authoritative global scheduler.
+`agent()` always resolves to `{ ok, output, structured?, jobId?, error?, usage? }`; scripts branch explicitly on `ok`. Each call requires a role. Optional `backend`, `modelTier`, `label`, `phase`, and bounded JSON `schema` cannot loosen that role's policy. Schema requests instruct the native agent to return JSON and validate it before exposing `structured`. `parallel()` accepts task functions and enforces concurrency 1–4 while the shared `JobManager` remains the authoritative global scheduler.
 
-Foreground runs update one bounded tool card. Background runs return immediately and deliver one follow-up result when settled. `/workflows` opens the persistent run dashboard; active runs can be cancelled there. V1 persists inspection artifacts but deliberately does not resume interrupted execution after Pi exits—stale running checkpoints become `aborted`.
+The workflow tool accepts optional `budget` limits for input tokens, output tokens, turns, and cost. Crossing a reported limit aborts the run and cancels remaining members; parallel work can overshoot by the usage of already-running members.
+
+Foreground runs update one bounded tool card. Background runs return immediately and deliver one follow-up result when settled. `/workflows` opens the persistent run dashboard with normalized agent transcript drill-down; active runs can be cancelled there. Terminal runs generate `report.md` alongside `workflow.json`, `result.json`, and bounded `transcripts.json`. V1 persists inspection artifacts but deliberately does not resume interrupted execution after Pi exits—stale running checkpoints become `aborted`.
 
 ## Development
 
@@ -130,7 +132,7 @@ npm run pack:check
 npm run check
 ```
 
-Tests use fake backends and protocol fixtures and cover lifecycle, concurrency, serialized cancellation/steering, abortable startup and shutdown, shutdown force-close, Pi terminal error mapping, Claude live-event/output bounds, string-ID and asynchronous JSON-RPC handling, frame limits, early child exit, hard backend timeouts, extension registration and duplicate-install detection, session isolation, legacy profile migration, role parsing, routing policy, trust/depth gates, environment sanitization, Unicode terminal-width truncation, bounded reducer state, strict LF JSONL framing, Unix process-tree cleanup, workflow sandbox escape denial, IPC and size limits, workflow cancellation, shared scheduling, artifact permissions/atomicity, background result delivery, and bounded workflow rendering/dashboard behavior.
+The intentionally thin, risk-based suite keeps roughly 55–70 tests. It favors broad invariants over branch/permutation coverage: trust/read-only/subscription auth, shared scheduling, cancellation/process cleanup, protocol framing, normalized transcript bounds, one-shot result delivery, sandbox capability denial, workflow persistence/recovery, and one renderer/dashboard contract per surface. Provider compatibility remains in opt-in live smokes rather than duplicated mock permutations.
 
 ### Opt-in live smoke tests
 
@@ -163,7 +165,7 @@ The live script verifies Claude `claude.ai` login and Codex ChatGPT login withou
 
 ## Architecture
 
-- `extensions/subagents/index.ts`, `dashboard.ts` — Pi tools, commands, completion delivery, TUI, trust/cwd gate, session lifecycle.
+- `extensions/subagents/index.ts`, `dashboard.ts`, `takeover.ts` — Pi tools, one-shot completion delivery, operational dashboard, normalized interactive transcript, trust/cwd gate, and session lifecycle.
 - `src/manager.ts` — queue, concurrency, wait/check/cancel/list, shutdown.
 - `src/types.ts`, `src/reducer.ts` — normalized contracts and bounded state machine.
 - `src/roles.ts`, `src/policy.ts` — role parsing and backend policy compilation.
@@ -176,7 +178,7 @@ The live script verifies Claude `claude.ai` login and Codex ChatGPT login withou
 
 ## Known compatibility boundaries
 
-Child-native Pi, Claude, and Codex sessions use each CLI's own private session storage. Ordinary subagents create no parallel logs, transcript files, or project-local runtime state. Workflows intentionally create private, mode-restricted artifacts under `~/.pi/agent/workflows/`; they contain the submitted script/args, bounded checkpoints, and result, and must not be synchronized as Pi configuration.
+Child-native Pi, Claude, and Codex sessions use each CLI's own private session storage. Ordinary subagents create no parallel logs, transcript files, or project-local runtime state; normalized takeover state remains bounded in memory while native harness session files stay private to their CLIs. Workflows intentionally create private, mode-restricted artifacts under `~/.pi/agent/workflows/`; they contain the submitted script/args, bounded checkpoints/results/transcripts, and generated report, and must not be synchronized as Pi configuration.
 
 Codex app-server is experimental and versioned with the installed CLI. The adapter intentionally uses a small stable protocol surface (`initialize`, `account/read`, `thread/start`, `turn/start`, `turn/interrupt`, and lifecycle notifications) and fails closed on unknown server approval requests. Run the Codex live smoke after CLI upgrades.
 

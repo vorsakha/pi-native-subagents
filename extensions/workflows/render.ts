@@ -183,7 +183,7 @@ export function buildWorkflowCardLines(
   }
 
   const usage = formatUsage(aggregateWorkflowUsage(snapshot));
-  if (usage) lines.push(theme.fg("dim", `Usage · ${usage}`));
+  if (usage) lines.push(theme.fg("dim", `Usage · ${usage}${formatBudget(snapshot)}`));
 
   if (snapshot.error) {
     const errorLines = sanitizeText(snapshot.error).split("\n").map(sanitizeInline).filter(Boolean);
@@ -210,6 +210,18 @@ export function buildWorkflowCardLines(
         : WORKFLOWS_POINTER;
   const content = clampContent(theme, lines, Math.max(0, budget - 1));
   return [...content, theme.fg("dim", footerText)].slice(0, budget);
+}
+
+function formatBudget(snapshot: WorkflowSnapshot): string {
+  const budget = snapshot.budget;
+  if (!budget) return "";
+  const limits = [
+    budget.maxInputTokens === undefined ? "" : `↑≤${budget.maxInputTokens}`,
+    budget.maxOutputTokens === undefined ? "" : `↓≤${budget.maxOutputTokens}`,
+    budget.maxTurns === undefined ? "" : `${budget.maxTurns}t`,
+    budget.maxCost === undefined ? "" : `$${budget.maxCost.toFixed(2)}`,
+  ].filter(Boolean);
+  return limits.length ? ` · budget ${limits.join("/")}` : "";
 }
 
 export function renderWorkflowCard(

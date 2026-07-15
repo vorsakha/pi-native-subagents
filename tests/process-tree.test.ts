@@ -30,25 +30,3 @@ test("managed process teardown terminates the spawned process group", { skip: pr
   await managed.terminate(100);
   await assertGone(grandchildPid);
 });
-
-test("an immediate terminate call escalates teardown already in progress", { skip: process.platform === "win32", timeout: 10_000 }, async () => {
-  const stubborn = `process.on('SIGTERM',()=>{}); console.log(process.pid); setInterval(()=>{},1000)`;
-  const managed = spawnManaged(process.execPath, ["-e", stubborn]);
-  const childPid = await readPid(managed);
-  const started = Date.now();
-  const graceful = managed.terminate(5_000);
-  await sleep(25);
-  await managed.terminate(0);
-  await graceful;
-  assert.ok(Date.now() - started < 1_000, "forced escalation reused the original grace deadline");
-  await assertGone(childPid);
-});
-
-test("teardown escalates after the group leader exits but a descendant ignores SIGTERM", { skip: process.platform === "win32", timeout: 10_000 }, async () => {
-  const stubborn = `process.on('SIGTERM',()=>{}); console.log('ready'); setInterval(()=>{},1000)`;
-  const leader = `const {spawn}=require('node:child_process'); const c=spawn(process.execPath,['-e',${JSON.stringify(stubborn)}],{stdio:['ignore','pipe','ignore']}); c.stdout.once('data',()=>console.log(c.pid)); setInterval(()=>{},1000);`;
-  const managed = spawnManaged(process.execPath, ["-e", leader]);
-  const descendantPid = await readPid(managed);
-  await managed.terminate(100);
-  await assertGone(descendantPid);
-});

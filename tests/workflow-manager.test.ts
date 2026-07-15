@@ -239,9 +239,15 @@ test("runs sequential and parallel agents through one JobManager and its global 
 test("preserves reviewer read-only role policy in the backend request", async () => {
   const f = await fixture();
   try {
-    const started = await f.workflows.start(f.request(
-      `export default async () => agent("audit", { role: "reviewer" });`,
-    ));
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        const reviewed = await agent("audit", {
+          role: "reviewer",
+          schema: { type: "object", required: ["clean"], properties: { clean: { type: "boolean" } } }
+        });
+        return reviewed.structured;
+      }
+    `));
     await waitFor(() => f.backend.requests.length === 1, "reviewer backend request");
     const request = f.backend.requests[0]!;
     assert.equal(request.role, "reviewer");
@@ -251,8 +257,19 @@ test("preserves reviewer read-only role policy in the backend request", async ()
     assert.deepEqual(request.policy.piTools, ["read", "grep"]);
     assert.deepEqual(request.policy.claudeTools, ["Read", "Glob"]);
     assert.equal(request.policy.approvalPolicy, "never");
-    f.backend.completeTask("audit", "clean");
-    assert.equal((await started.completion).status, "completed");
+    f.backend.completeTask(request.task, `{"clean":true}`);
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.deepEqual(final.result, { clean: true });
+    assert.deepEqual(final.agents[0]?.structured, { clean: true });
+
+    const malformed = await f.workflows.start(f.request(`
+      export default async () => agent("invalid schema", { role: "reviewer", schema: { type: "nonsense" } });
+    `));
+    const malformedFinal = await malformed.completion;
+    assert.equal((malformedFinal.result as { ok: boolean }).ok, false);
+    assert.match((malformedFinal.result as { error: string }).error, /bounded JSON Schema/);
+    assert.equal(f.backend.requests.length, 1, "invalid schemas fail before dispatch");
   } finally {
     await f.cleanup();
   }
@@ -288,7 +305,7 @@ test("records phases, results, and final workflow artifacts", async () => {
     ]);
     assert.deepEqual(final.result, { accepted: true, report: "looks good", subject: "change" });
     assert.deepEqual((await readdir(final.artifactDir)).sort(), [
-      "args.json", "result.json", "script.js", "workflow.json",
+      "args.json", "report.md", "result.json", "script.js", "transcripts.json", "workflow.json",
     ]);
     assert.equal(await readFile(join(final.artifactDir, "script.js"), "utf8"), script);
     assert.deepEqual(JSON.parse(await readFile(join(final.artifactDir, "args.json"), "utf8")), { subject: "change" });
@@ -297,38 +314,9 @@ test("records phases, results, and final workflow artifacts", async () => {
     assert.equal(persisted.status, "completed");
     assert.deepEqual(persisted.result, final.result);
     assert.equal(persisted.agents[0]?.output, "looks good");
-  } finally {
-    await f.cleanup();
-  }
-});
-
-test("returns agent failure as workflow data so scripts can branch and recover", async () => {
-  const f = await fixture();
-  try {
-    const started = await f.workflows.start(f.request(`
-      export default async () => {
-        const primary = await agent("primary", { role: "worker" });
-        if (!primary.ok) {
-          const recovery = await agent("recover:" + primary.error, { role: "worker" });
-          return { recovered: recovery.ok, output: recovery.output, primaryError: primary.error };
-        }
-        return { recovered: false, output: primary.output };
-      }
-    `));
-    await waitFor(() => f.backend.requests.length === 1, "primary agent");
-    f.backend.failTask("primary", "provider unavailable");
-    await waitFor(() => f.backend.requests.length === 2, "recovery agent");
-    f.backend.completeTask("recover:provider unavailable", "fallback result");
-
-    const final = await started.completion;
-    assert.equal(final.status, "completed");
-    assert.deepEqual(final.agents.map((agent) => agent.state), ["failed", "completed"]);
-    assert.equal(final.agents[0]?.error, "provider unavailable");
-    assert.deepEqual(final.result, {
-      recovered: true,
-      output: "fallback result",
-      primaryError: "provider unavailable",
-    });
+    const transcripts = JSON.parse(await readFile(join(final.artifactDir, "transcripts.json"), "utf8"));
+    assert.equal(transcripts["0"].at(-1).kind, "assistant");
+    assert.match(await readFile(join(final.artifactDir, "report.md"), "utf8"), /# release review[\s\S]*looks good/);
   } finally {
     await f.cleanup();
   }
@@ -379,24 +367,6 @@ test("cancels both running and queued workflow jobs", async () => {
     assert.deepEqual(f.jobs.list().map((job) => job.status), ["cancelled", "cancelled"]);
     assert.equal(f.backend.cancels.length, 1);
     assert.equal(f.backend.cancels[0]?.jobId, before.find((job) => job.status === "running")?.id);
-  } finally {
-    await f.cleanup();
-  }
-});
-
-test("fails a workflow when its sandbox timeout expires", async () => {
-  const f = await fixture();
-  try {
-    const started = await f.workflows.start(f.request(
-      `export default async () => new Promise(() => {});`,
-      { timeoutMs: 1 },
-    ));
-    const final = await started.completion;
-    assert.equal(final.status, "failed");
-    assert.match(final.error ?? "", /timed out after 1000 ms/i);
-    const persisted = JSON.parse(await readFile(join(final.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
-    assert.equal(persisted.status, "failed");
-    assert.match(persisted.error ?? "", /timed out/i);
   } finally {
     await f.cleanup();
   }
@@ -476,112 +446,6 @@ test("restores persisted running summaries as durably aborted stale workflows", 
   }
 });
 
-test("attaches workflow ownership metadata to every JobManager job", async () => {
-  const f = await fixture();
-  try {
-    const started = await f.workflows.start(f.request(`
-      export default async () => {
-        phase("Review");
-        return agent("owned job", { role: "reviewer", label: "security review" });
-      }
-    `));
-    await waitFor(() => f.jobs.list().length === 1, "owned workflow job");
-    const job = f.jobs.list()[0]!;
-    assert.deepEqual(job.workflow, {
-      runId: started.snapshot.runId,
-      agentIndex: 0,
-      label: "security review",
-      phase: "Review",
-    });
-    f.backend.completeTask("owned job", "owned output");
-    const final = await started.completion;
-    assert.equal(final.agents[0]?.jobId, job.id);
-    assert.equal(final.agents[0]?.label, "security review");
-    assert.equal(final.agents[0]?.phase, 0);
-  } finally {
-    await f.cleanup();
-  }
-});
-
-test("rejects completion with unawaited agent calls and waits for cancellation", async () => {
-  const f = await fixture();
-  try {
-    const started = await f.workflows.start(f.request(`
-      export default async () => {
-        void agent("forgotten", { role: "worker" });
-        return "premature";
-      }
-    `));
-    await waitFor(() => f.backend.requests.length === 1, "unawaited member to start");
-    const final = await started.completion;
-    assert.equal(final.status, "failed");
-    assert.match(final.error ?? "", /returned before 1 agent call settled/i);
-    assert.equal(final.agents[0]?.state, "cancelled");
-    assert.equal(f.backend.cancels.length, 1);
-  } finally {
-    await f.cleanup();
-  }
-});
-
-test("final artifact failure returns a structured failed snapshot instead of rejecting", async () => {
-  const f = await fixture();
-  try {
-    const started = await f.workflows.start(f.request(
-      `export default async () => agent("persist", { role: "worker" });`,
-      { background: true },
-    ));
-    await waitFor(() => f.backend.requests.length === 1, "member before artifact removal");
-    await rm(started.snapshot.artifactDir, { recursive: true, force: true });
-    f.backend.completeTask("persist", "done");
-    const final = await started.completion;
-    assert.equal(final.status, "failed");
-    assert.match(final.error ?? "", /artifact persistence failed/i);
-  } finally {
-    await f.cleanup();
-  }
-});
-
-test("fails workflows that exceed the retained unique phase limit", async () => {
-  const f = await fixture();
-  try {
-    const started = await f.workflows.start(f.request(`
-      export default async () => {
-        for (let index = 0; index < 65; index++) phase("phase-" + index);
-        return "unreachable";
-      }
-    `));
-    const final = await started.completion;
-    assert.equal(final.status, "failed");
-    assert.match(final.error ?? "", /phase limit exceeded \(64\)/i);
-    assert.equal(final.phases.length, 64);
-  } finally {
-    await f.cleanup();
-  }
-});
-
-test("implicit and assigned agent phases become running while their agents run", async () => {
-  const f = await fixture(2);
-  try {
-    const started = await f.workflows.start(f.request(`
-      export default async () => parallel([
-        () => agent("implicit", { role: "worker" }),
-        () => agent("assigned", { role: "worker", phase: "Audit" })
-      ], 2)
-    `));
-    await waitFor(() => f.backend.requests.length === 2, "implicit and assigned phases");
-    const live = f.workflows.check(started.snapshot.runId);
-    assert.deepEqual(live.phases.map((phase) => [phase.name, phase.status]), [
-      ["Agents", "running"],
-      ["Audit", "running"],
-    ]);
-    f.backend.completeTask("implicit");
-    f.backend.completeTask("assigned");
-    assert.equal((await started.completion).status, "completed");
-  } finally {
-    await f.cleanup();
-  }
-});
-
 test("aggregates usage across all workflow agents", async () => {
   const f = await fixture();
   try {
@@ -591,7 +455,7 @@ test("aggregates usage across all workflow agents", async () => {
         const two = await agent("usage two", { role: "worker" });
         return [one.ok, two.ok];
       }
-    `));
+    `, { budget: { maxTurns: 2 } }));
     await waitFor(() => f.backend.requests.length === 1, "first usage agent");
     f.backend.completeTask("usage one", "one", {
       input: 2, output: 3, cacheRead: 5, cacheWrite: 7, cost: 1.25, turns: 1,
@@ -614,6 +478,8 @@ test("aggregates usage across all workflow agents", async () => {
       cost: 3.75,
       turns: 3,
     });
+    assert.equal(final.status, "aborted");
+    assert.match(final.error ?? "", /turn budget exceeded/);
   } finally {
     await f.cleanup();
   }

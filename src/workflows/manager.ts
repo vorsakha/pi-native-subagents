@@ -1,4 +1,6 @@
 import { resolve } from "node:path";
+import type { TSchema } from "typebox";
+import { Check } from "typebox/value";
 import type { JobManager } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
 import type { BackendName, JobSnapshot, ModelTier, Usage } from "../types.ts";
@@ -6,12 +8,14 @@ import {
   checkpointWorkflow,
   createWorkflowArtifacts,
   loadWorkflowSummaries,
+  writeWorkflowReport,
   writeWorkflowResult,
 } from "./artifacts.ts";
 import { runWorkflowSandbox, type WorkflowAgentResult } from "./sandbox.ts";
 import type {
   WorkflowAgentRecord,
   WorkflowAgentState,
+  WorkflowBudget,
   WorkflowPhase,
   WorkflowSnapshot,
   WorkflowStatus,
@@ -37,6 +41,7 @@ export interface StartWorkflowRequest {
   cwd: string;
   trusted: boolean;
   depth?: number;
+  budget?: WorkflowBudget;
 }
 
 export interface StartedWorkflow {
@@ -157,6 +162,7 @@ export class WorkflowManager {
       currentPhase: null,
       phases: [],
       agents: [],
+      budget: request.budget,
     };
     const snapshot = await createWorkflowArtifacts(this.#artifactRoot, {
       script: request.script,
@@ -241,6 +247,8 @@ export class WorkflowManager {
       entry.snapshot.timestamps.updatedAt = now;
       entry.snapshot.timestamps.endedAt = now;
       try {
+        entry.snapshot.reportArtifact = "report.md";
+        await writeWorkflowReport(this.#artifactRoot, entry.snapshot);
         await this.#flushCheckpoint(entry);
       } catch (error) {
         // Artifact failure is a workflow failure, not a rejected lifecycle
@@ -264,6 +272,8 @@ export class WorkflowManager {
     signal: AbortSignal,
   ): Promise<WorkflowAgentResult> {
     if (!prompt.trim()) return { ok: false, output: "", error: "agent() requires a non-empty prompt" };
+    const existingBudgetError = workflowBudgetError(entry.snapshot);
+    if (existingBudgetError) return { ok: false, output: "", error: existingBudgetError };
     const role = typeof options.role === "string" ? options.role.trim() : "";
     if (!role) return { ok: false, output: "", error: "agent() requires options.role" };
     const backend = options.backend === undefined ? undefined : String(options.backend) as BackendName;
@@ -291,11 +301,24 @@ export class WorkflowManager {
     entry.snapshot.phases[phase]?.agents.push(index);
     this.#touch(entry);
 
+    const schema = options.schema === undefined ? undefined : workflowSchema(options.schema);
+    if (options.schema !== undefined && !schema) {
+      record.state = "failed";
+      record.error = "agent schema must be a bounded JSON Schema object";
+      record.timestamps.updatedAt = Date.now();
+      record.timestamps.endedAt = record.timestamps.updatedAt;
+      this.#touch(entry);
+      return { ok: false, output: "", error: record.error };
+    }
+    const task = schema
+      ? `${prompt}\n\nReturn ONLY valid JSON matching this JSON Schema (no markdown fences):\n${JSON.stringify(schema)}`
+      : prompt;
+
     let job: JobSnapshot;
     try {
       job = this.#jobs.spawn({
         role,
-        task: prompt,
+        task,
         cwd: request.cwd,
         trusted: request.trusted,
         backend,
@@ -333,7 +356,28 @@ export class WorkflowManager {
     try {
       const final = await this.#jobs.wait(job.id, { signal });
       this.#updateAgentFromJob(final);
+      const budgetError = workflowBudgetError(entry.snapshot);
+      if (budgetError) {
+        entry.snapshot.error = budgetError;
+        entry.controller.abort(new Error(budgetError));
+        return { ok: false, output: final.output, jobId: final.id, error: budgetError, usage: clone(final.usage) };
+      }
       if (final.status === "completed") {
+        if (schema) {
+          const structured = parseStructuredOutput(final.output);
+          if (structured === undefined || !Check(schema, structured)) {
+            record.state = "failed";
+            record.error = "Agent output did not match the requested JSON Schema";
+            record.timestamps.updatedAt = Date.now();
+            record.timestamps.endedAt = record.timestamps.updatedAt;
+            record.structured = undefined;
+            this.#touch(entry);
+            return { ok: false, output: final.output, jobId: final.id, error: record.error, usage: clone(final.usage) };
+          }
+          record.structured = structured;
+          this.#touch(entry);
+          return { ok: true, output: final.output, structured, jobId: final.id, usage: clone(final.usage) };
+        }
         return { ok: true, output: final.output, jobId: final.id, usage: clone(final.usage) };
       }
       return { ok: false, output: final.output, jobId: final.id, error: final.error ?? `Agent ${final.status}`, usage: clone(final.usage) };
@@ -359,6 +403,7 @@ export class WorkflowManager {
     agent.model = job.model;
     agent.preview = job.output.slice(-200);
     agent.output = isTerminal(job.status) ? job.output : undefined;
+    agent.transcript = job.transcript.map((item) => ({ ...item }));
     agent.error = job.error;
     agent.usage = workflowUsage(job.usage);
     agent.timestamps.updatedAt = now;
@@ -482,6 +527,91 @@ export function aggregateWorkflowUsage(snapshot: WorkflowSnapshot): WorkflowUsag
     cost: total.cost + agent.usage.cost,
     turns: total.turns + agent.usage.turns,
   }), workflowUsage());
+}
+
+export function workflowBudgetError(snapshot: WorkflowSnapshot): string | undefined {
+  const budget = snapshot.budget;
+  if (!budget) return undefined;
+  const usage = aggregateWorkflowUsage(snapshot);
+  if (budget.maxInputTokens !== undefined && usage.input > budget.maxInputTokens) return `Workflow input-token budget exceeded (${usage.input}/${budget.maxInputTokens})`;
+  if (budget.maxOutputTokens !== undefined && usage.output > budget.maxOutputTokens) return `Workflow output-token budget exceeded (${usage.output}/${budget.maxOutputTokens})`;
+  if (budget.maxTurns !== undefined && usage.turns > budget.maxTurns) return `Workflow turn budget exceeded (${usage.turns}/${budget.maxTurns})`;
+  if (budget.maxCost !== undefined && usage.cost > budget.maxCost) return `Workflow cost budget exceeded ($${usage.cost.toFixed(4)}/$${budget.maxCost.toFixed(4)})`;
+  return undefined;
+}
+
+function workflowSchema(value: unknown): TSchema | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const types = new Set(["null", "boolean", "object", "array", "number", "integer", "string"]);
+  const annotations = new Set(["$id", "$schema", "title", "description", "default", "examples", "readOnly", "writeOnly"]);
+  const numeric = new Set(["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"]);
+  const nonnegative = new Set(["minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"]);
+  const seen = new WeakSet<object>();
+  let nodes = 0;
+  const schema = (current: unknown, depth: number): boolean => {
+    if (current === true || current === false) return true;
+    if (!current || typeof current !== "object" || Array.isArray(current) || seen.has(current) || ++nodes > 2_000 || depth > 16) return false;
+    seen.add(current);
+    let constraint = false;
+    for (const [key, item] of Object.entries(current)) {
+      if (["__proto__", "prototype", "constructor", "$ref", "$dynamicRef"].includes(key)) return false;
+      if (annotations.has(key)) {
+        if (["$id", "$schema", "title", "description"].includes(key) && typeof item !== "string") return false;
+        continue;
+      }
+      if (key === "type") {
+        const values = Array.isArray(item) ? item : [item];
+        if (!values.length || !values.every((entry) => typeof entry === "string" && types.has(entry))) return false;
+        constraint = true;
+      } else if (["properties", "patternProperties", "$defs", "dependentSchemas"].includes(key)) {
+        if (!item || typeof item !== "object" || Array.isArray(item) || !Object.values(item).every((entry) => schema(entry, depth + 1))) return false;
+        constraint = true;
+      } else if (["items", "contains", "additionalProperties", "unevaluatedProperties", "propertyNames", "not", "if", "then", "else"].includes(key)) {
+        if (!schema(item, depth + 1)) return false;
+        constraint = true;
+      } else if (["allOf", "anyOf", "oneOf", "prefixItems"].includes(key)) {
+        if (!Array.isArray(item) || !item.length || !item.every((entry) => schema(entry, depth + 1))) return false;
+        constraint = true;
+      } else if (key === "required" || key === "dependentRequired") {
+        const valid = key === "required"
+          ? Array.isArray(item) && item.every((entry) => typeof entry === "string")
+          : !!item && typeof item === "object" && !Array.isArray(item) && Object.values(item).every((entry) => Array.isArray(entry) && entry.every((name) => typeof name === "string"));
+        if (!valid) return false;
+        constraint = true;
+      } else if (key === "enum") {
+        if (!Array.isArray(item) || !item.length) return false;
+        constraint = true;
+      } else if (key === "const") {
+        constraint = true;
+      } else if (numeric.has(key)) {
+        if (typeof item !== "number" || !Number.isFinite(item) || nonnegative.has(key) && (!Number.isInteger(item) || item < 0) || key === "multipleOf" && item <= 0) return false;
+        constraint = true;
+      } else if (key === "pattern") {
+        if (typeof item !== "string") return false;
+        try { new RegExp(item); } catch { return false; }
+        constraint = true;
+      } else if (key === "format") {
+        if (typeof item !== "string") return false;
+        constraint = true;
+      } else if (key === "uniqueItems") {
+        if (typeof item !== "boolean") return false;
+        constraint = true;
+      } else {
+        return false;
+      }
+    }
+    seen.delete(current);
+    return constraint;
+  };
+  return schema(value, 0) ? value as TSchema : undefined;
+}
+
+function parseStructuredOutput(output: string): unknown {
+  const text = output.trim();
+  const candidate = text.startsWith("```")
+    ? text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")
+    : text;
+  try { return JSON.parse(candidate); } catch { return undefined; }
 }
 
 export function workflowIsTerminal(status: WorkflowStatus): boolean {

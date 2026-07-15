@@ -1,3 +1,5 @@
+import type { TranscriptEntry } from "../types.ts";
+
 export type WorkflowStatus = "pending" | "running" | "completed" | "failed" | "aborted";
 
 export type WorkflowAgentState =
@@ -13,6 +15,13 @@ export interface WorkflowTimestamps {
   updatedAt: number;
   startedAt?: number;
   endedAt?: number;
+}
+
+export interface WorkflowBudget {
+  maxInputTokens?: number;
+  maxOutputTokens?: number;
+  maxTurns?: number;
+  maxCost?: number;
 }
 
 export interface WorkflowUsage {
@@ -36,6 +45,8 @@ export interface WorkflowAgentRecord {
   model?: string;
   preview?: string;
   output?: unknown;
+  structured?: unknown;
+  transcript?: TranscriptEntry[];
   error?: string;
   usage: WorkflowUsage;
 }
@@ -65,4 +76,7 @@ export interface WorkflowSnapshot {
   result?: unknown;
   error?: string;
   artifactDir: string;
+  transcriptArtifact?: string;
+  reportArtifact?: string;
+  budget?: WorkflowBudget;
 }

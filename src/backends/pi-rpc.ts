@@ -61,10 +61,14 @@ export class PiRpcBackend implements Backend {
     let tearingDown = false;
     let resolveCompleted!: () => void;
     const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
-    const runTimer = setTimeout(() => {
-      finish({ type: "failed", error: `Pi RPC run timed out after ${this.#runTimeoutMs}ms` });
-      void managed.terminate();
-    }, this.#runTimeoutMs);
+    let runTimer: NodeJS.Timeout | undefined;
+    const armRunTimer = () => {
+      if (runTimer) clearTimeout(runTimer);
+      runTimer = setTimeout(() => {
+        finish({ type: "failed", error: `Pi RPC run timed out after ${this.#runTimeoutMs}ms` });
+        void managed.terminate();
+      }, this.#runTimeoutMs);
+    };
 
     const rejectPending = (error: Error) => {
       for (const item of pending.values()) {
@@ -102,6 +106,7 @@ export class PiRpcBackend implements Backend {
       });
     };
 
+    armRunTimer();
     const framer = new JsonlFramer();
     const handle = (record: string) => {
       const event = parseJsonRecord(record);
@@ -122,6 +127,7 @@ export class PiRpcBackend implements Backend {
       if (event.type === "message_update") {
         const delta = asObject(event.assistantMessageEvent);
         if (delta.type === "text_delta") emit({ type: "text_delta", text: String(delta.delta ?? "") });
+        else if (delta.type === "thinking_delta") emit({ type: "thinking_delta", text: String(delta.delta ?? "") });
         else if (delta.type === "error") {
           terminalProblem = assistantProblem(asObject(delta.error ?? delta.message ?? delta.partial), "Pi assistant stream failed");
           retryableAssistantProblem = terminalProblem.type === "failed";
@@ -130,6 +136,9 @@ export class PiRpcBackend implements Backend {
         const message = asObject(event.message);
         if (message.role === "assistant") {
           output = bound(textContent(message.content) || output);
+          const thinking = thinkingContent(message.content);
+          if (thinking) emit({ type: "thinking_message", text: thinking });
+          if (output) emit({ type: "message", text: output });
           const stopReason = String(message.stopReason ?? "");
           if (stopReason === "error" || stopReason === "aborted") {
             terminalProblem = assistantProblem(message, stopReason === "aborted" ? "Pi assistant aborted" : "Pi assistant failed");
@@ -143,11 +152,21 @@ export class PiRpcBackend implements Backend {
             input: number(usage.input), output: number(usage.output), cacheRead: number(usage.cacheRead),
             cacheWrite: number(usage.cacheWrite), cost: number(asObject(usage.cost).total), turns: 1,
           } });
+        } else if (message.role === "user") {
+          const text = textContent(message.content);
+          if (text) emit({ type: "user_message", text });
         }
       } else if (event.type === "tool_execution_start") {
         emit({ type: "tool_start", id: String(event.toolCallId ?? "tool"), name: String(event.toolName ?? "tool"), summary: summarize(asObject(event.args)) });
       } else if (event.type === "tool_execution_end") {
-        emit({ type: "tool_end", id: String(event.toolCallId ?? "tool"), name: String(event.toolName ?? "tool"), error: event.isError === true });
+        emit({ type: "tool_end", id: String(event.toolCallId ?? "tool"), name: String(event.toolName ?? "tool"), output: resultPreview(event.result), error: event.isError === true });
+      } else if (event.type === "queue_update") {
+        const steering = Array.isArray(event.steering) ? event.steering : [];
+        const followUp = Array.isArray(event.followUp) ? event.followUp : [];
+        emit({ type: "queue_changed", messages: [
+          ...steering.map((text) => ({ text: String(text), behavior: "steer" as const })),
+          ...followUp.map((text) => ({ text: String(text), behavior: "followUp" as const })),
+        ] });
       } else if (event.type === "extension_error") {
         terminalProblem = { type: "failed", error: `Pi extension error: ${errorText(event.error, String(event.extensionPath ?? "unknown extension"))}` };
         retryableAssistantProblem = false;
@@ -196,6 +215,7 @@ export class PiRpcBackend implements Backend {
     const abortStartup = () => { startupAbortTeardown ??= managed.terminate(0); };
     request.signal.addEventListener("abort", abortStartup, { once: true });
 
+    emit({ type: "user_message", text: `Task: ${request.task}` });
     void command("prompt", { message: `Task: ${request.task}` })
       .then(() => emit({ type: "started" }))
       .catch((error) => {
@@ -203,8 +223,19 @@ export class PiRpcBackend implements Backend {
       });
 
     const send = async (message: string, behavior: SendBehavior = "steer") => {
-      if (settled) throw new Error("Pi RPC run is already settled");
-      await command(behavior === "steer" ? "steer" : "follow_up", { message });
+      if (closed) throw new Error("Pi RPC process is closed");
+      const restarting = settled;
+      if (restarting) {
+        settled = false;
+        output = "";
+        terminalProblem = undefined;
+        retryableAssistantProblem = false;
+        armRunTimer();
+        emit({ type: "started" });
+        behavior = "followUp";
+      }
+      await command(restarting ? "prompt" : behavior === "steer" ? "steer" : "follow_up", { message });
+      emit({ type: "queue_changed", messages: [{ text: message, behavior }] });
     };
 
     const run: BackendRun = {
@@ -264,6 +295,17 @@ function textContent(value: unknown): string {
   if (typeof value === "string") return value;
   if (!Array.isArray(value)) return "";
   return value.map((part) => asObject(part)).filter((part) => part.type === "text").map((part) => String(part.text ?? "")).join("\n");
+}
+function thinkingContent(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value.map((part) => asObject(part)).filter((part) => part.type === "thinking" && part.redacted !== true).map((part) => String(part.thinking ?? part.text ?? "")).join("\n");
+}
+function resultPreview(value: unknown): string {
+  if (typeof value === "string") return value.slice(0, 4_096);
+  const record = asObject(value);
+  const content = textContent(record.content);
+  if (content) return content.slice(0, 4_096);
+  try { return JSON.stringify(value).slice(0, 4_096); } catch { return ""; }
 }
 function summarize(args: Record<string, unknown>): string {
   const value = args.path ?? args.command ?? args.query ?? args.url ?? "";

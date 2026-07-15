@@ -38,17 +38,29 @@ export class ClaudeBackend implements Backend {
     const controller = new AbortController();
     const input = new AsyncInput();
     input.push(userMessage(`Task: ${request.task}`, "next"));
+    emit({ type: "user_message", text: `Task: ${request.task}` });
     let closing = false;
     let terminal = false;
     let expectedResults = 1;
     let resultCount = 0;
     let output = "";
+    const queuedMessages: Array<{ text: string; behavior: SendBehavior }> = [];
     let resolveCompleted!: () => void;
     const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
+    let runTimer: NodeJS.Timeout | undefined;
+    const armRunTimer = () => {
+      if (runTimer) clearTimeout(runTimer);
+      runTimer = setTimeout(() => {
+        finish({ type: "failed", error: `Claude run timed out after ${this.#runTimeoutMs}ms` });
+        controller.abort();
+        input.close();
+        stream.close();
+      }, this.#runTimeoutMs);
+    };
     const finish = (event: BackendEvent) => {
       if (terminal) return;
       terminal = true;
-      clearTimeout(runTimer);
+      if (runTimer) clearTimeout(runTimer);
       emit(event);
       resolveCompleted();
     };
@@ -75,12 +87,7 @@ export class ClaudeBackend implements Backend {
         maxTurns: 80,
       },
     });
-    const runTimer = setTimeout(() => {
-      finish({ type: "failed", error: `Claude run timed out after ${this.#runTimeoutMs}ms` });
-      controller.abort();
-      input.close();
-      stream.close();
-    }, this.#runTimeoutMs);
+    armRunTimer();
 
     const consuming = (async () => {
       try {
@@ -88,6 +95,10 @@ export class ClaudeBackend implements Backend {
           const result = handleMessage(message, emit, controller, request.policy.access === "readOnly");
           if (!result) continue;
           resultCount++;
+          if (queuedMessages.length) {
+            queuedMessages.shift();
+            emit({ type: "queue_changed", messages: [...queuedMessages] });
+          }
           output = appendOutput(output, result.output);
           if (!result.success) {
             finish({ type: "failed", error: result.error });
@@ -117,9 +128,19 @@ export class ClaudeBackend implements Backend {
     return {
       completed,
       async send(message: string, behavior: SendBehavior = "steer") {
-        if (terminal || closing) throw new Error("Claude run is already settled");
-        if (behavior === "followUp") expectedResults++;
+        if (closing) throw new Error("Claude session is closed");
+        if (terminal) {
+          terminal = false;
+          output = "";
+          expectedResults = resultCount + 1;
+          behavior = "followUp";
+          armRunTimer();
+          emit({ type: "started" });
+        } else if (behavior === "followUp") expectedResults++;
         input.push(userMessage(message, behavior === "steer" ? "now" : "later"));
+        emit({ type: "user_message", text: message });
+        queuedMessages.push({ text: message, behavior });
+        emit({ type: "queue_changed", messages: [...queuedMessages] });
       },
       async cancel(reason = "Cancelled") {
         await stop();
@@ -205,6 +226,8 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
     const event = message.event;
     if (event.type === "content_block_delta" && event.delta.type === "text_delta") {
       emit({ type: "text_delta", text: event.delta.text });
+    } else if (event.type === "content_block_delta" && event.delta.type === "thinking_delta") {
+      emit({ type: "thinking_delta", text: event.delta.thinking });
     }
     return;
   }
@@ -212,6 +235,8 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
     let text = "";
     for (const block of message.message.content) {
       if (block.type === "text") text += block.text;
+      else if (block.type === "thinking") emit({ type: "thinking_message", text: block.thinking });
+      else if (block.type === "redacted_thinking") emit({ type: "thinking_message", text: "[redacted reasoning]" });
       else if (block.type === "tool_use") emit({ type: "tool_start", id: block.id, name: block.name, summary: summarize(block.input) });
     }
     if (text) emit({ type: "message", text: boundedAppend("", text).text });
@@ -220,7 +245,7 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
   }
   if (message.type === "user" && Array.isArray(message.message.content)) {
     for (const block of message.message.content) {
-      if (block.type === "tool_result") emit({ type: "tool_end", id: block.tool_use_id, error: block.is_error === true });
+      if (block.type === "tool_result") emit({ type: "tool_end", id: block.tool_use_id, output: summarize(block.content), error: block.is_error === true });
     }
     return;
   }
@@ -231,6 +256,7 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
       cacheRead: num(usage.cache_read_input_tokens), cacheWrite: num(usage.cache_creation_input_tokens),
       cost: message.total_cost_usd, turns: message.num_turns,
     } });
+    if (message.subtype === "success" && message.result) emit({ type: "message", text: boundedAppend("", message.result).text });
     return message.subtype === "success"
       ? { success: true, output: message.result, error: "" }
       : { success: false, output: "", error: message.errors.join("\n") || message.subtype };
