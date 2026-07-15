@@ -89,7 +89,7 @@ test("dashboard fits the 90% overlay height and keeps its footer framed", (t) =>
   const lines = overlay.render(72);
   assert.ok(lines.length <= Math.floor(24 * 0.9));
   assert.match(lines.at(-2)!, /Esc close/);
-  assert.ok(lines.some((line) => line.includes("Transcript tail")));
+  assert.ok(lines.some((line) => line.includes("Transcript ")));
   assert.ok(lines.some((line) => line.includes("›") && line.includes("job-4-lo")));
   assert.equal(lines.at(-1), `╚${"═".repeat(70)}╝`);
   assert.ok(lines.every((line) => !/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/.test(line)));
@@ -120,6 +120,38 @@ test("dashboard closes once for Escape and the configured cancel binding", () =>
   const second = dashboard([job("two")], 24, (action) => cancelActions.push(action)).overlay;
   second.handleInput("\u0003");
   assert.deepEqual(cancelActions, [{ type: "close" }]);
+});
+
+test("dashboard scrolls the full bounded transcript with Shift and Page keys and resets on selection", (t) => {
+  const first = { ...job("first"), output: Array.from({ length: 40 }, (_, index) => `first-${index}`).join("\n") };
+  const second = { ...job("second"), output: "second-0\nsecond-1" };
+  const { overlay } = dashboard([first, second], 30);
+  t.after(() => overlay.dispose());
+  overlay.render(72);
+  assert.ok(overlay.render(72).some((line) => line.includes("first-0")));
+  overlay.handleInput("\u001b[6~"); // Page Down
+  const scrolled = overlay.render(72);
+  assert.ok(scrolled.some((line) => line.includes("first-")));
+  assert.ok(!scrolled.some((line) => line.includes("first-0")));
+  assert.ok(scrolled.every((line) => visibleWidth(line) === 72));
+
+  overlay.handleInput("j");
+  const reset = overlay.render(72);
+  assert.ok(reset.some((line) => line.includes("second-0")));
+  overlay.handleInput("\u001b[1;2B"); // Shift+Down
+  assert.ok(overlay.render(72).some((line) => line.includes("second-1")));
+});
+
+test("dashboard wraps and scrolls long logical transcript lines without hiding their suffix", (t) => {
+  const long = `${"segment ".repeat(180)}REACHABLE_SUFFIX`;
+  const { overlay } = dashboard([{ ...job("long-line"), output: long }], 24);
+  t.after(() => overlay.dispose());
+  const initial = overlay.render(48);
+  assert.ok(!initial.some((line) => line.includes("REACHABLE_SUFFIX")));
+  for (let index = 0; index < 20; index++) overlay.handleInput("\u001b[6~");
+  const scrolled = overlay.render(48);
+  assert.ok(scrolled.some((line) => line.includes("REACHABLE_SUFFIX")));
+  assert.ok(scrolled.every((line) => visibleWidth(line) === 48));
 });
 
 test("dashboard preserves navigation and running-job actions", () => {

@@ -3,14 +3,30 @@ import { homedir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
+import { keyHint } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ClaudeBackend, CodexAppServerBackend, PiRpcBackend } from "../../src/backends/index.ts";
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { claimExtensionInstall } from "../../src/install-guard.ts";
 import { openSubagentsDashboard } from "./dashboard.ts";
+import {
+  renderJobCard,
+  renderJobListCard,
+  renderToolCallLine,
+  sendBehaviorLabel,
+  shortId,
+  truncatePreview,
+} from "./render.ts";
 import { loadRoles, parseAllowedRoles } from "../../src/roles.ts";
 import type { Backend, BackendName, JobSnapshot, ModelTier, SendBehavior } from "../../src/types.ts";
+
+/** The configured expand-key hint (e.g. "ctrl+o to expand"), threaded into render options so render.ts stays testable without live keybinding state. */
+function expandHint(): string {
+  // Tool renderers can be invoked by headless hosts before Pi's interactive theme initializes.
+  try { return keyHint("app.tools.expand", "to expand"); }
+  catch { return "to expand"; }
+}
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const AGENTS_DIR = resolve(ROOT, "agents");
@@ -43,6 +59,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   let activeBackend = configuredBackend;
   let manager: JobManager | undefined;
   let unsubscribeManager: (() => void) | undefined;
+  let noticeTimer: NodeJS.Timeout | undefined;
+  let notices: Array<{ text: string; level: "info" | "warning" | "error" }> = [];
 
   const createManager = () => new JobManager({
     roles,
@@ -68,9 +86,30 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     const sessionManager = manager;
     unsubscribeManager = sessionManager.subscribe((job, event) => {
       updateStatus(ctx, sessionManager, activeBackend);
-      if (event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown")) {
-        const level = event.type === "failed" ? "error" : event.type === "cancelled" ? "warning" : "info";
-        ctx.ui.notify(`Subagent ${job.role} ${job.status} · ${job.id.slice(0, 8)}`, level);
+      const terminal = event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown");
+      if (!terminal) return;
+      // A foreground wait already renders the completion in-place. Only announce
+      // successful background completions while the parent is idle; failures and
+      // cancellations remain visible regardless. Batch near-simultaneous finishes
+      // into one notification instead of spraying one toast per agent.
+      if (event.type === "completed" && !ctx.isIdle()) return;
+      const glyph = event.type === "failed" ? "×" : event.type === "cancelled" ? "■" : "✓";
+      const level = event.type === "failed" ? "error" : event.type === "cancelled" ? "warning" : "info";
+      notices.push({ text: `${glyph} ${job.role} ${job.status} · ${job.id.slice(0, 8)}`, level });
+      if (!noticeTimer) {
+        noticeTimer = setTimeout(() => {
+          noticeTimer = undefined;
+          const pending = notices;
+          notices = [];
+          if (!pending.length) return;
+          const visible = pending.slice(0, 4).map((item) => item.text);
+          if (pending.length > visible.length) visible.push(`+${pending.length - visible.length} more`);
+          const notifyLevel = pending.some((item) => item.level === "error")
+            ? "error"
+            : pending.some((item) => item.level === "warning") ? "warning" : "info";
+          ctx.ui.notify(visible.join("\n"), notifyLevel);
+        }, 180);
+        noticeTimer.unref();
       }
     });
     updateStatus(ctx, sessionManager, activeBackend);
@@ -79,6 +118,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   pi.on("session_shutdown", async () => {
     unsubscribeManager?.();
     unsubscribeManager = undefined;
+    if (noticeTimer) clearTimeout(noticeTimer);
+    noticeTimer = undefined;
+    notices = [];
     try { await manager?.shutdown(); }
     finally {
       manager = undefined;
@@ -134,6 +176,16 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted());
       return result(snapshot, `Spawned ${snapshot.id} (${snapshot.role}, ${snapshot.backend}/${snapshot.model})`);
     },
+    renderCall(args, theme) {
+      const route = args.backend ? `${args.backend}${args.modelTier ? `/${args.modelTier}` : ""}` : args.modelTier ?? "";
+      const detail = [route, truncatePreview(args.task)].filter(Boolean).join(" · ");
+      return renderToolCallLine(theme, "Spawn", args.role, detail);
+    },
+    renderResult(res, { expanded, isPartial }, theme) {
+      const job = jobOf(res);
+      if (!job) return renderToolCallLine(theme, "Spawn", "failed");
+      return renderJobCard(job, theme, { expanded, now: Date.now(), isPartial, expandHint: expandHint() });
+    },
   });
 
   pi.registerTool({
@@ -145,6 +197,14 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const snapshot = getManager().check(params.jobId);
       return result(snapshot, statusLine(snapshot));
     },
+    renderCall(args, theme) {
+      return renderToolCallLine(theme, "Inspect", shortId(args.jobId));
+    },
+    renderResult(res, { expanded }, theme) {
+      const job = jobOf(res);
+      if (!job) return renderToolCallLine(theme, "Inspect", "not found");
+      return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint() });
+    },
   });
 
   pi.registerTool({
@@ -155,9 +215,28 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       jobId: Type.String(),
       timeoutMs: Type.Optional(Type.Integer({ minimum: 0, maximum: 600_000 })),
     }),
-    async execute(_id, params, signal) {
-      const snapshot = await getManager().wait(params.jobId, { timeoutMs: params.timeoutMs ?? 600_000, signal });
-      return result(snapshot, terminalText(snapshot));
+    async execute(_id, params, signal, onUpdate) {
+      const manager = getManager();
+      const timer = setInterval(() => {
+        const current = manager.check(params.jobId);
+        onUpdate?.({ content: [{ type: "text", text: statusLine(current) }], details: { job: current } });
+      }, 500);
+      timer.unref();
+      try {
+        const snapshot = await manager.wait(params.jobId, { timeoutMs: params.timeoutMs ?? 600_000, signal });
+        return result(snapshot, terminalText(snapshot));
+      } finally {
+        clearInterval(timer);
+      }
+    },
+    renderCall(args, theme) {
+      const timeout = args.timeoutMs ? `timeout ${Math.round(args.timeoutMs / 1000)}s` : undefined;
+      return renderToolCallLine(theme, "Wait", shortId(args.jobId), timeout);
+    },
+    renderResult(res, { expanded, isPartial }, theme) {
+      const job = jobOf(res);
+      if (!job) return renderToolCallLine(theme, "Wait", "not found");
+      return renderJobCard(job, theme, { expanded, now: Date.now(), isPartial, expandHint: expandHint() });
     },
   });
 
@@ -174,6 +253,23 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const snapshot = await getManager().send(params.jobId, params.message, (params.behavior ?? "steer") as SendBehavior);
       return result(snapshot, `Sent ${params.behavior ?? "steer"} message to ${snapshot.id}`);
     },
+    renderCall(args, theme) {
+      const resolved = (args.behavior ?? "steer") as SendBehavior;
+      const behavior = sendBehaviorLabel(resolved);
+      return renderToolCallLine(theme, sendTitle(resolved), shortId(args.jobId), `${behavior}: ${truncatePreview(args.message)}`);
+    },
+    renderResult(res, { expanded }, theme, context) {
+      const resolved = ((context.args as { behavior?: SendBehavior } | undefined)?.behavior ?? "steer") as SendBehavior;
+      const job = jobOf(res);
+      if (!job) return renderToolCallLine(theme, sendTitle(resolved), "failed");
+      const behavior = sendBehaviorLabel(resolved);
+      return renderJobCard(job, theme, {
+        expanded,
+        now: Date.now(),
+        expandHint: expandHint(),
+        lead: theme.fg("success", `✓ Sent ${behavior} message`),
+      });
+    },
   });
 
   pi.registerTool({
@@ -184,6 +280,14 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     async execute(_id, params) {
       const snapshot = await getManager().cancel(params.jobId);
       return result(snapshot, statusLine(snapshot));
+    },
+    renderCall(args, theme) {
+      return renderToolCallLine(theme, "Cancel", shortId(args.jobId));
+    },
+    renderResult(res, { expanded }, theme) {
+      const job = jobOf(res);
+      if (!job) return renderToolCallLine(theme, "Cancel", "failed");
+      return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint() });
     },
   });
 
@@ -196,6 +300,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const jobs = getManager().list();
       const text = jobs.length ? jobs.map(statusLine).join("\n") : "No subagent jobs in this session.";
       return { content: [{ type: "text", text }], details: { jobs } };
+    },
+    renderCall(_args, theme) {
+      return renderToolCallLine(theme, "List", "session jobs");
+    },
+    renderResult(res, { expanded }, theme) {
+      const jobs = (res.details as { jobs?: JobSnapshot[] } | undefined)?.jobs ?? [];
+      return renderJobListCard(jobs, theme, { expanded, now: Date.now() });
     },
   });
 
@@ -239,7 +350,21 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         clearInterval(timer);
       }
     },
+    renderCall(args, theme) {
+      const backend = args.backend ?? args.modelProfile ?? activeBackend;
+      const route = args.modelTier ? `${backend}/${args.modelTier}` : backend;
+      return renderToolCallLine(theme, "Run", args.agent, `[${route}] ${truncatePreview(args.task)}`);
+    },
+    renderResult(res, { expanded, isPartial }, theme) {
+      const job = jobOf(res);
+      if (!job) return renderToolCallLine(theme, "Run", "failed");
+      return renderJobCard(job, theme, { expanded, now: Date.now(), isPartial, expandHint: expandHint() });
+    },
   });
+}
+
+function sendTitle(behavior: SendBehavior): "Steer" | "Follow up" {
+  return behavior === "followUp" ? "Follow up" : "Steer";
 }
 
 function spawn(
@@ -313,4 +438,7 @@ function terminalText(job: JobSnapshot): string {
 }
 function result(job: JobSnapshot, text: string) {
   return { content: [{ type: "text" as const, text }], details: { job } };
+}
+function jobOf(res: { details?: unknown }): JobSnapshot | undefined {
+  return (res.details as { job?: JobSnapshot } | undefined)?.job;
 }

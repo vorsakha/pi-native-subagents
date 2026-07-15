@@ -1,6 +1,7 @@
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import { Key, type KeybindingsManager, matchesKey, truncateToWidth, type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { Key, type KeybindingsManager, matchesKey, truncateToWidth, type TUI, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { isTerminal, JobManager } from "../../src/manager.ts";
+import { sanitizeInline, sanitizeText } from "./render.ts";
 import type { JobSnapshot, SendBehavior } from "../../src/types.ts";
 
 type DashboardAction =
@@ -33,6 +34,13 @@ class DashboardOverlay {
   #timer: ReturnType<typeof setInterval> | undefined;
   #now: () => number;
   #clearInterval: typeof clearInterval;
+  /** Scroll offset (in lines) into the selected job's full transcript. */
+  #scroll = 0;
+  /** Job the current scroll offset applies to; scroll resets when the selection moves to a different job. */
+  #scrollJobId: string | undefined;
+  /** Visible transcript rows and total transcript lines from the last render, used to size Page Up/Down steps and clamp scroll. */
+  #transcriptRows = 0;
+  #transcriptTotal = 0;
   private readonly tui: Pick<TUI, "requestRender" | "terminal">;
   private readonly theme: Theme;
   private readonly keybindings: KeybindingsManager;
@@ -84,7 +92,7 @@ class DashboardOverlay {
     const focus = this.theme.bg("selectedBg", this.theme.bold(this.theme.fg(this.focused ? "accent" : "muted", " DASHBOARD ")));
     const count = this.theme.fg("dim", `${jobs.length} job${jobs.length === 1 ? "" : "s"}`);
     lines.push(row(this.theme.fg("accent", this.theme.bold("Native Subagents")) + " " + focus + " " + count));
-    lines.push(row(this.theme.fg("dim", "↑↓/j k select · s steer · f follow-up · x cancel")));
+    lines.push(row(this.theme.fg("dim", "↑↓/jk select · Shift+↑↓/Pg scroll · s steer · f follow-up · x cancel")));
     lines.push(separator());
 
     const contentRows = maxHeight - 8;
@@ -94,7 +102,7 @@ class DashboardOverlay {
     else for (const { job, index } of this.listViewport(jobs, listRows)) lines.push(row(this.renderJob(job, index === this.#selected)));
 
     lines.push(separator());
-    for (const detail of this.detailViewport(chosen, detailRows)) lines.push(row(detail));
+    for (const detail of this.detailViewport(chosen, detailRows, innerWidth)) lines.push(row(detail));
 
     lines.push(separator());
     const actionHint = chosen && !isTerminal(chosen.status) ? " · s steer · f follow-up · x cancel" : "";
@@ -114,8 +122,12 @@ class DashboardOverlay {
     if (this.#finished) return;
     const jobs = this.manager.list();
     if (matchesKey(data, Key.escape) || this.keybindings.matches(data, "tui.select.cancel")) return this.finish({ type: "close" });
-    if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.#selected = Math.max(0, this.#selected - 1);
-    else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.#selected = Math.min(Math.max(0, jobs.length - 1), this.#selected + 1);
+    if (matchesKey(data, Key.shift(Key.up))) this.scrollTranscript(-1);
+    else if (matchesKey(data, Key.shift(Key.down))) this.scrollTranscript(1);
+    else if (matchesKey(data, Key.pageUp)) this.scrollTranscript(-Math.max(1, this.#transcriptRows - 1));
+    else if (matchesKey(data, Key.pageDown)) this.scrollTranscript(Math.max(1, this.#transcriptRows - 1));
+    else if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectJob(Math.max(0, this.#selected - 1), jobs);
+    else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(Math.min(Math.max(0, jobs.length - 1), this.#selected + 1), jobs);
     else {
       const job = jobs[this.#selected];
       if (job && !isTerminal(job.status) && matchesKey(data, "s")) return this.finish({ type: "steer", jobId: job.id });
@@ -142,7 +154,7 @@ class DashboardOverlay {
   private renderJob(job: JobSnapshot, selected: boolean): string {
     const status = this.status(job);
     const marker = selected ? this.theme.fg("accent", "›") : " ";
-    const label = `${status.glyph} ${job.status.padEnd(9)} ${shortId(clean(job.id))} ${cleanInline(job.role)} · ${cleanInline(job.backend)}/${cleanInline(job.model)} · ${formatElapsed(job, this.#now())}`;
+    const label = `${status.glyph} ${job.status.padEnd(9)} ${shortId(sanitizeText(job.id))} ${sanitizeInline(job.role)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)} · ${formatElapsed(job, this.#now())}`;
     return marker + " " + this.theme.fg(status.color, label);
   }
 
@@ -158,25 +170,51 @@ class DashboardOverlay {
     return jobs.slice(start, start + rows).map((job, offset) => ({ job, index: start + offset }));
   }
 
-  private detailViewport(chosen: JobSnapshot | undefined, rows: number): string[] {
+  private detailViewport(chosen: JobSnapshot | undefined, rows: number, width: number): string[] {
     if (!chosen) return [this.theme.fg("dim", "Select a job to view its detail.")].slice(0, rows);
+    if (this.#scrollJobId !== chosen.id) {
+      this.#scrollJobId = chosen.id;
+      this.#scroll = 0;
+    }
     const status = this.status(chosen);
     const lines = [
-      this.theme.fg("accent", this.theme.bold(`${clean(chosen.role)} · ${shortId(clean(chosen.id))}`)) + this.theme.fg("dim", ` · ${clean(chosen.backend)}/${clean(chosen.model)}`),
+      this.theme.fg("accent", this.theme.bold(`${sanitizeInline(chosen.role)} · ${shortId(sanitizeText(chosen.id))}`)) + this.theme.fg("dim", ` · ${sanitizeInline(chosen.backend)}/${sanitizeInline(chosen.model)}`),
       this.theme.fg(status.color, `${status.glyph} ${chosen.status}`) + this.theme.fg("dim", ` · ${formatElapsed(chosen, this.#now())}`),
-      this.theme.fg("dim", cleanInline(chosen.task) || "(no task description)"),
+      this.theme.fg("dim", sanitizeInline(chosen.task) || "(no task description)"),
     ];
-    if (chosen.error && lines.length < rows - 2) lines.push(this.theme.fg("error", cleanInline(chosen.error)));
+    // Always reserve a label and at least one transcript row, so every bounded output is reachable.
+    if (chosen.error && lines.length < rows - 2) lines.push(this.theme.fg("error", sanitizeInline(chosen.error)));
     const toolRows = Math.max(0, Math.min(2, rows - lines.length - 2));
-    const tools = chosen.tools.slice(-toolRows).map((tool) => {
+    for (const tool of chosen.tools.slice(-toolRows)) {
       const glyph = tool.status === "running" ? "…" : tool.status === "failed" ? "×" : "✓";
-      return this.theme.fg("muted", `${glyph} ${cleanInline(tool.name)}${tool.summary ? `: ${cleanInline(tool.summary)}` : ""}`);
-    });
-    const transcript = (chosen.output || "(no assistant text yet)").split("\n").slice(-2).map(clean);
-    lines.push(...tools);
-    if (rows > lines.length) lines.push(this.theme.fg("dim", `Transcript tail${transcript.length > 1 ? " · …" : ""}`));
-    if (rows > lines.length) lines.push(...transcript.slice(-Math.max(1, rows - lines.length)));
+      lines.push(this.theme.fg("muted", `${glyph} ${sanitizeInline(tool.name)}${tool.summary ? `: ${sanitizeInline(tool.summary)}` : ""}`));
+    }
+
+    const transcript = sanitizeText(chosen.output || "(no assistant text yet)")
+      .split("\n")
+      .flatMap((line) => wrapTextWithAnsi(line || " ", Math.max(1, width)));
+    const transcriptRows = Math.max(0, rows - lines.length - 1);
+    this.#transcriptRows = transcriptRows;
+    this.#transcriptTotal = transcript.length;
+    const maxScroll = Math.max(0, transcript.length - transcriptRows);
+    this.#scroll = Math.max(0, Math.min(this.#scroll, maxScroll));
+    const start = this.#scroll;
+    const end = Math.min(transcript.length, start + transcriptRows);
+    lines.push(this.theme.fg("dim", `Transcript ${transcriptRows ? `${start + 1}–${end}` : "0"}/${transcript.length} · Shift+↑↓/PgUp/PgDn`));
+    lines.push(...transcript.slice(start, end));
     return lines.slice(0, rows);
+  }
+
+  private selectJob(index: number, jobs: JobSnapshot[]): void {
+    if (index === this.#selected) return;
+    this.#selected = index;
+    this.#scroll = 0;
+    this.#scrollJobId = jobs[index]?.id;
+  }
+
+  private scrollTranscript(delta: number): void {
+    const maxScroll = Math.max(0, this.#transcriptTotal - this.#transcriptRows);
+    this.#scroll = Math.max(0, Math.min(this.#scroll + delta, maxScroll));
   }
 
   private status(job: JobSnapshot): { glyph: string; color: "accent" | "success" | "warning" | "error" | "muted" } {
@@ -217,13 +255,6 @@ export async function openSubagentsDashboard(ctx: ExtensionCommandContext, manag
 }
 
 function shortId(id: string): string { return id.slice(0, 8); }
-function clean(value: string): string {
-  return value
-    .replace(/\u001B(?:\][^\u0007\u001B]*(?:\u0007|\u001B\\)|\[[0-?]*[ -/]*[@-~]|[PX^_][^\u001B]*(?:\u001B\\)|.)/g, "")
-    .replace(/\t/g, "    ")
-    .replace(/[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g, "");
-}
-function cleanInline(value: string): string { return clean(value).replace(/\s+/g, " ").trim(); }
 function formatElapsed(job: JobSnapshot, now: number): string {
   const elapsed = Math.max(0, (job.endedAt ?? now) - (job.startedAt ?? job.createdAt));
   const seconds = Math.floor(elapsed / 1000);
