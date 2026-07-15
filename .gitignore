@@ -1,0 +1,11 @@
+node_modules/
+*.tgz
+coverage/
+dist/
+.env
+.env.*
+auth.json
+sessions/
+transcripts/
+*.log
+.pi/
