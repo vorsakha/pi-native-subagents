@@ -78,10 +78,12 @@ export function formatUsage(usage: Usage): string {
 
 type StatusColor = "accent" | "success" | "warning" | "error" | "muted";
 
-/** Frame-driven pulse for active jobs. Avoids unreliable ANSI blink while remaining width-stable. */
+const ACTIVE_PULSE_MS = 800;
+
+/** Frame-driven on/off pulse for active jobs. Avoids unreliable ANSI blink while remaining width-stable. */
 export function statusMeta(status: JobStatus, now?: number): { glyph: string; color: StatusColor } {
   switch (status) {
-    case "running": return { glyph: now !== undefined && Math.floor(now / 500) % 2 ? "◉" : "●", color: "accent" };
+    case "running": return { glyph: now !== undefined && Math.floor(now / ACTIVE_PULSE_MS) % 2 ? " " : "●", color: "accent" };
     case "completed": return { glyph: "✓", color: "success" };
     case "failed": return { glyph: "×", color: "error" };
     case "cancelled": return { glyph: "■", color: "warning" };
