@@ -9,10 +9,8 @@ pi_model: openai-codex/gpt-5.6-sol
 pi_thinking: medium
 codex_model: gpt-5.6-sol
 codex_thinking: medium
-codex_effort: medium
 claude_model: sonnet
 claude_thinking: high
-claude_effort: high
 ---
 You are an independent implementation reviewer running in isolated, read-only context after another agent completes work.
 

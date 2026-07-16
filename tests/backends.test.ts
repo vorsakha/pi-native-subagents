@@ -103,7 +103,7 @@ function request(backend: BackendName, cwd: string, env: NodeJS.ProcessEnv): Bac
     jobId: `job-${backend}`, role: "worker", task: "fixture task", systemPrompt: "fixture system", cwd, env,
     signal: new AbortController().signal,
     policy: {
-      backend, access: "readOnly", model: "fixture-model", thinking: "low", effort: "low",
+      backend, access: "readOnly", model: "fixture-model", thinking: "low",
       piTools: [], claudeTools: [], approvalPolicy: "never",
       codexSandbox: { type: "readOnly", networkAccess: false },
       nestedAgents: [], depth: 1, maxDepth: 2,
@@ -214,6 +214,7 @@ test("Claude emits live events and reopens a completed subscription session", as
   }
   const final = terminal(events) as Extract<BackendEvent, { type: "completed" }>;
   assert.equal(capturedOptions?.includePartialMessages, true);
+  assert.equal(capturedOptions?.effort, undefined, "Claude effort is provider-adaptive unless explicitly requested");
   const childEnv = capturedOptions?.env as NodeJS.ProcessEnv;
   for (const env of [verifiedEnv, childEnv]) {
     assert.equal(env?.ANTHROPIC_BASE_URL, undefined);
@@ -256,8 +257,10 @@ test("Codex reuses its native thread for queued and post-settlement follow-ups",
   const paramFile = join(fake.dir, "turn-params.jsonl");
   const threadParamFile = join(fake.dir, "thread-params.json");
   try {
+    const codexRequest = request("codex", fake.dir, { ...process.env, MODE: "normal", PARAM_FILE: paramFile, THREAD_PARAM_FILE: threadParamFile });
+    codexRequest.policy.effort = "high";
     const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 500, runTimeoutMs: 2_000 })
-      .start(request("codex", fake.dir, { ...process.env, MODE: "normal", PARAM_FILE: paramFile, THREAD_PARAM_FILE: threadParamFile }), (event) => events.push(event));
+      .start(codexRequest, (event) => events.push(event));
     await run.completed;
     assert.deepEqual(terminal(events), { type: "completed", output: "FIRST" });
     await run.send("FOLLOW", "followUp");
@@ -273,6 +276,7 @@ test("Codex reuses its native thread for queued and post-settlement follow-ups",
       assert.deepEqual(params.sandboxPolicy, { type: "readOnly", networkAccess: false });
       assert.equal(params.approvalPolicy, "never");
       assert.equal(params.cwd, fake.dir);
+      assert.equal(params.effort, "high", "explicit Codex effort is forwarded");
     }
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }

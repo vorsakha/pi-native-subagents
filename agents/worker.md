@@ -10,10 +10,8 @@ pi_model: openai-codex/gpt-5.6-terra
 pi_thinking: medium
 codex_model: gpt-5.6-terra
 codex_thinking: medium
-codex_effort: medium
 claude_model: sonnet
 claude_thinking: medium
-claude_effort: medium
 ---
 You are a worker subagent. You run in an isolated context and can make code changes.
 

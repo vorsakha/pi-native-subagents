@@ -64,7 +64,7 @@ Every `subagent_*` tool and the compatibility `subagent` tool define custom `ren
 The same card renders live partial tool updates (`onUpdate` polling in `subagent_wait` and the compatibility `subagent` tool) and settled results — there is no separate "(subagent running...)" placeholder text.
 
 ### Other tool renderers
-- `subagent_spawn` / `subagent_check` / `subagent_cancel`: one-line `renderCall` (`tool name` + accent identifier + dim detail) and a job card `renderResult`.
+- `subagent_spawn` owns the full live job card. `subagent_check`, `subagent_wait`, `subagent_send`, and `subagent_cancel` render one-line receipts when collapsed so multiple operations on the same job do not duplicate the card; expanding a receipt reveals the full bounded job context.
 - `subagent_list`: `renderResult` shows a header count line plus capped rows (8 collapsed / 20 expanded) with a `+N more — see /subagents` note when the session has more jobs than fit.
 - Unconsumed background completions render through the same job card as one parent follow-up. Active waits, foreground calls, cancellations, and workflow-owned jobs suppress duplicate delivery.
 - All tool text is sanitized (`sanitizeText`/`sanitizeInline`): ANSI/OSC/DCS escape sequences and C0/C1 control characters are stripped before rendering, matching the dashboard's transcript sanitation.
@@ -91,6 +91,8 @@ Workflows reuse the subagent system rather than presenting a separate visual lan
 
 ### Sandboxed execution
 The JavaScript sandbox is a control-plane component, not a new permission authority. It has no filesystem, network, subprocess, import, environment, or credential access. It communicates over authenticated size-bounded IPC and can only announce phases, request agents, and return JSON. `WorkflowManager` validates every request and delegates it to the shared `JobManager`, preserving project trust, role access, routing, nesting depth, cancellation, and the global four-job cap.
+
+Model tier, thinking policy, and effort are independent controls. Tiers choose provider-native models without rewriting role thinking; runtime effort is omitted by default so Claude/Codex remain provider-adaptive, with an explicit request-scoped effort hint available to orchestrators when warranted. Legacy role-frontmatter effort values are accepted as inert compatibility metadata rather than enforced policy.
 
 Provider diversity is a role policy, not a prompt convention. The `adversary` role receives the parent model's normalized provider family and must route to the other native provider (Claude ↔ Codex); same-provider and Pi-backend overrides fail closed. Unknown providers use Claude Opus as the independent fallback. Provider-neutral roles replace the former `claudio` alias and may select Claude directly through normal backend/tier routing.
 

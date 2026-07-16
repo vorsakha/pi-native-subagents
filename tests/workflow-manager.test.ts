@@ -219,6 +219,7 @@ test("runs sequential and parallel agents through one JobManager and its global 
 
     await waitFor(() => f.backend.requests.length === 1, "first sequential agent");
     assert.equal(f.backend.requests[0]?.task, "seq-1");
+    assert.equal(f.backend.requests[0]?.policy.effort, undefined, "workflow agents default to provider-adaptive effort");
     f.backend.completeTask("seq-1", "one");
     await waitFor(() => f.backend.requests.length === 2, "second sequential agent");
     assert.equal(f.backend.requests[1]?.task, "seq-2:one");
@@ -257,6 +258,7 @@ test("preserves reviewer read-only role policy in the backend request", async ()
       export default async () => {
         const reviewed = await agent("audit", {
           role: "reviewer",
+          effort: "high",
           schema: { type: "object", required: ["clean"], properties: { clean: { type: "boolean" } } }
         });
         return reviewed.structured;
@@ -271,6 +273,7 @@ test("preserves reviewer read-only role policy in the backend request", async ()
     assert.deepEqual(request.policy.piTools, ["read", "grep"]);
     assert.deepEqual(request.policy.claudeTools, ["Read", "Glob"]);
     assert.equal(request.policy.approvalPolicy, "never");
+    assert.equal(request.policy.effort, "high");
     f.backend.completeTask(request.task, `{"clean":true}`);
     const final = await started.completion;
     assert.equal(final.status, "completed");

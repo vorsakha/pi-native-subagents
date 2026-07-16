@@ -6,6 +6,7 @@ import {
   MAX_COLLAPSED_LINES,
   MAX_EXPANDED_LINES,
   buildJobCardLines,
+  renderJobReceipt,
   sanitizeInline,
   sanitizeText,
   statusMeta,
@@ -100,6 +101,9 @@ test("renderer sanitizes output, enforces line budgets, and registers runtime re
   assert.ok(resultIndex > 0 && resultIndex < activityIndex && activityIndex < usageIndex, "collapsed card prioritizes outcome before activity and usage");
   assert.ok(outcomeLines.some((line) => line.includes("tool-latest")));
   assert.ok(outcomeLines.every((line) => !line.includes("tool-old")), "collapsed card keeps only latest activity");
+  const receipt = renderJobReceipt(job({ status: "running" }), theme, { action: "Waiting on", now: 5_000 }).render(80);
+  assert.equal(receipt.length, 1);
+  assert.match(receipt[0]!, /Waiting on worker 01234567/);
 
   const expandedLines = buildJobCardLines(bigJob, theme, { expanded: true, now: 4_000 });
   assert.ok(expandedLines.length <= MAX_EXPANDED_LINES, `expanded produced ${expandedLines.length} lines`);
@@ -162,6 +166,9 @@ function assertRuntimeRenderers(): void {
     const details = name === "subagent_list" ? { jobs: [job()] } : { job: job({ status: "completed", endedAt: 3_000, output: "first\nlast" }) };
     const resultLines = toolDef.renderResult({ details }, { expanded: false, isPartial: false }, ansiTheme, { args: args[name] }).render(48);
     assert.ok(resultLines.length <= MAX_COLLAPSED_LINES, `${name} result exceeded budget`);
+    if (["subagent_check", "subagent_wait", "subagent_send", "subagent_cancel"].includes(name)) {
+      assert.equal(resultLines.length, 1, `${name} should render a compact receipt instead of duplicating the spawn card`);
+    }
     assert.ok(resultLines.every((line: string) => visibleWidth(line) <= 48), `${name} result exceeded width`);
   }
 }

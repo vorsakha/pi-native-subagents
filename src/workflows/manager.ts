@@ -3,7 +3,7 @@ import type { TSchema } from "typebox";
 import { Check } from "typebox/value";
 import type { JobManager } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
-import type { BackendName, JobSnapshot, ModelTier, ProviderFamily, Usage } from "../types.ts";
+import type { BackendName, EffortLevel, JobSnapshot, ModelTier, ProviderFamily, Usage } from "../types.ts";
 import {
   checkpointWorkflow,
   createWorkflowArtifacts,
@@ -24,6 +24,7 @@ import type {
 
 const BACKENDS = new Set<BackendName>(["pi", "claude", "codex"]);
 const TIERS = new Set<ModelTier>(["economy", "balanced", "quality"]);
+const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1_000;
 const MAX_TIMEOUT_MS = 2 * 60 * 60 * 1_000;
 const CHECKPOINT_DELAY_MS = 150;
@@ -282,6 +283,9 @@ export class WorkflowManager {
     const tierValue = options.modelTier ?? options.tier;
     const tier = tierValue === undefined ? undefined : String(tierValue) as ModelTier;
     if (tier && !TIERS.has(tier)) return { ok: false, output: "", error: `Unknown model tier: ${tier}` };
+    const effortValue = options.effort;
+    const effort = effortValue === undefined ? undefined : String(effortValue) as EffortLevel;
+    if (effort && !EFFORTS.has(effort)) return { ok: false, output: "", error: `Unknown effort: ${effort}` };
 
     const phase = typeof options.phase === "string"
       ? this.#ensurePhase(entry, options.phase)
@@ -324,6 +328,7 @@ export class WorkflowManager {
         trusted: request.trusted,
         backend,
         tier,
+        effort,
         parentProvider: request.parentProvider,
         depth: request.depth,
         workflow: {

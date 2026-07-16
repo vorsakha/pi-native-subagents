@@ -60,7 +60,7 @@ export class CodexAppServerBackend implements Backend {
       const turnResult = asObject(await peer.request("turn/start", {
         threadId,
         input: input(text),
-        effort: request.policy.effort,
+        ...(request.policy.effort ? { effort: request.policy.effort } : {}),
         approvalPolicy: request.policy.approvalPolicy,
         sandboxPolicy: request.policy.codexSandbox,
         cwd: request.cwd,

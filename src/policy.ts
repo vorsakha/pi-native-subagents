@@ -7,10 +7,10 @@ export function providerFamily(provider: unknown): ProviderFamily {
   return "other";
 }
 
-const TIER_MODELS: Record<ModelTier, { codex: string; claude: string; pi: string; thinking: BackendPolicy["thinking"]; effort: BackendPolicy["effort"] }> = {
-  economy: { codex: "gpt-5.6-luna", claude: "haiku", pi: "openai-codex/gpt-5.6-luna", thinking: "low", effort: "low" },
-  balanced: { codex: "gpt-5.6-terra", claude: "sonnet", pi: "openai-codex/gpt-5.6-terra", thinking: "medium", effort: "medium" },
-  quality: { codex: "gpt-5.6-sol", claude: "opus", pi: "openai-codex/gpt-5.6-sol", thinking: "high", effort: "high" },
+const TIER_MODELS: Record<ModelTier, { codex: string; claude: string; pi: string }> = {
+  economy: { codex: "gpt-5.6-luna", claude: "haiku", pi: "openai-codex/gpt-5.6-luna" },
+  balanced: { codex: "gpt-5.6-terra", claude: "sonnet", pi: "openai-codex/gpt-5.6-terra" },
+  quality: { codex: "gpt-5.6-sol", claude: "opus", pi: "openai-codex/gpt-5.6-sol" },
 };
 
 export interface CompiledJob {
@@ -50,8 +50,6 @@ export function compilePolicy(role: RoleDefinition, request: SpawnRequest, maxDe
   if (request.tier) {
     const tier = TIER_MODELS[request.tier];
     route.model = selected === "pi" ? tier.pi : selected === "claude" ? tier.claude : tier.codex;
-    route.thinking = tier.thinking;
-    route.effort = tier.effort;
   }
 
   const readOnly = role.access === "readOnly";
@@ -62,7 +60,7 @@ export function compilePolicy(role: RoleDefinition, request: SpawnRequest, maxDe
       access: role.access,
       model: route.model,
       thinking: route.thinking,
-      effort: route.effort,
+      effort: request.effort,
       piTools: readOnly
         ? role.piTools.filter((tool) => ["read", "grep", "find", "ls"].includes(tool))
         : [...new Set(role.piTools)],

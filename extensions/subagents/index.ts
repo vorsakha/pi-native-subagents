@@ -14,13 +14,14 @@ import { openSubagentsDashboard } from "./dashboard.ts";
 import {
   renderJobCard,
   renderJobListCard,
+  renderJobReceipt,
   renderToolCallLine,
   sendBehaviorLabel,
   shortId,
   truncatePreview,
 } from "./render.ts";
 import { loadRoles, parseAllowedRoles } from "../../src/roles.ts";
-import type { Backend, BackendName, JobSnapshot, ModelTier, ProviderFamily, SendBehavior } from "../../src/types.ts";
+import type { Backend, BackendName, EffortLevel, JobSnapshot, ModelTier, ProviderFamily, SendBehavior } from "../../src/types.ts";
 import { registerWorkflows } from "../workflows/index.ts";
 
 /** The configured expand-key hint (e.g. "ctrl+o to expand"), threaded into render options so render.ts stays testable without live keybinding state. */
@@ -37,6 +38,7 @@ const LEGACY_STATE_ENTRY = "subagents-profile";
 const SUBAGENT_RESULT_MESSAGE = "native-subagent-result";
 const BACKENDS = ["codex", "claude", "pi"] as const;
 const TIERS = ["economy", "balanced", "quality"] as const;
+const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 
 interface RegistrationOptions {
   registry?: object;
@@ -169,7 +171,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const renderLiveJob = (
     fallback: JobSnapshot,
     theme: Theme,
-    options: { expanded: boolean; isPartial?: boolean; lead?: string },
+    options: { expanded: boolean; isPartial?: boolean; lead?: string; receipt?: string | ((job: JobSnapshot) => string) },
     context?: LiveCardRenderContext,
   ) => {
     const current = liveJob(fallback, context);
@@ -184,9 +186,14 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         return latest.generation === fallback.generation && !isTerminal(latest.status);
       } catch { return false; }
     });
+    const now = Date.now();
+    if (!options.expanded && options.receipt) {
+      const action = typeof options.receipt === "function" ? options.receipt(current.job) : options.receipt;
+      return renderJobReceipt(current.job, theme, { action, now });
+    }
     return renderJobCard(current.job, theme, {
       ...options,
-      now: Date.now(),
+      now,
       isPartial: options.isPartial || active,
       expandHint: expandHint(),
     });
@@ -346,6 +353,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     cwd: Type.Optional(Type.String()),
     backend: Type.Optional(StringEnum(BACKENDS)),
     modelTier: Type.Optional(StringEnum(TIERS)),
+    effort: Type.Optional(StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" })),
   });
 
   pi.registerTool({
@@ -362,7 +370,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const route = args.backend
         ? `${args.backend}${args.modelTier ? `/${args.modelTier}` : ""}`
         : roles.get(args.role)?.differentProviderFromParent ? "cross-provider" : args.modelTier ?? "";
-      const detail = [route, truncatePreview(args.task)].filter(Boolean).join(" · ");
+      const detail = [route, args.effort ? `effort:${args.effort}` : "", truncatePreview(args.task)].filter(Boolean).join(" · ");
       return renderToolCallLine(theme, "Spawn", args.role, detail);
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
@@ -387,7 +395,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     renderResult(res, { expanded }, theme, context) {
       const job = jobOf(res);
       if (!job) return renderToolCallLine(theme, "Inspect", "not found");
-      return renderLiveJob(job, theme, { expanded }, context);
+      return renderLiveJob(job, theme, { expanded, receipt: "Checked" }, context);
     },
   });
 
@@ -424,7 +432,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
       if (!job) return renderToolCallLine(theme, "Wait", "not found");
-      return renderLiveJob(job, theme, { expanded, isPartial }, context);
+      return renderLiveJob(job, theme, {
+        expanded,
+        isPartial,
+        receipt: (current) => isTerminal(current.status) ? "Wait complete" : "Waiting on",
+      }, context);
     },
   });
 
@@ -454,6 +466,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       return renderLiveJob(job, theme, {
         expanded,
         lead: theme.fg("success", `✓ Sent ${behavior} message`),
+        receipt: behavior === "follow-up" ? "Follow-up sent" : "Steer sent",
       }, context);
     },
   });
@@ -480,7 +493,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     renderResult(res, { expanded }, theme, context) {
       const job = jobOf(res);
       if (!job) return renderToolCallLine(theme, "Cancel", "failed");
-      return renderLiveJob(job, theme, { expanded }, context);
+      return renderLiveJob(job, theme, { expanded, receipt: "Cancel complete" }, context);
     },
   });
 
@@ -520,11 +533,12 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       backend: Type.Optional(StringEnum(BACKENDS)),
       modelProfile: Type.Optional(StringEnum(BACKENDS)),
       modelTier: Type.Optional(StringEnum(TIERS)),
+      effort: Type.Optional(StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" })),
     }),
     async execute(_id, params, signal, onUpdate, ctx) {
       const snapshot = spawn(getManager(), {
         role: params.agent, task: params.task, cwd: params.cwd,
-        backend: params.backend ?? params.modelProfile, modelTier: params.modelTier,
+        backend: params.backend ?? params.modelProfile, modelTier: params.modelTier, effort: params.effort,
       }, ctx.cwd, ctx.isProjectTrusted(), roles.get(params.agent)?.lockedBackend || roles.get(params.agent)?.differentProviderFromParent ? undefined : activeBackend, providerFamily(ctx.model?.provider));
       const generation = beginResultConsumption(snapshot.id);
       let consumed = false;
@@ -551,7 +565,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const role = roles.get(args.agent);
       const backend = args.backend ?? args.modelProfile ?? role?.lockedBackend ?? (role?.differentProviderFromParent ? "cross-provider" : activeBackend);
       const route = args.modelTier ? `${backend}/${args.modelTier}` : backend;
-      return renderToolCallLine(theme, "Run", args.agent, `[${route}] ${truncatePreview(args.task)}`);
+      const effort = args.effort ? ` · effort:${args.effort}` : "";
+      return renderToolCallLine(theme, "Run", args.agent, `[${route}${effort}] ${truncatePreview(args.task)}`);
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
@@ -567,7 +582,7 @@ function sendTitle(behavior: SendBehavior): "Steer" | "Follow up" {
 
 function spawn(
   manager: JobManager,
-  params: { role: string; task: string; cwd?: string; backend?: BackendName; modelTier?: ModelTier },
+  params: { role: string; task: string; cwd?: string; backend?: BackendName; modelTier?: ModelTier; effort?: EffortLevel },
   parentCwd: string,
   trusted: boolean,
   compatibilityBackend?: BackendName,
@@ -582,6 +597,7 @@ function spawn(
     trusted,
     backend: resolveBackendOverride(params.backend, params.modelTier, compatibilityBackend),
     tier: params.modelTier,
+    effort: params.effort,
     parentProvider,
     depth,
   });

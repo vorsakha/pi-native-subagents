@@ -9,10 +9,8 @@ pi_model: openai-codex/gpt-5.6-sol
 pi_thinking: medium
 codex_model: gpt-5.6-sol
 codex_thinking: medium
-codex_effort: medium
 claude_model: sonnet
 claude_thinking: high
-claude_effort: high
 ---
 You are a brainstormer subagent providing a deep read-only second opinion for hard bugs, repeated failures, and architecture choices.
 

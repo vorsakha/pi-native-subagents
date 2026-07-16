@@ -53,11 +53,13 @@ Workflow JavaScript runs in a separate Node process with the permission model en
 
 `modelTier` is provider-native after routing:
 
-| Tier | Native Codex | Native Claude | Pi Codex route | Effort |
-| --- | --- | --- | --- | --- |
-| `economy` | Luna | Haiku | `openai-codex/gpt-5.6-luna` | low |
-| `balanced` | Terra | Sonnet | `openai-codex/gpt-5.6-terra` | medium |
-| `quality` | Sol | Opus | `openai-codex/gpt-5.6-sol` | high |
+| Tier | Native Codex | Native Claude | Pi Codex route |
+| --- | --- | --- | --- |
+| `economy` | Luna | Haiku | `openai-codex/gpt-5.6-luna` |
+| `balanced` | Terra | Sonnet | `openai-codex/gpt-5.6-terra` |
+| `quality` | Sol | Opus | `openai-codex/gpt-5.6-sol` |
+
+Model tiers select models only; they do not rewrite a role's thinking policy or provider effort. Claude and Codex omit the effort hint by default so provider/model behavior remains adaptive. Orchestrators may independently pass `effort: "low" | "medium" | "high" | "xhigh" | "max"` when a task deliberately needs a constraint. Pi-native children retain their own thinking policy because Pi exposes thinking rather than the provider effort field.
 
 Without an explicit backend, `modelTier` selects native Codex for ordinary roles. An explicit backend always wins and the tier resolves inside that provider's model family. Omitting `modelTier` preserves role defaults. For `adversary`, cross-provider routing outranks a backend-less tier: it chooses Claude Opus against an OpenAI/Codex parent and Codex Sol against a Claude parent. An explicit same-provider request or Pi backend is rejected so the independence guarantee cannot be bypassed.
 
@@ -119,7 +121,7 @@ export default async function () {
 }
 ```
 
-`agent()` always resolves to `{ ok, output, structured?, jobId?, error?, usage? }`; scripts branch explicitly on `ok`. Each call requires a role. Optional `backend`, `modelTier`, `label`, `phase`, and bounded JSON `schema` cannot loosen that role's policy. Schema requests instruct the native agent to return JSON and validate it before exposing `structured`. `parallel()` accepts task functions and enforces concurrency 1–4 while the shared `JobManager` remains the authoritative global scheduler.
+`agent()` always resolves to `{ ok, output, structured?, jobId?, error?, usage? }`; scripts branch explicitly on `ok`. Each call requires a role. Optional `backend`, `modelTier`, request-scoped `effort`, `label`, `phase`, and bounded JSON `schema` cannot loosen that role's policy. Schema requests instruct the native agent to return JSON and validate it before exposing `structured`. `parallel()` accepts task functions and enforces concurrency 1–4 while the shared `JobManager` remains the authoritative global scheduler.
 
 The workflow tool accepts optional `budget` limits for input tokens, output tokens, turns, and cost. Crossing a reported limit aborts the run and cancels remaining members; parallel work can overshoot by the usage of already-running members.
 

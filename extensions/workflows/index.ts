@@ -117,7 +117,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   pi.registerTool({
     name: "workflow",
     label: "Workflow",
-    description: `Run sandboxed JavaScript orchestration over native role-based subagents. Available roles: ${options.roleNames.join(", ") || "none"}. Scripts export a default async function and may call phase(title), agent(prompt,{role,label?,backend?,modelTier?,phase?,schema?}), and parallel(tasks,{concurrency?}). Optional workflow budgets cap reported tokens, turns, and cost.`,
+    description: `Run sandboxed JavaScript orchestration over native role-based subagents. Available roles: ${options.roleNames.join(", ") || "none"}. Scripts export a default async function and may call phase(title), agent(prompt,{role,label?,backend?,modelTier?,effort?,phase?,schema?}), and parallel(tasks,{concurrency?}). Optional workflow budgets cap reported tokens, turns, and cost.`,
     promptSnippet: "Run a sandboxed multi-agent workflow with phases and bounded parallelism",
     promptGuidelines: [
       "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls.",

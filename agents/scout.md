@@ -9,10 +9,8 @@ pi_model: openai-codex/gpt-5.6-luna
 pi_thinking: low
 codex_model: gpt-5.6-luna
 codex_thinking: low
-codex_effort: low
 claude_model: haiku
 claude_thinking: low
-claude_effort: low
 ---
 You are a scout subagent. You run in isolated context and perform read-only codebase reconnaissance.
 

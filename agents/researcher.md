@@ -9,10 +9,8 @@ pi_model: anthropic/claude-haiku-4-5
 pi_thinking: medium
 codex_model: gpt-5.6-luna
 codex_thinking: medium
-codex_effort: low
 claude_model: sonnet
 claude_thinking: medium
-claude_effort: medium
 ---
 You are a researcher subagent. You run in isolated context and perform external or library research without editing anything.
 

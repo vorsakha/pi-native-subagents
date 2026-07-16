@@ -31,16 +31,14 @@ function access(value: unknown, name: string): AccessMode {
 
 function route(meta: Record<string, unknown>, name: BackendName): RoleRoute {
   const defaults: Record<BackendName, RoleRoute> = {
-    pi: { model: "openai-codex/gpt-5.6-terra", thinking: "medium", effort: "medium" },
-    claude: { model: "sonnet", thinking: "medium", effort: "medium" },
-    codex: { model: "gpt-5.6-terra", thinking: "medium", effort: "medium" },
+    pi: { model: "openai-codex/gpt-5.6-terra", thinking: "medium" },
+    claude: { model: "sonnet", thinking: "medium" },
+    codex: { model: "gpt-5.6-terra", thinking: "medium" },
   };
   const thinkingValue = String(meta[`${name}_thinking`] ?? defaults[name].thinking) as ThinkingLevel;
-  const effortValue = String(meta[`${name}_effort`] ?? defaults[name].effort) as RoleRoute["effort"];
   return {
     model: String(meta[`${name}_model`] ?? defaults[name].model),
     thinking: THINKING.has(thinkingValue) ? thinkingValue : defaults[name].thinking,
-    effort: ["low", "medium", "high", "xhigh", "max"].includes(effortValue) ? effortValue : defaults[name].effort,
   };
 }
 

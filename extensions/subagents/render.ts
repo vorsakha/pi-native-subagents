@@ -238,6 +238,13 @@ export function renderJobCard(job: JobSnapshot, theme: Theme, options: JobCardOp
   return linesComponent(buildJobCardLines(job, theme, options));
 }
 
+/** Compact acknowledgement for operations that reference a job already represented by its spawn card. */
+export function renderJobReceipt(job: JobSnapshot, theme: Theme, options: { action: string; now: number }): Component {
+  const status = statusMeta(job.status, options.now);
+  const line = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(options.action))} ${theme.fg("accent", sanitizeInline(job.role))} ${theme.fg("dim", shortId(sanitizeText(job.id)))} ${theme.fg("dim", `· ${job.backend}/${job.model} · ${job.status} · ${formatElapsed(job, options.now)}`)}`;
+  return linesComponent([line]);
+}
+
 function jobRow(job: JobSnapshot, theme: Theme, now: number): string {
   const status = statusMeta(job.status, now);
   return `${theme.fg(status.color, status.glyph)} ${theme.fg("dim", job.status.padEnd(9))} ${theme.fg("toolTitle", shortId(sanitizeText(job.id)))} ${sanitizeInline(job.role)} ${theme.fg("dim", `· ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)} · ${formatElapsed(job, now)}`)}`;

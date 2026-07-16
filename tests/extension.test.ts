@@ -128,11 +128,12 @@ test("extension registers once and spawn uses role default while foreground uses
   assert.doesNotMatch(historicalAfterFollowUp, /second generation/, "older thread cards stay pinned to their own generation");
 
   const explicitClaude = await pi.tools.get("subagent_spawn").execute("claude-tier", {
-    role: "worker", task: "explicit Claude wins", backend: "claude", modelTier: "economy",
+    role: "worker", task: "explicit Claude wins", backend: "claude", modelTier: "economy", effort: "max",
   }, undefined, undefined, ctx);
   assert.equal(explicitClaude.details.job.backend, "claude", "explicit backend must outrank modelTier");
   assert.equal(explicitClaude.details.job.model, "haiku", "Claude resolves economy within its provider family");
   await pi.tools.get("subagent_wait").execute("wait-claude-tier", { jobId: explicitClaude.details.job.id }, undefined, undefined, ctx);
+  assert.equal(backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "explicit Claude wins")?.policy.effort, "max");
 
   const foreground = await pi.tools.get("subagent").execute("foreground", { agent: "researcher", task: "foreground" }, undefined, undefined, ctx);
   assert.equal(foreground.details.job.backend, "pi", "compatibility foreground uses the restored session profile");

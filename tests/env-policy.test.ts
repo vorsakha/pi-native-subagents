@@ -80,6 +80,7 @@ test("explicit backend outranks tier while backend-less tiers select Codex", () 
   const compiled = compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, tier: "quality", depth: 0 });
   assert.equal(compiled.policy.backend, "codex");
   assert.equal(compiled.policy.model, "gpt-5.6-sol");
+  assert.equal(compiled.policy.thinking, "medium", "tier changes the model without rewriting role thinking policy");
   assert.equal(compiled.policy.access, "full");
   assert.deepEqual(compiled.policy.codexSandbox, { type: "dangerFullAccess" });
   assert.deepEqual(compiled.policy.nestedAgents, ["scout", "researcher"]);
@@ -87,19 +88,25 @@ test("explicit backend outranks tier while backend-less tiers select Codex", () 
   const claude = compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, backend: "claude", tier: "economy" });
   assert.equal(claude.policy.backend, "claude");
   assert.equal(claude.policy.model, "haiku", "Claude resolves the tier within its own model family");
-  assert.equal(claude.policy.effort, "low");
+  assert.equal(claude.policy.thinking, "medium");
+  assert.equal(claude.policy.effort, undefined, "tiers do not force provider effort");
+  const claudeExplicitEffort = compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, backend: "claude", tier: "economy", effort: "high" });
+  assert.equal(claudeExplicitEffort.policy.model, "haiku");
+  assert.equal(claudeExplicitEffort.policy.effort, "high");
 
   const pi = compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, backend: "pi", tier: "economy" });
   assert.equal(pi.policy.backend, "pi");
   assert.equal(pi.policy.model, "openai-codex/gpt-5.6-luna");
-  assert.equal(pi.policy.effort, "low");
+  assert.equal(pi.policy.effort, undefined);
 
   const lockedClaude = { ...role, name: "fixed-claude", lockedBackend: "claude" as const, routes: { ...role.routes, claude: { model: "opus", thinking: "high" as const, effort: "high" as const } } };
   const fixedDefault = compilePolicy(lockedClaude, { role: "fixed-claude", task: "x", cwd: "/tmp", trusted: true, backend: "claude" });
   assert.equal(fixedDefault.policy.backend, "claude");
   assert.equal(fixedDefault.policy.model, "opus");
+  assert.equal(fixedDefault.policy.effort, undefined, "legacy role effort metadata is not enforced");
   const fixedEconomy = compilePolicy(lockedClaude, { role: "fixed-claude", task: "x", cwd: "/tmp", trusted: true, backend: "claude", tier: "economy" });
   assert.equal(fixedEconomy.policy.model, "haiku", "an orchestrator-selected tier may override the role's default model");
+  assert.equal(fixedEconomy.policy.thinking, "high", "tier preserves the role's thinking policy");
   assert.throws(() => compilePolicy(lockedClaude, { role: "fixed-claude", task: "x", cwd: "/tmp", trusted: true, backend: "codex" }), /locks its backend to claude/);
 
   const adversary = { ...role, name: "adversary", defaultBackend: "claude" as const, differentProviderFromParent: true, routes: { ...role.routes, claude: { model: "opus", thinking: "high" as const, effort: "high" as const }, codex: { model: "gpt-5.6-sol", thinking: "high" as const, effort: "high" as const } } };

@@ -3,6 +3,7 @@ export type ProviderFamily = "claude" | "codex" | "other";
 export type AccessMode = "readOnly" | "full";
 export type ModelTier = "economy" | "balanced" | "quality";
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
+export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export interface Usage {
@@ -34,7 +35,8 @@ export interface BackendPolicy {
   access: AccessMode;
   model: string;
   thinking: ThinkingLevel;
-  effort: "low" | "medium" | "high" | "xhigh" | "max";
+  /** Optional provider hint. Omitted by default so the model/provider remains adaptive. */
+  effort?: EffortLevel;
   piTools: string[];
   claudeTools: string[];
   approvalPolicy: "never";
@@ -86,7 +88,8 @@ export interface Backend {
 export interface RoleRoute {
   model: string;
   thinking: ThinkingLevel;
-  effort: "low" | "medium" | "high" | "xhigh" | "max";
+  /** Deprecated compatibility metadata; runtime effort is request-scoped and provider-adaptive by default. */
+  effort?: EffortLevel;
 }
 
 export interface RoleDefinition {
@@ -119,6 +122,7 @@ export interface SpawnRequest {
   trusted: boolean;
   backend?: BackendName;
   tier?: ModelTier;
+  effort?: EffortLevel;
   parentProvider?: ProviderFamily;
   depth?: number;
   /** Internal ownership metadata supplied by the workflow runtime, never by a backend. */
