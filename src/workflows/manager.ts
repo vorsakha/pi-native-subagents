@@ -3,7 +3,7 @@ import type { TSchema } from "typebox";
 import { Check } from "typebox/value";
 import type { JobManager } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
-import type { BackendName, JobSnapshot, ModelTier, Usage } from "../types.ts";
+import type { BackendName, JobSnapshot, ModelTier, ProviderFamily, Usage } from "../types.ts";
 import {
   checkpointWorkflow,
   createWorkflowArtifacts,
@@ -40,6 +40,7 @@ export interface StartWorkflowRequest {
   timeoutMs?: number;
   cwd: string;
   trusted: boolean;
+  parentProvider?: ProviderFamily;
   depth?: number;
   budget?: WorkflowBudget;
 }
@@ -323,6 +324,7 @@ export class WorkflowManager {
         trusted: request.trusted,
         backend,
         tier,
+        parentProvider: request.parentProvider,
         depth: request.depth,
         workflow: {
           runId: entry.snapshot.runId,

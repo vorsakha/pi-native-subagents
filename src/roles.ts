@@ -5,7 +5,7 @@ import type { AccessMode, BackendName, RoleDefinition, RoleRoute, ThinkingLevel 
 
 const BACKENDS: BackendName[] = ["pi", "claude", "codex"];
 const THINKING = new Set<ThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const READ_ONLY_ROLES = new Set(["scout", "researcher", "reviewer", "brainstormer", "claudio", "adversary"]);
+const READ_ONLY_ROLES = new Set(["scout", "researcher", "reviewer", "brainstormer", "adversary"]);
 
 function csv(value: unknown): string[] {
   if (Array.isArray(value)) return value.map(String).map((item) => item.trim()).filter(Boolean);
@@ -60,6 +60,7 @@ export function loadRoles(directory: string, allowed?: string[]): Map<string, Ro
       access: access(meta.access, name),
       defaultBackend,
       lockedBackend: locked,
+      differentProviderFromParent: meta.provider_strategy === "different_from_parent",
       nestedAgents: csv(meta.nested_agents ?? meta.subagent_agents),
       piTools: csv(meta.pi_tools ?? meta.tools),
       claudeTools: csv(meta.claude_tools),

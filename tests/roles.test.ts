@@ -11,8 +11,11 @@ test("known reviewer/scout roles are forced read-only and process allowlist filt
     for (const name of ["reviewer", "worker"]) {
       writeFileSync(join(dir, `${name}.md`), `---\nname: ${name}\naccess: full\n---\nx\n`);
     }
-    const loaded = loadRoles(dir, ["reviewer"]);
-    assert.deepEqual([...loaded.keys()], ["reviewer"]);
+    writeFileSync(join(dir, "adversary.md"), "---\nname: adversary\naccess: full\nbackend: claude\nprovider_strategy: different_from_parent\n---\nx\n");
+    const loaded = loadRoles(dir, ["reviewer", "adversary"]);
+    assert.deepEqual([...loaded.keys()], ["adversary", "reviewer"]);
     assert.equal(loaded.get("reviewer")?.access, "readOnly");
+    assert.equal(loaded.get("adversary")?.access, "readOnly");
+    assert.equal(loaded.get("adversary")?.differentProviderFromParent, true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

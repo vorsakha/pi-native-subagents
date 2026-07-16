@@ -9,6 +9,7 @@ import { Type } from "typebox";
 import { ClaudeBackend, CodexAppServerBackend, PiRpcBackend } from "../../src/backends/index.ts";
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { claimExtensionInstall } from "../../src/install-guard.ts";
+import { providerFamily } from "../../src/policy.ts";
 import { openSubagentsDashboard } from "./dashboard.ts";
 import {
   renderJobCard,
@@ -19,7 +20,7 @@ import {
   truncatePreview,
 } from "./render.ts";
 import { loadRoles, parseAllowedRoles } from "../../src/roles.ts";
-import type { Backend, BackendName, JobSnapshot, ModelTier, SendBehavior } from "../../src/types.ts";
+import type { Backend, BackendName, JobSnapshot, ModelTier, ProviderFamily, SendBehavior } from "../../src/types.ts";
 import { registerWorkflows } from "../workflows/index.ts";
 
 /** The configured expand-key hint (e.g. "ctrl+o to expand"), threaded into render options so render.ts stays testable without live keybinding state. */
@@ -354,11 +355,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     promptSnippet: "Spawn a native Pi, Claude Code, or Codex subagent in the background",
     parameters: spawnParameters,
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted());
+      const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), undefined, providerFamily(ctx.model?.provider));
       return result(snapshot, `Spawned ${snapshot.id} (${snapshot.role}, ${snapshot.backend}/${snapshot.model})`);
     },
     renderCall(args, theme) {
-      const route = args.backend ? `${args.backend}${args.modelTier ? `/${args.modelTier}` : ""}` : args.modelTier ?? "";
+      const route = args.backend
+        ? `${args.backend}${args.modelTier ? `/${args.modelTier}` : ""}`
+        : roles.get(args.role)?.differentProviderFromParent ? "cross-provider" : args.modelTier ?? "";
       const detail = [route, truncatePreview(args.task)].filter(Boolean).join(" · ");
       return renderToolCallLine(theme, "Spawn", args.role, detail);
     },
@@ -522,7 +525,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const snapshot = spawn(getManager(), {
         role: params.agent, task: params.task, cwd: params.cwd,
         backend: params.backend ?? params.modelProfile, modelTier: params.modelTier,
-      }, ctx.cwd, ctx.isProjectTrusted(), roles.get(params.agent)?.lockedBackend ? undefined : activeBackend);
+      }, ctx.cwd, ctx.isProjectTrusted(), roles.get(params.agent)?.lockedBackend || roles.get(params.agent)?.differentProviderFromParent ? undefined : activeBackend, providerFamily(ctx.model?.provider));
       const generation = beginResultConsumption(snapshot.id);
       let consumed = false;
       const timer = setInterval(() => {
@@ -545,7 +548,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
     },
     renderCall(args, theme) {
-      const backend = args.backend ?? args.modelProfile ?? roles.get(args.agent)?.lockedBackend ?? activeBackend;
+      const role = roles.get(args.agent);
+      const backend = args.backend ?? args.modelProfile ?? role?.lockedBackend ?? (role?.differentProviderFromParent ? "cross-provider" : activeBackend);
       const route = args.modelTier ? `${backend}/${args.modelTier}` : backend;
       return renderToolCallLine(theme, "Run", args.agent, `[${route}] ${truncatePreview(args.task)}`);
     },
@@ -567,6 +571,7 @@ function spawn(
   parentCwd: string,
   trusted: boolean,
   compatibilityBackend?: BackendName,
+  parentProvider?: ProviderFamily,
 ): JobSnapshot {
   const cwd = secureCwd(parentCwd, params.cwd);
   const depth = Number.parseInt(process.env.PI_NATIVE_SUBAGENTS_DEPTH ?? "0", 10) || 0;
@@ -577,6 +582,7 @@ function spawn(
     trusted,
     backend: resolveBackendOverride(params.backend, params.modelTier, compatibilityBackend),
     tier: params.modelTier,
+    parentProvider,
     depth,
   });
 }

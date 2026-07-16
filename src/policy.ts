@@ -1,4 +1,11 @@
-import type { BackendName, BackendPolicy, ModelTier, RoleDefinition, SpawnRequest } from "./types.ts";
+import type { BackendName, BackendPolicy, ModelTier, ProviderFamily, RoleDefinition, SpawnRequest } from "./types.ts";
+
+export function providerFamily(provider: unknown): ProviderFamily {
+  const normalized = String(provider ?? "").trim().toLowerCase();
+  if (normalized.includes("anthropic") || normalized.includes("claude")) return "claude";
+  if (normalized.includes("openai") || normalized.includes("codex")) return "codex";
+  return "other";
+}
 
 const TIER_MODELS: Record<ModelTier, { codex: string; claude: string; pi: string; thinking: BackendPolicy["thinking"]; effort: BackendPolicy["effort"] }> = {
   economy: { codex: "gpt-5.6-luna", claude: "haiku", pi: "openai-codex/gpt-5.6-luna", thinking: "low", effort: "low" },
@@ -27,6 +34,16 @@ export function compilePolicy(role: RoleDefinition, request: SpawnRequest, maxDe
       throw new Error(`${role.name} locks its backend to ${role.lockedBackend}`);
     }
     selected = role.lockedBackend;
+  }
+  if (role.differentProviderFromParent) {
+    if (role.lockedBackend) throw new Error(`${role.name} cannot lock a backend and require cross-provider routing`);
+    if (request.backend === "pi") throw new Error(`${role.name} requires a native Claude or Codex backend`);
+    const parent = request.parentProvider;
+    if (request.backend && parent !== "other" && request.backend === parent) {
+      throw new Error(`${role.name} must use a provider different from the parent ${parent} model`);
+    }
+    selected = request.backend
+      ?? (parent === "claude" ? "codex" : parent === "codex" ? "claude" : role.defaultBackend === "codex" ? "codex" : "claude");
   }
 
   const route = { ...role.routes[selected] };

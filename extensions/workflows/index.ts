@@ -3,6 +3,7 @@ import { getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import type { JobManager } from "../../src/manager.ts";
+import { providerFamily } from "../../src/policy.ts";
 import { serializeWorkflowValue } from "../../src/workflows/artifacts.ts";
 import {
   WorkflowManager,
@@ -154,6 +155,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         timeoutMs: params.timeoutMs,
         cwd: ctx.cwd,
         trusted: ctx.isProjectTrusted(),
+        parentProvider: providerFamily(ctx.model?.provider),
         depth,
         budget: params.budget,
       };

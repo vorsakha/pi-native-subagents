@@ -111,6 +111,20 @@ const worker: RoleDefinition = {
   filePath: "worker.md",
 };
 
+const adversary: RoleDefinition = {
+  name: "adversary",
+  description: "cross-provider adversary",
+  access: "readOnly",
+  defaultBackend: "claude",
+  differentProviderFromParent: true,
+  nestedAgents: [],
+  piTools: ["read"],
+  claudeTools: ["Read"],
+  routes,
+  systemPrompt: "adversary system prompt",
+  filePath: "adversary.md",
+};
+
 const reviewer: RoleDefinition = {
   name: "reviewer",
   description: "read-only reviewer",
@@ -146,7 +160,7 @@ async function fixture(concurrency = 4) {
   const backend = new ControlledBackend();
   const jobs = new JobManager({
     backends: [backend],
-    roles: new Map([[worker.name, worker], [reviewer.name, reviewer]]),
+    roles: new Map([[worker.name, worker], [reviewer.name, reviewer], [adversary.name, adversary]]),
     concurrency,
   });
   const workflows = new WorkflowManager({ jobs, artifactRoot });
@@ -270,6 +284,16 @@ test("preserves reviewer read-only role policy in the backend request", async ()
     assert.equal((malformedFinal.result as { ok: boolean }).ok, false);
     assert.match((malformedFinal.result as { error: string }).error, /bounded JSON Schema/);
     assert.equal(f.backend.requests.length, 1, "invalid schemas fail before dispatch");
+
+    const crossProvider = await f.workflows.start(f.request(`
+      export default async () => agent("challenge parent", { role: "adversary" });
+    `, { parentProvider: "claude" }));
+    await waitFor(() => f.backend.requests.length === 2, "cross-provider workflow adversary");
+    const adversaryRequest = f.backend.requests[1]!;
+    assert.equal(adversaryRequest.role, "adversary");
+    assert.equal(adversaryRequest.policy.backend, "codex", "Claude-parent workflow routes adversary to Codex");
+    f.backend.completeTask(adversaryRequest.task, "independent review");
+    assert.equal((await crossProvider.completion).status, "completed");
   } finally {
     await f.cleanup();
   }

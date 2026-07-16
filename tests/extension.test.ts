@@ -73,9 +73,10 @@ const theme = {
   bold: (text: string) => text,
 };
 
-function context(branch: unknown[] = []) {
+function context(branch: unknown[] = [], provider?: string) {
   return {
     cwd: process.cwd(),
+    model: provider ? { provider, id: "parent-model" } : undefined,
     mode: "rpc",
     isProjectTrusted: () => true,
     isIdle: () => false,
@@ -135,12 +136,17 @@ test("extension registers once and spawn uses role default while foreground uses
 
   const foreground = await pi.tools.get("subagent").execute("foreground", { agent: "researcher", task: "foreground" }, undefined, undefined, ctx);
   assert.equal(foreground.details.job.backend, "pi", "compatibility foreground uses the restored session profile");
-  const adversaryDefault = await pi.tools.get("subagent").execute("foreground-adversary", { agent: "adversary", task: "locked default" }, undefined, undefined, ctx);
-  assert.equal(adversaryDefault.details.job.backend, "claude", "locked role outranks the foreground compatibility fallback");
+  const adversaryDefault = await pi.tools.get("subagent").execute("foreground-adversary", { agent: "adversary", task: "cross-provider default" }, undefined, undefined, ctx);
+  assert.equal(adversaryDefault.details.job.backend, "claude", "unknown parent provider uses the adversary's Claude fallback");
   assert.equal(adversaryDefault.details.job.model, "opus");
-  const claudioDefault = await pi.tools.get("subagent").execute("foreground-claudio", { agent: "claudio", task: "locked default" }, undefined, undefined, ctx);
-  assert.equal(claudioDefault.details.job.backend, "claude");
-  assert.equal(claudioDefault.details.job.model, "sonnet");
+  const claudeParent = context([], "anthropic");
+  const adversaryAgainstClaude = await pi.tools.get("subagent_spawn").execute("adversary-codex", { role: "adversary", task: "review Claude independently" }, undefined, undefined, claudeParent);
+  assert.equal(adversaryAgainstClaude.details.job.backend, "codex");
+  assert.equal(adversaryAgainstClaude.details.job.model, "gpt-5.6-sol");
+  await assert.rejects(
+    pi.tools.get("subagent_spawn").execute("adversary-same", { role: "adversary", backend: "claude", task: "invalid same provider" }, undefined, undefined, claudeParent),
+    /different from the parent claude/,
+  );
 
   await pi.handlers.get("session_shutdown")?.();
 

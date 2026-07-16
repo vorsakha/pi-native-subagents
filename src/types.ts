@@ -1,4 +1,5 @@
 export type BackendName = "pi" | "claude" | "codex";
+export type ProviderFamily = "claude" | "codex" | "other";
 export type AccessMode = "readOnly" | "full";
 export type ModelTier = "economy" | "balanced" | "quality";
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -94,6 +95,8 @@ export interface RoleDefinition {
   access: AccessMode;
   defaultBackend: BackendName;
   lockedBackend?: BackendName;
+  /** Route onto a native provider different from the parent model when possible. */
+  differentProviderFromParent?: boolean;
   nestedAgents: string[];
   piTools: string[];
   claudeTools: string[];
@@ -116,6 +119,7 @@ export interface SpawnRequest {
   trusted: boolean;
   backend?: BackendName;
   tier?: ModelTier;
+  parentProvider?: ProviderFamily;
   depth?: number;
   /** Internal ownership metadata supplied by the workflow runtime, never by a backend. */
   workflow?: WorkflowJobReference;

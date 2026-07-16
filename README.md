@@ -47,10 +47,9 @@ Workflow JavaScript runs in a separate Node process with the permission model en
 | `worker` | Codex | full | Terra / medium |
 | `reviewer` | Codex | read-only | Sol / medium |
 | `brainstormer` | Codex | read-only | Sol / medium (Claude Sonnet/high available) |
-| `claudio` | Claude (locked) | read/web-only | Sonnet / medium |
-| `adversary` | Claude (locked) | read-only | Opus / high |
+| `adversary` | Different from parent | read-only | Claude Opus / Codex Sol |
 
-`adversary` intentionally maps directly to the native Claude backend instead of preserving the old Codex-wrapper-plus-special-review-tool implementation. `image-composer` is intentionally omitted because its old controlled image-generation tool is outside this package. These are the two compatibility exceptions required to avoid depending on unimplemented tools from the local extension.
+`claudio` is intentionally omitted: provider-neutral roles such as researcher, reviewer, and brainstormer can all route directly to Claude with provider-native tiers, so a Claude-only consultation alias adds no capability. `adversary` enforces actual provider diversity instead of hardcoding Claude: OpenAI/Codex parent → Claude Opus; Claude parent → Codex Sol; unknown/other parent → Claude Opus fallback. `image-composer` remains omitted because its old controlled image-generation tool is outside this package.
 
 `modelTier` is provider-native after routing:
 
@@ -60,7 +59,7 @@ Workflow JavaScript runs in a separate Node process with the permission model en
 | `balanced` | Terra | Sonnet | `openai-codex/gpt-5.6-terra` | medium |
 | `quality` | Sol | Opus | `openai-codex/gpt-5.6-sol` | high |
 
-Without an explicit backend, `modelTier` selects native Codex. An explicit backend always wins and the tier resolves inside that provider's model family. Omitting `modelTier` preserves the role default, so `adversary` defaults to Claude Opus and `claudio` defaults to Claude Sonnet; an orchestrator may deliberately choose another tier. Locked role backends remain authoritative even when their model tier changes.
+Without an explicit backend, `modelTier` selects native Codex for ordinary roles. An explicit backend always wins and the tier resolves inside that provider's model family. Omitting `modelTier` preserves role defaults. For `adversary`, cross-provider routing outranks a backend-less tier: it chooses Claude Opus against an OpenAI/Codex parent and Codex Sol against a Claude parent. An explicit same-provider request or Pi backend is rejected so the independence guarantee cannot be bypassed.
 
 Role prompts live in `agents/*.md` and contain backend-specific model/tool frontmatter. Roles known to be reviewers/scouts are forced read-only even if frontmatter is accidentally loosened.
 
