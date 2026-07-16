@@ -130,11 +130,17 @@ test("extension registers once and spawn uses role default while foreground uses
     role: "worker", task: "explicit Claude wins", backend: "claude", modelTier: "economy",
   }, undefined, undefined, ctx);
   assert.equal(explicitClaude.details.job.backend, "claude", "explicit backend must outrank modelTier");
-  assert.equal(explicitClaude.details.job.model, "sonnet");
+  assert.equal(explicitClaude.details.job.model, "haiku", "Claude resolves economy within its provider family");
   await pi.tools.get("subagent_wait").execute("wait-claude-tier", { jobId: explicitClaude.details.job.id }, undefined, undefined, ctx);
 
   const foreground = await pi.tools.get("subagent").execute("foreground", { agent: "researcher", task: "foreground" }, undefined, undefined, ctx);
   assert.equal(foreground.details.job.backend, "pi", "compatibility foreground uses the restored session profile");
+  const adversaryDefault = await pi.tools.get("subagent").execute("foreground-adversary", { agent: "adversary", task: "locked default" }, undefined, undefined, ctx);
+  assert.equal(adversaryDefault.details.job.backend, "claude", "locked role outranks the foreground compatibility fallback");
+  assert.equal(adversaryDefault.details.job.model, "opus");
+  const claudioDefault = await pi.tools.get("subagent").execute("foreground-claudio", { agent: "claudio", task: "locked default" }, undefined, undefined, ctx);
+  assert.equal(claudioDefault.details.job.backend, "claude");
+  assert.equal(claudioDefault.details.job.model, "sonnet");
 
   await pi.handlers.get("session_shutdown")?.();
 

@@ -522,7 +522,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const snapshot = spawn(getManager(), {
         role: params.agent, task: params.task, cwd: params.cwd,
         backend: params.backend ?? params.modelProfile, modelTier: params.modelTier,
-      }, ctx.cwd, ctx.isProjectTrusted(), activeBackend);
+      }, ctx.cwd, ctx.isProjectTrusted(), roles.get(params.agent)?.lockedBackend ? undefined : activeBackend);
       const generation = beginResultConsumption(snapshot.id);
       let consumed = false;
       const timer = setInterval(() => {
@@ -545,7 +545,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
     },
     renderCall(args, theme) {
-      const backend = args.backend ?? args.modelProfile ?? activeBackend;
+      const backend = args.backend ?? args.modelProfile ?? roles.get(args.agent)?.lockedBackend ?? activeBackend;
       const route = args.modelTier ? `${backend}/${args.modelTier}` : backend;
       return renderToolCallLine(theme, "Run", args.agent, `[${route}] ${truncatePreview(args.task)}`);
     },

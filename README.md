@@ -52,13 +52,15 @@ Workflow JavaScript runs in a separate Node process with the permission model en
 
 `adversary` intentionally maps directly to the native Claude backend instead of preserving the old Codex-wrapper-plus-special-review-tool implementation. `image-composer` is intentionally omitted because its old controlled image-generation tool is outside this package. These are the two compatibility exceptions required to avoid depending on unimplemented tools from the local extension.
 
-Tier overrides preserve the previous Luna/Terra/Sol vocabulary:
+`modelTier` is provider-native after routing:
 
-- `economy` → `gpt-5.6-luna`, low
-- `balanced` → `gpt-5.6-terra`, medium
-- `quality` → `gpt-5.6-sol`, high
+| Tier | Native Codex | Native Claude | Pi Codex route | Effort |
+| --- | --- | --- | --- | --- |
+| `economy` | Luna | Haiku | `openai-codex/gpt-5.6-luna` | low |
+| `balanced` | Terra | Sonnet | `openai-codex/gpt-5.6-terra` | medium |
+| `quality` | Sol | Opus | `openai-codex/gpt-5.6-sol` | high |
 
-Without an explicit backend, `modelTier` selects native Codex. An explicit backend always wins: Codex uses the native tier model, Pi uses the corresponding `openai-codex/...` model, and Claude keeps the role's configured Claude route because Luna/Terra/Sol are not Claude aliases. Locked role backends remain authoritative.
+Without an explicit backend, `modelTier` selects native Codex. An explicit backend always wins and the tier resolves inside that provider's model family. Omitting `modelTier` preserves the role default, so `adversary` defaults to Claude Opus and `claudio` defaults to Claude Sonnet; an orchestrator may deliberately choose another tier. Locked role backends remain authoritative even when their model tier changes.
 
 Role prompts live in `agents/*.md` and contain backend-specific model/tool frontmatter. Roles known to be reviewers/scouts are forced read-only even if frontmatter is accidentally loosened.
 

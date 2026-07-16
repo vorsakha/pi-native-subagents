@@ -1,9 +1,9 @@
 import type { BackendName, BackendPolicy, ModelTier, RoleDefinition, SpawnRequest } from "./types.ts";
 
-const TIER_MODELS: Record<ModelTier, { codex: string; pi: string; thinking: BackendPolicy["thinking"]; effort: BackendPolicy["effort"] }> = {
-  economy: { codex: "gpt-5.6-luna", pi: "openai-codex/gpt-5.6-luna", thinking: "low", effort: "low" },
-  balanced: { codex: "gpt-5.6-terra", pi: "openai-codex/gpt-5.6-terra", thinking: "medium", effort: "medium" },
-  quality: { codex: "gpt-5.6-sol", pi: "openai-codex/gpt-5.6-sol", thinking: "high", effort: "high" },
+const TIER_MODELS: Record<ModelTier, { codex: string; claude: string; pi: string; thinking: BackendPolicy["thinking"]; effort: BackendPolicy["effort"] }> = {
+  economy: { codex: "gpt-5.6-luna", claude: "haiku", pi: "openai-codex/gpt-5.6-luna", thinking: "low", effort: "low" },
+  balanced: { codex: "gpt-5.6-terra", claude: "sonnet", pi: "openai-codex/gpt-5.6-terra", thinking: "medium", effort: "medium" },
+  quality: { codex: "gpt-5.6-sol", claude: "opus", pi: "openai-codex/gpt-5.6-sol", thinking: "high", effort: "high" },
 };
 
 export interface CompiledJob {
@@ -30,9 +30,9 @@ export function compilePolicy(role: RoleDefinition, request: SpawnRequest, maxDe
   }
 
   const route = { ...role.routes[selected] };
-  if (request.tier && selected !== "claude") {
+  if (request.tier) {
     const tier = TIER_MODELS[request.tier];
-    route.model = selected === "pi" ? tier.pi : tier.codex;
+    route.model = selected === "pi" ? tier.pi : selected === "claude" ? tier.claude : tier.codex;
     route.thinking = tier.thinking;
     route.effort = tier.effort;
   }

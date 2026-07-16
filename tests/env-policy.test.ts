@@ -86,8 +86,8 @@ test("explicit backend outranks tier while backend-less tiers select Codex", () 
 
   const claude = compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, backend: "claude", tier: "economy" });
   assert.equal(claude.policy.backend, "claude");
-  assert.equal(claude.policy.model, "sonnet", "Claude keeps the role's provider-native route");
-  assert.equal(claude.policy.effort, "medium");
+  assert.equal(claude.policy.model, "haiku", "Claude resolves the tier within its own model family");
+  assert.equal(claude.policy.effort, "low");
 
   const pi = compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, backend: "pi", tier: "economy" });
   assert.equal(pi.policy.backend, "pi");
@@ -95,9 +95,12 @@ test("explicit backend outranks tier while backend-less tiers select Codex", () 
   assert.equal(pi.policy.effort, "low");
 
   const lockedClaude = { ...role, name: "adversary", lockedBackend: "claude" as const, routes: { ...role.routes, claude: { model: "opus", thinking: "high" as const, effort: "high" as const } } };
-  const adversary = compilePolicy(lockedClaude, { role: "adversary", task: "x", cwd: "/tmp", trusted: true, backend: "claude", tier: "economy" });
-  assert.equal(adversary.policy.backend, "claude");
-  assert.equal(adversary.policy.model, "opus");
+  const adversaryDefault = compilePolicy(lockedClaude, { role: "adversary", task: "x", cwd: "/tmp", trusted: true, backend: "claude" });
+  assert.equal(adversaryDefault.policy.backend, "claude");
+  assert.equal(adversaryDefault.policy.model, "opus");
+  const adversaryEconomy = compilePolicy(lockedClaude, { role: "adversary", task: "x", cwd: "/tmp", trusted: true, backend: "claude", tier: "economy" });
+  assert.equal(adversaryEconomy.policy.backend, "claude");
+  assert.equal(adversaryEconomy.policy.model, "haiku", "an orchestrator-selected tier may override the role's default model");
   assert.throws(() => compilePolicy(lockedClaude, { role: "adversary", task: "x", cwd: "/tmp", trusted: true, backend: "codex" }), /locks its backend to claude/);
 
   const nested = compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, depth: 1 });
