@@ -6,6 +6,23 @@ import { join } from "node:path";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
 import type { Backend, BackendEvent, BackendName, BackendRequest, BackendRun } from "../src/types.ts";
 
+class HoldingBackend implements Backend {
+  readonly name: BackendName;
+  constructor(name: BackendName) { this.name = name; }
+  async start(_request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
+    let resolveCompleted!: () => void;
+    const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
+    emit({ type: "started", backendSessionId: `${this.name}-session` });
+    const settle = (event: BackendEvent) => { emit(event); resolveCompleted(); };
+    return {
+      completed,
+      async send() {},
+      async cancel(reason = "Cancelled") { settle({ type: "cancelled", reason }); },
+      async close() { resolveCompleted(); },
+    };
+  }
+}
+
 class ImmediateBackend implements Backend {
   readonly starts: BackendRequest[] = [];
   readonly name: BackendName;
@@ -102,4 +119,37 @@ test("extension registers once and spawn uses role default while foreground uses
   assert.equal(foreground.details.job.backend, "pi", "compatibility foreground uses the restored session profile");
 
   await pi.handlers.get("session_shutdown")?.();
+
+  const pulsePi = fakePi();
+  const pulseTimers = new Map<object, () => void>();
+  const fakeSetInterval = ((callback: () => void) => {
+    const timer = { unref() {} };
+    pulseTimers.set(timer, callback);
+    return timer;
+  }) as unknown as typeof setInterval;
+  const fakeClearInterval = ((timer: object) => { pulseTimers.delete(timer); }) as unknown as typeof clearInterval;
+  registerNativeSubagents(pulsePi.api, {
+    registry: {},
+    legacyRoot: false,
+    backends: [new HoldingBackend("pi"), new HoldingBackend("claude"), new HoldingBackend("codex")],
+    workflowArtifactRoot: join(await mkdtemp(join(tmpdir(), "extension-pulse-workflows-")), "runs"),
+    setInterval: fakeSetInterval,
+    clearInterval: fakeClearInterval,
+  });
+  const pulseCtx = context();
+  pulsePi.handlers.get("session_start")?.({}, pulseCtx);
+  const active = await pulsePi.tools.get("subagent_spawn").execute("pulse", { role: "researcher", task: "show pulse" }, undefined, undefined, pulseCtx);
+  await new Promise((resolve) => setImmediate(resolve));
+  let invalidations = 0;
+  const renderContext = { args: {}, state: {}, invalidate: () => { invalidations++; } };
+  const activeCard = pulsePi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, renderContext);
+  assert.ok(activeCard.render(80).some((line: string) => line.includes("updating…")), "background thread card follows the live job");
+  assert.equal(pulseTimers.size, 1, "active thread card owns one bounded pulse timer");
+  pulseTimers.values().next().value?.();
+  assert.equal(invalidations, 1, "pulse timer invalidates the existing thread row");
+  await pulsePi.tools.get("subagent_cancel").execute("cancel-pulse", { jobId: active.details.job.id }, undefined, undefined, pulseCtx);
+  const settledCard = pulsePi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, renderContext);
+  assert.ok(settledCard.render(80).some((line: string) => line.includes("cancelled")), "thread card settles from manager state");
+  assert.equal(pulseTimers.size, 0, "settled thread card stops its pulse timer");
+  await pulsePi.handlers.get("session_shutdown")?.();
 });

@@ -4,7 +4,7 @@ import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { keyHint } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ClaudeBackend, CodexAppServerBackend, PiRpcBackend } from "../../src/backends/index.ts";
 import { isTerminal, JobManager } from "../../src/manager.ts";
@@ -42,6 +42,21 @@ interface RegistrationOptions {
   legacyRoot?: string | false;
   backends?: Backend[];
   workflowArtifactRoot?: string;
+  setInterval?: typeof setInterval;
+  clearInterval?: typeof clearInterval;
+}
+
+interface LiveCardPulse {
+  invalidate?: () => void;
+}
+
+interface LiveCardRenderState {
+  nativeSubagentPulse?: LiveCardPulse;
+}
+
+interface LiveCardRenderContext {
+  state: LiveCardRenderState;
+  invalidate(): void;
 }
 
 export default function nativeSubagents(pi: ExtensionAPI): void {
@@ -64,6 +79,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   let unsubscribeManager: (() => void) | undefined;
   let sessionContext: { isIdle(): boolean } | undefined;
   const deferredResults = new Map<string, JobSnapshot>();
+  const liveCardPulses = new Set<LiveCardPulse>();
+  const schedulePulse = options.setInterval ?? setInterval;
+  const cancelPulse = options.clearInterval ?? clearInterval;
+  let liveCardTicker: ReturnType<typeof setInterval> | undefined;
   const waitInterest = new Map<string, number>();
   const consumedResults = new Set<string>();
   const resultKey = (id: string, generation: number) => `${id}:${generation}`;
@@ -75,6 +94,66 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     backends: options.backends ?? [new PiRpcBackend(), new ClaudeBackend(), new CodexAppServerBackend()],
   });
   const getManager = () => manager ??= createManager();
+  const stopCardPulse = (pulse: LiveCardPulse) => {
+    pulse.invalidate = undefined;
+    liveCardPulses.delete(pulse);
+    if (!liveCardPulses.size && liveCardTicker) {
+      cancelPulse(liveCardTicker);
+      liveCardTicker = undefined;
+    }
+  };
+  const clearCardPulses = () => {
+    for (const pulse of liveCardPulses) pulse.invalidate = undefined;
+    liveCardPulses.clear();
+    if (liveCardTicker) cancelPulse(liveCardTicker);
+    liveCardTicker = undefined;
+  };
+  const syncCardPulse = (context: LiveCardRenderContext | undefined, active: boolean) => {
+    if (!context?.state) return;
+    const pulse = context.state.nativeSubagentPulse ??= {};
+    if (!active) return stopCardPulse(pulse);
+    pulse.invalidate = context.invalidate;
+    liveCardPulses.add(pulse);
+    if (liveCardTicker) return;
+    liveCardTicker = schedulePulse(() => {
+      for (const current of [...liveCardPulses]) {
+        try { current.invalidate?.(); }
+        catch { stopCardPulse(current); }
+      }
+    }, 800);
+    liveCardTicker.unref?.();
+  };
+  const liveJob = (fallback: JobSnapshot): { job: JobSnapshot; tracked: boolean } => {
+    if (!manager) return { job: fallback, tracked: false };
+    try { return { job: manager.check(fallback.id), tracked: true }; }
+    catch { return { job: fallback, tracked: false }; }
+  };
+  const renderLiveJob = (
+    fallback: JobSnapshot,
+    theme: Theme,
+    options: { expanded: boolean; isPartial?: boolean; lead?: string },
+    context?: LiveCardRenderContext,
+  ) => {
+    const current = liveJob(fallback);
+    const active = current.tracked && !isTerminal(current.job.status);
+    syncCardPulse(context, active);
+    return renderJobCard(current.job, theme, {
+      ...options,
+      now: Date.now(),
+      isPartial: options.isPartial || active,
+      expandHint: expandHint(),
+    });
+  };
+  const renderLiveList = (
+    fallback: JobSnapshot[],
+    theme: Theme,
+    expanded: boolean,
+    context?: LiveCardRenderContext,
+  ) => {
+    const jobs = manager?.list() ?? fallback;
+    syncCardPulse(context, !!manager && jobs.some((job) => !isTerminal(job.status)));
+    return renderJobListCard(jobs, theme, { expanded, now: Date.now() });
+  };
   const workflows = registerWorkflows(pi, { roleNames, artifactRoot: options.workflowArtifactRoot });
 
   pi.registerMessageRenderer(SUBAGENT_RESULT_MESSAGE, (message, { expanded }, theme) => {
@@ -128,6 +207,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   };
 
   pi.on("session_start", (_event, ctx) => {
+    clearCardPulses();
     manager = createManager();
     sessionContext = ctx;
     deferredResults.clear();
@@ -161,6 +241,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     unsubscribeManager?.();
     unsubscribeManager = undefined;
     sessionContext = undefined;
+    clearCardPulses();
     deferredResults.clear();
     waitInterest.clear();
     consumedResults.clear();
@@ -227,10 +308,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const detail = [route, truncatePreview(args.task)].filter(Boolean).join(" · ");
       return renderToolCallLine(theme, "Spawn", args.role, detail);
     },
-    renderResult(res, { expanded, isPartial }, theme) {
+    renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
       if (!job) return renderToolCallLine(theme, "Spawn", "failed");
-      return renderJobCard(job, theme, { expanded, now: Date.now(), isPartial, expandHint: expandHint() });
+      return renderLiveJob(job, theme, { expanded, isPartial }, context);
     },
   });
 
@@ -246,10 +327,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     renderCall(args, theme) {
       return renderToolCallLine(theme, "Inspect", shortId(args.jobId));
     },
-    renderResult(res, { expanded }, theme) {
+    renderResult(res, { expanded }, theme, context) {
       const job = jobOf(res);
       if (!job) return renderToolCallLine(theme, "Inspect", "not found");
-      return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint() });
+      return renderLiveJob(job, theme, { expanded }, context);
     },
   });
 
@@ -283,10 +364,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const timeout = args.timeoutMs ? `timeout ${Math.round(args.timeoutMs / 1000)}s` : undefined;
       return renderToolCallLine(theme, "Wait", shortId(args.jobId), timeout);
     },
-    renderResult(res, { expanded, isPartial }, theme) {
+    renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
       if (!job) return renderToolCallLine(theme, "Wait", "not found");
-      return renderJobCard(job, theme, { expanded, now: Date.now(), isPartial, expandHint: expandHint() });
+      return renderLiveJob(job, theme, { expanded, isPartial }, context);
     },
   });
 
@@ -313,12 +394,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const job = jobOf(res);
       if (!job) return renderToolCallLine(theme, sendTitle(resolved), "failed");
       const behavior = sendBehaviorLabel(resolved);
-      return renderJobCard(job, theme, {
+      return renderLiveJob(job, theme, {
         expanded,
-        now: Date.now(),
-        expandHint: expandHint(),
         lead: theme.fg("success", `✓ Sent ${behavior} message`),
-      });
+      }, context);
     },
   });
 
@@ -341,10 +420,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     renderCall(args, theme) {
       return renderToolCallLine(theme, "Cancel", shortId(args.jobId));
     },
-    renderResult(res, { expanded }, theme) {
+    renderResult(res, { expanded }, theme, context) {
       const job = jobOf(res);
       if (!job) return renderToolCallLine(theme, "Cancel", "failed");
-      return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint() });
+      return renderLiveJob(job, theme, { expanded }, context);
     },
   });
 
@@ -361,9 +440,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     renderCall(_args, theme) {
       return renderToolCallLine(theme, "List", "session jobs");
     },
-    renderResult(res, { expanded }, theme) {
+    renderResult(res, { expanded }, theme, context) {
       const jobs = (res.details as { jobs?: JobSnapshot[] } | undefined)?.jobs ?? [];
-      return renderJobListCard(jobs, theme, { expanded, now: Date.now() });
+      return renderLiveList(jobs, theme, expanded, context);
     },
   });
 
@@ -416,10 +495,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const route = args.modelTier ? `${backend}/${args.modelTier}` : backend;
       return renderToolCallLine(theme, "Run", args.agent, `[${route}] ${truncatePreview(args.task)}`);
     },
-    renderResult(res, { expanded, isPartial }, theme) {
+    renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
       if (!job) return renderToolCallLine(theme, "Run", "failed");
-      return renderJobCard(job, theme, { expanded, now: Date.now(), isPartial, expandHint: expandHint() });
+      return renderLiveJob(job, theme, { expanded, isPartial }, context);
     },
   });
 }
