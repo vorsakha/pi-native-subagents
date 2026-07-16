@@ -48,10 +48,12 @@ interface RegistrationOptions {
 
 interface LiveCardPulse {
   invalidate?: () => void;
+  shouldContinue?: () => boolean;
 }
 
 interface LiveCardRenderState {
   nativeSubagentPulse?: LiveCardPulse;
+  nativeSubagentSnapshot?: JobSnapshot;
 }
 
 interface LiveCardRenderContext {
@@ -79,6 +81,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   let unsubscribeManager: (() => void) | undefined;
   let sessionContext: { isIdle(): boolean } | undefined;
   const deferredResults = new Map<string, JobSnapshot>();
+  const cardSnapshots = new Map<string, JobSnapshot>();
   const liveCardPulses = new Set<LiveCardPulse>();
   const schedulePulse = options.setInterval ?? setInterval;
   const cancelPulse = options.clearInterval ?? clearInterval;
@@ -96,6 +99,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const getManager = () => manager ??= createManager();
   const stopCardPulse = (pulse: LiveCardPulse) => {
     pulse.invalidate = undefined;
+    pulse.shouldContinue = undefined;
     liveCardPulses.delete(pulse);
     if (!liveCardPulses.size && liveCardTicker) {
       cancelPulse(liveCardTicker);
@@ -103,30 +107,63 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     }
   };
   const clearCardPulses = () => {
-    for (const pulse of liveCardPulses) pulse.invalidate = undefined;
+    for (const pulse of liveCardPulses) {
+      pulse.invalidate = undefined;
+      pulse.shouldContinue = undefined;
+    }
     liveCardPulses.clear();
     if (liveCardTicker) cancelPulse(liveCardTicker);
     liveCardTicker = undefined;
   };
-  const syncCardPulse = (context: LiveCardRenderContext | undefined, active: boolean) => {
+  const syncCardPulse = (context: LiveCardRenderContext | undefined, active: boolean, shouldContinue: () => boolean) => {
     if (!context?.state) return;
     const pulse = context.state.nativeSubagentPulse ??= {};
     if (!active) return stopCardPulse(pulse);
     pulse.invalidate = context.invalidate;
+    pulse.shouldContinue = shouldContinue;
     liveCardPulses.add(pulse);
     if (liveCardTicker) return;
     liveCardTicker = schedulePulse(() => {
       for (const current of [...liveCardPulses]) {
+        if (!current.shouldContinue?.()) {
+          stopCardPulse(current);
+          continue;
+        }
         try { current.invalidate?.(); }
         catch { stopCardPulse(current); }
       }
     }, 200);
     liveCardTicker.unref?.();
   };
-  const liveJob = (fallback: JobSnapshot): { job: JobSnapshot; tracked: boolean } => {
-    if (!manager) return { job: fallback, tracked: false };
-    try { return { job: manager.check(fallback.id), tracked: true }; }
-    catch { return { job: fallback, tracked: false }; }
+  const refreshCardPulses = () => {
+    for (const pulse of [...liveCardPulses]) {
+      const keep = pulse.shouldContinue?.() === true;
+      try { pulse.invalidate?.(); }
+      catch { stopCardPulse(pulse); continue; }
+      if (!keep) stopCardPulse(pulse);
+    }
+  };
+  const cardKey = (job: Pick<JobSnapshot, "id" | "generation">) => `${job.id}:${job.generation}`;
+  const rememberCardSnapshot = (job: JobSnapshot) => {
+    cardSnapshots.set(cardKey(job), job);
+    if (cardSnapshots.size > 400) cardSnapshots.delete(cardSnapshots.keys().next().value!);
+  };
+  const liveJob = (fallback: JobSnapshot, context?: LiveCardRenderContext): { job: JobSnapshot; tracked: boolean } => {
+    const key = cardKey(fallback);
+    let job = cardSnapshots.get(key) ?? context?.state?.nativeSubagentSnapshot ?? fallback;
+    let tracked = false;
+    if (manager) {
+      try {
+        const current = manager.check(fallback.id);
+        if (current.generation === fallback.generation) {
+          job = current;
+          tracked = true;
+          rememberCardSnapshot(current);
+        }
+      } catch { /* retained row snapshot survives manager eviction */ }
+    }
+    if (context?.state) context.state.nativeSubagentSnapshot = job;
+    return { job, tracked };
   };
   const renderLiveJob = (
     fallback: JobSnapshot,
@@ -134,9 +171,18 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     options: { expanded: boolean; isPartial?: boolean; lead?: string },
     context?: LiveCardRenderContext,
   ) => {
-    const current = liveJob(fallback);
+    const current = liveJob(fallback, context);
     const active = current.tracked && !isTerminal(current.job.status);
-    syncCardPulse(context, active);
+    const key = cardKey(fallback);
+    syncCardPulse(context, active, () => {
+      const remembered = cardSnapshots.get(key);
+      if (remembered && isTerminal(remembered.status)) return false;
+      if (!manager) return false;
+      try {
+        const latest = manager.check(fallback.id);
+        return latest.generation === fallback.generation && !isTerminal(latest.status);
+      } catch { return false; }
+    });
     return renderJobCard(current.job, theme, {
       ...options,
       now: Date.now(),
@@ -151,7 +197,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     context?: LiveCardRenderContext,
   ) => {
     const jobs = manager?.list() ?? fallback;
-    syncCardPulse(context, !!manager && jobs.some((job) => !isTerminal(job.status)));
+    syncCardPulse(
+      context,
+      !!manager && jobs.some((job) => !isTerminal(job.status)),
+      () => !!manager && manager.list().some((job) => !isTerminal(job.status)),
+    );
     return renderJobListCard(jobs, theme, { expanded, now: Date.now() });
   };
   const workflows = registerWorkflows(pi, { roleNames, artifactRoot: options.workflowArtifactRoot });
@@ -211,6 +261,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     manager = createManager();
     sessionContext = ctx;
     deferredResults.clear();
+    cardSnapshots.clear();
     waitInterest.clear();
     consumedResults.clear();
     activeBackend = configuredBackend;
@@ -226,6 +277,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     }
     const sessionManager = manager;
     unsubscribeManager = sessionManager.subscribe((job, event) => {
+      rememberCardSnapshot(job);
+      refreshCardPulses();
       updateStatus(ctx, sessionManager, activeBackend);
       if (event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown")) {
         deferResult(job);
@@ -243,6 +296,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     sessionContext = undefined;
     clearCardPulses();
     deferredResults.clear();
+    cardSnapshots.clear();
     waitInterest.clear();
     consumedResults.clear();
     try {

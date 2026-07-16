@@ -68,6 +68,11 @@ function fakePi() {
   };
 }
 
+const theme = {
+  fg: (_color: string, text: string) => text,
+  bold: (text: string) => text,
+};
+
 function context(branch: unknown[] = []) {
   return {
     cwd: process.cwd(),
@@ -110,10 +115,16 @@ test("extension registers once and spawn uses role default while foreground uses
   await pi.tools.get("subagent_wait").execute("wait", { jobId: consumed.details.job.id }, undefined, undefined, ctx);
   pi.handlers.get("agent_settled")?.();
   assert.equal(pi.messages.length, 1, "wait consumes deferred delivery without duplication");
+  const historicalContext = { args: {}, state: {}, invalidate() {} };
+  const generationZero = pi.tools.get("subagent_spawn").renderResult(consumed, { expanded: true, isPartial: false }, theme, historicalContext).render(100).join("\n");
+  assert.match(generationZero, /claude-ok/);
   await pi.tools.get("subagent_send").execute("send", { jobId: consumed.details.job.id, message: "second generation", behavior: "followUp" }, undefined, undefined, ctx);
   await new Promise((resolve) => setImmediate(resolve));
   pi.handlers.get("agent_settled")?.();
   assert.equal(pi.messages.length, 2, "consumption is scoped to one generation; reused-session output still delivers once");
+  const historicalAfterFollowUp = pi.tools.get("subagent_spawn").renderResult(consumed, { expanded: true, isPartial: false }, theme, historicalContext).render(100).join("\n");
+  assert.match(historicalAfterFollowUp, /claude-ok/);
+  assert.doesNotMatch(historicalAfterFollowUp, /second generation/, "older thread cards stay pinned to their own generation");
 
   const foreground = await pi.tools.get("subagent").execute("foreground", { agent: "researcher", task: "foreground" }, undefined, undefined, ctx);
   assert.equal(foreground.details.job.backend, "pi", "compatibility foreground uses the restored session profile");
@@ -144,15 +155,15 @@ test("extension registers once and spawn uses role default while foreground uses
   await new Promise((resolve) => setImmediate(resolve));
   let invalidations = 0;
   const renderContext = { args: {}, state: {}, invalidate: () => { invalidations++; } };
-  const activeCard = pulsePi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, renderContext);
+  const activeCard = pulsePi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
   assert.ok(activeCard.render(80).some((line: string) => line.includes("updating…")), "background thread card follows the live job");
   assert.equal(pulseTimers.size, 1, "active thread cards share one bounded pulse timer");
   assert.equal(pulseDelay, 200, "thread card fade advances in smooth 200 ms frames");
   pulseTimers.values().next().value?.();
   assert.equal(invalidations, 1, "pulse timer invalidates the existing thread row");
   await pulsePi.tools.get("subagent_cancel").execute("cancel-pulse", { jobId: active.details.job.id }, undefined, undefined, pulseCtx);
-  const settledCard = pulsePi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, renderContext);
-  assert.ok(settledCard.render(80).some((line: string) => line.includes("cancelled")), "thread card settles from manager state");
-  assert.equal(pulseTimers.size, 0, "settled thread card stops its pulse timer");
+  assert.equal(pulseTimers.size, 0, "manager settlement prunes the pulse without requiring a rerender");
+  const settledCard = pulsePi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
+  assert.ok(settledCard.render(80).some((line: string) => line.includes("cancelled")), "thread card settles from remembered manager state");
   await pulsePi.handlers.get("session_shutdown")?.();
 });
