@@ -76,14 +76,26 @@ export function formatUsage(usage: Usage): string {
   return parts.join(" ");
 }
 
-type StatusColor = "accent" | "success" | "warning" | "error" | "muted";
+type StatusColor = "accent" | "success" | "warning" | "error" | "muted" | "dim";
 
-const ACTIVE_PULSE_MS = 800;
+const ACTIVE_PULSE_FRAME_MS = 200;
+const ACTIVE_PULSE_FRAMES: ReadonlyArray<{ glyph: string; color: StatusColor }> = [
+  { glyph: " ", color: "dim" },
+  { glyph: "·", color: "dim" },
+  { glyph: "•", color: "muted" },
+  { glyph: "●", color: "accent" },
+  { glyph: "●", color: "accent" },
+  { glyph: "•", color: "muted" },
+  { glyph: "·", color: "dim" },
+  { glyph: " ", color: "dim" },
+];
 
-/** Frame-driven on/off pulse for active jobs. Avoids unreliable ANSI blink while remaining width-stable. */
+/** Frame-driven fade for active jobs. Uses width-stable glyph/color steps instead of unreliable ANSI blink. */
 export function statusMeta(status: JobStatus, now?: number): { glyph: string; color: StatusColor } {
   switch (status) {
-    case "running": return { glyph: now !== undefined && Math.floor(now / ACTIVE_PULSE_MS) % 2 ? " " : "●", color: "accent" };
+    case "running": return now === undefined
+      ? { glyph: "●", color: "accent" }
+      : ACTIVE_PULSE_FRAMES[Math.floor(now / ACTIVE_PULSE_FRAME_MS) % ACTIVE_PULSE_FRAMES.length]!;
     case "completed": return { glyph: "✓", color: "success" };
     case "failed": return { glyph: "×", color: "error" };
     case "cancelled": return { glyph: "■", color: "warning" };

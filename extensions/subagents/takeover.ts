@@ -56,7 +56,7 @@ class TakeoverView implements Focusable {
       }, 50);
       this.#renderTimer.unref();
     });
-    this.#ticker = setInterval(() => this.#tui.requestRender(), 800);
+    this.#ticker = setInterval(() => this.#tui.requestRender(), 200);
     this.#ticker.unref();
     this.#input.onSubmit = (raw) => {
       const message = raw.trim();

@@ -122,7 +122,9 @@ test("extension registers once and spawn uses role default while foreground uses
 
   const pulsePi = fakePi();
   const pulseTimers = new Map<object, () => void>();
-  const fakeSetInterval = ((callback: () => void) => {
+  let pulseDelay = 0;
+  const fakeSetInterval = ((callback: () => void, delay: number) => {
+    pulseDelay = delay;
     const timer = { unref() {} };
     pulseTimers.set(timer, callback);
     return timer;
@@ -144,7 +146,8 @@ test("extension registers once and spawn uses role default while foreground uses
   const renderContext = { args: {}, state: {}, invalidate: () => { invalidations++; } };
   const activeCard = pulsePi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, { fg: (_color: string, text: string) => text, bold: (text: string) => text }, renderContext);
   assert.ok(activeCard.render(80).some((line: string) => line.includes("updating…")), "background thread card follows the live job");
-  assert.equal(pulseTimers.size, 1, "active thread card owns one bounded pulse timer");
+  assert.equal(pulseTimers.size, 1, "active thread cards share one bounded pulse timer");
+  assert.equal(pulseDelay, 200, "thread card fade advances in smooth 200 ms frames");
   pulseTimers.values().next().value?.();
   assert.equal(invalidations, 1, "pulse timer invalidates the existing thread row");
   await pulsePi.tools.get("subagent_cancel").execute("cancel-pulse", { jobId: active.details.job.id }, undefined, undefined, pulseCtx);

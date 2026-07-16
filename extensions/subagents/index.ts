@@ -120,7 +120,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         try { current.invalidate?.(); }
         catch { stopCardPulse(current); }
       }
-    }, 800);
+    }, 200);
     liveCardTicker.unref?.();
   };
   const liveJob = (fallback: JobSnapshot): { job: JobSnapshot; tracked: boolean } => {
