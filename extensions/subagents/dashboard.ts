@@ -1,7 +1,7 @@
 import { getMarkdownTheme, type ExtensionCommandContext, type Theme } from "@earendil-works/pi-coding-agent";
 import { Key, Markdown, type KeybindingsManager, matchesKey, truncateToWidth, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { isTerminal, JobManager } from "../../src/manager.ts";
-import { sanitizeInline, sanitizeText, statusMeta } from "./render.ts";
+import { formatEffort, sanitizeInline, sanitizeText, statusMeta } from "./render.ts";
 import { openSubagentTakeover } from "./takeover.ts";
 import type { JobSnapshot, SendBehavior } from "../../src/types.ts";
 
@@ -163,7 +163,7 @@ class DashboardOverlay {
     const status = statusMeta(job.status, this.#now());
     const marker = selected ? this.theme.fg("accent", "›") : " ";
     const owner = job.workflow ? ` · wf:${sanitizeInline(job.workflow.label)}` : "";
-    const label = `${status.glyph} ${job.status.padEnd(9)} ${shortId(sanitizeText(job.id))} ${sanitizeInline(job.role)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)}${owner} · ${formatElapsed(job, this.#now())}`;
+    const label = `${status.glyph} ${job.status.padEnd(9)} ${shortId(sanitizeText(job.id))} ${sanitizeInline(job.role)} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)}${owner} · ${formatElapsed(job, this.#now())}`;
     return marker + " " + this.theme.fg(status.color, label);
   }
 
@@ -187,7 +187,7 @@ class DashboardOverlay {
     }
     const status = statusMeta(chosen.status, this.#now());
     const lines = [
-      this.theme.fg("accent", this.theme.bold(`${sanitizeInline(chosen.role)} · ${shortId(sanitizeText(chosen.id))}`)) + this.theme.fg("dim", ` · ${sanitizeInline(chosen.backend)}/${sanitizeInline(chosen.model)}`),
+      this.theme.fg("accent", this.theme.bold(`${sanitizeInline(chosen.role)} · ${shortId(sanitizeText(chosen.id))}`)) + this.theme.fg("dim", ` · effort ${formatEffort(chosen.effort)} · ${sanitizeInline(chosen.backend)}/${sanitizeInline(chosen.model)}`),
       this.theme.fg(status.color, `${status.glyph} ${chosen.status}`) + this.theme.fg("dim", ` · ${formatElapsed(chosen, this.#now())}`),
       this.theme.fg("dim", sanitizeInline(chosen.task) || "(no task description)"),
     ];
@@ -281,4 +281,4 @@ export function truncateDashboardLine(value: string, width: number): string {
 function truncate(value: string, width: number, ellipsis = "…"): string {
   return truncateToWidth(value, Math.max(0, width), ellipsis);
 }
-function statusLine(job: JobSnapshot): string { return `${job.id} ${job.status} ${job.role} [${job.backend}/${job.model}]`; }
+function statusLine(job: JobSnapshot): string { return `${job.id} ${job.status} ${job.role} [${job.backend}/${job.model}; effort ${formatEffort(job.effort)}]`; }

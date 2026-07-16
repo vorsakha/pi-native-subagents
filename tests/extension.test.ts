@@ -112,14 +112,16 @@ test("extension registers once and spawn uses role default while foreground uses
   pi.handlers.get("agent_settled")?.();
   assert.equal((pi.messages[0] as any)?.customType, "native-subagent-result", "unconsumed background result is delivered once");
 
-  const consumed = await pi.tools.get("subagent_spawn").execute("spawn", { role: "researcher", task: "consumed" }, undefined, undefined, ctx);
+  const consumed = await pi.tools.get("subagent_spawn").execute("spawn", { role: "researcher", task: "consumed", effort: "high" }, undefined, undefined, ctx);
+  assert.equal(consumed.details.job.effort, "high");
   await pi.tools.get("subagent_wait").execute("wait", { jobId: consumed.details.job.id }, undefined, undefined, ctx);
   pi.handlers.get("agent_settled")?.();
   assert.equal(pi.messages.length, 1, "wait consumes deferred delivery without duplication");
   const historicalContext = { args: {}, state: {}, invalidate() {} };
   const generationZero = pi.tools.get("subagent_spawn").renderResult(consumed, { expanded: true, isPartial: false }, theme, historicalContext).render(100).join("\n");
   assert.match(generationZero, /claude-ok/);
-  await pi.tools.get("subagent_send").execute("send", { jobId: consumed.details.job.id, message: "second generation", behavior: "followUp" }, undefined, undefined, ctx);
+  const reused = await pi.tools.get("subagent_send").execute("send", { jobId: consumed.details.job.id, message: "second generation", behavior: "followUp" }, undefined, undefined, ctx);
+  assert.equal(reused.details.job.effort, "high", "retained-session generations preserve request effort metadata");
   await new Promise((resolve) => setImmediate(resolve));
   pi.handlers.get("agent_settled")?.();
   assert.equal(pi.messages.length, 2, "consumption is scoped to one generation; reused-session output still delivers once");

@@ -68,6 +68,7 @@ export class JobManager {
       role: role.name,
       backend: policy.backend,
       model: policy.model,
+      effort: policy.effort,
       task: request.task,
       cwd: request.cwd,
       status: "queued",

@@ -32,6 +32,7 @@ function job(id: string, status: JobSnapshot["status"] = "running"): JobSnapshot
     role: "worker",
     backend: "codex",
     model: "gpt-5.6",
+    effort: "high",
     task: "Review Unicode output 你好世界",
     cwd: "/tmp",
     status,
@@ -79,6 +80,8 @@ test("dashboard layout, exit/actions, and transcript scrolling follow the overla
   assert.ok(lines.filter((line) => line.startsWith("║ ")).every((line) => line.endsWith(" ║")));
   assert.ok(lines.filter((line) => line.startsWith("╠")).every((line) => line.endsWith("╣")));
   assert.ok(lines.some((line) => line.includes("Esc close")));
+  assert.ok(lines.some((line) => line.includes("effort high")), "dashboard details show request effort");
+  assert.ok(overlay.render(60).some((line) => line.includes("effort high")), "effort survives the dashboard minimum width");
   assert.ok(overlay.render(72).some((line) => line.includes("first-0")));
   overlay.handleInput("\u001b[6~"); // Page Down
   const scrolled = overlay.render(72);
@@ -149,6 +152,8 @@ test("takeover renders normalized thinking, tools, queued messages, and closes r
   assert.ok(lines.some((line) => line.includes("considering options")));
   assert.ok(lines.some((line) => line.includes("read · file.ts")));
   assert.ok(lines.some((line) => line.includes("also verify tests")));
+  assert.ok(lines.some((line) => line.includes("effort high")), "takeover metadata shows request effort");
+  assert.ok(view.render(48).some((line) => line.includes("effort high")), "effort survives bounded takeover rendering");
   assert.ok(buildTranscript(current, 72, theme).every((line) => visibleWidth(line) <= 72));
   view.handleInput("\x1b");
   assert.deepEqual(closed, [null]);

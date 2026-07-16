@@ -6,6 +6,7 @@ import {
   MAX_COLLAPSED_LINES,
   MAX_EXPANDED_LINES,
   buildJobCardLines,
+  renderJobCard,
   renderJobReceipt,
   sanitizeInline,
   sanitizeText,
@@ -88,8 +89,13 @@ test("renderer sanitizes output, enforces line budgets, and registers runtime re
   assert.ok(collapsedLines.length <= MAX_COLLAPSED_LINES, `collapsed produced ${collapsedLines.length} lines`);
   assert.ok(collapsedLines.every((line) => !CONTROL_CHARS.test(line)));
 
+  const adaptiveLines = buildJobCardLines(job(), theme, { expanded: false, now: 5_000 });
+  assert.ok(adaptiveLines[0]?.includes("effort adaptive"), "default effort is visible in the main thread card");
+  assert.ok(renderJobCard(job(), theme, { expanded: false, now: 5_000 }).render(48)[0]?.includes("effort adaptive"), "adaptive effort survives bounded-width rendering");
+
   const outcomeLines = buildJobCardLines(job({
     status: "completed",
+    effort: "high",
     endedAt: 4_000,
     output: "## Verdict\nPASS\nDetails\nFinal recommendation",
     tools: [tool("old"), tool("latest")],
@@ -99,11 +105,14 @@ test("renderer sanitizes output, enforces line budgets, and registers runtime re
   const activityIndex = outcomeLines.findIndex((line) => line.includes("Activity"));
   const usageIndex = outcomeLines.findIndex((line) => line.includes("Usage"));
   assert.ok(resultIndex > 0 && resultIndex < activityIndex && activityIndex < usageIndex, "collapsed card prioritizes outcome before activity and usage");
+  assert.ok(outcomeLines[0]?.includes("effort high"), "explicit effort is visible in the main thread card");
+  assert.ok(renderJobCard(job({ effort: "high" }), theme, { expanded: false, now: 5_000 }).render(48)[0]?.includes("effort high"), "explicit effort survives bounded-width rendering");
   assert.ok(outcomeLines.some((line) => line.includes("tool-latest")));
   assert.ok(outcomeLines.every((line) => !line.includes("tool-old")), "collapsed card keeps only latest activity");
-  const receipt = renderJobReceipt(job({ status: "running" }), theme, { action: "Waiting on", now: 5_000 }).render(80);
+  const receipt = renderJobReceipt(job({ status: "running" }), theme, { action: "Waiting on", now: 5_000 }).render(48);
   assert.equal(receipt.length, 1);
   assert.match(receipt[0]!, /Waiting on worker 01234567/);
+  assert.match(receipt[0]!, /effort adaptive/);
 
   const expandedLines = buildJobCardLines(bigJob, theme, { expanded: true, now: 4_000 });
   assert.ok(expandedLines.length <= MAX_EXPANDED_LINES, `expanded produced ${expandedLines.length} lines`);

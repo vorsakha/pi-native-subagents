@@ -12,6 +12,7 @@ import { claimExtensionInstall } from "../../src/install-guard.ts";
 import { providerFamily } from "../../src/policy.ts";
 import { openSubagentsDashboard } from "./dashboard.ts";
 import {
+  formatEffort,
   renderJobCard,
   renderJobListCard,
   renderJobReceipt,
@@ -364,7 +365,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     parameters: spawnParameters,
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), undefined, providerFamily(ctx.model?.provider));
-      return result(snapshot, `Spawned ${snapshot.id} (${snapshot.role}, ${snapshot.backend}/${snapshot.model})`);
+      return result(snapshot, `Spawned ${snapshot.id} (${snapshot.role}, ${snapshot.backend}/${snapshot.model}, effort ${formatEffort(snapshot.effort)})`);
     },
     renderCall(args, theme) {
       const route = args.backend
@@ -645,7 +646,7 @@ function updateStatus(ctx: { ui: { setStatus(key: string, text: string | undefin
 }
 
 function statusLine(job: JobSnapshot): string {
-  return `${job.id} ${job.status} ${job.role} [${job.backend}/${job.model}]`;
+  return `${job.id} ${job.status} ${job.role} [${job.backend}/${job.model}; effort ${formatEffort(job.effort)}]`;
 }
 function terminalText(job: JobSnapshot): string {
   if (job.status === "completed") return job.output || "(completed with no text output)";

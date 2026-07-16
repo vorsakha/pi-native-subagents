@@ -65,6 +65,10 @@ function formatTokens(count: number): string {
   return `${(count / 1_000_000).toFixed(1)}M`;
 }
 
+export function formatEffort(effort: JobSnapshot["effort"]): string {
+  return effort ?? "adaptive";
+}
+
 export function formatUsage(usage: Usage): string {
   const parts: string[] = [];
   if (usage.turns) parts.push(`${usage.turns}t`);
@@ -169,7 +173,7 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
 
   if (options.lead) lines.push(options.lead);
 
-  const header = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(job.role)))} ${theme.fg("dim", shortId(sanitizeText(job.id)))} ${theme.fg("dim", `· ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)} · ${job.status} · ${formatElapsed(job, now)}`)}`;
+  const header = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(job.role)))} ${theme.fg("dim", shortId(sanitizeText(job.id)))} ${theme.fg("dim", `· effort ${formatEffort(job.effort)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)} · ${job.status} · ${formatElapsed(job, now)}`)}`;
   lines.push(header);
 
   const task = sanitizeInline(job.task);
@@ -241,13 +245,13 @@ export function renderJobCard(job: JobSnapshot, theme: Theme, options: JobCardOp
 /** Compact acknowledgement for operations that reference a job already represented by its spawn card. */
 export function renderJobReceipt(job: JobSnapshot, theme: Theme, options: { action: string; now: number }): Component {
   const status = statusMeta(job.status, options.now);
-  const line = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(options.action))} ${theme.fg("accent", sanitizeInline(job.role))} ${theme.fg("dim", shortId(sanitizeText(job.id)))} ${theme.fg("dim", `· ${job.backend}/${job.model} · ${job.status} · ${formatElapsed(job, options.now)}`)}`;
+  const line = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(options.action))} ${theme.fg("accent", sanitizeInline(job.role))} ${theme.fg("dim", shortId(sanitizeText(job.id)))} ${theme.fg("dim", `· effort ${formatEffort(job.effort)} · ${job.backend}/${job.model} · ${job.status} · ${formatElapsed(job, options.now)}`)}`;
   return linesComponent([line]);
 }
 
 function jobRow(job: JobSnapshot, theme: Theme, now: number): string {
   const status = statusMeta(job.status, now);
-  return `${theme.fg(status.color, status.glyph)} ${theme.fg("dim", job.status.padEnd(9))} ${theme.fg("toolTitle", shortId(sanitizeText(job.id)))} ${sanitizeInline(job.role)} ${theme.fg("dim", `· ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)} · ${formatElapsed(job, now)}`)}`;
+  return `${theme.fg(status.color, status.glyph)} ${theme.fg("dim", job.status.padEnd(9))} ${theme.fg("toolTitle", shortId(sanitizeText(job.id)))} ${sanitizeInline(job.role)} ${theme.fg("dim", `· effort ${formatEffort(job.effort)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)} · ${formatElapsed(job, now)}`)}`;
 }
 
 export function renderJobListCard(jobs: JobSnapshot[], theme: Theme, options: { expanded: boolean; now: number }): Component {

@@ -12,7 +12,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { isTerminal, type JobManager } from "../../src/manager.ts";
 import type { JobSnapshot, TranscriptEntry } from "../../src/types.ts";
-import { formatUsage, sanitizeInline, sanitizeText, shortId, statusMeta } from "./render.ts";
+import { formatEffort, formatUsage, sanitizeInline, sanitizeText, shortId, statusMeta } from "./render.ts";
 
 interface TakeoverManager extends Pick<JobManager, "check" | "send" | "cancel" | "subscribe"> {}
 
@@ -95,7 +95,7 @@ class TakeoverView implements Focusable {
     const usage = formatUsage(job.usage);
     const owner = job.workflow ? ` · workflow ${sanitizeInline(job.workflow.label)}` : "";
     const header = `${this.#theme.fg(status.color, status.glyph)} ${this.#theme.fg("accent", this.#theme.bold(`${sanitizeInline(job.role)} · ${shortId(job.id)}`))}${this.#theme.fg("dim", ` · ${job.status} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)}${owner}`)}`;
-    const meta = [usage, job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""].filter(Boolean).join(" · ");
+    const meta = [`effort ${formatEffort(job.effort)}`, usage, job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""].filter(Boolean).join(" · ");
     const transcript = buildTranscript(job, width, this.#theme);
     const terminalRows = Math.max(10, this.#tui.terminal.rows || 24);
     const reusable = job.status !== "failed" && job.status !== "cancelled";

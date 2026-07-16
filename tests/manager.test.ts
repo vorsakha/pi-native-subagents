@@ -68,6 +68,20 @@ test("manager enforces concurrency cap four and pumps queued work", async () => 
   await manager.shutdown();
 });
 
+test("snapshots preserve explicit effort and distinguish provider-adaptive defaults", async () => {
+  const { backend, manager } = setup(2);
+  const adaptive = manager.spawn(request(1));
+  const explicit = manager.spawn({ ...request(2), effort: "high" });
+  assert.equal(adaptive.effort, undefined);
+  assert.equal(explicit.effort, "high");
+  assert.equal(manager.check(explicit.id).effort, "high");
+  await tick();
+  backend.complete(adaptive.id);
+  backend.complete(explicit.id);
+  await Promise.all([manager.wait(adaptive.id), manager.wait(explicit.id)]);
+  await manager.shutdown();
+});
+
 test("wait resolves terminal state and timeout returns current state", async () => {
   const { backend, manager } = setup(1);
   const job = manager.spawn(request(1));

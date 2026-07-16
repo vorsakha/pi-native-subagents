@@ -141,6 +141,8 @@ export interface JobSnapshot {
   role: string;
   backend: BackendName;
   model: string;
+  /** Explicit request-scoped provider effort; omitted means provider-adaptive. */
+  effort?: EffortLevel;
   task: string;
   cwd: string;
   status: JobStatus;
