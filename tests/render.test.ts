@@ -8,6 +8,7 @@ import {
   buildJobCardLines,
   sanitizeInline,
   sanitizeText,
+  statusMeta,
 } from "../extensions/subagents/render.ts";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
 import type { Backend, BackendEvent, BackendName, BackendRequest, BackendRun, JobSnapshot, ToolTrace } from "../src/types.ts";
@@ -64,6 +65,9 @@ test("renderer sanitizes output, enforces line budgets, and registers runtime re
   assert.equal(CONTROL_CHARS.test(clean), false);
   assert.ok(clean.includes("\n"));
   assert.equal(sanitizeInline("a\n\nb\tc   d"), "a b c d");
+  assert.deepEqual(statusMeta("running", 0), { glyph: "●", color: "accent" });
+  assert.deepEqual(statusMeta("running", 500), { glyph: "◉", color: "accent" });
+  assert.deepEqual(statusMeta("completed", 500), { glyph: "✓", color: "success" });
   const hugeOutput = Array.from({ length: 5_000 }, (_, i) => `${ESC}[3${i % 8}mline ${i} `).join("\n");
   const bigJob = job({
     status: "completed",

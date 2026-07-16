@@ -56,7 +56,7 @@ class TakeoverView implements Focusable {
       }, 50);
       this.#renderTimer.unref();
     });
-    this.#ticker = setInterval(() => this.#tui.requestRender(), 1_000);
+    this.#ticker = setInterval(() => this.#tui.requestRender(), 500);
     this.#ticker.unref();
     this.#input.onSubmit = (raw) => {
       const message = raw.trim();
@@ -91,7 +91,7 @@ class TakeoverView implements Focusable {
     catch { return [this.#theme.fg("error", "Subagent is no longer tracked")]; }
 
     const border = this.#theme.fg(this.focused ? "borderAccent" : "borderMuted", "─".repeat(width));
-    const status = statusMeta(job.status);
+    const status = statusMeta(job.status, Date.now());
     const usage = formatUsage(job.usage);
     const owner = job.workflow ? ` · workflow ${sanitizeInline(job.workflow.label)}` : "";
     const header = `${this.#theme.fg(status.color, status.glyph)} ${this.#theme.fg("accent", this.#theme.bold(`${sanitizeInline(job.role)} · ${shortId(job.id)}`))}${this.#theme.fg("dim", ` · ${job.status} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)}${owner}`)}`;

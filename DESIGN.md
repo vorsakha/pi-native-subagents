@@ -38,7 +38,7 @@ The outer frame uses the same focused double-line and unfocused rounded-line voc
 - Arrow keys and `j`/`k` navigate; Shift+Up/Down and Page Up/Down scroll the selected job's full bounded output. Long logical lines wrap into width-safe visual rows so no retained text is hidden.
 - Enter opens takeover; `s` steers, `f` queues a follow-up, and `x` cancels a running job.
 - Takeover shows bounded normalized user, thinking, assistant, tool, live-thinking, and queued-message state. Active jobs expose steering input; successfully settled jobs expose follow-up input while their native session remains retained. Failed/cancelled/expired sessions remain read-only.
-- State changes redraw without stealing input or trapping focus.
+- State changes redraw without stealing input or trapping focus. Running-job glyphs pulse between `●` and `◉` every 500 ms in live cards, the dashboard, and takeover; queued and terminal glyphs remain still so motion communicates execution rather than decoration.
 
 ## Tool call/result rendering
 

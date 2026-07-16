@@ -78,9 +78,10 @@ export function formatUsage(usage: Usage): string {
 
 type StatusColor = "accent" | "success" | "warning" | "error" | "muted";
 
-export function statusMeta(status: JobStatus): { glyph: string; color: StatusColor } {
+/** Frame-driven pulse for active jobs. Avoids unreliable ANSI blink while remaining width-stable. */
+export function statusMeta(status: JobStatus, now?: number): { glyph: string; color: StatusColor } {
   switch (status) {
-    case "running": return { glyph: "●", color: "accent" };
+    case "running": return { glyph: now !== undefined && Math.floor(now / 500) % 2 ? "◉" : "●", color: "accent" };
     case "completed": return { glyph: "✓", color: "success" };
     case "failed": return { glyph: "×", color: "error" };
     case "cancelled": return { glyph: "■", color: "warning" };
@@ -145,7 +146,7 @@ export interface JobCardOptions {
 export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCardOptions): string[] {
   const { expanded, now } = options;
   const budget = expanded ? MAX_EXPANDED_LINES : MAX_COLLAPSED_LINES;
-  const status = statusMeta(job.status);
+  const status = statusMeta(job.status, now);
   const lines: string[] = [];
 
   if (options.lead) lines.push(options.lead);
@@ -207,7 +208,7 @@ export function renderJobCard(job: JobSnapshot, theme: Theme, options: JobCardOp
 }
 
 function jobRow(job: JobSnapshot, theme: Theme, now: number): string {
-  const status = statusMeta(job.status);
+  const status = statusMeta(job.status, now);
   return `${theme.fg(status.color, status.glyph)} ${theme.fg("dim", job.status.padEnd(9))} ${theme.fg("toolTitle", shortId(sanitizeText(job.id)))} ${sanitizeInline(job.role)} ${theme.fg("dim", `· ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)} · ${formatElapsed(job, now)}`)}`;
 }
 

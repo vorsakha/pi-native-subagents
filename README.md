@@ -8,7 +8,7 @@ Standalone Pi package for native Pi, Claude Code, and Codex subagents plus sandb
 - Session-scoped `JobManager` with a hard concurrency cap of four.
 - Background `subagent_spawn`, `subagent_wait`, `subagent_check`, `subagent_send`, `subagent_cancel`, and `subagent_list` tools.
 - Compatibility foreground `subagent` tool plus native steering/follow-up control.
-- `/subagents` TUI dashboard with live job status, cancellation, steering, queued follow-ups, and Enter-to-open interactive takeover with normalized user/assistant/thinking/tool state.
+- `/subagents` TUI dashboard with pulsing active-job glyphs, live status, cancellation, steering, queued follow-ups, and Enter-to-open interactive takeover with normalized user/assistant/thinking/tool state.
 - Sandboxed `workflow` orchestration with phases, sequential and bounded-parallel role-based agents, structured schemas, usage budgets, foreground/background execution, durable artifacts, automatic background result delivery, and `/workflows` inspection.
 - Unconsumed ordinary background results are delivered once as bounded parent follow-ups; `subagent_wait`, foreground runs, and workflow-owned jobs consume or suppress duplicate delivery.
 - Bounded in-memory subagent state. Workflow scripts, checkpoints, results, normalized transcripts, and generated reports are stored privately under `~/.pi/agent/workflows/`, never in the project tree.

@@ -1,7 +1,7 @@
 import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Key, type KeybindingsManager, matchesKey, truncateToWidth, type TUI, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { isTerminal, JobManager } from "../../src/manager.ts";
-import { sanitizeInline, sanitizeText } from "./render.ts";
+import { sanitizeInline, sanitizeText, statusMeta } from "./render.ts";
 import { openSubagentTakeover } from "./takeover.ts";
 import type { JobSnapshot, SendBehavior } from "../../src/types.ts";
 
@@ -157,7 +157,7 @@ class DashboardOverlay {
   }
 
   private renderJob(job: JobSnapshot, selected: boolean): string {
-    const status = this.status(job);
+    const status = statusMeta(job.status, this.#now());
     const marker = selected ? this.theme.fg("accent", "›") : " ";
     const owner = job.workflow ? ` · wf:${sanitizeInline(job.workflow.label)}` : "";
     const label = `${status.glyph} ${job.status.padEnd(9)} ${shortId(sanitizeText(job.id))} ${sanitizeInline(job.role)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)}${owner} · ${formatElapsed(job, this.#now())}`;
@@ -182,7 +182,7 @@ class DashboardOverlay {
       this.#scrollJobId = chosen.id;
       this.#scroll = 0;
     }
-    const status = this.status(chosen);
+    const status = statusMeta(chosen.status, this.#now());
     const lines = [
       this.theme.fg("accent", this.theme.bold(`${sanitizeInline(chosen.role)} · ${shortId(sanitizeText(chosen.id))}`)) + this.theme.fg("dim", ` · ${sanitizeInline(chosen.backend)}/${sanitizeInline(chosen.model)}`),
       this.theme.fg(status.color, `${status.glyph} ${chosen.status}`) + this.theme.fg("dim", ` · ${formatElapsed(chosen, this.#now())}`),
@@ -227,15 +227,6 @@ class DashboardOverlay {
     this.#scroll = Math.max(0, Math.min(this.#scroll + delta, maxScroll));
   }
 
-  private status(job: JobSnapshot): { glyph: string; color: "accent" | "success" | "warning" | "error" | "muted" } {
-    switch (job.status) {
-      case "running": return { glyph: "●", color: "accent" };
-      case "completed": return { glyph: "✓", color: "success" };
-      case "failed": return { glyph: "×", color: "error" };
-      case "cancelled": return { glyph: "■", color: "warning" };
-      default: return { glyph: "○", color: "muted" };
-    }
-  }
 }
 
 export async function openSubagentsDashboard(ctx: ExtensionCommandContext, manager: JobManager): Promise<void> {
