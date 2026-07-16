@@ -38,7 +38,8 @@ The outer frame uses the same focused double-line and unfocused rounded-line voc
 - Arrow keys and `j`/`k` navigate; Shift+Up/Down and Page Up/Down scroll the selected job's full bounded output. Long logical lines wrap into width-safe visual rows so no retained text is hidden.
 - Enter opens takeover; `s` steers, `f` queues a follow-up, and `x` cancels a running job.
 - Takeover shows bounded normalized user, thinking, assistant, tool, live-thinking, and queued-message state. Active jobs expose steering input; successfully settled jobs expose follow-up input while their native session remains retained. Failed/cancelled/expired sessions remain read-only.
-- State changes redraw without stealing input or trapping focus. Running-job glyphs fade through width-stable `blank → · → • → ● → • → · → blank` frames at 200 ms per frame in conversation thread cards, the dashboard, and takeover. Pi semantic `dim`, `muted`, and `accent` colors reinforce the fade without terminal-specific blink escapes. Queued and terminal glyphs remain still so motion communicates execution rather than decoration. Thread cards share one session-scoped ticker and invalidate only their own Pi tool rows. Each row is pinned to its job id and generation, with a bounded session snapshot ledger preserving terminal history across retained-session follow-ups and manager eviction. Manager events settle rows and prune their pulse registrations directly, so cleanup never depends on a detached or no-op row rerender.
+- State changes redraw without stealing input or trapping focus. Running-job glyphs fade through width-stable `blank → · → • → ● → • → · → blank` frames at 200 ms per frame in conversation thread cards, the dashboard, and takeover. Pi semantic `dim`, `muted`, and `accent` colors reinforce the fade without terminal-specific blink escapes. Queued and terminal glyphs remain still so motion communicates execution rather than decoration.
+- Dashboard assistant output is sanitized first, then rendered through Pi's native Markdown component so headings, lists, emphasis, and code blocks inherit the active theme while remaining width-safe and scrollable. Thread cards share one session-scoped ticker and invalidate only their own Pi tool rows. Each row is pinned to its job id and generation, with a bounded session snapshot ledger preserving terminal history across retained-session follow-ups and manager eviction. Manager events settle rows and prune their pulse registrations directly, so cleanup never depends on a detached or no-op row rerender.
 
 ## Tool call/result rendering
 
@@ -53,11 +54,11 @@ Every `subagent_*` tool and the compatibility `subagent` tool define custom `ren
 ### Job card anatomy (`renderJobCard`)
 1. Optional lead line (e.g. `✓ Sent steer message`) for `subagent_send`.
 2. Header: status glyph + role + short id + `backend/model` + status word + elapsed/duration, one line.
-3. Task summary (sanitized, single line, collapsed to one line even when multi-line).
-4. Error (collapsed: 1 line; expanded: up to 3 lines), only when present.
-5. Tool trace tail: last 3 tools collapsed, last 8 expanded, each `glyph name: summary`; an omitted-count note when older calls exist.
-6. Usage summary line (tokens in/out, cache, cost, turns) — omitted entirely when all zero.
-7. Output preview: streaming cards show the last 3/16 lines; settled cards show a head/tail preview within the same budget. Empty output is explicit, and upstream truncation is noted.
+3. `Task` summary (sanitized and collapsed to one line).
+4. `Workflow` ownership when applicable, then `Error` (collapsed: 1 line; expanded: up to 3 lines).
+5. **Outcome first:** `Result` for terminal jobs or `Latest` for active jobs. Streaming cards show the last 3/16 lines; settled cards show a head/tail conclusion preview within the same budget.
+6. `Activity`: only the latest tool call when collapsed; a labeled tail of up to 8 calls plus omitted count when expanded. Queued/running empty states explain what the job is waiting for.
+7. `Usage` metadata (tokens, cache, cost, turns), omitted when all zero. It never displaces the result above it.
 8. Footer: always present, either the configured expand-key hint plus `/subagents` (collapsed, settled), `updating…` (collapsed, streaming/partial), or `full bounded output: /subagents` (expanded).
 
 The same card renders live partial tool updates (`onUpdate` polling in `subagent_wait` and the compatibility `subagent` tool) and settled results — there is no separate "(subagent running...)" placeholder text.

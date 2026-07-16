@@ -1,5 +1,5 @@
-import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import { Key, type KeybindingsManager, matchesKey, truncateToWidth, type TUI, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { getMarkdownTheme, type ExtensionCommandContext, type Theme } from "@earendil-works/pi-coding-agent";
+import { Key, Markdown, type KeybindingsManager, matchesKey, truncateToWidth, type TUI, visibleWidth } from "@earendil-works/pi-tui";
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { sanitizeInline, sanitizeText, statusMeta } from "./render.ts";
 import { openSubagentTakeover } from "./takeover.ts";
@@ -15,6 +15,7 @@ interface DashboardOverlayOptions {
   now?: () => number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
+  renderMarkdown?: (text: string, width: number) => string[];
 }
 
 export function createDashboardOverlay(
@@ -35,6 +36,7 @@ class DashboardOverlay {
   #timer: ReturnType<typeof setInterval> | undefined;
   #now: () => number;
   #clearInterval: typeof clearInterval;
+  #renderMarkdown: (text: string, width: number) => string[];
   /** Scroll offset (in lines) into the selected job's full transcript. */
   #scroll = 0;
   /** Job the current scroll offset applies to; scroll resets when the selection moves to a different job. */
@@ -63,6 +65,7 @@ class DashboardOverlay {
     this.done = done;
     this.#now = options.now ?? Date.now;
     this.#clearInterval = options.clearInterval ?? clearInterval;
+    this.#renderMarkdown = options.renderMarkdown ?? renderMarkdown;
     const schedule = options.setInterval ?? setInterval;
     this.#timer = schedule(() => {
       if (!this.#finished) this.tui.requestRender();
@@ -200,9 +203,9 @@ class DashboardOverlay {
       lines.push(this.theme.fg("muted", `${glyph} ${sanitizeInline(tool.name)}${tool.summary ? `: ${sanitizeInline(tool.summary)}` : ""}`));
     }
 
-    const transcript = sanitizeText(chosen.output || "(no assistant text yet)")
-      .split("\n")
-      .flatMap((line) => wrapTextWithAnsi(line || " ", Math.max(1, width)));
+    const transcript = chosen.output
+      ? this.#renderMarkdown(chosen.output, Math.max(1, width)).map((line) => truncate(line, width, ""))
+      : [this.theme.fg("dim", "(no assistant text yet)")];
     const transcriptRows = Math.max(0, rows - lines.length - 1);
     this.#transcriptRows = transcriptRows;
     this.#transcriptTotal = transcript.length;
@@ -265,6 +268,13 @@ function formatElapsed(job: JobSnapshot, now: number): string {
   const seconds = Math.floor(elapsed / 1000);
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
+export function renderMarkdown(text: string, width: number): string[] {
+  const safeWidth = Math.max(1, width);
+  return new Markdown(sanitizeText(text), 0, 0, getMarkdownTheme())
+    .render(safeWidth)
+    .map((line) => truncateToWidth(line, safeWidth, ""));
+}
+
 export function truncateDashboardLine(value: string, width: number): string {
   return truncateToWidth(value, Math.max(0, width), "…");
 }

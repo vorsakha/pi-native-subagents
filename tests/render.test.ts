@@ -87,6 +87,20 @@ test("renderer sanitizes output, enforces line budgets, and registers runtime re
   assert.ok(collapsedLines.length <= MAX_COLLAPSED_LINES, `collapsed produced ${collapsedLines.length} lines`);
   assert.ok(collapsedLines.every((line) => !CONTROL_CHARS.test(line)));
 
+  const outcomeLines = buildJobCardLines(job({
+    status: "completed",
+    endedAt: 4_000,
+    output: "## Verdict\nPASS\nDetails\nFinal recommendation",
+    tools: [tool("old"), tool("latest")],
+    usage: usage({ input: 1200, output: 50, turns: 2 }),
+  }), theme, { expanded: false, now: 5_000 });
+  const resultIndex = outcomeLines.findIndex((line) => line.includes("Result"));
+  const activityIndex = outcomeLines.findIndex((line) => line.includes("Activity"));
+  const usageIndex = outcomeLines.findIndex((line) => line.includes("Usage"));
+  assert.ok(resultIndex > 0 && resultIndex < activityIndex && activityIndex < usageIndex, "collapsed card prioritizes outcome before activity and usage");
+  assert.ok(outcomeLines.some((line) => line.includes("tool-latest")));
+  assert.ok(outcomeLines.every((line) => !line.includes("tool-old")), "collapsed card keeps only latest activity");
+
   const expandedLines = buildJobCardLines(bigJob, theme, { expanded: true, now: 4_000 });
   assert.ok(expandedLines.length <= MAX_EXPANDED_LINES, `expanded produced ${expandedLines.length} lines`);
   assert.ok(expandedLines.every((line) => !CONTROL_CHARS.test(line)));

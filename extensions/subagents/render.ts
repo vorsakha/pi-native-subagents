@@ -8,7 +8,7 @@ import type { JobSnapshot, JobStatus, SendBehavior, ToolTrace, Usage } from "../
 export const MAX_COLLAPSED_LINES = 10;
 export const MAX_EXPANDED_LINES = 36;
 
-const MAX_TOOLS_COLLAPSED = 3;
+const MAX_TOOLS_COLLAPSED = 1;
 const MAX_TOOLS_EXPANDED = 8;
 const MAX_TAIL_COLLAPSED = 3;
 const MAX_TAIL_EXPANDED = 16;
@@ -103,10 +103,14 @@ export function statusMeta(status: JobStatus, now?: number): { glyph: string; co
   }
 }
 
-function toolLine(theme: Theme, tool: ToolTrace): string {
+function toolLine(theme: Theme, tool: ToolTrace, indent = ""): string {
   const glyph = tool.status === "running" ? "…" : tool.status === "failed" ? "×" : "✓";
   const summary = tool.summary ? `: ${sanitizeInline(tool.summary)}` : "";
-  return theme.fg("muted", `${glyph} ${sanitizeInline(tool.name)}${summary}`);
+  return theme.fg("muted", `${indent}${glyph} ${sanitizeInline(tool.name)}${summary}`);
+}
+
+function sectionLine(theme: Theme, label: string, value: string, color: "text" | "toolOutput" | "dim" | "muted" | "error" = "dim"): string {
+  return theme.fg("muted", `${label.padEnd(9)} `) + theme.fg(color, value);
 }
 
 /**
@@ -169,42 +173,55 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
   lines.push(header);
 
   const task = sanitizeInline(job.task);
-  if (task) lines.push(theme.fg("dim", task));
+  if (task) lines.push(sectionLine(theme, "Task", task));
   if (job.workflow) {
     const phase = job.workflow.phase ? ` · ${sanitizeInline(job.workflow.phase)}` : "";
-    lines.push(theme.fg("muted", `↳ workflow ${shortId(sanitizeText(job.workflow.runId))} · ${sanitizeInline(job.workflow.label)}${phase}`));
+    lines.push(sectionLine(theme, "Workflow", `${shortId(sanitizeText(job.workflow.runId))} · ${sanitizeInline(job.workflow.label)}${phase}`, "muted"));
   }
 
   if (job.error) {
     const errorLines = sanitizeText(job.error).split("\n").map(sanitizeInline).filter(Boolean);
     const maxErrorLines = expanded ? 3 : 1;
-    for (const line of errorLines.slice(0, maxErrorLines)) lines.push(theme.fg("error", line));
+    for (const [index, line] of errorLines.slice(0, maxErrorLines).entries()) {
+      lines.push(sectionLine(theme, index ? "" : "Error", line, "error"));
+    }
+  }
+
+  // Outcome precedes implementation noise: the conclusion is what users need from a thread card.
+  if (job.output) {
+    const outputLines = sanitizeText(job.output).split("\n").map((line) => line.trimEnd());
+    const maxTail = expanded ? MAX_TAIL_EXPANDED : MAX_TAIL_COLLAPSED;
+    const preview = options.isPartial ? tailPreview(outputLines, maxTail) : headTailPreview(outputLines, maxTail);
+    const label = isTerminal(job.status) ? "Result" : "Latest";
+    for (const [index, line] of preview.shown.entries()) {
+      lines.push(sectionLine(theme, index ? "" : label, line || " ", "toolOutput"));
+    }
+    if (preview.omitted > 0 || job.truncated) {
+      lines.push(sectionLine(theme, "", job.truncated ? "(subagent output truncated)" : `… ${preview.omitted} earlier line${preview.omitted === 1 ? "" : "s"}`, "muted"));
+    }
   }
 
   const maxTools = expanded ? MAX_TOOLS_EXPANDED : MAX_TOOLS_COLLAPSED;
   if (job.tools.length) {
     const shown = job.tools.slice(-maxTools);
-    for (const tool of shown) lines.push(toolLine(theme, tool));
-    const omitted = job.tools.length - shown.length;
-    if (omitted > 0) lines.push(theme.fg("muted", `+${omitted} earlier tool call${omitted === 1 ? "" : "s"}`));
+    if (expanded) {
+      lines.push(theme.fg("muted", "Activity"));
+      for (const tool of shown) lines.push(toolLine(theme, tool, "  "));
+      const omitted = job.tools.length - shown.length;
+      if (omitted > 0) lines.push(theme.fg("muted", `  +${omitted} earlier tool call${omitted === 1 ? "" : "s"}`));
+    } else {
+      lines.push(sectionLine(theme, "Activity", toolLine(theme, shown[0]!), "muted"));
+    }
+  } else if (!job.output && job.status === "queued") {
+    lines.push(sectionLine(theme, "Activity", "waiting for a worker slot", "dim"));
+  } else if (!job.output && job.status === "running") {
+    lines.push(sectionLine(theme, "Activity", "waiting for the first response", "dim"));
+  } else if (!job.output && isTerminal(job.status)) {
+    lines.push(sectionLine(theme, "Result", "(no assistant text)", "dim"));
   }
 
   const usage = formatUsage(job.usage);
-  if (usage) lines.push(theme.fg("dim", usage));
-
-  if (job.output) {
-    const outputLines = sanitizeText(job.output).split("\n").map((line) => line.trimEnd());
-    const maxTail = expanded ? MAX_TAIL_EXPANDED : MAX_TAIL_COLLAPSED;
-    const preview = options.isPartial ? tailPreview(outputLines, maxTail) : headTailPreview(outputLines, maxTail);
-    for (const line of preview.shown) lines.push(theme.fg("toolOutput", line));
-    if (preview.omitted > 0 || job.truncated) {
-      lines.push(theme.fg("muted", job.truncated ? "(subagent output truncated)" : `… ${preview.omitted} earlier line${preview.omitted === 1 ? "" : "s"}`));
-    }
-  } else if (job.status === "running" || job.status === "queued") {
-    lines.push(theme.fg("dim", "(no output yet)"));
-  } else {
-    lines.push(theme.fg("dim", "(no output)"));
-  }
+  if (usage) lines.push(sectionLine(theme, "Usage", usage, "dim"));
 
   const footer = theme.fg("dim", expanded
     ? `full bounded output: ${DASHBOARD_POINTER}`

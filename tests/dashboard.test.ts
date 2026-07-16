@@ -48,7 +48,12 @@ function job(id: string, status: JobSnapshot["status"] = "running"): JobSnapshot
   };
 }
 
-function dashboard(jobs: JobSnapshot[], rows = 24, done: (action: unknown) => void = () => {}) {
+function dashboard(
+  jobs: JobSnapshot[],
+  rows = 24,
+  done: (action: unknown) => void = () => {},
+  renderMarkdown: (text: string, width: number) => string[] = (text) => text.split("\n"),
+) {
   let renders = 0;
   const overlay = createDashboardOverlay(
     { requestRender: () => { renders++; }, terminal: { rows } } as never,
@@ -56,7 +61,7 @@ function dashboard(jobs: JobSnapshot[], rows = 24, done: (action: unknown) => vo
     { matches: (data: string, binding: string) => binding === "tui.select.cancel" && data === "\u0003" } as unknown as KeybindingsManager,
     { list: () => jobs },
     done as never,
-    { now: () => 65_000 },
+    { now: () => 65_000, renderMarkdown },
   );
   return { overlay, renders: () => renders };
 }
@@ -93,6 +98,22 @@ test("dashboard layout, exit/actions, and transcript scrolling follow the overla
   escape.handleInput("\x1b");
   escape.handleInput("\x1b");
   assert.deepEqual(exits, [{ type: "close" }]);
+
+  let markdownSource = "";
+  const markdown = dashboard(
+    [{ ...job("markdown", "completed"), output: "# Verdict\n\n**PASS**" }],
+    24,
+    () => {},
+    (text) => {
+      markdownSource = text;
+      return ["\u001b[1mVerdict\u001b[0m", "\u001b[32mPASS\u001b[0m"];
+    },
+  ).overlay;
+  t.after(() => markdown.dispose());
+  const styled = markdown.render(72);
+  assert.equal(markdownSource, "# Verdict\n\n**PASS**");
+  assert.ok(styled.some((line) => line.includes("\u001b[1mVerdict\u001b[0m")), "dashboard preserves native Markdown styling");
+  assert.ok(styled.every((line) => visibleWidth(line) === 72));
 });
 
 test("takeover renders normalized thinking, tools, queued messages, and closes reliably", (t) => {
