@@ -52,11 +52,13 @@ Workflow JavaScript runs in a separate Node process with the permission model en
 
 `adversary` intentionally maps directly to the native Claude backend instead of preserving the old Codex-wrapper-plus-special-review-tool implementation. `image-composer` is intentionally omitted because its old controlled image-generation tool is outside this package. These are the two compatibility exceptions required to avoid depending on unimplemented tools from the local extension.
 
-Codex tier overrides preserve the previous routing vocabulary:
+Tier overrides preserve the previous Luna/Terra/Sol vocabulary:
 
 - `economy` → `gpt-5.6-luna`, low
 - `balanced` → `gpt-5.6-terra`, medium
 - `quality` → `gpt-5.6-sol`, high
+
+Without an explicit backend, `modelTier` selects native Codex. An explicit backend always wins: Codex uses the native tier model, Pi uses the corresponding `openai-codex/...` model, and Claude keeps the role's configured Claude route because Luna/Terra/Sol are not Claude aliases. Locked role backends remain authoritative.
 
 Role prompts live in `agents/*.md` and contain backend-specific model/tool frontmatter. Roles known to be reviewers/scouts are forced read-only even if frontmatter is accidentally loosened.
 
@@ -89,7 +91,7 @@ Open the interactive dashboard with `/subagents`. Switch the compatibility tool'
 
 The argument-taking `/subagents` forms remain compatible, including legacy `/subagents --use-codex` and `/subagents --use-claude`; `/subagents-config` is the explicit configuration command. During migration, legacy `PI_SUBAGENTS_PROFILE` is accepted when `PI_NATIVE_SUBAGENTS_BACKEND` is unset, and session entries of custom type `subagents-profile` with `{ profile }` are restored. New writes use `native-subagents-profile` with `{ backend }`.
 
-The session backend is a compatibility default for the foreground `subagent` tool only. `subagent_spawn` with no `backend` preserves the selected role's `defaultBackend`; an explicit per-call `backend` overrides it, and `modelTier` forces the native Codex route. Successfully completed ordinary jobs retain their native Pi/Claude/Codex session for 15 minutes: `subagent_send(..., behavior: "followUp")` or takeover input reopens another turn on the same job and native session. Failed, cancelled, expired, evicted, and workflow-owned sessions are not reusable.
+The session backend is a compatibility default for the foreground `subagent` tool only. `subagent_spawn` with neither `backend` nor `modelTier` preserves the selected role's `defaultBackend`. A backend-less `modelTier` selects native Codex, while an explicit per-call `backend` outranks the tier and locked role backends outrank both. Successfully completed ordinary jobs retain their native Pi/Claude/Codex session for 15 minutes: `subagent_send(..., behavior: "followUp")` or takeover input reopens another turn on the same job and native session. Failed, cancelled, expired, evicted, and workflow-owned sessions are not reusable.
 
 ## Workflows
 

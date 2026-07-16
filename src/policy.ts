@@ -18,18 +18,21 @@ export function compilePolicy(role: RoleDefinition, request: SpawnRequest, maxDe
     throw new Error(`Nested subagent depth limit reached (${maxDepth})`);
   }
 
-  let selected: BackendName = request.tier ? "codex" : request.backend ?? role.defaultBackend;
+  // Explicit routing is authoritative. A tier selects native Codex only when the caller
+  // did not choose a backend; this prevents `{ backend: "claude", tier: "economy" }`
+  // from silently crossing providers.
+  let selected: BackendName = request.backend ?? (request.tier ? "codex" : role.defaultBackend);
   if (role.lockedBackend) {
-    if (request.backend && request.backend !== role.lockedBackend || request.tier && role.lockedBackend !== "codex") {
+    if (request.backend && request.backend !== role.lockedBackend) {
       throw new Error(`${role.name} locks its backend to ${role.lockedBackend}`);
     }
     selected = role.lockedBackend;
   }
 
   const route = { ...role.routes[selected] };
-  if (request.tier) {
+  if (request.tier && selected !== "claude") {
     const tier = TIER_MODELS[request.tier];
-    route.model = tier.codex;
+    route.model = selected === "pi" ? tier.pi : tier.codex;
     route.thinking = tier.thinking;
     route.effort = tier.effort;
   }

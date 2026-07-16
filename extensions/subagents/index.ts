@@ -604,7 +604,7 @@ export function resolveBackendOverride(
   tier: ModelTier | undefined,
   compatibilityBackend?: BackendName,
 ): BackendName | undefined {
-  return tier ? undefined : requested ?? compatibilityBackend;
+  return requested ?? (tier ? undefined : compatibilityBackend);
 }
 
 export function normalizeBackend(value: unknown): BackendName | undefined {

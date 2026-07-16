@@ -76,13 +76,30 @@ test("policy denies untrusted work and depth overflow", () => {
   assert.throws(() => compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, depth: 2 }), /depth limit/);
 });
 
-test("tier override forces Codex route and nested allowlist is bounded", () => {
+test("explicit backend outranks tier while backend-less tiers select Codex", () => {
   const compiled = compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, tier: "quality", depth: 0 });
   assert.equal(compiled.policy.backend, "codex");
   assert.equal(compiled.policy.model, "gpt-5.6-sol");
   assert.equal(compiled.policy.access, "full");
   assert.deepEqual(compiled.policy.codexSandbox, { type: "dangerFullAccess" });
   assert.deepEqual(compiled.policy.nestedAgents, ["scout", "researcher"]);
+
+  const claude = compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, backend: "claude", tier: "economy" });
+  assert.equal(claude.policy.backend, "claude");
+  assert.equal(claude.policy.model, "sonnet", "Claude keeps the role's provider-native route");
+  assert.equal(claude.policy.effort, "medium");
+
+  const pi = compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, backend: "pi", tier: "economy" });
+  assert.equal(pi.policy.backend, "pi");
+  assert.equal(pi.policy.model, "openai-codex/gpt-5.6-luna");
+  assert.equal(pi.policy.effort, "low");
+
+  const lockedClaude = { ...role, name: "adversary", lockedBackend: "claude" as const, routes: { ...role.routes, claude: { model: "opus", thinking: "high" as const, effort: "high" as const } } };
+  const adversary = compilePolicy(lockedClaude, { role: "adversary", task: "x", cwd: "/tmp", trusted: true, backend: "claude", tier: "economy" });
+  assert.equal(adversary.policy.backend, "claude");
+  assert.equal(adversary.policy.model, "opus");
+  assert.throws(() => compilePolicy(lockedClaude, { role: "adversary", task: "x", cwd: "/tmp", trusted: true, backend: "codex" }), /locks its backend to claude/);
+
   const nested = compilePolicy(role, { role: "worker", task: "x", cwd: "/tmp", trusted: true, depth: 1 });
   assert.deepEqual(nested.policy.nestedAgents, []);
 });
