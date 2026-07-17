@@ -33,6 +33,14 @@ test("reducer tracks lifecycle, tools, usage, and authoritative final message", 
 });
 
 test("reducer bounds in-memory transcript output", () => {
+  const seeded = job();
+  seeded.transcript = [{ kind: "assistant", text: "retained context" }];
+  seeded.tools = [{ id: "read", name: "read", status: "completed" }];
+  const streamed = reduceJob(seeded, { type: "text_delta", text: "partial" });
+  assert.equal(streamed.transcript, seeded.transcript, "streaming deltas reuse immutable transcript state");
+  assert.equal(streamed.tools, seeded.tools, "streaming deltas do not clone unrelated tool state");
+  assert.equal(streamed.usage, seeded.usage, "streaming deltas do not clone unrelated usage state");
+
   const state = reduceJob(job(), { type: "text_delta", text: "x".repeat(MAX_OUTPUT_BYTES + 5_000) });
   assert.equal(state.truncated, true);
   assert.ok(Buffer.byteLength(state.output) <= MAX_OUTPUT_BYTES + 40);

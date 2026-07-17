@@ -64,6 +64,11 @@ class TakeoverView implements Focusable {
       let job: JobSnapshot;
       try { job = this.#manager.check(this.#jobId); }
       catch { return; }
+      if (job.workflow) {
+        this.#notice = "Workflow-owned agents are read-only here; inspect or cancel them from /workflows.";
+        this.#tui.requestRender();
+        return;
+      }
       if (job.status === "failed" || job.status === "cancelled") {
         this.#notice = `This native session cannot continue after ${job.status}.`;
         this.#tui.requestRender();
@@ -98,7 +103,7 @@ class TakeoverView implements Focusable {
     const meta = [`effort ${formatEffort(job.effort)}`, usage, job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""].filter(Boolean).join(" · ");
     const transcript = buildTranscript(job, width, this.#theme);
     const terminalRows = Math.max(10, this.#tui.terminal.rows || 24);
-    const reusable = job.status !== "failed" && job.status !== "cancelled";
+    const reusable = !job.workflow && job.status !== "failed" && job.status !== "cancelled";
     const inputRows = reusable ? Math.max(1, this.#input.render(width).length) : 1;
     const chrome = 6 + inputRows;
     this.#viewportRows = Math.max(4, terminalRows - chrome);
@@ -118,7 +123,9 @@ class TakeoverView implements Focusable {
       ...body.map((line) => truncateToWidth(line, width, "…")),
       border,
     ];
-    if (!reusable) lines.push(this.#theme.fg("dim", "Session unavailable — read-only transcript"));
+    if (!reusable) lines.push(this.#theme.fg("dim", job.workflow
+      ? "Workflow-owned agent — read-only transcript; use /workflows for supervision"
+      : "Session unavailable — read-only transcript"));
     else lines.push(...this.#input.render(width));
     if (this.#notice) lines.push(truncateToWidth(this.#theme.fg("warning", this.#notice), width, "…"));
     else lines.push(truncateToWidth(this.#theme.fg("dim", `${job.status === "completed" ? "Enter follow-up" : "Enter steer"} · Shift+↑↓/Pg scroll · Ctrl+L abort · Esc close`), width, "…"));
@@ -143,7 +150,7 @@ class TakeoverView implements Focusable {
     else if (matchesKey(data, Key.pageDown)) this.scroll(-(this.#viewportRows - 1));
     else {
       const job = this.#manager.check(this.#jobId);
-      if (job.status !== "failed" && job.status !== "cancelled") this.#input.handleInput(data);
+      if (!job.workflow && job.status !== "failed" && job.status !== "cancelled") this.#input.handleInput(data);
     }
     this.#tui.requestRender();
   }

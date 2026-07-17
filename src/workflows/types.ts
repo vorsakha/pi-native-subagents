@@ -1,4 +1,4 @@
-import type { TranscriptEntry } from "../types.ts";
+import type { EffortLevel, ToolTrace, TranscriptEntry } from "../types.ts";
 
 export type WorkflowStatus = "pending" | "running" | "completed" | "failed" | "aborted";
 
@@ -43,6 +43,14 @@ export interface WorkflowAgentRecord {
   timestamps: WorkflowTimestamps;
   backend?: string;
   model?: string;
+  effort?: EffortLevel;
+  /** Original caller prompt, bounded before persistence; excludes schema scaffolding. */
+  prompt?: string;
+  /** Bounded recent tool state, projected live and frozen when the job settles. */
+  tools?: ToolTrace[];
+  /** Live-only thinking preview projected from JobManager when available. */
+  liveThinking?: string;
+  truncated?: boolean;
   preview?: string;
   output?: unknown;
   structured?: unknown;

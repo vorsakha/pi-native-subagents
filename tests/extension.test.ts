@@ -80,7 +80,7 @@ function context(branch: unknown[] = [], provider?: string) {
     mode: "rpc",
     isProjectTrusted: () => true,
     isIdle: () => false,
-    sessionManager: { getBranch: () => branch },
+    sessionManager: { getBranch: () => branch, getSessionId: () => "extension-session" },
     ui: {
       setStatus() {},
       notify() {},

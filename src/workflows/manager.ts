@@ -3,7 +3,7 @@ import type { TSchema } from "typebox";
 import { Check } from "typebox/value";
 import type { JobManager } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
-import type { BackendName, EffortLevel, JobSnapshot, ModelTier, ProviderFamily, Usage } from "../types.ts";
+import type { BackendEvent, BackendName, EffortLevel, JobSnapshot, ModelTier, ProviderFamily, Usage } from "../types.ts";
 import {
   checkpointWorkflow,
   createWorkflowArtifacts,
@@ -100,6 +100,7 @@ function terminalWorkflow(status: WorkflowStatus): boolean {
 export class WorkflowManager {
   readonly #jobs: JobManager;
   readonly #artifactRoot: string;
+  readonly #sessionId: string;
   readonly #runs = new Map<string, RunEntry>();
   readonly #jobOwners = new Map<string, { runId: string; agentIndex: number }>();
   readonly #listeners = new Set<(snapshot: WorkflowSnapshot) => void>();
@@ -107,15 +108,16 @@ export class WorkflowManager {
   #initializing?: Promise<void>;
   #closed = false;
 
-  constructor(options: { jobs: JobManager; artifactRoot: string }) {
+  constructor(options: { jobs: JobManager; artifactRoot: string; sessionId: string }) {
     this.#jobs = options.jobs;
     this.#artifactRoot = resolve(options.artifactRoot);
-    this.#unsubscribeJobs = this.#jobs.subscribe((job) => this.#updateAgentFromJob(job));
+    this.#sessionId = options.sessionId;
+    this.#unsubscribeJobs = this.#jobs.subscribe((job, event) => this.#updateAgentFromJob(job, event));
   }
 
   async initialize(): Promise<void> {
     this.#initializing ??= (async () => {
-      const restored = await loadWorkflowSummaries(this.#artifactRoot, { staleAfterMs: 0 });
+      const restored = await loadWorkflowSummaries(this.#artifactRoot, { staleAfterMs: 0, sessionId: this.#sessionId });
       for (const snapshot of restored.slice(0, MAX_RETAINED_RUNS)) {
         if (this.#runs.has(snapshot.runId)) continue;
         const controller = new AbortController();
@@ -140,7 +142,9 @@ export class WorkflowManager {
   check(runId: string): WorkflowSnapshot {
     const entry = this.#runs.get(runId);
     if (!entry) throw new Error(`Unknown workflow: ${runId}`);
-    return clone(entry.snapshot);
+    const snapshot = clone(entry.snapshot);
+    snapshot.agents = snapshot.agents.map((agent) => this.#projectAgent(agent));
+    return snapshot;
   }
 
   subscribe(listener: (snapshot: WorkflowSnapshot) => void): () => void {
@@ -192,6 +196,17 @@ export class WorkflowManager {
     entry.snapshot.error = boundedText(reason);
     entry.controller.abort(new Error(reason));
     return entry.completion;
+  }
+
+  async cancelAgent(runId: string, agentIndex: number, reason = "Workflow agent cancelled by user"): Promise<WorkflowSnapshot> {
+    const entry = this.#runs.get(runId);
+    if (!entry) throw new Error(`Unknown workflow: ${runId}`);
+    const agent = entry.snapshot.agents.find((candidate) => candidate.index === agentIndex);
+    if (!agent) throw new Error(`Unknown workflow agent: ${agentIndex}`);
+    if (!agent.jobId) throw new Error(`Workflow agent ${agent.label} has not started`);
+    if (["completed", "failed", "cancelled", "aborted"].includes(agent.state)) return this.check(runId);
+    await this.#jobs.cancel(agent.jobId, reason);
+    return this.check(runId);
   }
 
   async shutdown(timeoutMs = 8_000): Promise<void> {
@@ -300,6 +315,9 @@ export class WorkflowManager {
       phase,
       state: "queued",
       timestamps: { createdAt: now, updatedAt: now },
+      prompt: boundedText(prompt, 2 * 1024),
+      effort,
+      tools: [],
       usage: workflowUsage(),
     };
     entry.snapshot.agents.push(record);
@@ -398,24 +416,64 @@ export class WorkflowManager {
     }
   }
 
-  #updateAgentFromJob(job: JobSnapshot): void {
+  #projectAgent(agent: WorkflowAgentRecord): WorkflowAgentRecord {
+    if (!agent.jobId || ["completed", "failed", "cancelled", "aborted"].includes(agent.state)) return agent;
+    let job: JobSnapshot;
+    try { job = this.#jobs.check(agent.jobId); }
+    catch { return agent; }
+    return {
+      ...agent,
+      state: agentState(job),
+      backend: job.backend,
+      model: job.model,
+      effort: job.effort,
+      preview: job.output.slice(-500),
+      output: isTerminal(job.status) ? job.output : agent.output,
+      transcript: job.transcript.map((item) => ({ ...item })),
+      tools: job.tools.slice(-8).map((tool) => ({ ...tool })),
+      liveThinking: job.liveThinking,
+      truncated: job.truncated,
+      error: job.error,
+      usage: workflowUsage(job.usage),
+      timestamps: {
+        ...agent.timestamps,
+        updatedAt: Date.now(),
+        startedAt: agent.timestamps.startedAt ?? job.startedAt,
+        endedAt: job.endedAt,
+      },
+    };
+  }
+
+  #updateAgentFromJob(job: JobSnapshot, event: BackendEvent = { type: "started" }): void {
     const owner = this.#jobOwners.get(job.id);
     if (!owner) return;
     const entry = this.#runs.get(owner.runId);
     const agent = entry?.snapshot.agents[owner.agentIndex];
     if (!entry || !agent) return;
+
+    // Streaming deltas stay authoritative in JobManager and are projected by check().
+    // Persisting and cloning the full workflow on every token is both redundant and quadratic.
+    if (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "queue_changed") return;
+
     const now = Date.now();
     agent.state = agentState(job);
     agent.backend = job.backend;
     agent.model = job.model;
-    agent.preview = job.output.slice(-200);
-    agent.output = isTerminal(job.status) ? job.output : undefined;
-    agent.transcript = job.transcript.map((item) => ({ ...item }));
+    agent.effort = job.effort;
+    agent.preview = job.output.slice(-500);
     agent.error = job.error;
     agent.usage = workflowUsage(job.usage);
     agent.timestamps.updatedAt = now;
     agent.timestamps.startedAt ??= job.startedAt;
     agent.timestamps.endedAt = job.endedAt;
+
+    if (event.type === "user_message" || event.type === "thinking_message" || event.type === "message"
+        || event.type === "tool_start" || event.type === "tool_end" || isTerminal(job.status)) {
+      agent.transcript = job.transcript.map((item) => ({ ...item }));
+      agent.tools = job.tools.slice(-8).map((tool) => ({ ...tool }));
+      agent.truncated = job.truncated;
+    }
+    if (isTerminal(job.status)) agent.output = job.output;
     this.#touch(entry);
   }
 

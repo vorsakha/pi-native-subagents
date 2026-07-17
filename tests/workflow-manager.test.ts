@@ -163,7 +163,7 @@ async function fixture(concurrency = 4) {
     roles: new Map([[worker.name, worker], [reviewer.name, reviewer], [adversary.name, adversary]]),
     concurrency,
   });
-  const workflows = new WorkflowManager({ jobs, artifactRoot });
+  const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1" });
   return {
     parent,
     cwd,
@@ -274,11 +274,21 @@ test("preserves reviewer read-only role policy in the backend request", async ()
     assert.deepEqual(request.policy.claudeTools, ["Read", "Glob"]);
     assert.equal(request.policy.approvalPolicy, "never");
     assert.equal(request.policy.effort, "high");
+    const run = f.backend.runs.get(request.jobId)!;
+    run.emit({ type: "tool_start", id: "read-1", name: "read", summary: "src/policy.ts" });
+    const projected = f.workflows.check(started.snapshot.runId).agents[0]!;
+    assert.equal(projected.prompt, "audit", "workflow receipts preserve the caller prompt without schema scaffolding");
+    assert.equal(projected.effort, "high");
+    assert.deepEqual(projected.tools, [{ id: "read-1", name: "read", summary: "src/policy.ts", status: "running" }]);
+    run.emit({ type: "tool_end", id: "read-1", name: "read", output: "ok" });
     f.backend.completeTask(request.task, `{"clean":true}`);
     const final = await started.completion;
     assert.equal(final.status, "completed");
     assert.deepEqual(final.result, { clean: true });
     assert.deepEqual(final.agents[0]?.structured, { clean: true });
+    assert.equal(final.agents[0]?.prompt, "audit");
+    assert.equal(final.agents[0]?.effort, "high");
+    assert.equal(final.agents[0]?.tools?.at(-1)?.status, "completed");
 
     const malformed = await f.workflows.start(f.request(`
       export default async () => agent("invalid schema", { role: "reviewer", schema: { type: "nonsense" } });
@@ -288,11 +298,25 @@ test("preserves reviewer read-only role policy in the backend request", async ()
     assert.match((malformedFinal.result as { error: string }).error, /bounded JSON Schema/);
     assert.equal(f.backend.requests.length, 1, "invalid schemas fail before dispatch");
 
+    const mismatch = await f.workflows.start(f.request(`
+      export default async () => agent("schema mismatch", {
+        role: "reviewer",
+        schema: { type: "object", required: ["clean"], properties: { clean: { type: "boolean" } } }
+      });
+    `));
+    await waitFor(() => f.backend.requests.length === 2, "schema mismatch agent");
+    const mismatchRequest = f.backend.requests[1]!;
+    f.backend.completeTask(mismatchRequest.task, `{"clean":"no"}`);
+    await mismatch.completion;
+    const mismatchAgent = f.workflows.check(mismatch.snapshot.runId).agents[0]!;
+    assert.equal(mismatchAgent.state, "failed", "workflow validation failure outranks the backend's completed state");
+    assert.match(mismatchAgent.error ?? "", /did not match/);
+
     const crossProvider = await f.workflows.start(f.request(`
       export default async () => agent("challenge parent", { role: "adversary" });
     `, { parentProvider: "claude" }));
-    await waitFor(() => f.backend.requests.length === 2, "cross-provider workflow adversary");
-    const adversaryRequest = f.backend.requests[1]!;
+    await waitFor(() => f.backend.requests.length === 3, "cross-provider workflow adversary");
+    const adversaryRequest = f.backend.requests[2]!;
     assert.equal(adversaryRequest.role, "adversary");
     assert.equal(adversaryRequest.policy.backend, "codex", "Claude-parent workflow routes adversary to Codex");
     f.backend.completeTask(adversaryRequest.task, "independent review");
@@ -341,6 +365,8 @@ test("records phases, results, and final workflow artifacts", async () => {
     assert.equal(persisted.status, "completed");
     assert.deepEqual(persisted.result, final.result);
     assert.equal(persisted.agents[0]?.output, "looks good");
+    assert.equal(persisted.agents[0]?.prompt, "inspect change");
+    assert.equal(persisted.agents[0]?.liveThinking, undefined, "live-only supervision state is not persisted");
     const transcripts = JSON.parse(await readFile(join(final.artifactDir, "transcripts.json"), "utf8"));
     assert.equal(transcripts["0"].at(-1).kind, "assistant");
     assert.match(await readFile(join(final.artifactDir, "report.md"), "utf8"), /# release review[\s\S]*looks good/);
@@ -387,6 +413,10 @@ test("cancels both running and queued workflow jobs", async () => {
     const before = f.jobs.list();
     assert.deepEqual(before.map((job) => job.status).sort(), ["queued", "running"]);
 
+    const queuedAgent = f.workflows.check(started.snapshot.runId).agents.find((agent) => agent.state === "queued")!;
+    const afterAgentCancel = await f.workflows.cancelAgent(started.snapshot.runId, queuedAgent.index, "stop queued member");
+    assert.equal(afterAgentCancel.agents[queuedAgent.index]?.state, "cancelled");
+
     const final = await f.workflows.cancel(started.snapshot.runId, "stop workflow");
     assert.equal(final.status, "aborted");
     assert.equal(final.error, "stop workflow");
@@ -432,7 +462,7 @@ test("restores persisted running summaries as durably aborted stale workflows", 
       script: `export default async () => "never resumed";`,
       args: null,
       snapshot: {
-        sessionId: "restored-session",
+        sessionId: "session-1",
         name: "stale workflow",
         description: "",
         background: true,
@@ -458,6 +488,22 @@ test("restores persisted running summaries as durably aborted stale workflows", 
       },
     });
 
+    const foreign = await createWorkflowArtifacts(f.artifactRoot, {
+      script: `export default async () => "private to another session";`,
+      args: null,
+      snapshot: {
+        sessionId: "another-session",
+        name: "foreign workflow",
+        description: "must not be listed",
+        background: true,
+        status: "running",
+        timestamps: { createdAt: old, updatedAt: old, startedAt: old },
+        currentPhase: null,
+        phases: [],
+        agents: [],
+      },
+    });
+
     await f.workflows.initialize();
     const restored = f.workflows.check(created.runId);
     assert.equal(restored.status, "aborted");
@@ -465,6 +511,9 @@ test("restores persisted running summaries as durably aborted stale workflows", 
     assert.equal(restored.agents[0]?.state, "aborted");
     assert.match(restored.error ?? "", /stale/i);
     assert.equal(f.workflows.list().length, 1);
+    assert.throws(() => f.workflows.check(foreign.runId), /Unknown workflow/, "workflow history is scoped to the active Pi session");
+    const foreignPersisted = JSON.parse(await readFile(join(foreign.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
+    assert.equal(foreignPersisted.status, "running", "initializing this session does not abort another session's active workflow");
     const persisted = JSON.parse(await readFile(join(created.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
     assert.equal(persisted.status, "aborted");
     assert.equal(persisted.agents[0]?.state, "aborted");

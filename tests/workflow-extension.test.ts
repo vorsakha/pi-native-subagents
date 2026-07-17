@@ -41,6 +41,7 @@ function fakePi() {
 
 function context(trusted = true) {
   const statuses = new Map<string, string | undefined>();
+  const notifications: Array<{ message: string; type: string }> = [];
   return {
     ctx: {
       cwd: process.cwd(),
@@ -51,10 +52,11 @@ function context(trusted = true) {
       sessionManager: { getBranch: () => [], getSessionId: () => "workflow-extension-session" },
       ui: {
         setStatus(key: string, value: string | undefined) { statuses.set(key, value); },
-        notify() {},
+        notify(message: string, type: string) { notifications.push({ message, type }); },
       },
     } as any,
     statuses,
+    notifications,
   };
 }
 
@@ -85,6 +87,8 @@ test("background workflows return immediately and deliver one follow-up result f
   assert.equal(pi.messages[0]?.options.deliverAs, "followUp");
   assert.equal(pi.messages[0]?.options.triggerTurn, true);
   assert.equal(pi.messages[0]?.message.details.workflow.status, "completed");
+  assert.equal(pi.messages[0]?.message.details.workflow.agents[0]?.prompt, undefined, "model-facing compact details exclude agent prompts");
+  assert.equal(pi.messages[0]?.message.details.workflow.agents[0]?.tools, undefined, "model-facing compact details exclude supervision traces");
   await pi.handlers.get("session_shutdown")?.();
 
   const failed = await setup();
@@ -121,5 +125,7 @@ test("workflow tool rejects invalid JSON args and untrusted projects", async () 
     denied.pi.tools.get("workflow").execute("wf", { name: "denied", script: "export default async () => null" }, undefined, undefined, untrusted.ctx),
     /disabled for untrusted projects/,
   );
+  await denied.pi.commands.get("workflows").handler("", untrusted.ctx);
+  assert.match(untrusted.notifications.at(-1)?.message ?? "", /unavailable for untrusted projects/);
   await denied.pi.handlers.get("session_shutdown")?.();
 });

@@ -281,6 +281,13 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
       ...agent,
       label: truncateUtf8(agent.label, 1_000),
       role: truncateUtf8(agent.role, 1_000),
+      prompt: agent.prompt ? truncateUtf8(agent.prompt, 2 * 1024) : undefined,
+      tools: agent.tools?.slice(-8).map((tool) => ({
+        ...tool,
+        name: truncateUtf8(tool.name, 512),
+        summary: tool.summary ? truncateUtf8(tool.summary, 1_000) : undefined,
+      })),
+      liveThinking: undefined,
       preview: agent.preview ? truncateUtf8(agent.preview, 1_000) : undefined,
       output: serializeWorkflowValue(agent.output, { maxNodes: 256, maxStringBytes: 4 * 1024, maxTotalBytes: 6 * 1024 }),
       structured: serializeWorkflowValue(agent.structured, { maxNodes: 512, maxStringBytes: 8 * 1024, maxTotalBytes: 16 * 1024 }),
@@ -488,6 +495,7 @@ export async function loadWorkflowSummaries(
     try {
       const parsed: unknown = JSON.parse(await readFile(join(directory, "workflow.json"), "utf8"));
       if (!isWorkflowSnapshot(parsed) || parsed.runId !== entry.name) continue;
+      if (options.sessionId !== undefined && parsed.sessionId !== options.sessionId) continue;
       let snapshot: WorkflowSnapshot = { ...parsed, artifactDir: directory };
       if (snapshot.transcriptArtifact) {
         try {
@@ -509,7 +517,7 @@ export async function loadWorkflowSummaries(
           maxTotalBytes: Math.max(512 * 1024, options.limits?.maxTotalBytes ?? 0),
         });
       }
-      if (options.sessionId === undefined || snapshot.sessionId === options.sessionId) summaries.push(snapshot);
+      summaries.push(snapshot);
     } catch {
       // A partial, corrupt, unreadable, or concurrently removed run is not a summary.
     }

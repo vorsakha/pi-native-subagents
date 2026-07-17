@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { JobManager } from "../src/manager.ts";
-import type { Backend, BackendEvent, BackendRequest, BackendRun, RoleDefinition } from "../src/types.ts";
+import type { Backend, BackendEvent, BackendRequest, BackendRun, JobSnapshot, RoleDefinition } from "../src/types.ts";
 
 class FakeBackend implements Backend {
   readonly name = "codex" as const;
@@ -245,9 +245,18 @@ test("manager terminalizes a job when backend cancellation rejects", async () =>
 test("manager forwards steering and emits automatic lifecycle observations", async () => {
   const { backend, manager } = setup(1);
   const observed: string[] = [];
-  const unsubscribe = manager.subscribe((job, event) => observed.push(`${job.status}:${event.type}`));
+  const streamedSnapshots: JobSnapshot[] = [];
+  const unsubscribe = manager.subscribe((job, event) => {
+    observed.push(`${job.status}:${event.type}`);
+    if (event.type === "started" || event.type === "text_delta" || event.type === "thinking_delta") streamedSnapshots.push(job);
+  });
   const job = manager.spawn(request(1));
   await tick();
+  backend.runs.get(job.id)!.emit({ type: "text_delta", text: "partial" });
+  backend.runs.get(job.id)!.emit({ type: "thinking_delta", text: "thinking" });
+  assert.equal(streamedSnapshots.length, 3);
+  assert.equal(streamedSnapshots[1]!.transcript, streamedSnapshots[0]!.transcript, "observer projections reuse unchanged transcript clones across deltas");
+  assert.equal(streamedSnapshots[2]!.tools, streamedSnapshots[1]!.tools, "observer projections reuse unchanged tool clones across deltas");
   await manager.send(job.id, "change course", "steer");
   assert.deepEqual(backend.sends, [{ id: job.id, message: "change course", behavior: "steer" }]);
   backend.complete(job.id, "done");
@@ -261,6 +270,16 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
   const continued = await manager.wait(job.id);
   assert.equal(continued.status, "completed");
   assert.equal(continued.output, "second result");
+
+  const workflowOwned = manager.spawn({
+    ...request(2),
+    workflow: { runId: "wf-test", agentIndex: 0, label: "implementation", phase: "Build" },
+  });
+  await assert.rejects(
+    manager.send(workflowOwned.id, "override the workflow", "steer"),
+    /workflow-owned agents are controlled by their workflow/,
+  );
+  await manager.cancel(workflowOwned.id);
   unsubscribe();
   await manager.shutdown();
 });

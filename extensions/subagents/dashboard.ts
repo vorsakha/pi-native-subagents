@@ -109,7 +109,9 @@ class DashboardOverlay {
     for (const detail of this.detailViewport(chosen, detailRows, innerWidth)) lines.push(row(detail));
 
     lines.push(separator());
-    const actionHint = chosen && !isTerminal(chosen.status) ? " · s steer · f follow-up · x cancel" : "";
+    const actionHint = chosen && !isTerminal(chosen.status)
+      ? chosen.workflow ? " · x cancel" : " · s steer · f follow-up · x cancel"
+      : "";
     lines.push(row(this.theme.fg("dim", `Enter takeover · Esc close${actionHint}`)));
     lines.push(bottom());
     return lines;
@@ -138,8 +140,8 @@ class DashboardOverlay {
     else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(Math.min(Math.max(0, jobs.length - 1), this.#selected + 1), jobs);
     else {
       const job = jobs[this.#selected];
-      if (job && !isTerminal(job.status) && matchesKey(data, "s")) return this.finish({ type: "steer", jobId: job.id });
-      if (job && !isTerminal(job.status) && matchesKey(data, "f")) return this.finish({ type: "followUp", jobId: job.id });
+      if (job && !job.workflow && !isTerminal(job.status) && matchesKey(data, "s")) return this.finish({ type: "steer", jobId: job.id });
+      if (job && !job.workflow && !isTerminal(job.status) && matchesKey(data, "f")) return this.finish({ type: "followUp", jobId: job.id });
       if (job && !isTerminal(job.status) && matchesKey(data, "x")) return this.finish({ type: "cancel", jobId: job.id });
     }
     this.tui.requestRender();

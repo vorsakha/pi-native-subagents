@@ -138,7 +138,7 @@ function agentLine(agent: WorkflowAgentRecord, theme: Theme): string {
   const route = agent.backend || agent.model
     ? ` · ${sanitizeInline(agent.backend ?? "backend")}/${sanitizeInline(agent.model ?? "model")}`
     : "";
-  return `  ${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(agent.label || agent.role))} ${theme.fg("dim", `${sanitizeInline(agent.role)} · ${agent.state}${route}`)}`;
+  return `  ${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(agent.label || agent.role))} ${theme.fg("dim", `${sanitizeInline(agent.role)} · ${agent.state}${route} · effort ${agent.effort ?? "adaptive"}`)}`;
 }
 
 function clampContent(theme: Theme, lines: string[], budget: number): string[] {

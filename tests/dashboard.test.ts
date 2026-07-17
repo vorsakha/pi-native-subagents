@@ -158,4 +158,29 @@ test("takeover renders normalized thinking, tools, queued messages, and closes r
   view.handleInput("\x1b");
   assert.deepEqual(closed, [null]);
   assert.equal(updates.size, 0);
+
+  const workflowCurrent = {
+    ...current,
+    workflow: { runId: "wf-test", agentIndex: 0, label: "implementation", phase: "Build" },
+  };
+  let workflowSends = 0;
+  const workflowView = new TakeoverView(
+    { requestRender() {}, terminal: { rows: 24 } } as never,
+    theme,
+    { matches: () => false } as unknown as KeybindingsManager,
+    {
+      check: () => workflowCurrent,
+      async send() { workflowSends++; return workflowCurrent; },
+      async cancel() { return { ...workflowCurrent, status: "cancelled" as const }; },
+      subscribe() { return () => {}; },
+    } as never,
+    workflowCurrent.id,
+    () => {},
+  );
+  t.after(() => workflowView.dispose());
+  workflowView.focused = true;
+  assert.ok(workflowView.render(72).some((line) => line.includes("Workflow-owned agent")));
+  workflowView.handleInput("a");
+  workflowView.handleInput("\r");
+  assert.equal(workflowSends, 0, "workflow-owned takeover is read-only");
 });

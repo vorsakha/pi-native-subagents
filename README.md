@@ -125,7 +125,7 @@ export default async function () {
 
 The workflow tool accepts optional `budget` limits for input tokens, output tokens, turns, and cost. Crossing a reported limit aborts the run and cancels remaining members; parallel work can overshoot by the usage of already-running members.
 
-Foreground runs update one bounded tool card. Background runs return immediately and deliver one follow-up result when settled. `/workflows` opens the persistent run dashboard with normalized agent transcript drill-down; active runs can be cancelled there. Terminal runs generate `report.md` alongside `workflow.json`, `result.json`, and bounded `transcripts.json`. V1 persists inspection artifacts but deliberately does not resume interrupted execution after Pi exits—stale running checkpoints become `aborted`.
+Foreground runs update one bounded tool card. Background runs return immediately and deliver one follow-up result when settled. `/workflows` opens the persistent run dashboard with phase agent rosters, status filtering, per-agent route/effort/usage/duration, bounded caller prompts, recent activity, and a read-only Markdown transcript/result inspector. Operators may cancel the selected queued/running agent or the whole active run. Workflow-owned jobs remain inspectable in `/subagents` but reject steering and follow-ups so external messages cannot corrupt script-controlled results. Terminal runs generate `report.md` alongside `workflow.json`, `result.json`, and bounded `transcripts.json`. V1 persists inspection artifacts but deliberately does not resume interrupted execution after Pi exits—stale running checkpoints become `aborted`.
 
 ## Development
 

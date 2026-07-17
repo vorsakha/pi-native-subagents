@@ -18,15 +18,22 @@ interface InternalJob {
   startupController?: AbortController;
   pendingRestart?: { message: string; behavior: SendBehavior };
   idleTimer?: NodeJS.Timeout;
+  /** Last observer-safe projection, used to reuse unchanged bounded collections on streaming events. */
+  publishedSource?: JobSnapshot;
+  publishedSnapshot?: JobSnapshot;
 }
 
-function clone(snapshot: JobSnapshot): JobSnapshot {
+function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: JobSnapshot }): JobSnapshot {
   return {
     ...snapshot,
-    usage: { ...snapshot.usage },
-    tools: snapshot.tools.map((tool) => ({ ...tool })),
-    transcript: snapshot.transcript.map((entry) => ({ ...entry })),
-    queuedMessages: snapshot.queuedMessages.map((message) => ({ ...message })),
+    usage: previous?.source.usage === snapshot.usage ? previous.value.usage : { ...snapshot.usage },
+    tools: previous?.source.tools === snapshot.tools ? previous.value.tools : snapshot.tools.map((tool) => ({ ...tool })),
+    transcript: previous?.source.transcript === snapshot.transcript
+      ? previous.value.transcript
+      : snapshot.transcript.map((entry) => ({ ...entry })),
+    queuedMessages: previous?.source.queuedMessages === snapshot.queuedMessages
+      ? previous.value.queuedMessages
+      : snapshot.queuedMessages.map((message) => ({ ...message })),
     workflow: snapshot.workflow ? { ...snapshot.workflow } : undefined,
   };
 }
@@ -108,6 +115,9 @@ export class JobManager {
     if (!message.trim()) throw new Error("Subagent message must not be empty");
     const job = this.#jobs.get(id);
     if (!job) throw new Error(`Unknown job: ${id}`);
+    if (job.snapshot.workflow) {
+      throw new Error(`Cannot send to ${id}: workflow-owned agents are controlled by their workflow; inspect or cancel them instead`);
+    }
     if (job.snapshot.status === "failed" || job.snapshot.status === "cancelled") {
       throw new Error(`Cannot reuse ${id}: job is ${job.snapshot.status}`);
     }
@@ -407,7 +417,12 @@ export class JobManager {
   }
 
   #publish(job: InternalJob, event: BackendEvent): void {
-    const snapshot = clone(job.snapshot);
+    const source = job.snapshot;
+    const snapshot = clone(source, job.publishedSource && job.publishedSnapshot
+      ? { source: job.publishedSource, value: job.publishedSnapshot }
+      : undefined);
+    job.publishedSource = source;
+    job.publishedSnapshot = snapshot;
     for (const listener of this.#listeners) {
       try { listener(snapshot, event); } catch { /* observers cannot break lifecycle */ }
     }

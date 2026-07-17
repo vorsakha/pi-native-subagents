@@ -39,10 +39,22 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
     ...structuredClone(snapshot),
     result,
     agents: snapshot.agents.map((agent) => ({
-      ...structuredClone(agent),
+      index: agent.index,
+      label: agent.label,
+      role: agent.role,
+      phase: agent.phase,
+      jobId: agent.jobId,
+      state: agent.state,
+      timestamps: structuredClone(agent.timestamps),
+      backend: agent.backend,
+      model: agent.model,
+      effort: agent.effort,
+      preview: agent.preview?.slice(-500),
+      structured: agent.structured === undefined ? undefined : structuredClone(agent.structured),
+      error: agent.error,
+      usage: structuredClone(agent.usage),
       output: undefined,
       transcript: undefined,
-      preview: agent.preview?.slice(-500),
     })),
   };
 }
@@ -217,6 +229,10 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   pi.registerCommand("workflows", {
     description: "Inspect and cancel persisted workflow runs.",
     handler: async (_args, ctx) => {
+      if (!ctx.isProjectTrusted()) {
+        ctx.ui.notify("Workflow history is unavailable for untrusted projects.", "error");
+        return;
+      }
       await getManager().initialize();
       await openWorkflowsDashboard(ctx, getManager());
     },
@@ -228,7 +244,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       shuttingDown = false;
       sessionContext = ctx;
       unsubscribe?.();
-      manager = new WorkflowManager({ jobs, artifactRoot });
+      manager = new WorkflowManager({ jobs, artifactRoot, sessionId: ctx.sessionManager.getSessionId() });
       unsubscribe = manager.subscribe((snapshot) => updateStatus(snapshot));
       void manager.initialize().then(() => updateStatus()).catch((error) => {
         if (ctx.hasUI) ctx.ui.notify(`Workflow history unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");

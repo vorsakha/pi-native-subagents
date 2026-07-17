@@ -44,13 +44,9 @@ function pushTranscript(job: JobSnapshot, entry: JobSnapshot["transcript"][numbe
 }
 
 export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now()): JobSnapshot {
-  const next: JobSnapshot = {
-    ...job,
-    usage: { ...job.usage },
-    tools: job.tools.map((tool) => ({ ...tool })),
-    transcript: job.transcript.map((entry) => ({ ...entry })),
-    queuedMessages: job.queuedMessages.map((message) => ({ ...message })),
-  };
+  // Copy arrays only in the event branches that mutate them. Streaming text/thinking
+  // deltas are the hot path and must not duplicate a bounded 256 KiB transcript per token.
+  const next: JobSnapshot = { ...job };
   switch (event.type) {
     case "started":
       if (next.status === "queued") next.status = "running";
@@ -59,6 +55,7 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
       next.sessionFile = event.sessionFile ?? next.sessionFile;
       break;
     case "user_message":
+      next.transcript = job.transcript.map((entry) => ({ ...entry }));
       pushTranscript(next, { kind: "user", text: event.text, at: event.at ?? now });
       break;
     case "text_delta": {
@@ -72,9 +69,11 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
       break;
     case "thinking_message":
       next.liveThinking = "";
+      next.transcript = job.transcript.map((entry) => ({ ...entry }));
       pushTranscript(next, { kind: "thinking", text: event.text, at: event.at ?? now });
       break;
     case "message": {
+      next.transcript = job.transcript.map((entry) => ({ ...entry }));
       const appended = boundedAppend("", event.text);
       next.output = appended.text;
       next.truncated ||= appended.truncated;
@@ -86,11 +85,15 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
       next.queuedMessages = event.messages.slice(-32).map((message) => ({ ...message, text: boundedText(message.text, 4 * 1024) }));
       break;
     case "tool_start":
+      next.tools = job.tools.map((tool) => ({ ...tool }));
+      next.transcript = job.transcript.map((entry) => ({ ...entry }));
       next.tools.push({ id: event.id, name: event.name, summary: event.summary, status: "running" });
       pushTranscript(next, { kind: "tool", toolId: event.id, name: event.name, text: event.summary, at: event.at ?? now });
       if (next.tools.length > MAX_TOOL_TRACES) next.tools.splice(0, next.tools.length - MAX_TOOL_TRACES);
       break;
     case "tool_end": {
+      next.tools = job.tools.map((tool) => ({ ...tool }));
+      next.transcript = job.transcript.map((entry) => ({ ...entry }));
       for (let index = next.tools.length - 1; index >= 0; index--) {
         const tool = next.tools[index];
         if (tool?.id === event.id) {
@@ -102,6 +105,7 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
       break;
     }
     case "usage":
+      next.usage = { ...job.usage };
       for (const key of Object.keys(next.usage) as Array<keyof Usage>) {
         const value = event.usage[key];
         if (typeof value === "number" && Number.isFinite(value)) next.usage[key] += value;
@@ -114,6 +118,7 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
         next.truncated ||= bounded.truncated;
       }
       if (event.output !== undefined && !next.transcript.some((entry) => entry.kind === "assistant" && entry.text === event.output)) {
+        next.transcript = job.transcript.map((entry) => ({ ...entry }));
         pushTranscript(next, { kind: "assistant", text: event.output, at: event.at ?? now });
       }
       next.status = "completed";

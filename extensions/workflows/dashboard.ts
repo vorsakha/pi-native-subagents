@@ -9,6 +9,7 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import type { TranscriptEntry } from "../../src/types.ts";
 import { aggregateWorkflowUsage, workflowIsTerminal } from "../../src/workflows/manager.ts";
 import type {
   WorkflowAgentRecord,
@@ -24,12 +25,14 @@ const MAX_RESULT_ROWS = 400;
 
 export type WorkflowsDashboardAction =
   | { type: "cancel"; runId: string }
+  | { type: "cancelAgent"; runId: string; agentIndex: number }
   | { type: "close" };
 
 export interface WorkflowsDashboardManager {
   list(): WorkflowSnapshot[];
   check(runId: string): WorkflowSnapshot;
   cancel(runId: string, reason?: string): Promise<WorkflowSnapshot>;
+  cancelAgent(runId: string, agentIndex: number, reason?: string): Promise<WorkflowSnapshot>;
   subscribe(listener: (snapshot: WorkflowSnapshot) => void): () => void;
 }
 
@@ -41,6 +44,8 @@ export interface WorkflowsDashboardOverlayOptions {
 }
 
 type StatusColor = "accent" | "success" | "warning" | "error" | "muted";
+type AgentFilter = "all" | "active" | "failed" | "completed";
+const AGENT_FILTERS: AgentFilter[] = ["all", "active", "failed", "completed"];
 
 export function createWorkflowsDashboardOverlay(
   tui: Pick<TUI, "requestRender" | "terminal">,
@@ -59,6 +64,8 @@ export class WorkflowsDashboardOverlay {
   #selectedPhase = 0;
   #selectedAgent = 0;
   #selectionRunId: string | undefined;
+  #inspectingAgent = false;
+  #agentFilter: AgentFilter = "all";
   #scroll = 0;
   #scrollKey: string | undefined;
   #resultRows = 0;
@@ -135,7 +142,7 @@ export class WorkflowsDashboardOverlay {
     const lines = [
       top(),
       row(`${this.theme.fg("accent", this.theme.bold("Workflow Runs"))} ${focus} ${this.theme.fg("dim", `${runs.length} total · ${active} active`)}`),
-      row(this.theme.fg("dim", "↑↓/jk run · ←→/hl phase · Tab agent · Shift+↑↓/Pg scroll")),
+      row(this.theme.fg("dim", "↑↓/jk run · ←→/hl phase · Tab agent · Enter inspect · f filter · Shift+↑↓/Pg scroll")),
       separator(),
     ];
 
@@ -151,8 +158,11 @@ export class WorkflowsDashboardOverlay {
     lines.push(separator());
     for (const detail of this.detailViewport(chosen, detailRows, innerWidth)) lines.push(row(detail));
     lines.push(separator());
-    const action = chosen && !workflowIsTerminal(chosen.status) ? " · x cancel run" : "";
-    lines.push(row(this.theme.fg("dim", `Esc close${action}`)));
+    const selectedAgent = this.selectedAgent(chosen);
+    const agentAction = selectedAgent && (selectedAgent.state === "queued" || selectedAgent.state === "running") ? " · x cancel agent" : "";
+    const runAction = chosen && !workflowIsTerminal(chosen.status) ? " · X cancel run" : "";
+    const back = this.#inspectingAgent ? " · h/← overview" : "";
+    lines.push(row(this.theme.fg("dim", `Esc close${back}${agentAction}${runAction}`)));
     lines.push(bottom());
     return lines.slice(0, maxHeight);
   }
@@ -177,12 +187,32 @@ export class WorkflowsDashboardOverlay {
     else if (matchesKey(data, Key.shift(Key.down))) this.scrollResult(1);
     else if (matchesKey(data, Key.pageUp)) this.scrollResult(-Math.max(1, this.#resultRows - 1));
     else if (matchesKey(data, Key.pageDown)) this.scrollResult(Math.max(1, this.#resultRows - 1));
-    else if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectRun(this.#selectedRun - 1, runs);
-    else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectRun(this.#selectedRun + 1, runs);
-    else if (matchesKey(data, Key.left) || matchesKey(data, "h")) this.selectPhase(-1, runs[this.#selectedRun]);
-    else if (matchesKey(data, Key.right) || matchesKey(data, "l")) this.selectPhase(1, runs[this.#selectedRun]);
+    else if (this.#inspectingAgent && (matchesKey(data, Key.left) || matchesKey(data, "h"))) {
+      this.#inspectingAgent = false;
+      this.resetScroll();
+    }
+    else if (!this.#inspectingAgent && (matchesKey(data, Key.up) || matchesKey(data, "k"))) this.selectRun(this.#selectedRun - 1, runs);
+    else if (!this.#inspectingAgent && (matchesKey(data, Key.down) || matchesKey(data, "j"))) this.selectRun(this.#selectedRun + 1, runs);
+    else if (!this.#inspectingAgent && (matchesKey(data, Key.left) || matchesKey(data, "h"))) this.selectPhase(-1, runs[this.#selectedRun]);
+    else if (!this.#inspectingAgent && (matchesKey(data, Key.right) || matchesKey(data, "l"))) this.selectPhase(1, runs[this.#selectedRun]);
     else if (data === "\t") this.selectAgent(runs[this.#selectedRun]);
+    else if (!this.#inspectingAgent && matchesKey(data, "f")) this.cycleAgentFilter(runs[this.#selectedRun]);
+    else if (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter)) {
+      const run = runs[this.#selectedRun];
+      if (this.selectedAgent(run)) {
+        this.#inspectingAgent = true;
+        this.resetScroll();
+      }
+    }
     else if (matchesKey(data, "x")) {
+      const run = runs[this.#selectedRun];
+      const agent = this.selectedAgent(run);
+      if (run && agent && (agent.state === "queued" || agent.state === "running")) {
+        this.finish({ type: "cancelAgent", runId: run.runId, agentIndex: agent.index });
+        return;
+      }
+    }
+    else if (matchesKey(data, Key.shift("x"))) {
       const run = runs[this.#selectedRun];
       if (run && !workflowIsTerminal(run.status)) {
         this.finish({ type: "cancel", runId: run.runId });
@@ -215,6 +245,7 @@ export class WorkflowsDashboardOverlay {
       this.#selectionRunId = undefined;
       this.#selectedPhase = 0;
       this.#selectedAgent = 0;
+      this.#inspectingAgent = false;
       this.resetScroll();
       return;
     }
@@ -223,6 +254,7 @@ export class WorkflowsDashboardOverlay {
       const current = run.phases.findIndex((phase) => phase.index === run.currentPhase);
       this.#selectedPhase = current >= 0 ? current : Math.max(0, run.phases.length - 1);
       this.#selectedAgent = 0;
+      this.#inspectingAgent = false;
       this.resetScroll();
     }
     this.#selectedPhase = run.phases.length ? clamp(this.#selectedPhase, 0, run.phases.length - 1) : 0;
@@ -266,43 +298,123 @@ export class WorkflowsDashboardOverlay {
       this.#resultTotal = 0;
       return [this.theme.fg("dim", "Start a workflow to inspect phases, agents, and results.")].slice(0, rows);
     }
+    return this.#inspectingAgent
+      ? this.agentInspectorViewport(run, rows, width)
+      : this.workflowOverviewViewport(run, rows, width);
+  }
 
+  private workflowOverviewViewport(run: WorkflowSnapshot, rows: number, width: number): string[] {
+    this.#resultRows = 0;
+    this.#resultTotal = 0;
     const phase = run.phases[this.#selectedPhase];
+    const allAgents = this.allPhaseAgents(run, phase);
     const agents = this.phaseAgents(run, phase);
-    const agent = agents[this.#selectedAgent];
     const status = statusMeta(run.status);
     const usage = formatUsage(aggregateWorkflowUsage(run));
     const lines: string[] = [
       `${this.theme.fg("accent", this.theme.bold(sanitizeInline(run.name) || "Workflow"))} ${this.theme.fg("dim", `· ${shortId(sanitizeText(run.runId))} · ${status.glyph} ${run.status} · ${formatElapsed(run, this.#now())}`)}`,
+      this.theme.fg("dim", sanitizeInline(run.description) || "(no workflow description)"),
+      phase ? this.renderPhase(phase, run.phases.length) : this.theme.fg("dim", "Phase · waiting for the first phase"),
     ];
-    if (rows >= 3) lines.push(this.theme.fg("dim", sanitizeInline(run.description) || "(no workflow description)"));
-    if (phase && rows >= 4) lines.push(this.renderPhase(phase, run.phases.length));
-    else if (rows >= 4) lines.push(this.theme.fg("dim", "Phase · waiting for the first phase"));
-    if (agent && rows >= 5) lines.push(this.renderAgent(agent, agents.length));
-    else if (rows >= 5) lines.push(this.theme.fg("dim", "Agent · none in this phase"));
-    if (usage && rows >= 7) {
-      const budget = run.budget;
-      const limits = budget ? [budget.maxInputTokens && `↑≤${budget.maxInputTokens}`, budget.maxOutputTokens && `↓≤${budget.maxOutputTokens}`, budget.maxTurns && `${budget.maxTurns}t`, budget.maxCost !== undefined && `$${budget.maxCost.toFixed(2)}`].filter(Boolean).join("/") : "";
-      lines.push(this.theme.fg("dim", `Usage · ${usage}${limits ? ` · budget ${limits}` : ""}`));
+    if (usage) lines.push(this.theme.fg("dim", `Usage · ${usage}${formatBudget(run)}`));
+    lines.push(this.theme.fg("muted", `Agents · ${agents.length}/${allAgents.length} shown · filter ${this.#agentFilter} · Tab select · Enter inspect`));
+
+    if (!agents.length) {
+      lines.push(this.theme.fg("dim", allAgents.length ? "No agents match this filter." : "No agents in this phase yet."));
+      if (!allAgents.length && run.result !== undefined && lines.length < rows - 1) {
+        lines.push(this.theme.fg("muted", "Workflow result"));
+        lines.push(...this.renderBoundedResult(run, phase, undefined, width).slice(0, Math.max(0, rows - lines.length)));
+      }
+      return lines.slice(0, rows);
+    }
+    const room = Math.max(1, rows - lines.length);
+    const start = Math.max(0, Math.min(this.#selectedAgent - Math.floor(room / 2), agents.length - room));
+    for (const [offset, agent] of agents.slice(start, start + room).entries()) {
+      lines.push(this.renderAgentRow(agent, start + offset === this.#selectedAgent));
+    }
+    return lines.slice(0, rows);
+  }
+
+  private agentInspectorViewport(run: WorkflowSnapshot, rows: number, width: number): string[] {
+    const phase = run.phases[this.#selectedPhase];
+    const agents = this.phaseAgents(run, phase);
+    const agent = agents[this.#selectedAgent];
+    if (!agent) {
+      this.#inspectingAgent = false;
+      return this.workflowOverviewViewport(run, rows, width);
     }
 
-    const error = sanitizeInline(agent?.error ?? phase?.error ?? run.error ?? "");
-    if (error && lines.length < rows - 2) lines.push(this.theme.fg("error", error));
+    const status = statusMeta(agent.state);
+    const route = agent.backend || agent.model
+      ? `${sanitizeInline(agent.backend ?? "backend")}/${sanitizeInline(agent.model ?? "model")}`
+      : "route pending";
+    const effort = agent.effort ?? "adaptive";
+    const duration = formatAgentElapsed(agent, this.#now());
+    const usage = formatUsage(agent.usage);
+    const lines: string[] = [
+      `${this.theme.fg("accent", this.theme.bold(sanitizeInline(agent.label || agent.role)))} ${this.theme.fg(status.color, `· ${status.glyph} ${agent.state}`)} ${this.theme.fg("dim", `· ${sanitizeInline(agent.role)}`)}`,
+      this.theme.fg("dim", `${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${route} · effort ${effort} · ${duration}`),
+      this.theme.fg("dim", `${phase ? `${sanitizeInline(run.name)} · ${sanitizeInline(phase.name)}` : sanitizeInline(run.name)}${usage ? ` · ${usage}` : ""}`),
+    ];
 
-    const wrapped = this.renderBoundedResult(run, phase, agent, width);
-    const resultRows = Math.max(0, rows - lines.length - 1);
-    this.#resultRows = resultRows;
-    this.#resultTotal = wrapped.length;
-    const key = `${run.runId}:${phase?.index ?? "workflow"}:${agent?.index ?? "result"}`;
+    const body: string[] = [];
+    const error = sanitizeText(agent.error ?? phase?.error ?? run.error ?? "");
+    if (error.trim()) {
+      appendBoundedSection(body, this.theme, "Error", renderPrefixedRows(this.theme, "", error, "error", width), 12);
+    }
+    if (agent.prompt) {
+      appendBoundedSection(
+        body,
+        this.theme,
+        "Prompt",
+        renderPrefixedRows(this.theme, this.theme.fg("accent", "> "), agent.prompt, "userMessageText", width),
+        48,
+      );
+    }
+    if (agent.liveThinking?.trim() || agent.tools?.length) {
+      const activity: string[] = [];
+      if (agent.liveThinking?.trim()) activity.push(...renderPrefixedRows(this.theme, this.theme.fg("dim", "~ "), agent.liveThinking.slice(-2 * 1024), "muted", width));
+      for (const tool of agent.tools?.slice(-3) ?? []) {
+        const glyph = tool.status === "running" ? "…" : tool.status === "failed" ? "×" : "✓";
+        const color = tool.status === "failed" ? "error" : "muted";
+        activity.push(this.theme.fg(color, `${glyph} ${sanitizeInline(tool.name)}${tool.summary ? ` · ${sanitizeInline(tool.summary)}` : ""}`));
+      }
+      appendBoundedSection(body, this.theme, "Activity", activity, 16);
+    }
+    if (agent.structured !== undefined) {
+      const raw = serializeResult(agent.structured);
+      const text = sanitizeText(boundedHeadTailText(raw, 4 * 1024, "structured result"));
+      const structured = this.#renderMarkdown(`\`\`\`json\n${text}\n\`\`\``, width);
+      if (text.length < raw.length) structured.push(this.theme.fg("muted", "… structured result truncated to 4 KiB"));
+      appendBoundedSection(body, this.theme, "Structured result", structured, 72);
+    }
+    appendBoundedSection(
+      body,
+      this.theme,
+      agent.transcript?.length ? "Transcript" : "Result",
+      this.renderBoundedResult(run, phase, agent, width),
+      160,
+    );
+    const finalAssistant = [...(agent.transcript ?? [])].reverse().find((entry) => entry.kind === "assistant")?.text;
+    if (agent.transcript?.length && typeof agent.output === "string" && agent.output && agent.output !== finalAssistant) {
+      const finalResult = this.#renderMarkdown(sanitizeText(boundedHeadTailText(agent.output, 8 * 1024, "final result")), width);
+      appendBoundedSection(body, this.theme, "Final result", finalResult, 80);
+    }
+    if (body.length > MAX_RESULT_ROWS) body.splice(MAX_RESULT_ROWS);
+
+    const viewportRows = Math.max(0, rows - lines.length - 1);
+    this.#resultRows = viewportRows;
+    this.#resultTotal = body.length;
+    const key = `${run.runId}:${phase?.index ?? "workflow"}:${agent.index}:inspector`;
     if (key !== this.#scrollKey) {
       this.#scrollKey = key;
       this.#scroll = 0;
     }
-    this.#scroll = clamp(this.#scroll, 0, Math.max(0, wrapped.length - resultRows));
+    this.#scroll = clamp(this.#scroll, 0, Math.max(0, body.length - viewportRows));
     const start = this.#scroll;
-    const end = Math.min(wrapped.length, start + resultRows);
-    lines.push(this.theme.fg("dim", `Result ${resultRows ? `${start + 1}–${end}` : "0"}/${wrapped.length} · Shift+↑↓/PgUp/PgDn`));
-    lines.push(...wrapped.slice(start, end));
+    const end = Math.min(body.length, start + viewportRows);
+    lines.push(this.theme.fg("dim", `Detail ${viewportRows ? `${start + 1}–${end}` : "0"}/${body.length} · Shift+↑↓/PgUp/PgDn`));
+    lines.push(...body.slice(start, end));
     return lines.slice(0, rows);
   }
 
@@ -311,18 +423,28 @@ export class WorkflowsDashboardOverlay {
     return `${this.theme.fg("accent", `Phase ${this.#selectedPhase + 1}/${total}`)} ${this.theme.fg(status.color, `${status.glyph} ${sanitizeInline(phase.name)}`)} ${this.theme.fg("dim", `· ${phase.status} · ←→`)}`;
   }
 
-  private renderAgent(agent: WorkflowAgentRecord, total: number): string {
+  private renderAgentRow(agent: WorkflowAgentRecord, selected: boolean): string {
     const status = statusMeta(agent.state);
-    const route = agent.backend || agent.model
-      ? ` · ${sanitizeInline(agent.backend ?? "backend")}/${sanitizeInline(agent.model ?? "model")}`
-      : "";
-    return `${this.theme.fg("accent", `Agent ${this.#selectedAgent + 1}/${total}`)} ${this.theme.fg(status.color, `${status.glyph} ${sanitizeInline(agent.label || agent.role)}`)} ${this.theme.fg("dim", `· ${sanitizeInline(agent.role)} · ${agent.state}${route} · Tab`)}`;
+    const marker = selected ? this.theme.fg("accent", "›") : " ";
+    const label = selected ? this.theme.fg("accent", sanitizeInline(agent.label || agent.role)) : this.theme.fg("text", sanitizeInline(agent.label || agent.role));
+    const route = agent.backend || agent.model ? `${sanitizeInline(agent.backend ?? "backend")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
+    const usage = formatUsage(agent.usage);
+    return `${marker} ${this.theme.fg(status.color, status.glyph)} ${label} ${this.theme.fg("dim", `· ${sanitizeInline(agent.role)} · ${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}${usage ? ` · ${usage}` : ""}`)}`;
   }
 
-  private phaseAgents(run: WorkflowSnapshot, phase: WorkflowPhase | undefined): WorkflowAgentRecord[] {
+  private allPhaseAgents(run: WorkflowSnapshot, phase: WorkflowPhase | undefined): WorkflowAgentRecord[] {
     if (!phase) return [];
     const indices = new Set(phase.agents);
     return run.agents.filter((agent) => indices.has(agent.index) || agent.phase === phase.index);
+  }
+
+  private phaseAgents(run: WorkflowSnapshot, phase: WorkflowPhase | undefined): WorkflowAgentRecord[] {
+    return this.allPhaseAgents(run, phase).filter((agent) => matchesAgentFilter(agent, this.#agentFilter));
+  }
+
+  private selectedAgent(run: WorkflowSnapshot | undefined): WorkflowAgentRecord | undefined {
+    if (!run) return undefined;
+    return this.phaseAgents(run, run.phases[this.#selectedPhase])[this.#selectedAgent];
   }
 
   private renderBoundedResult(
@@ -334,19 +456,15 @@ export class WorkflowsDashboardOverlay {
     const safeWidth = Math.max(1, width);
     const transcript = agent?.transcript?.length ? agent.transcript : undefined;
     let rows: string[] = [];
-    let remaining = MAX_RESULT_CHARS;
     let truncated = false;
 
     if (transcript) {
-      for (const entry of transcript) {
-        if (remaining <= 0) { truncated = true; break; }
-        const raw = entry.kind === "tool"
-          ? `${entry.name}${entry.text ? ` · ${entry.text}` : ""}`
-          : entry.text;
-        const clean = sanitizeText(raw);
-        const text = clean.slice(0, remaining);
-        remaining -= text.length;
-        if (text.length < clean.length) truncated = true;
+      const parts = boundedTranscriptParts(transcript, MAX_RESULT_CHARS);
+      for (const { entry, text } of parts) {
+        if (!entry) {
+          rows.push(this.theme.fg("muted", text));
+          continue;
+        }
         if (!text.trim()) continue;
 
         if (entry.kind === "assistant") {
@@ -369,7 +487,7 @@ export class WorkflowsDashboardOverlay {
         const structured = typeof value !== "string";
         const raw = serializeResult(value);
         truncated = raw.length > MAX_RESULT_CHARS;
-        const text = sanitizeText(raw.slice(0, MAX_RESULT_CHARS));
+        const text = sanitizeText(boundedHeadTailText(raw, MAX_RESULT_CHARS, structured ? "structured result" : "result"));
         rows = this.#renderMarkdown(structured ? `\`\`\`json\n${text}\n\`\`\`` : text, safeWidth);
       }
     }
@@ -387,6 +505,7 @@ export class WorkflowsDashboardOverlay {
     if (next === this.#selectedRun) return;
     this.#selectedRun = next;
     this.#selectionRunId = undefined;
+    this.#inspectingAgent = false;
     this.resetScroll();
   }
 
@@ -394,6 +513,7 @@ export class WorkflowsDashboardOverlay {
     if (!run?.phases.length) return;
     this.#selectedPhase = clamp(this.#selectedPhase + delta, 0, run.phases.length - 1);
     this.#selectedAgent = 0;
+    this.#inspectingAgent = false;
     this.resetScroll();
   }
 
@@ -405,6 +525,15 @@ export class WorkflowsDashboardOverlay {
     this.resetScroll();
   }
 
+  private cycleAgentFilter(run: WorkflowSnapshot | undefined): void {
+    const index = AGENT_FILTERS.indexOf(this.#agentFilter);
+    this.#agentFilter = AGENT_FILTERS[(index + 1) % AGENT_FILTERS.length]!;
+    this.#selectedAgent = 0;
+    this.#inspectingAgent = false;
+    this.resetScroll();
+    if (run) this.syncSelections(run);
+  }
+
   private scrollResult(delta: number): void {
     this.#scroll = clamp(this.#scroll + delta, 0, Math.max(0, this.#resultTotal - this.#resultRows));
   }
@@ -413,6 +542,53 @@ export class WorkflowsDashboardOverlay {
     this.#scroll = 0;
     this.#scrollKey = undefined;
   }
+}
+
+function boundedHeadTailText(text: string, limit: number, label: string): string {
+  if (limit <= 0) return "";
+  if (text.length <= limit) return text;
+  const marker = `\n\n… ${label} truncated …\n\n`;
+  if (marker.length >= limit) return text.slice(-limit);
+  const head = Math.max(1, Math.ceil((limit - marker.length) / 2));
+  const tail = Math.max(0, limit - marker.length - head);
+  return `${text.slice(0, head)}${marker}${tail ? text.slice(-tail) : ""}`;
+}
+
+function transcriptDisplayText(entry: TranscriptEntry): string {
+  if (entry.kind !== "tool") return sanitizeText(entry.text);
+  return sanitizeText(`${entry.name}${entry.text ? ` · ${entry.text}` : ""}`);
+}
+
+function boundedTranscriptParts(
+  entries: TranscriptEntry[],
+  limit: number,
+): Array<{ entry?: TranscriptEntry; text: string }> {
+  const parts = entries.map((entry) => ({ entry, text: transcriptDisplayText(entry) }));
+  const total = parts.reduce((sum, part) => sum + part.text.length, 0);
+  if (total <= limit) return parts;
+  if (parts.length === 1) {
+    return [{ entry: parts[0]!.entry, text: boundedHeadTailText(parts[0]!.text, limit, "transcript") }];
+  }
+
+  const marker = "… older transcript content omitted …";
+  const firstBudget = Math.max(1, Math.floor((limit - marker.length) / 3));
+  const first = {
+    entry: parts[0]!.entry,
+    text: parts[0]!.text.slice(0, firstBudget),
+  };
+  let remaining = Math.max(0, limit - first.text.length - marker.length);
+  const tail: Array<{ entry?: TranscriptEntry; text: string }> = [];
+  for (let index = parts.length - 1; index > 0 && remaining > 0; index--) {
+    const part = parts[index]!;
+    if (part.text.length <= remaining) {
+      tail.unshift(part);
+      remaining -= part.text.length;
+      continue;
+    }
+    tail.unshift({ entry: part.entry, text: boundedHeadTailText(part.text, remaining, "transcript entry") });
+    remaining = 0;
+  }
+  return [first, { text: marker }, ...tail];
 }
 
 function serializeResult(value: unknown): string {
@@ -426,6 +602,26 @@ function serializeResult(value: unknown): string {
   }
 }
 
+function appendBoundedSection(
+  target: string[],
+  theme: Theme,
+  label: string,
+  rows: string[],
+  limit: number,
+): void {
+  target.push(theme.fg("muted", label));
+  if (rows.length <= limit) {
+    target.push(...rows);
+    return;
+  }
+  const head = Math.max(1, Math.ceil((limit - 1) / 2));
+  const tail = Math.max(0, limit - head - 1);
+  const omitted = rows.length - head - tail;
+  target.push(...rows.slice(0, head));
+  target.push(theme.fg("muted", `… ${omitted} ${label.toLowerCase()} rows omitted`));
+  if (tail) target.push(...rows.slice(-tail));
+}
+
 function renderPrefixedRows(
   theme: Theme,
   prefix: string,
@@ -434,7 +630,7 @@ function renderPrefixedRows(
   width: number,
 ): string[] {
   const prefixWidth = visibleWidth(prefix);
-  const wrapped = wrapTextWithAnsi(text, Math.max(1, width - prefixWidth));
+  const wrapped = wrapTextWithAnsi(sanitizeText(text), Math.max(1, width - prefixWidth));
   return wrapped.map((line, index) => `${index === 0 ? prefix : " ".repeat(prefixWidth)}${theme.fg(color, line)}`);
 }
 
@@ -465,11 +661,40 @@ export async function openWorkflowsDashboard(
     );
     if (!action || action.type === "close") return;
     try {
-      await manager.cancel(action.runId, "Cancelled from /workflows dashboard");
+      if (action.type === "cancelAgent") {
+        await manager.cancelAgent(action.runId, action.agentIndex, "Workflow agent cancelled from /workflows dashboard");
+      } else {
+        await manager.cancel(action.runId, "Cancelled from /workflows dashboard");
+      }
     } catch (error) {
       ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
     }
   }
+}
+
+function matchesAgentFilter(agent: WorkflowAgentRecord, filter: AgentFilter): boolean {
+  if (filter === "all") return true;
+  if (filter === "active") return agent.state === "queued" || agent.state === "running";
+  if (filter === "failed") return agent.state === "failed" || agent.state === "cancelled" || agent.state === "aborted";
+  return agent.state === "completed";
+}
+
+function formatAgentElapsed(agent: WorkflowAgentRecord, now: number): string {
+  const elapsed = Math.max(0, (agent.timestamps.endedAt ?? now) - (agent.timestamps.startedAt ?? agent.timestamps.createdAt));
+  const seconds = Math.floor(elapsed / 1_000);
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+function formatBudget(run: WorkflowSnapshot): string {
+  const budget = run.budget;
+  if (!budget) return "";
+  const limits = [
+    budget.maxInputTokens === undefined ? "" : `↑≤${budget.maxInputTokens}`,
+    budget.maxOutputTokens === undefined ? "" : `↓≤${budget.maxOutputTokens}`,
+    budget.maxTurns === undefined ? "" : `${budget.maxTurns}t`,
+    budget.maxCost === undefined ? "" : `$${budget.maxCost.toFixed(2)}`,
+  ].filter(Boolean);
+  return limits.length ? ` · budget ${limits.join("/")}` : "";
 }
 
 function statusMeta(status: WorkflowStatus | WorkflowAgentState): { glyph: string; color: StatusColor } {
