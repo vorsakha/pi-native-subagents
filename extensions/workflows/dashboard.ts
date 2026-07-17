@@ -1,6 +1,7 @@
-import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import { getMarkdownTheme, type ExtensionCommandContext, type Theme } from "@earendil-works/pi-coding-agent";
 import {
   Key,
+  Markdown,
   type KeybindingsManager,
   matchesKey,
   truncateToWidth,
@@ -36,6 +37,7 @@ export interface WorkflowsDashboardOverlayOptions {
   now?: () => number;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
+  renderMarkdown?: (text: string, width: number) => string[];
 }
 
 type StatusColor = "accent" | "success" | "warning" | "error" | "muted";
@@ -66,6 +68,7 @@ export class WorkflowsDashboardOverlay {
   #unsubscribe: (() => void) | undefined;
   readonly #now: () => number;
   readonly #clearInterval: typeof clearInterval;
+  readonly #renderMarkdown: (text: string, width: number) => string[];
   private readonly tui: Pick<TUI, "requestRender" | "terminal">;
   private readonly theme: Theme;
   private readonly keybindings: KeybindingsManager;
@@ -87,6 +90,7 @@ export class WorkflowsDashboardOverlay {
     this.done = done;
     this.#now = options.now ?? Date.now;
     this.#clearInterval = options.clearInterval ?? clearInterval;
+    this.#renderMarkdown = options.renderMarkdown ?? renderWorkflowMarkdown;
     const schedule = options.setInterval ?? setInterval;
     this.#timer = schedule(() => {
       if (!this.#finished) this.tui.requestRender();
@@ -285,8 +289,7 @@ export class WorkflowsDashboardOverlay {
     const error = sanitizeInline(agent?.error ?? phase?.error ?? run.error ?? "");
     if (error && lines.length < rows - 2) lines.push(this.theme.fg("error", error));
 
-    const result = this.resultText(run, phase, agent);
-    const wrapped = this.wrapBoundedResult(result.text, width, result.truncated);
+    const wrapped = this.renderBoundedResult(run, phase, agent, width);
     const resultRows = Math.max(0, rows - lines.length - 1);
     this.#resultRows = resultRows;
     this.#resultTotal = wrapped.length;
@@ -322,44 +325,59 @@ export class WorkflowsDashboardOverlay {
     return run.agents.filter((agent) => indices.has(agent.index) || agent.phase === phase.index);
   }
 
-  private resultText(
+  private renderBoundedResult(
     run: WorkflowSnapshot,
     phase: WorkflowPhase | undefined,
     agent: WorkflowAgentRecord | undefined,
-  ): { text: string; truncated: boolean } {
-    const transcript = agent?.transcript?.map((entry) => {
-      if (entry.kind === "user") return `> ${entry.text}`;
-      if (entry.kind === "thinking") return `~ ${entry.text}`;
-      if (entry.kind === "assistant") return entry.text;
-      return `${entry.error ? "×" : "→"} ${entry.name}${entry.text ? ` · ${entry.text}` : ""}`;
-    }).join("\n\n");
-    const value = transcript || agent?.output || agent?.preview || phase?.result || run.result;
-    if (value === undefined || value === null || value === "") {
-      return { text: run.status === "running" || run.status === "pending" ? "(no result yet)" : "(no result)", truncated: false };
-    }
-    let raw: string;
-    if (typeof value === "string") raw = value;
-    else {
-      try {
-        const serialized = JSON.stringify(value, (_key, nested) => typeof nested === "bigint" ? String(nested) : nested, 2);
-        raw = serialized === undefined ? String(value) : serialized;
-      }
-      catch {
-        try { raw = String(value); }
-        catch { raw = "[unrenderable result]"; }
-      }
-    }
-    const truncated = raw.length > MAX_RESULT_CHARS;
-    return { text: sanitizeText(raw.slice(0, MAX_RESULT_CHARS)), truncated };
-  }
-
-  private wrapBoundedResult(text: string, width: number, truncated: boolean): string[] {
+    width: number,
+  ): string[] {
     const safeWidth = Math.max(1, width);
-    let rows = text.split("\n").flatMap((line) => wrapTextWithAnsi(line || " ", safeWidth));
-    if (truncated) rows.push("… result truncated to 16 KiB");
+    const transcript = agent?.transcript?.length ? agent.transcript : undefined;
+    let rows: string[] = [];
+    let remaining = MAX_RESULT_CHARS;
+    let truncated = false;
+
+    if (transcript) {
+      for (const entry of transcript) {
+        if (remaining <= 0) { truncated = true; break; }
+        const raw = entry.kind === "tool"
+          ? `${entry.name}${entry.text ? ` · ${entry.text}` : ""}`
+          : entry.text;
+        const clean = sanitizeText(raw);
+        const text = clean.slice(0, remaining);
+        remaining -= text.length;
+        if (text.length < clean.length) truncated = true;
+        if (!text.trim()) continue;
+
+        if (entry.kind === "assistant") {
+          rows.push(...this.#renderMarkdown(text, safeWidth));
+        } else if (entry.kind === "user") {
+          rows.push(...renderPrefixedRows(this.theme, this.theme.fg("accent", "> "), text, "userMessageText", safeWidth));
+        } else if (entry.kind === "thinking") {
+          rows.push(...renderPrefixedRows(this.theme, this.theme.fg("dim", "~ "), text, "muted", safeWidth));
+        } else {
+          const prefix = entry.error ? this.theme.fg("error", "× ") : this.theme.fg("muted", "→ ");
+          rows.push(...renderPrefixedRows(this.theme, prefix, text, entry.error ? "error" : "muted", safeWidth));
+        }
+      }
+    } else {
+      const value = [agent?.output, agent?.preview, phase?.result, run.result]
+        .find((candidate) => candidate !== undefined && candidate !== null && candidate !== "");
+      if (value === undefined) {
+        rows = [this.theme.fg("dim", run.status === "running" || run.status === "pending" ? "(no result yet)" : "(no result)")];
+      } else {
+        const structured = typeof value !== "string";
+        const raw = serializeResult(value);
+        truncated = raw.length > MAX_RESULT_CHARS;
+        const text = sanitizeText(raw.slice(0, MAX_RESULT_CHARS));
+        rows = this.#renderMarkdown(structured ? `\`\`\`json\n${text}\n\`\`\`` : text, safeWidth);
+      }
+    }
+
+    if (truncated) rows.push(this.theme.fg("muted", "… result truncated to 16 KiB"));
     if (rows.length > MAX_RESULT_ROWS) {
       const omitted = rows.length - MAX_RESULT_ROWS + 1;
-      rows = [...rows.slice(0, MAX_RESULT_ROWS - 1), `… ${omitted} wrapped rows omitted`];
+      rows = [...rows.slice(0, MAX_RESULT_ROWS - 1), this.theme.fg("muted", `… ${omitted} rendered rows omitted`)];
     }
     return rows.length ? rows : [" "];
   }
@@ -395,6 +413,36 @@ export class WorkflowsDashboardOverlay {
     this.#scroll = 0;
     this.#scrollKey = undefined;
   }
+}
+
+function serializeResult(value: unknown): string {
+  if (typeof value === "string") return value;
+  try {
+    const serialized = JSON.stringify(value, (_key, nested) => typeof nested === "bigint" ? String(nested) : nested, 2);
+    return serialized === undefined ? String(value) : serialized;
+  } catch {
+    try { return String(value); }
+    catch { return "[unrenderable result]"; }
+  }
+}
+
+function renderPrefixedRows(
+  theme: Theme,
+  prefix: string,
+  text: string,
+  color: Parameters<Theme["fg"]>[0],
+  width: number,
+): string[] {
+  const prefixWidth = visibleWidth(prefix);
+  const wrapped = wrapTextWithAnsi(text, Math.max(1, width - prefixWidth));
+  return wrapped.map((line, index) => `${index === 0 ? prefix : " ".repeat(prefixWidth)}${theme.fg(color, line)}`);
+}
+
+export function renderWorkflowMarkdown(text: string, width: number): string[] {
+  const safeWidth = Math.max(1, width);
+  return new Markdown(sanitizeText(text), 0, 0, getMarkdownTheme())
+    .render(safeWidth)
+    .map((line) => truncateToWidth(line, safeWidth, ""));
 }
 
 export async function openWorkflowsDashboard(

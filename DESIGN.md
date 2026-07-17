@@ -87,7 +87,7 @@ Workflows reuse the subagent system rather than presenting a separate visual lan
 - Up/Down or `j`/`k` selects runs; Left/Right or `h`/`l` selects phases; Tab cycles agents in the selected phase.
 - Shift+Up/Down and Page Up/Down scroll wrapped bounded results. Long logical lines remain reachable.
 - `x` cancels only active workflows. Escape and the configured cancel binding always close.
-- Selected detail prioritizes workflow → phase → agent hierarchy, then usage/error/result. Agent detail uses normalized bounded transcripts when available. Artifact paths and raw scripts are not shown in the dashboard.
+- Selected detail prioritizes workflow → phase → agent hierarchy, then usage/error/result. Assistant messages and standalone results are sanitized and rendered through Pi's native Markdown theme; user, thinking, and tool transcript entries retain explicit role prefixes and semantic colors. Agent detail uses normalized bounded transcripts when available. Artifact paths and raw scripts are not shown in the dashboard.
 
 ### Sandboxed execution
 The JavaScript sandbox is a control-plane component, not a new permission authority. It has no filesystem, network, subprocess, import, environment, or credential access. It communicates over authenticated size-bounded IPC and can only announce phases, request agents, and return JSON. `WorkflowManager` validates every request and delegates it to the shared `JobManager`, preserving project trust, role access, routing, nesting depth, cancellation, and the global four-job cap.

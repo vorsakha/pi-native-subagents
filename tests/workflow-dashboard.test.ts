@@ -43,7 +43,12 @@ function workflow(id: string, status: WorkflowSnapshot["status"] = "running"): W
   };
 }
 
-function harness(runs: WorkflowSnapshot[], rows = 30, done: (action: unknown) => void = () => {}) {
+function harness(
+  runs: WorkflowSnapshot[],
+  rows = 30,
+  done: (action: unknown) => void = () => {},
+  renderMarkdown?: (text: string, width: number) => string[],
+) {
   let renders = 0;
   let listener: ((snapshot: WorkflowSnapshot) => void) | undefined;
   let unsubscribed = 0;
@@ -68,10 +73,51 @@ function harness(runs: WorkflowSnapshot[], rows = 30, done: (action: unknown) =>
     { matches: (data: string, binding: string) => binding === "tui.select.cancel" && data === "\u0003" } as unknown as KeybindingsManager,
     manager,
     done as never,
-    { now: () => 65_000 },
+    { now: () => 65_000, renderMarkdown },
   );
   return { overlay, manager, renders: () => renders, emit: () => listener?.(runs[0]!), unsubscribed: () => unsubscribed, checked };
 }
+
+test("workflow results use native Markdown while transcript roles keep explicit styling", (t) => {
+  const markdown = workflow("markdown", "completed");
+  markdown.agents[0]!.transcript = [
+    { kind: "user", text: "**inspect this literally**" },
+    { kind: "thinking", text: "considering options" },
+    { kind: "assistant", text: "\u001b[31m# Verdict\u001b[0m\n\n**PASS**" },
+    { kind: "tool", toolId: "t1", name: "read", text: "file.ts" },
+  ];
+  const sources: string[] = [];
+  const { overlay } = harness([markdown], 30, () => {}, (text) => {
+    sources.push(text);
+    return ["\u001b[1mVerdict\u001b[0m", "\u001b[32mPASS\u001b[0m"];
+  });
+  t.after(() => overlay.dispose());
+
+  const lines = overlay.render(72);
+  assert.deepEqual(sources, ["# Verdict\n\n**PASS**"], "only assistant content is routed through Markdown");
+  assert.ok(lines.some((line) => line.includes("\u001b[1mVerdict\u001b[0m")), "native Markdown styling survives dashboard chrome");
+  assert.ok(lines.some((line) => line.includes("> **inspect this literally**")), "user transcript remains an explicit role row");
+  assert.ok(lines.some((line) => line.includes("~ considering options")), "thinking transcript remains explicitly styled");
+  assert.ok(lines.some((line) => line.includes("→ read · file.ts")), "tool transcript remains explicitly styled");
+
+  const standalone = workflow("standalone", "completed");
+  standalone.agents = [];
+  standalone.phases[0]!.agents = [];
+  standalone.result = "## Summary\n\n- one\n- two";
+  const resultSources: string[] = [];
+  const resultOverlay = harness([standalone], 30, () => {}, (text) => {
+    resultSources.push(text);
+    return ["\u001b[1mSummary\u001b[0m", "• one", "• two"];
+  }).overlay;
+  t.after(() => resultOverlay.dispose());
+  assert.ok(resultOverlay.render(72).some((line) => line.includes("\u001b[1mSummary\u001b[0m")));
+  assert.deepEqual(resultSources, ["## Summary\n\n- one\n- two"], "standalone workflow results are routed through Markdown");
+
+  standalone.result = false;
+  resultSources.length = 0;
+  resultOverlay.render(72);
+  assert.deepEqual(resultSources, ["```json\nfalse\n```"], "structured and falsey results retain readable fenced JSON");
+});
 
 test("dashboard navigation, cancellation, and scrolling share one interaction contract", (t) => {
   const first = workflow("first");
