@@ -12,17 +12,17 @@ Escape and Pi's cancel binding close the overlay. Arrow keys or `j`/`k` navigate
 
 Takeover normalizes bounded user, thinking, assistant, tool, live-thinking, and queued-message state. Active jobs accept steering; retained completed jobs accept follow-ups; failed/cancelled/expired jobs remain read-only.
 
-Running glyphs use width-stable fade frames every 200 ms. Output is sanitized before Pi-native Markdown rendering. Cards are pinned to job id and generation so retained-session follow-ups do not rewrite historical rows.
+Running glyphs use a width-stable 500 ms blink. Output is sanitized before Pi-native Markdown rendering. Cards are pinned to job id and generation so retained-session follow-ups do not rewrite historical rows.
 
 ## Tool rendering
 
-Every direct tool has custom bounded rendering. Collapsed results are at most 10 lines; expanded results are at most 36. Lines truncate to actual width. Job cards prioritize status/policy, task, workflow ownership/error, outcome, recent activity, informational usage, and a single `/subagents` disclosure footer.
+Every direct tool uses the inline trace shell: `⌁` opens the call row and `│` carries result rows. Collapsed results are at most 10 lines; expanded results are at most 36. Lines truncate to actual width. Job cards prioritize status, policy, outcome, recent activity, informational usage, and a single `/subagents` disclosure footer. Task text stays on the call row unless expanded.
 
-`subagent_spawn` owns the live card. Check/wait/send/cancel use one-line receipts when collapsed. List shows bounded rows. Unconsumed background completions reuse the same card as a single follow-up.
+`subagent_spawn` owns the live card. Check/wait/send/cancel use one-line outcome receipts when collapsed. Wait identifies the agent once on the call row, then reports only state and elapsed time. List shows bounded rows. Unconsumed background completions reuse the same card as a single follow-up.
 
 ## Workflow surfaces
 
-Workflow cards use the same sanitizers, colors, glyphs, 10/36-line budgets, and one `/workflows` pointer. They show phase position, generic agent count/state, access/profile/route/effort, informational aggregate usage, result, and errors.
+Workflow calls and results use the same `⌁`/`│` trace grammar, sanitizers, colors, glyphs, 10/36-line budgets, and one `/workflows` pointer. Collapsed cards show the current phase, active agent, result preview, and essential policy; expanded cards reveal description, summaries, and phase history.
 
 There are no configured workflow token, turn, cost, or overall deadline limits. Usage is reporting only. The enforced workflow bounds are 512 KiB source, 256 KiB args, 1 MiB result, 32 agent calls, 128 phase events/64 retained phases, and four-way parallelism; backend lifecycle and shutdown deadlines remain separate and bounded.
 

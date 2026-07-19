@@ -6,6 +6,12 @@ import { join } from "node:path";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
 import type { Backend, BackendEvent, BackendName, BackendRequest, BackendRun } from "../src/types.ts";
 
+const theme = {
+  fg: (_color: string, text: string) => text,
+  bg: (_color: string, text: string) => text,
+  bold: (text: string) => text,
+} as any;
+
 class ImmediateBackend implements Backend {
   readonly name: BackendName;
   constructor(name: BackendName) { this.name = name; }
@@ -13,6 +19,25 @@ class ImmediateBackend implements Backend {
     emit({ type: "usage", usage: { input: 12, output: 3, cost: 0.01, turns: 1 } });
     emit({ type: "completed", output: `${request.name}:${request.task}` });
     return { completed: Promise.resolve(), async send() {}, async cancel() {}, async close() {} };
+  }
+}
+
+class HoldingBackend implements Backend {
+  readonly name: BackendName = "codex";
+  starts = 0;
+  private emit: ((event: BackendEvent) => void) | undefined;
+  private settle: (() => void) | undefined;
+
+  async start(_request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
+    this.starts++;
+    this.emit = emit;
+    const completed = new Promise<void>((resolve) => { this.settle = resolve; });
+    return { completed, async send() {}, async cancel() {}, async close() {} };
+  }
+
+  complete(output = "done"): void {
+    this.emit?.({ type: "completed", output });
+    this.settle?.();
   }
 }
 
@@ -60,18 +85,26 @@ function context(trusted = true) {
   };
 }
 
-async function setup() {
+async function setup(options: {
+  backends?: Backend[];
+  setInterval?: typeof setInterval;
+  clearInterval?: typeof clearInterval;
+} = {}) {
   const root = join(await mkdtemp(join(tmpdir(), "workflow-extension-")), "runs");
   const globalProfilesDir = join(await mkdtemp(join(tmpdir(), "workflow-extension-profiles-")), "profiles");
   const pi = fakePi();
-  const backends = [new ImmediateBackend("pi"), new ImmediateBackend("claude"), new ImmediateBackend("codex")];
-  registerNativeSubagents(pi.api, { registry: {}, legacyRoot: false, backends, workflowArtifactRoot: root, globalProfilesDir });
+  const backends = options.backends ?? [new ImmediateBackend("pi"), new ImmediateBackend("claude"), new ImmediateBackend("codex")];
+  registerNativeSubagents(pi.api, {
+    registry: {}, legacyRoot: false, backends, workflowArtifactRoot: root, globalProfilesDir,
+    setInterval: options.setInterval, clearInterval: options.clearInterval,
+  });
   return { root, pi };
 }
 
 test("background workflows return immediately and deliver one follow-up result for success or failure", async () => {
   const { pi } = await setup();
   const { ctx } = context();
+  assert.equal(pi.tools.get("workflow").renderShell, "self", "workflow should use the inline trace shell");
   pi.handlers.get("session_start")?.({}, ctx);
   const result = await pi.tools.get("workflow").execute("wf", {
     name: "Background review",
@@ -107,6 +140,49 @@ test("background workflows return immediately and deliver one follow-up result f
   assert.equal(failed.pi.messages[0]?.message.details.workflow.status, "failed");
   assert.match(failed.pi.messages[0]?.message.details.workflow.error ?? "", /script exploded/);
   await failed.pi.handlers.get("session_shutdown")?.();
+});
+
+test("background workflow cards follow live state with one bounded blink timer", async () => {
+  const backend = new HoldingBackend();
+  const timers = new Map<object, () => void>();
+  let blinkDelay = 0;
+  const fakeSetInterval = ((callback: () => void, delay: number) => {
+    blinkDelay = delay;
+    const timer = { unref() {} };
+    timers.set(timer, callback);
+    return timer;
+  }) as unknown as typeof setInterval;
+  const fakeClearInterval = ((timer: object) => { timers.delete(timer); }) as unknown as typeof clearInterval;
+  const { pi } = await setup({ backends: [backend], setInterval: fakeSetInterval, clearInterval: fakeClearInterval });
+  const { ctx } = context();
+  pi.handlers.get("session_start")?.({}, ctx);
+  const result = await pi.tools.get("workflow").execute("wf-live", {
+    name: "Live review",
+    script: `export default async () => agent("inspect", { name: "inspection", access: "readOnly" })`,
+    background: true,
+  }, new AbortController().signal, undefined, ctx);
+  for (let index = 0; index < 50 && backend.starts === 0; index++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(backend.starts, 1);
+
+  let invalidations = 0;
+  const renderContext = { args: {}, state: {}, invalidate: () => { invalidations++; } };
+  const activeCard = pi.tools.get("workflow").renderResult(result, { expanded: false, isPartial: false }, theme, renderContext);
+  assert.ok(activeCard.render(100).some((line: string) => line.includes("running")));
+  assert.equal(timers.size, 1);
+  assert.equal(blinkDelay, 500);
+  timers.values().next().value?.();
+  assert.equal(invalidations, 1);
+
+  backend.complete("review complete");
+  for (let index = 0; index < 50 && pi.messages.length === 0; index++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.equal(timers.size, 0, "terminal workflow state prunes the shared blink timer");
+  const settledCard = pi.tools.get("workflow").renderResult(result, { expanded: false, isPartial: false }, theme, renderContext);
+  assert.ok(settledCard.render(100).some((line: string) => line.includes("completed")));
+  await pi.handlers.get("session_shutdown")?.();
 });
 
 test("workflow tool rejects invalid JSON args and untrusted projects", async () => {

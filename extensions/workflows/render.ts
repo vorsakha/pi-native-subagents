@@ -3,16 +3,18 @@ import type { Component } from "@earendil-works/pi-tui";
 import { aggregateWorkflowUsage } from "../../src/workflows/manager.ts";
 import type {
   WorkflowAgentRecord,
-  WorkflowAgentState,
   WorkflowSnapshot,
-  WorkflowStatus,
 } from "../../src/workflows/types.ts";
 import {
   formatUsage,
   linesComponent,
+  renderToolCallLine,
   sanitizeInline,
   sanitizeText,
   shortId,
+  traceResultLine,
+  traceResultLines,
+  traceStatusMeta,
 } from "../subagents/render.ts";
 
 /** Hard budgets for workflow tool results, including their footer. */
@@ -24,24 +26,12 @@ const MAX_RESULT_CHARS = 16_384;
 const MAX_PHASES_EXPANDED = 6;
 const MAX_AGENTS_EXPANDED = 8;
 
-type StatusColor = "accent" | "success" | "warning" | "error" | "muted";
-
 export interface WorkflowCardOptions {
   expanded: boolean;
   isPartial?: boolean;
   expandHint?: string;
+  standalone?: boolean;
   now: number;
-}
-
-function statusMeta(status: WorkflowStatus | WorkflowAgentState): { glyph: string; color: StatusColor } {
-  switch (status) {
-    case "running": return { glyph: "●", color: "accent" };
-    case "completed": return { glyph: "✓", color: "success" };
-    case "failed": return { glyph: "×", color: "error" };
-    case "cancelled":
-    case "aborted": return { glyph: "■", color: "warning" };
-    default: return { glyph: "○", color: "muted" };
-  }
 }
 
 function formatElapsed(snapshot: WorkflowSnapshot, now: number): string {
@@ -110,11 +100,11 @@ function finalPreview(snapshot: WorkflowSnapshot): unknown {
   return last?.output ?? last?.preview;
 }
 
-function phaseSummary(snapshot: WorkflowSnapshot, theme: Theme): string {
+function phaseSummary(snapshot: WorkflowSnapshot, theme: Theme, now: number): string {
   if (!snapshot.phases.length) return theme.fg("dim", "Phases · waiting for the first phase");
   const phase = snapshot.phases.find((candidate) => candidate.index === snapshot.currentPhase)
     ?? snapshot.phases.at(-1)!;
-  const status = statusMeta(phase.status);
+  const status = traceStatusMeta(phase.status, now);
   const position = Math.max(1, snapshot.phases.findIndex((candidate) => candidate.index === phase.index) + 1);
   return `${theme.fg("dim", `Phase ${position}/${snapshot.phases.length}`)} ${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(phase.name))} ${theme.fg("dim", phase.status)}`;
 }
@@ -126,15 +116,15 @@ function agentSummary(snapshot: WorkflowSnapshot, theme: Theme): string {
   return theme.fg("dim", `Agents · ${snapshot.agents.length} total · ${active} active${failed ? ` · ${failed} stopped` : ""}`);
 }
 
-function phaseLine(snapshot: WorkflowSnapshot, index: number, theme: Theme): string {
+function phaseLine(snapshot: WorkflowSnapshot, index: number, theme: Theme, now: number): string {
   const phase = snapshot.phases[index]!;
-  const status = statusMeta(phase.status);
+  const status = traceStatusMeta(phase.status, now);
   const current = phase.index === snapshot.currentPhase ? theme.fg("accent", "›") : " ";
   return `${current} ${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(phase.name))} ${theme.fg("dim", `· ${phase.status} · ${countLabel(phase.agents.length, "agent")}`)}`;
 }
 
-function agentLine(agent: WorkflowAgentRecord, theme: Theme): string {
-  const status = statusMeta(agent.state);
+function agentLine(agent: WorkflowAgentRecord, theme: Theme, now: number): string {
+  const status = traceStatusMeta(agent.state, now);
   const route = agent.backend || agent.model
     ? ` · ${sanitizeInline(agent.backend ?? "backend")}/${sanitizeInline(agent.model ?? "model")}`
     : "";
@@ -157,29 +147,29 @@ export function buildWorkflowCardLines(
   options: WorkflowCardOptions,
 ): string[] {
   const budget = options.expanded ? MAX_EXPANDED_LINES : MAX_COLLAPSED_LINES;
-  const status = statusMeta(snapshot.status);
+  const status = traceStatusMeta(snapshot.status, options.now);
   const mode = snapshot.background ? "background" : "foreground";
   const lines: string[] = [
     `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(snapshot.name) || "Workflow"))} ${theme.fg("dim", shortId(sanitizeText(snapshot.runId)))} ${theme.fg("dim", `· ${snapshot.status} · ${mode} · ${formatElapsed(snapshot, options.now)}`)}`,
   ];
 
   const description = sanitizeInline(snapshot.description);
-  if (description) lines.push(theme.fg("dim", description));
-  lines.push(phaseSummary(snapshot, theme));
+  if (options.expanded && description) lines.push(theme.fg("dim", description));
+  lines.push(phaseSummary(snapshot, theme, options.now));
 
   if (options.expanded) {
     const phases = snapshot.phases.slice(0, MAX_PHASES_EXPANDED);
-    for (let index = 0; index < phases.length; index++) lines.push(phaseLine(snapshot, index, theme));
+    for (let index = 0; index < phases.length; index++) lines.push(phaseLine(snapshot, index, theme, options.now));
     if (snapshot.phases.length > phases.length) lines.push(theme.fg("muted", `  +${snapshot.phases.length - phases.length} more phases`));
   }
 
-  lines.push(agentSummary(snapshot, theme));
+  if (options.expanded) lines.push(agentSummary(snapshot, theme));
   const collapsedAgent = [...snapshot.agents].reverse().find((agent) => agent.state === "queued" || agent.state === "running")
     ?? snapshot.agents.at(-1);
   const agents = options.expanded
     ? snapshot.agents.slice(-MAX_AGENTS_EXPANDED)
     : collapsedAgent ? [collapsedAgent] : [];
-  for (const agent of agents) lines.push(agentLine(agent, theme));
+  for (const agent of agents) lines.push(agentLine(agent, theme, options.now));
   if (options.expanded && snapshot.agents.length > agents.length) {
     lines.push(theme.fg("muted", `  +${snapshot.agents.length - agents.length} earlier agents`));
   }
@@ -205,11 +195,9 @@ export function buildWorkflowCardLines(
 
   const footerText = options.expanded
     ? `full bounded result: ${WORKFLOWS_POINTER}`
-    : options.isPartial
-      ? `updating… · ${WORKFLOWS_POINTER}`
-      : options.expandHint
-        ? `${sanitizeInline(options.expandHint)} · ${WORKFLOWS_POINTER}`
-        : WORKFLOWS_POINTER;
+    : options.expandHint
+      ? `${sanitizeInline(options.expandHint)} · ${WORKFLOWS_POINTER}`
+      : WORKFLOWS_POINTER;
   const content = clampContent(theme, lines, Math.max(0, budget - 1));
   return [...content, theme.fg("dim", footerText)].slice(0, budget);
 }
@@ -219,7 +207,11 @@ export function renderWorkflowCard(
   theme: Theme,
   options: WorkflowCardOptions,
 ): Component {
-  return linesComponent(buildWorkflowCardLines(snapshot, theme, options));
+  return linesComponent(traceResultLines(theme, buildWorkflowCardLines(snapshot, theme, options), options.standalone));
+}
+
+export function renderWorkflowFailure(text: string, theme: Theme): Component {
+  return linesComponent([traceResultLine(theme, "×", text, "error")]);
 }
 
 export function renderWorkflowCall(
@@ -229,12 +221,6 @@ export function renderWorkflowCall(
   theme: Theme,
 ): Component {
   const title = sanitizeInline(name) || "Workflow";
-  const detail = sanitizeInline(description);
-  const parts = [
-    theme.fg("toolTitle", theme.bold("▶ Workflow")),
-    theme.fg("accent", title),
-    theme.fg("dim", background ? "· background" : "· foreground"),
-  ];
-  if (detail) parts.push(theme.fg("dim", `· ${detail}`));
-  return linesComponent([parts.join(" ")]);
+  const detail = [background ? "background" : "foreground", sanitizeInline(description)].filter(Boolean).join(" · ");
+  return renderToolCallLine(theme, "Workflow", title, detail);
 }

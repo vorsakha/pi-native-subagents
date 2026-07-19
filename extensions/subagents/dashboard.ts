@@ -69,7 +69,7 @@ class DashboardOverlay {
     const schedule = options.setInterval ?? setInterval;
     this.#timer = schedule(() => {
       if (!this.#finished) this.tui.requestRender();
-    }, 200);
+    }, 500);
   }
 
   render(width: number): string[] {

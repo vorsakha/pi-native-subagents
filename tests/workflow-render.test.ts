@@ -5,6 +5,8 @@ import {
   MAX_COLLAPSED_LINES,
   MAX_EXPANDED_LINES,
   buildWorkflowCardLines,
+  renderWorkflowCall,
+  renderWorkflowCard,
 } from "../extensions/workflows/render.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 
@@ -74,6 +76,13 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
   assert.ok(collapsed.some((line) => line.includes("agent")));
   assert.ok(collapsed.some((line) => line.includes("↑")));
 
+  const callLines = renderWorkflowCall("Release readiness", "Review and verify", false, theme).render(100);
+  assert.ok(callLines[0]?.startsWith("⌁"));
+  const cardLines = renderWorkflowCard(workflow(), theme, { expanded: false, now: 6_000 }).render(100);
+  assert.ok(cardLines.every((line) => line.startsWith("│")), "workflow result rows use the trace continuation rail");
+  assert.ok(buildWorkflowCardLines(workflow(), theme, { expanded: false, now: 6_000 }).some((line) => line.includes("●")));
+  assert.ok(buildWorkflowCardLines(workflow(), theme, { expanded: false, now: 6_500 }).every((line) => !line.includes("●")), "active workflow state uses a two-frame blink");
+
   const expanded = buildWorkflowCardLines(huge, theme, { expanded: true, now: 6_000 });
   assert.ok(expanded.length <= MAX_EXPANDED_LINES);
   assert.ok(expanded.at(-1)?.includes("/workflows"));
@@ -93,7 +102,7 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
   });
   assert.ok(lines.length <= MAX_COLLAPSED_LINES);
   assert.ok(lines.some((line) => line.includes("latest 1")));
-  assert.ok(lines.at(-1)?.includes("updating"));
   assert.ok(lines.at(-1)?.includes("/workflows"));
+  assert.ok(lines.every((line) => !line.includes("updating")), "active state is conveyed by the blink, not redundant copy");
   assert.ok(lines.every((line) => !CONTROL_CHARS.test(line)));
 });

@@ -33,6 +33,28 @@ export function linesComponent(lines: string[]): Component {
   return new Lines(lines.length ? lines : [""]);
 }
 
+const TRACE_GROUP = "⌁";
+const TRACE_RAIL = "│";
+const TRACE_INDENT = "     ";
+
+export function traceResultLine(
+  theme: Theme,
+  glyph: string,
+  text: string,
+  color: "accent" | "success" | "warning" | "error" | "muted" | "dim" = "muted",
+): string {
+  return `${theme.fg("dim", TRACE_RAIL)}${TRACE_INDENT}${theme.fg(color, glyph)} ${theme.fg("muted", sanitizeInline(text))}`;
+}
+
+export function traceResultLines(theme: Theme, lines: string[], standalone = false): string[] {
+  return lines.map((line, index) => {
+    const prefix = standalone && index === 0
+      ? theme.fg("accent", TRACE_GROUP)
+      : theme.fg("dim", TRACE_RAIL);
+    return `${prefix}${TRACE_INDENT}${line}`;
+  });
+}
+
 const ESCAPE_SEQUENCE =
   /\u001B(?:\][^\u0007\u001B]*(?:\u0007|\u001B\\)|\[[0-?]*[ -/]*[@-~]|[PX^_][^\u001B]*(?:\u001B\\)|.)/g;
 const CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/g;
@@ -80,31 +102,26 @@ export function formatUsage(usage: Usage): string {
   return parts.join(" ");
 }
 
-type StatusColor = "accent" | "success" | "warning" | "error" | "muted" | "dim";
+export type TraceStatusColor = "accent" | "success" | "warning" | "error" | "muted" | "dim";
 
-const ACTIVE_PULSE_FRAME_MS = 200;
-const ACTIVE_PULSE_FRAMES: ReadonlyArray<{ glyph: string; color: StatusColor }> = [
-  { glyph: " ", color: "dim" },
-  { glyph: "·", color: "dim" },
-  { glyph: "•", color: "muted" },
-  { glyph: "●", color: "accent" },
-  { glyph: "●", color: "accent" },
-  { glyph: "•", color: "muted" },
-  { glyph: "·", color: "dim" },
-  { glyph: " ", color: "dim" },
-];
+const ACTIVE_BLINK_MS = 500;
 
-/** Frame-driven fade for active jobs. Uses width-stable glyph/color steps instead of unreliable ANSI blink. */
-export function statusMeta(status: JobStatus, now?: number): { glyph: string; color: StatusColor } {
+/** Shared width-stable status vocabulary for subagents and workflows. */
+export function traceStatusMeta(status: string, now?: number): { glyph: string; color: TraceStatusColor } {
   switch (status) {
-    case "running": return now === undefined
+    case "running": return now === undefined || Math.floor(now / ACTIVE_BLINK_MS) % 2 === 0
       ? { glyph: "●", color: "accent" }
-      : ACTIVE_PULSE_FRAMES[Math.floor(now / ACTIVE_PULSE_FRAME_MS) % ACTIVE_PULSE_FRAMES.length]!;
+      : { glyph: " ", color: "dim" };
     case "completed": return { glyph: "✓", color: "success" };
     case "failed": return { glyph: "×", color: "error" };
-    case "cancelled": return { glyph: "■", color: "warning" };
+    case "cancelled":
+    case "aborted": return { glyph: "■", color: "warning" };
     default: return { glyph: "○", color: "muted" };
   }
+}
+
+export function statusMeta(status: JobStatus, now?: number): { glyph: string; color: TraceStatusColor } {
+  return traceStatusMeta(status, now);
 }
 
 function toolLine(theme: Theme, tool: ToolTrace, indent = ""): string {
@@ -175,11 +192,12 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
 
   const profile = job.profile ? ` · profile ${sanitizeInline(job.profile)}` : "";
   const independent = job.independent ? " · independent" : "";
-  const header = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(job.name)))} ${theme.fg("dim", shortId(sanitizeText(job.id)))} ${theme.fg("dim", `· ${job.access}${profile}${independent} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)} · ${job.status} · ${formatElapsed(job, now)}`)}`;
-  lines.push(header);
+  const header = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(job.name)))} ${theme.fg("dim", `${shortId(sanitizeText(job.id))} · ${job.status} · ${formatElapsed(job, now)}`)}`;
+  const policy = theme.fg("dim", `${job.access}${profile}${independent} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)}`);
+  lines.push(header, policy);
 
   const task = sanitizeInline(job.task);
-  if (task) lines.push(sectionLine(theme, "Task", task));
+  if (options.expanded && task) lines.push(sectionLine(theme, "Task", task));
   if (job.workflow) {
     const phase = job.workflow.phase ? ` · ${sanitizeInline(job.workflow.phase)}` : "";
     lines.push(sectionLine(theme, "Workflow", `${shortId(sanitizeText(job.workflow.runId))} · ${sanitizeInline(job.workflow.label)}${phase}`, "muted"));
@@ -231,24 +249,22 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
 
   const footer = theme.fg("dim", expanded
     ? `full bounded output: ${DASHBOARD_POINTER}`
-    : options.isPartial
-      ? "updating…"
-      : options.expandHint
-        ? `${options.expandHint} · ${DASHBOARD_POINTER}`
-        : DASHBOARD_POINTER);
+    : options.expandHint
+      ? `${options.expandHint} · ${DASHBOARD_POINTER}`
+      : DASHBOARD_POINTER);
   const content = clampLines(theme, lines, Math.max(1, budget - 1));
   return [...content, footer].slice(0, budget);
 }
 
-export function renderJobCard(job: JobSnapshot, theme: Theme, options: JobCardOptions): Component {
-  return linesComponent(buildJobCardLines(job, theme, options));
+export function renderJobCard(job: JobSnapshot, theme: Theme, options: JobCardOptions & { standalone?: boolean }): Component {
+  return linesComponent(traceResultLines(theme, buildJobCardLines(job, theme, options), options.standalone));
 }
 
-/** Compact acknowledgement for operations that reference a job already represented by its spawn card. */
+/** Compact acknowledgement for operations already identified by their call row. */
 export function renderJobReceipt(job: JobSnapshot, theme: Theme, options: { action: string; now: number }): Component {
   const status = statusMeta(job.status, options.now);
-  const line = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(options.action))} ${theme.fg("accent", sanitizeInline(job.name))} ${theme.fg("dim", shortId(sanitizeText(job.id)))} ${theme.fg("dim", `· ${job.access}${job.independent ? " · independent" : ""} · effort ${formatEffort(job.effort)} · ${job.backend}/${job.model} · ${job.status} · ${formatElapsed(job, options.now)}`)}`;
-  return linesComponent([line]);
+  const elapsed = formatElapsed(job, options.now);
+  return linesComponent([traceResultLine(theme, status.glyph, `${options.action} · ${elapsed}`, status.color)]);
 }
 
 function jobRow(job: JobSnapshot, theme: Theme, now: number): string {
@@ -258,7 +274,7 @@ function jobRow(job: JobSnapshot, theme: Theme, now: number): string {
 
 export function renderJobListCard(jobs: JobSnapshot[], theme: Theme, options: { expanded: boolean; now: number }): Component {
   const budget = options.expanded ? MAX_EXPANDED_LINES : MAX_COLLAPSED_LINES;
-  if (!jobs.length) return linesComponent([theme.fg("muted", "No subagent jobs in this session.")]);
+  if (!jobs.length) return linesComponent([traceResultLine(theme, "○", "No subagent jobs in this session.", "muted")]);
 
   const running = jobs.filter((job) => job.status === "running" || job.status === "queued").length;
   const finished = jobs.length - running;
@@ -272,7 +288,7 @@ export function renderJobListCard(jobs: JobSnapshot[], theme: Theme, options: { 
   // generic clampLines() hidden-count note below must never repeat it.
   if (omitted > 0) lines.push(theme.fg("muted", `+${omitted} more job${omitted === 1 ? "" : "s"} — see ${DASHBOARD_POINTER}`));
 
-  return linesComponent(clampLines(theme, lines, budget));
+  return linesComponent(traceResultLines(theme, clampLines(theme, lines, budget)));
 }
 
 export function truncatePreview(value: string, maxLength = 80): string {
@@ -281,22 +297,25 @@ export function truncatePreview(value: string, maxLength = 80): string {
 }
 
 /** Restrained icon + title vocabulary shared by every `subagent_*` call/result renderer. */
-export type ToolCallTitle = "Spawn" | "Inspect" | "Wait" | "Steer" | "Follow up" | "Cancel" | "List" | "Run";
+export type ToolCallTitle = "Spawn" | "Inspect" | "Wait" | "Steer" | "Follow up" | "Cancel" | "List" | "Run" | "Workflow";
 
 const TOOL_CALL_ICON: Record<ToolCallTitle, string> = {
-  Spawn: "→",
-  Inspect: "◎",
-  Wait: "…",
+  Spawn: "◇",
+  Inspect: "◌",
+  Wait: "·",
   Steer: "↝",
   "Follow up": "+",
   Cancel: "×",
   List: "≡",
-  Run: "▶",
+  Run: "◆",
+  Workflow: "◆",
 };
 
 export function renderToolCallLine(theme: Theme, title: ToolCallTitle, accent: string, detail?: string): Component {
-  const label = `${TOOL_CALL_ICON[title]} ${title}`;
-  const parts = [theme.fg("toolTitle", theme.bold(label)), theme.fg("accent", sanitizeInline(accent))];
+  const prefix = theme.fg("accent", TRACE_GROUP);
+  const glyph = theme.fg("muted", TOOL_CALL_ICON[title]);
+  const label = theme.fg("toolTitle", theme.bold(title.toLowerCase()));
+  const parts = [`${prefix}  ${glyph} ${label}`, theme.fg("accent", sanitizeInline(accent))];
   if (detail) parts.push(theme.fg("dim", sanitizeInline(detail)));
   return linesComponent([parts.join(" ")]);
 }

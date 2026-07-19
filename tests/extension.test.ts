@@ -123,7 +123,12 @@ test("extension exposes generic direct tools, configured routing, independence, 
 
   const consumed = await pi.tools.get("subagent_spawn").execute("spawn", { name: "reader", task: "consumed", access: "readOnly", effort: "high" }, undefined, undefined, ctx);
   assert.equal(consumed.details.job.effort, "high");
-  await pi.tools.get("subagent_wait").execute("wait", { jobId: consumed.details.job.id }, undefined, undefined, ctx);
+  const waitCall = pi.tools.get("subagent_wait").renderCall({ jobId: consumed.details.job.id, timeoutMs: 600_000 }, theme).render(100).join("\n");
+  assert.match(waitCall, /⌁\s+· wait reader .*timeout 600s/, "wait call resolves the human-readable agent name once");
+  const waited = await pi.tools.get("subagent_wait").execute("wait", { jobId: consumed.details.job.id }, undefined, undefined, ctx);
+  const waitReceipt = pi.tools.get("subagent_wait").renderResult(waited, { expanded: false, isPartial: false }, theme, { args: {} }).render(100).join("\n");
+  assert.match(waitReceipt, /^│\s+✓ completed ·/);
+  assert.equal(waitReceipt.includes("reader"), false, "wait result does not repeat its call target");
   pi.handlers.get("agent_settled")?.();
   assert.equal(pi.messages.length, 1, "wait consumes deferred delivery without duplication");
   const historicalContext = { args: {}, state: {}, invalidate() {} };
@@ -170,40 +175,40 @@ test("extension exposes generic direct tools, configured routing, independence, 
 
   await pi.handlers.get("session_shutdown")?.();
 
-  const pulsePi = fakePi();
-  const pulseTimers = new Map<object, () => void>();
-  let pulseDelay = 0;
+  const blinkPi = fakePi();
+  const blinkTimers = new Map<object, () => void>();
+  let blinkDelay = 0;
   const fakeSetInterval = ((callback: () => void, delay: number) => {
-    pulseDelay = delay;
+    blinkDelay = delay;
     const timer = { unref() {} };
-    pulseTimers.set(timer, callback);
+    blinkTimers.set(timer, callback);
     return timer;
   }) as unknown as typeof setInterval;
-  const fakeClearInterval = ((timer: object) => { pulseTimers.delete(timer); }) as unknown as typeof clearInterval;
-  registerNativeSubagents(pulsePi.api, {
+  const fakeClearInterval = ((timer: object) => { blinkTimers.delete(timer); }) as unknown as typeof clearInterval;
+  registerNativeSubagents(blinkPi.api, {
     registry: {},
     legacyRoot: false,
     backends: [new HoldingBackend("pi"), new HoldingBackend("claude"), new HoldingBackend("codex")],
-    workflowArtifactRoot: join(await mkdtemp(join(tmpdir(), "extension-pulse-workflows-")), "runs"),
-    globalProfilesDir: join(await mkdtemp(join(tmpdir(), "extension-pulse-profiles-")), "profiles"),
+    workflowArtifactRoot: join(await mkdtemp(join(tmpdir(), "extension-blink-workflows-")), "runs"),
+    globalProfilesDir: join(await mkdtemp(join(tmpdir(), "extension-blink-profiles-")), "profiles"),
     setInterval: fakeSetInterval,
     clearInterval: fakeClearInterval,
   });
-  const pulseCtx = context();
-  pulsePi.handlers.get("session_start")?.({}, pulseCtx);
-  const active = await pulsePi.tools.get("subagent_spawn").execute("pulse", { name: "pulse", task: "show pulse" }, undefined, undefined, pulseCtx);
+  const blinkCtx = context();
+  blinkPi.handlers.get("session_start")?.({}, blinkCtx);
+  const active = await blinkPi.tools.get("subagent_spawn").execute("blink", { name: "blink", task: "show blink" }, undefined, undefined, blinkCtx);
   await new Promise((resolve) => setImmediate(resolve));
   let invalidations = 0;
   const renderContext = { args: {}, state: {}, invalidate: () => { invalidations++; } };
-  const activeCard = pulsePi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
-  assert.ok(activeCard.render(80).some((line: string) => line.includes("updating…")), "background thread card follows the live job");
-  assert.equal(pulseTimers.size, 1, "active thread cards share one bounded pulse timer");
-  assert.equal(pulseDelay, 200, "thread card fade advances in smooth 200 ms frames");
-  pulseTimers.values().next().value?.();
-  assert.equal(invalidations, 1, "pulse timer invalidates the existing thread row");
-  await pulsePi.tools.get("subagent_cancel").execute("cancel-pulse", { jobId: active.details.job.id }, undefined, undefined, pulseCtx);
-  assert.equal(pulseTimers.size, 0, "manager settlement prunes the pulse without requiring a rerender");
-  const settledCard = pulsePi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
+  const activeCard = blinkPi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
+  assert.ok(activeCard.render(80).some((line: string) => line.includes("running")), "background thread card follows the live job");
+  assert.equal(blinkTimers.size, 1, "active thread cards share one bounded blink timer");
+  assert.equal(blinkDelay, 500, "thread card status blinks at a restrained 500 ms cadence");
+  blinkTimers.values().next().value?.();
+  assert.equal(invalidations, 1, "blink timer invalidates the existing thread row");
+  await blinkPi.tools.get("subagent_cancel").execute("cancel-blink", { jobId: active.details.job.id }, undefined, undefined, blinkCtx);
+  assert.equal(blinkTimers.size, 0, "manager settlement prunes the blink without requiring a rerender");
+  const settledCard = blinkPi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
   assert.ok(settledCard.render(80).some((line: string) => line.includes("cancelled")), "thread card settles from remembered manager state");
-  await pulsePi.handlers.get("session_shutdown")?.();
+  await blinkPi.handlers.get("session_shutdown")?.();
 });

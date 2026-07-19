@@ -12,7 +12,7 @@ import {
 } from "../../src/workflows/manager.ts";
 import type { WorkflowSnapshot } from "../../src/workflows/types.ts";
 import { openWorkflowsDashboard } from "./dashboard.ts";
-import { renderWorkflowCall, renderWorkflowCard } from "./render.ts";
+import { renderWorkflowCall, renderWorkflowCard, renderWorkflowFailure } from "./render.ts";
 
 const WORKFLOW_MESSAGE = "native-workflow-result";
 const MAX_RESULT_TEXT_BYTES = 48 * 1024;
@@ -25,6 +25,21 @@ export interface WorkflowRegistration {
 export interface RegisterWorkflowOptions {
   artifactRoot?: string;
   defaultBackend?: () => "pi" | "claude" | "codex";
+  setInterval?: typeof setInterval;
+  clearInterval?: typeof clearInterval;
+}
+
+interface LiveWorkflowBlink {
+  runId?: string;
+  invalidate?: () => void;
+}
+
+interface LiveWorkflowRenderContext {
+  state: {
+    nativeWorkflowBlink?: LiveWorkflowBlink;
+    nativeWorkflowSnapshot?: WorkflowSnapshot;
+  };
+  invalidate(): void;
 }
 
 function expandHint(): string {
@@ -94,10 +109,80 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   let sessionContext: ExtensionContext | undefined;
   let generation = 0;
   let shuttingDown = false;
+  const scheduleBlink = options.setInterval ?? setInterval;
+  const cancelBlink = options.clearInterval ?? clearInterval;
+  const liveBlinks = new Set<LiveWorkflowBlink>();
+  let liveBlinkTicker: ReturnType<typeof setInterval> | undefined;
 
   const getManager = () => {
     if (!manager) throw new Error("Workflow manager is not available before session_start");
     return manager;
+  };
+  const stopBlink = (blink: LiveWorkflowBlink) => {
+    blink.invalidate = undefined;
+    blink.runId = undefined;
+    liveBlinks.delete(blink);
+    if (!liveBlinks.size && liveBlinkTicker) {
+      cancelBlink(liveBlinkTicker);
+      liveBlinkTicker = undefined;
+    }
+  };
+  const clearBlinks = () => {
+    for (const blink of liveBlinks) {
+      blink.invalidate = undefined;
+      blink.runId = undefined;
+    }
+    liveBlinks.clear();
+    if (liveBlinkTicker) cancelBlink(liveBlinkTicker);
+    liveBlinkTicker = undefined;
+  };
+  const workflowIsActive = (runId: string): boolean => {
+    if (!manager) return false;
+    try { return !workflowIsTerminal(manager.check(runId).status); }
+    catch { return false; }
+  };
+  const syncBlink = (context: LiveWorkflowRenderContext | undefined, runId: string, active: boolean) => {
+    if (!context?.state) return;
+    const blink = context.state.nativeWorkflowBlink ??= {};
+    if (!active) return stopBlink(blink);
+    blink.runId = runId;
+    blink.invalidate = context.invalidate;
+    liveBlinks.add(blink);
+    if (liveBlinkTicker) return;
+    liveBlinkTicker = scheduleBlink(() => {
+      for (const current of [...liveBlinks]) {
+        if (!current.runId || !workflowIsActive(current.runId)) {
+          stopBlink(current);
+          continue;
+        }
+        try { current.invalidate?.(); }
+        catch { stopBlink(current); }
+      }
+    }, 500);
+    liveBlinkTicker.unref?.();
+  };
+  const refreshBlinks = () => {
+    for (const blink of [...liveBlinks]) {
+      if (!blink.runId || !workflowIsActive(blink.runId)) {
+        stopBlink(blink);
+        continue;
+      }
+      try { blink.invalidate?.(); }
+      catch { stopBlink(blink); }
+    }
+  };
+  const liveSnapshot = (fallback: WorkflowSnapshot, context?: LiveWorkflowRenderContext): WorkflowSnapshot => {
+    let snapshot = context?.state.nativeWorkflowSnapshot ?? fallback;
+    let tracked = false;
+    if (manager) {
+      try {
+        snapshot = compactSnapshot(manager.check(fallback.runId));
+        tracked = true;
+      } catch { /* durable transcript snapshot survives history eviction */ }
+    }
+    if (context?.state) context.state.nativeWorkflowSnapshot = snapshot;
+    syncBlink(context, fallback.runId, tracked && !workflowIsTerminal(snapshot.status));
+    return snapshot;
   };
 
   const updateStatus = (snapshot?: WorkflowSnapshot) => {
@@ -130,6 +215,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
 
   pi.registerTool({
     name: "workflow",
+    renderShell: "self",
     label: "Workflow",
     description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Scripts export a default async function and may call phase(title), agent(prompt,{name?,label?,access?,backend?,modelTier?,effort?,independent?,profile?,phase?,schema?}), and parallel(tasks,{concurrency?}). agent(prompt) works without options. Runs are limited to 32 agent calls and four concurrent agents.",
     promptSnippet: "Run a sandboxed multi-agent workflow with phases and bounded parallelism",
@@ -190,7 +276,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
           const current = compactSnapshot(workflows.check(started.snapshot.runId));
           onUpdate?.({ content: [{ type: "text", text: `Workflow ${current.runId} ${current.status}` }], details: { workflow: current } });
         } catch { /* run may be settling */ }
-      }, 300);
+      }, 500);
       timer.unref();
       try {
         const final = await started.completion;
@@ -206,17 +292,23 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     renderCall(args, theme) {
       return renderWorkflowCall(args.name ?? "Workflow", args.description ?? "", args.background ?? false, theme);
     },
-    renderResult(result, { expanded, isPartial }, theme) {
-      const snapshot = (result.details as { workflow?: WorkflowSnapshot } | undefined)?.workflow;
-      if (!snapshot) return renderWorkflowCall("Workflow", "result unavailable", false, theme);
-      return renderWorkflowCard(snapshot, theme, { expanded, isPartial, expandHint: expandHint(), now: Date.now() });
+    renderResult(result, { expanded, isPartial }, theme, context) {
+      const fallback = (result.details as { workflow?: WorkflowSnapshot } | undefined)?.workflow;
+      if (!fallback) return renderWorkflowFailure("workflow result unavailable", theme);
+      const snapshot = liveSnapshot(fallback, context as LiveWorkflowRenderContext | undefined);
+      return renderWorkflowCard(snapshot, theme, {
+        expanded,
+        isPartial: isPartial || !workflowIsTerminal(snapshot.status),
+        expandHint: expandHint(),
+        now: Date.now(),
+      });
     },
   });
 
   pi.registerMessageRenderer(WORKFLOW_MESSAGE, (message, { expanded }, theme) => {
     const snapshot = (message.details as { workflow?: WorkflowSnapshot } | undefined)?.workflow;
     if (!snapshot) return renderWorkflowCall("Workflow", "background result", true, theme);
-    return renderWorkflowCard(snapshot, theme, { expanded, expandHint: expandHint(), now: Date.now() });
+    return renderWorkflowCard(snapshot, theme, { expanded, expandHint: expandHint(), standalone: true, now: Date.now() });
   });
 
   pi.registerCommand("workflows", {
@@ -235,10 +327,14 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     sessionStart(ctx, jobs) {
       generation++;
       shuttingDown = false;
+      clearBlinks();
       sessionContext = ctx;
       unsubscribe?.();
       manager = new WorkflowManager({ jobs, artifactRoot, sessionId: ctx.sessionManager.getSessionId() });
-      unsubscribe = manager.subscribe((snapshot) => updateStatus(snapshot));
+      unsubscribe = manager.subscribe((snapshot) => {
+        updateStatus(snapshot);
+        refreshBlinks();
+      });
       void manager.initialize().then(() => updateStatus()).catch((error) => {
         if (ctx.hasUI) ctx.ui.notify(`Workflow history unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
       });
@@ -246,6 +342,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     async sessionShutdown() {
       shuttingDown = true;
       generation++;
+      clearBlinks();
       unsubscribe?.();
       unsubscribe = undefined;
       const closing = manager;

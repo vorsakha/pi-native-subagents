@@ -13,12 +13,10 @@ import type { TranscriptEntry } from "../../src/types.ts";
 import { aggregateWorkflowUsage, workflowIsTerminal } from "../../src/workflows/manager.ts";
 import type {
   WorkflowAgentRecord,
-  WorkflowAgentState,
   WorkflowPhase,
   WorkflowSnapshot,
-  WorkflowStatus,
 } from "../../src/workflows/types.ts";
-import { formatUsage, sanitizeInline, sanitizeText, shortId } from "../subagents/render.ts";
+import { formatUsage, sanitizeInline, sanitizeText, shortId, traceStatusMeta } from "../subagents/render.ts";
 
 const MAX_RESULT_CHARS = 16_384;
 const MAX_RESULT_ROWS = 400;
@@ -43,7 +41,6 @@ export interface WorkflowsDashboardOverlayOptions {
   renderMarkdown?: (text: string, width: number) => string[];
 }
 
-type StatusColor = "accent" | "success" | "warning" | "error" | "muted";
 type AgentFilter = "all" | "active" | "failed" | "completed";
 const AGENT_FILTERS: AgentFilter[] = ["all", "active", "failed", "completed"];
 
@@ -285,7 +282,7 @@ export class WorkflowsDashboardOverlay {
   }
 
   private renderRun(run: WorkflowSnapshot, selected: boolean): string {
-    const status = statusMeta(run.status);
+    const status = traceStatusMeta(run.status, this.#now());
     const marker = selected ? this.theme.fg("accent", "›") : " ";
     const phase = run.currentPhase === null ? "waiting" : `${Math.min(run.phases.length, run.currentPhase + 1)}/${run.phases.length}`;
     const label = `${status.glyph} ${run.status.padEnd(9)} ${shortId(sanitizeText(run.runId))} ${sanitizeInline(run.name)} · phase ${phase} · ${formatElapsed(run, this.#now())}`;
@@ -309,7 +306,7 @@ export class WorkflowsDashboardOverlay {
     const phase = run.phases[this.#selectedPhase];
     const allAgents = this.allPhaseAgents(run, phase);
     const agents = this.phaseAgents(run, phase);
-    const status = statusMeta(run.status);
+    const status = traceStatusMeta(run.status, this.#now());
     const usage = formatUsage(aggregateWorkflowUsage(run));
     const lines: string[] = [
       `${this.theme.fg("accent", this.theme.bold(sanitizeInline(run.name) || "Workflow"))} ${this.theme.fg("dim", `· ${shortId(sanitizeText(run.runId))} · ${status.glyph} ${run.status} · ${formatElapsed(run, this.#now())}`)}`,
@@ -344,7 +341,7 @@ export class WorkflowsDashboardOverlay {
       return this.workflowOverviewViewport(run, rows, width);
     }
 
-    const status = statusMeta(agent.state);
+    const status = traceStatusMeta(agent.state, this.#now());
     const route = agent.backend || agent.model
       ? `${sanitizeInline(agent.backend ?? "backend")}/${sanitizeInline(agent.model ?? "model")}`
       : "route pending";
@@ -419,12 +416,12 @@ export class WorkflowsDashboardOverlay {
   }
 
   private renderPhase(phase: WorkflowPhase, total: number): string {
-    const status = statusMeta(phase.status);
+    const status = traceStatusMeta(phase.status, this.#now());
     return `${this.theme.fg("accent", `Phase ${this.#selectedPhase + 1}/${total}`)} ${this.theme.fg(status.color, `${status.glyph} ${sanitizeInline(phase.name)}`)} ${this.theme.fg("dim", `· ${phase.status} · ←→`)}`;
   }
 
   private renderAgentRow(agent: WorkflowAgentRecord, selected: boolean): string {
-    const status = statusMeta(agent.state);
+    const status = traceStatusMeta(agent.state, this.#now());
     const marker = selected ? this.theme.fg("accent", "›") : " ";
     const label = selected ? this.theme.fg("accent", sanitizeInline(agent.name)) : this.theme.fg("text", sanitizeInline(agent.name));
     const route = agent.backend || agent.model ? `${sanitizeInline(agent.backend ?? "backend")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
@@ -685,16 +682,6 @@ function formatAgentElapsed(agent: WorkflowAgentRecord, now: number): string {
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
-function statusMeta(status: WorkflowStatus | WorkflowAgentState): { glyph: string; color: StatusColor } {
-  switch (status) {
-    case "running": return { glyph: "●", color: "accent" };
-    case "completed": return { glyph: "✓", color: "success" };
-    case "failed": return { glyph: "×", color: "error" };
-    case "cancelled":
-    case "aborted": return { glyph: "■", color: "warning" };
-    default: return { glyph: "○", color: "muted" };
-  }
-}
 
 function formatElapsed(run: WorkflowSnapshot, now: number): string {
   const elapsed = Math.max(0, (run.timestamps.endedAt ?? now) - (run.timestamps.startedAt ?? run.timestamps.createdAt));

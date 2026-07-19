@@ -13,12 +13,14 @@ import { providerFamily } from "../../src/policy.ts";
 import { openSubagentsDashboard } from "./dashboard.ts";
 import {
   formatEffort,
+  linesComponent,
   renderJobCard,
   renderJobListCard,
   renderJobReceipt,
   renderToolCallLine,
   sendBehaviorLabel,
   shortId,
+  traceResultLine,
   truncatePreview,
 } from "./render.ts";
 import { loadProfiles, type ProfileCatalog } from "../../src/profiles.ts";
@@ -50,13 +52,13 @@ interface RegistrationOptions {
   globalProfilesDir?: string;
 }
 
-interface LiveCardPulse {
+interface LiveCardBlink {
   invalidate?: () => void;
   shouldContinue?: () => boolean;
 }
 
 interface LiveCardRenderState {
-  nativeSubagentPulse?: LiveCardPulse;
+  nativeSubagentBlink?: LiveCardBlink;
   nativeSubagentSnapshot?: JobSnapshot;
 }
 
@@ -83,9 +85,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   let sessionContext: { isIdle(): boolean } | undefined;
   const deferredResults = new Map<string, JobSnapshot>();
   const cardSnapshots = new Map<string, JobSnapshot>();
-  const liveCardPulses = new Set<LiveCardPulse>();
-  const schedulePulse = options.setInterval ?? setInterval;
-  const cancelPulse = options.clearInterval ?? clearInterval;
+  const liveCardBlinks = new Set<LiveCardBlink>();
+  const scheduleBlink = options.setInterval ?? setInterval;
+  const cancelBlink = options.clearInterval ?? clearInterval;
   let liveCardTicker: ReturnType<typeof setInterval> | undefined;
   const waitInterest = new Map<string, number>();
   const consumedResults = new Set<string>();
@@ -97,50 +99,60 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     backends: options.backends ?? [new PiRpcBackend(), new ClaudeBackend(), new CodexAppServerBackend()],
   });
   const getManager = () => manager ??= createManager();
-  const stopCardPulse = (pulse: LiveCardPulse) => {
-    pulse.invalidate = undefined;
-    pulse.shouldContinue = undefined;
-    liveCardPulses.delete(pulse);
-    if (!liveCardPulses.size && liveCardTicker) {
-      cancelPulse(liveCardTicker);
+  const jobCallTarget = (jobId: string): { accent: string; detail: string } => {
+    try {
+      const job = manager?.check(jobId);
+      if (!job) throw new Error("Job manager is not active");
+      return { accent: job.name, detail: shortId(job.id) };
+    } catch {
+      return { accent: shortId(jobId), detail: "" };
+    }
+  };
+  const renderFailure = (theme: Theme, text: string) => linesComponent([traceResultLine(theme, "×", text, "error")]);
+  const stopCardBlink = (blink: LiveCardBlink) => {
+    blink.invalidate = undefined;
+    blink.shouldContinue = undefined;
+    liveCardBlinks.delete(blink);
+    if (!liveCardBlinks.size && liveCardTicker) {
+      cancelBlink(liveCardTicker);
       liveCardTicker = undefined;
     }
   };
-  const clearCardPulses = () => {
-    for (const pulse of liveCardPulses) {
-      pulse.invalidate = undefined;
-      pulse.shouldContinue = undefined;
+  const clearCardBlinks = () => {
+    for (const blink of liveCardBlinks) {
+      blink.invalidate = undefined;
+      blink.shouldContinue = undefined;
     }
-    liveCardPulses.clear();
-    if (liveCardTicker) cancelPulse(liveCardTicker);
+    liveCardBlinks.clear();
+    if (liveCardTicker) cancelBlink(liveCardTicker);
     liveCardTicker = undefined;
   };
-  const syncCardPulse = (context: LiveCardRenderContext | undefined, active: boolean, shouldContinue: () => boolean) => {
+  const syncCardBlink = (context: LiveCardRenderContext | undefined, active: boolean, shouldContinue: () => boolean) => {
     if (!context?.state) return;
-    const pulse = context.state.nativeSubagentPulse ??= {};
-    if (!active) return stopCardPulse(pulse);
-    pulse.invalidate = context.invalidate;
-    pulse.shouldContinue = shouldContinue;
-    liveCardPulses.add(pulse);
+    const blink = context.state.nativeSubagentBlink ??= {};
+    if (!active) return stopCardBlink(blink);
+    blink.invalidate = context.invalidate;
+    blink.shouldContinue = shouldContinue;
+    liveCardBlinks.add(blink);
     if (liveCardTicker) return;
-    liveCardTicker = schedulePulse(() => {
-      for (const current of [...liveCardPulses]) {
+    liveCardTicker = scheduleBlink(() => {
+      for (const current of [...liveCardBlinks]) {
         if (!current.shouldContinue?.()) {
-          stopCardPulse(current);
+          stopCardBlink(current);
           continue;
         }
         try { current.invalidate?.(); }
-        catch { stopCardPulse(current); }
+        catch { stopCardBlink(current); }
       }
-    }, 200);
+    }, 500);
     liveCardTicker.unref?.();
   };
-  const refreshCardPulses = () => {
-    for (const pulse of [...liveCardPulses]) {
-      const keep = pulse.shouldContinue?.() === true;
-      try { pulse.invalidate?.(); }
-      catch { stopCardPulse(pulse); continue; }
-      if (!keep) stopCardPulse(pulse);
+  const refreshCardBlinks = () => {
+    for (const blink of [...liveCardBlinks]) {
+      const keep = blink.shouldContinue?.() === true;
+      try { blink.invalidate?.(); }
+      catch { stopCardBlink(blink); continue; }
+      if (!keep) stopCardBlink(blink);
     }
   };
   const cardKey = (job: Pick<JobSnapshot, "id" | "generation">) => `${job.id}:${job.generation}`;
@@ -174,7 +186,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     const current = liveJob(fallback, context);
     const active = current.tracked && !isTerminal(current.job.status);
     const key = cardKey(fallback);
-    syncCardPulse(context, active, () => {
+    syncCardBlink(context, active, () => {
       const remembered = cardSnapshots.get(key);
       if (remembered && isTerminal(remembered.status)) return false;
       if (!manager) return false;
@@ -202,19 +214,24 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     context?: LiveCardRenderContext,
   ) => {
     const jobs = manager?.list() ?? fallback;
-    syncCardPulse(
+    syncCardBlink(
       context,
       !!manager && jobs.some((job) => !isTerminal(job.status)),
       () => !!manager && manager.list().some((job) => !isTerminal(job.status)),
     );
     return renderJobListCard(jobs, theme, { expanded, now: Date.now() });
   };
-  const workflows = registerWorkflows(pi, { artifactRoot: options.workflowArtifactRoot, defaultBackend: () => activeBackend });
+  const workflows = registerWorkflows(pi, {
+    artifactRoot: options.workflowArtifactRoot,
+    defaultBackend: () => activeBackend,
+    setInterval: options.setInterval,
+    clearInterval: options.clearInterval,
+  });
 
   pi.registerMessageRenderer(SUBAGENT_RESULT_MESSAGE, (message, { expanded }, theme) => {
     const job = (message.details as { job?: JobSnapshot } | undefined)?.job;
     if (!job) return renderToolCallLine(theme, "Inspect", "subagent result unavailable");
-    return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint() });
+    return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint(), standalone: true });
   });
 
   const deliverResult = (job: JobSnapshot) => {
@@ -262,7 +279,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   };
 
   pi.on("session_start", (_event, ctx) => {
-    clearCardPulses();
+    clearCardBlinks();
     profileCatalog = loadProfiles(
       globalProfilesDir,
       ctx.isProjectTrusted() ? resolve(ctx.cwd, CONFIG_DIR_NAME, "subagents") : undefined,
@@ -283,7 +300,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     const sessionManager = manager;
     unsubscribeManager = sessionManager.subscribe((job, event) => {
       rememberCardSnapshot(job);
-      refreshCardPulses();
+      refreshCardBlinks();
       updateStatus(ctx, sessionManager, activeBackend);
       if (event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown")) {
         deferResult(job);
@@ -299,7 +316,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     unsubscribeManager?.();
     unsubscribeManager = undefined;
     sessionContext = undefined;
-    clearCardPulses();
+    clearCardBlinks();
     deferredResults.clear();
     cardSnapshots.clear();
     waitInterest.clear();
@@ -364,6 +381,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 
   pi.registerTool({
     name: "subagent_spawn",
+    renderShell: "self",
     label: "Spawn Subagent",
     description: "Spawn a generic task-driven native background subagent. Maximum four jobs run concurrently. Unconsumed results are delivered automatically as one follow-up.",
     promptSnippet: "Spawn a native Pi, Claude Code, or Codex subagent in the background",
@@ -387,13 +405,14 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
-      if (!job) return renderToolCallLine(theme, "Spawn", "failed");
+      if (!job) return renderFailure(theme, "spawn failed");
       return renderLiveJob(job, theme, { expanded, isPartial }, context);
     },
   });
 
   pi.registerTool({
     name: "subagent_check",
+    renderShell: "self",
     label: "Check Subagent",
     description: "Check one background subagent without waiting.",
     parameters: Type.Object({ jobId: Type.String() }),
@@ -402,17 +421,19 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       return result(snapshot, statusLine(snapshot));
     },
     renderCall(args, theme) {
-      return renderToolCallLine(theme, "Inspect", shortId(args.jobId));
+      const target = jobCallTarget(args.jobId);
+      return renderToolCallLine(theme, "Inspect", target.accent, target.detail);
     },
     renderResult(res, { expanded }, theme, context) {
       const job = jobOf(res);
-      if (!job) return renderToolCallLine(theme, "Inspect", "not found");
-      return renderLiveJob(job, theme, { expanded, receipt: "Checked" }, context);
+      if (!job) return renderFailure(theme, "subagent not found");
+      return renderLiveJob(job, theme, { expanded, receipt: (current) => current.status }, context);
     },
   });
 
   pi.registerTool({
     name: "subagent_wait",
+    renderShell: "self",
     label: "Wait for Subagent",
     description: "Wait for a background subagent to finish, or return its current state after a timeout.",
     parameters: Type.Object({
@@ -438,22 +459,24 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
     },
     renderCall(args, theme) {
-      const timeout = args.timeoutMs ? `timeout ${Math.round(args.timeoutMs / 1000)}s` : undefined;
-      return renderToolCallLine(theme, "Wait", shortId(args.jobId), timeout);
+      const target = jobCallTarget(args.jobId);
+      const timeout = args.timeoutMs ? `timeout ${Math.round(args.timeoutMs / 1000)}s` : "";
+      return renderToolCallLine(theme, "Wait", target.accent, [target.detail, timeout].filter(Boolean).join(" · "));
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
-      if (!job) return renderToolCallLine(theme, "Wait", "not found");
+      if (!job) return renderFailure(theme, "subagent not found");
       return renderLiveJob(job, theme, {
         expanded,
         isPartial,
-        receipt: (current) => isTerminal(current.status) ? "Wait complete" : "Waiting on",
+        receipt: (current) => isTerminal(current.status) ? current.status : "waiting",
       }, context);
     },
   });
 
   pi.registerTool({
     name: "subagent_send",
+    renderShell: "self",
     label: "Send to Subagent",
     description: "Steer an active subagent now or queue a follow-up on its native session.",
     parameters: Type.Object({
@@ -467,24 +490,24 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     },
     renderCall(args, theme) {
       const resolved = (args.behavior ?? "steer") as SendBehavior;
-      const behavior = sendBehaviorLabel(resolved);
-      return renderToolCallLine(theme, sendTitle(resolved), shortId(args.jobId), `${behavior}: ${truncatePreview(args.message)}`);
+      const target = jobCallTarget(args.jobId);
+      return renderToolCallLine(theme, sendTitle(resolved), target.accent, [target.detail, truncatePreview(args.message)].filter(Boolean).join(" · "));
     },
     renderResult(res, { expanded }, theme, context) {
       const resolved = ((context.args as { behavior?: SendBehavior } | undefined)?.behavior ?? "steer") as SendBehavior;
       const job = jobOf(res);
-      if (!job) return renderToolCallLine(theme, sendTitle(resolved), "failed");
+      if (!job) return renderFailure(theme, `${sendBehaviorLabel(resolved)} failed`);
       const behavior = sendBehaviorLabel(resolved);
       return renderLiveJob(job, theme, {
         expanded,
-        lead: theme.fg("success", `✓ Sent ${behavior} message`),
-        receipt: behavior === "follow-up" ? "Follow-up sent" : "Steer sent",
+        receipt: behavior === "follow-up" ? "follow-up sent" : "steer sent",
       }, context);
     },
   });
 
   pi.registerTool({
     name: "subagent_cancel",
+    renderShell: "self",
     label: "Cancel Subagent",
     description: "Cancel a queued or running background subagent and tear down its process tree.",
     parameters: Type.Object({ jobId: Type.String() }),
@@ -500,17 +523,19 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
     },
     renderCall(args, theme) {
-      return renderToolCallLine(theme, "Cancel", shortId(args.jobId));
+      const target = jobCallTarget(args.jobId);
+      return renderToolCallLine(theme, "Cancel", target.accent, target.detail);
     },
     renderResult(res, { expanded }, theme, context) {
       const job = jobOf(res);
-      if (!job) return renderToolCallLine(theme, "Cancel", "failed");
-      return renderLiveJob(job, theme, { expanded, receipt: "Cancel complete" }, context);
+      if (!job) return renderFailure(theme, "cancel failed");
+      return renderLiveJob(job, theme, { expanded, receipt: (current) => current.status }, context);
     },
   });
 
   pi.registerTool({
     name: "subagent_list",
+    renderShell: "self",
     label: "List Subagents",
     description: "List all jobs scoped to the current Pi session.",
     parameters: Type.Object({}),
@@ -530,6 +555,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 
   pi.registerTool({
     name: "subagent",
+    renderShell: "self",
     label: "Subagent",
     description: `Foreground convenience for one generic task-driven subagent. Default backend: ${activeBackend}.`,
     promptSnippet: "Run one isolated generic subagent and wait for its result",
@@ -574,7 +600,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
-      if (!job) return renderToolCallLine(theme, "Run", "failed");
+      if (!job) return renderFailure(theme, "subagent failed");
       return renderLiveJob(job, theme, { expanded, isPartial }, context);
     },
   });
