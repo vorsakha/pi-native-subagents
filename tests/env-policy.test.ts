@@ -44,7 +44,7 @@ test("subscription environments remove billing-switch credentials without mutati
   assert.equal(source.ANTHROPIC_API_KEY, "secret-a");
 });
 
-test("generic policy defaults to trusted full Codex with balanced provider-native routing", () => {
+test("generic policy defaults to trusted full Codex with the balanced fallback mapping", () => {
   assert.throws(() => compilePolicy({ ...request, trusted: false }), /untrusted/);
   const compiled = compilePolicy(request);
   assert.equal(compiled.policy.backend, "codex");

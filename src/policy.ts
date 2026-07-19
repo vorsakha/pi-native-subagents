@@ -1,4 +1,5 @@
 import type { BackendName, BackendPolicy, ModelTier, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
+import { BUILT_IN_MODEL_TIERS, type ModelTierMappings } from "./model-routing.ts";
 
 export function providerFamily(provider: unknown): ProviderFamily {
   const normalized = String(provider ?? "").trim().toLowerCase();
@@ -7,19 +8,13 @@ export function providerFamily(provider: unknown): ProviderFamily {
   return "other";
 }
 
-const TIER_MODELS: Record<ModelTier, { codex: string; claude: string; pi: string }> = {
-  economy: { codex: "gpt-5.6-luna", claude: "haiku", pi: "openai-codex/gpt-5.6-luna" },
-  balanced: { codex: "gpt-5.6-terra", claude: "sonnet", pi: "openai-codex/gpt-5.6-terra" },
-  quality: { codex: "gpt-5.6-sol", claude: "opus", pi: "openai-codex/gpt-5.6-sol" },
-};
-
 export interface CompiledJob {
   profile?: ProfileDefinition;
   policy: BackendPolicy;
   independent: boolean;
 }
 
-export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition): CompiledJob {
+export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition, mappings: ModelTierMappings = BUILT_IN_MODEL_TIERS): CompiledJob {
   if (!request.trusted) throw new Error("Subagents are disabled for untrusted projects");
   const independent = request.independent === true || profile?.independent === true;
   let selected: BackendName = request.backend ?? profile?.backend ?? request.defaultBackend ?? "codex";
@@ -40,8 +35,7 @@ export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition
   }
 
   const tierName = request.modelTier ?? profile?.modelTier ?? "balanced";
-  const tier = TIER_MODELS[tierName];
-  const model = selected === "pi" ? tier.pi : selected === "claude" ? tier.claude : tier.codex;
+  const model = mappings[selected][tierName];
   const access = profile?.access === "readOnly" ? "readOnly" : request.access ?? profile?.access ?? "full";
   const readOnly = access === "readOnly";
   return {

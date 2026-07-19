@@ -22,15 +22,33 @@ Behavior comes from the task plus a short isolation baseline. Give every child a
 - required `task`;
 - optional `name`, `cwd`, `backend`, `modelTier`, `effort`, `access`, `independent`, and `profile`.
 
-`access` is `readOnly` or `full` and defaults to `full` only after Pi's project-trust gate succeeds. The configured backend defaults to Codex, and the default model tier is provider-native `balanced`. Explicit backend, tier, and effort values override those defaults.
+`access` is `readOnly` or `full` and defaults to `full` only after Pi's project-trust gate succeeds. The configured backend defaults to Codex, and the default model tier is `balanced`, resolved through the effective global mapping. Explicit backend, tier, and effort values override those defaults.
 
 `independent: true` forces a different native provider from the parent: OpenAI/GPT/Codex parent → Claude, Claude parent → Codex. Explicit Pi or same-provider routes are rejected. For an unknown parent provider, Claude is the native fallback.
 
-| Tier | Native Codex | Native Claude | Pi Codex route |
-| --- | --- | --- | --- |
-| `economy` | Luna | Haiku | `openai-codex/gpt-5.6-luna` |
-| `balanced` | Terra | Sonnet | `openai-codex/gpt-5.6-terra` |
-| `quality` | Sol | Opus | `openai-codex/gpt-5.6-sol` |
+`economy`, `balanced`, and `quality` are the stable model-routing API for tools, workflows, and profiles. An administrator maps them globally in `getAgentDir()/subagents.json`; project files never control concrete model selection. The mapping is loaded for the next session, strictly validated, and falls back as one safe built-in map if absent or invalid:
+
+```json
+{
+  "modelTiers": {
+    "codex": {
+      "economy": "gpt-5.6-luna",
+      "balanced": "gpt-5.6-terra",
+      "quality": "gpt-5.6-sol"
+    },
+    "claude": {
+      "economy": "haiku",
+      "balanced": "sonnet",
+      "quality": "opus"
+    },
+    "pi": {
+      "economy": "openai-codex/gpt-5.6-luna",
+      "balanced": "openai-codex/gpt-5.6-terra",
+      "quality": "openai-codex/gpt-5.6-sol"
+    }
+  }
+}
+```
 
 Claude and Codex omit effort by default so provider behavior remains adaptive. Callers may set `low`, `medium`, `high`, `xhigh`, or `max`.
 
@@ -76,6 +94,7 @@ Workflow JavaScript runs in a separate permission-restricted Node process with 1
 ```text
 /subagents
 /subagents status
+/subagents models
 /subagents profiles
 /subagents codex
 /subagents claude
@@ -84,7 +103,7 @@ Workflow JavaScript runs in a separate permission-restricted Node process with 1
 /workflows
 ```
 
-The default backend applies to both direct tools and workflow `agent()` calls. Successfully completed ordinary jobs retain their native session for 15 minutes; follow-up sends reopen the same job/session. Failed, cancelled, expired, evicted, and workflow-owned sessions are not reusable.
+The default backend and effective tier mapping apply to both direct tools and workflow `agent()` calls. `/subagents models` shows the effective mappings, source, and validation warnings; `/subagents status` gives the concise source and warning count. Successfully completed ordinary jobs retain their native session for 15 minutes; follow-up sends reopen the same job/session. Failed, cancelled, expired, evicted, and workflow-owned sessions are not reusable.
 
 Workflow scripts compose task-driven agents directly:
 

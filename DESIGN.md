@@ -6,7 +6,7 @@ Inherit Pi's active theme and TUI vocabulary. Use semantic colors, compact bold 
 
 ## Subagent surfaces
 
-The `/subagents` overlay contains title/status, keyboard guidance, a job list, selected-job detail, a bounded transcript viewport, and an exit/action footer. Rows and detail headers show agent name, access, optional profile, backend/model, effort, status, and elapsed time.
+The `/subagents` overlay contains title/status, keyboard guidance, a job list, selected-job detail, a bounded transcript viewport, and an exit/action footer. Rows and detail headers show agent name, access, optional profile, backend/model, effort, status, and elapsed time. Stable `economy`/`balanced`/`quality` tiers are resolved once per session from the administrator-owned `getAgentDir()/subagents.json`; strict whole-document validation makes invalid input use the complete bundled fallback map. Project configuration cannot select concrete models. `/subagents models` exposes the effective map, source, and warnings without adding routing noise to the footer.
 
 Escape and Pi's cancel binding close the overlay. Arrow keys or `j`/`k` navigate; Shift+Up/Down and Page Up/Down scroll. Enter opens takeover; `s` steers, `f` queues a follow-up, and `x` cancels. Workflow-owned agents remain inspectable but cannot be steered.
 

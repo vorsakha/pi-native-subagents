@@ -8,6 +8,7 @@ class FakeBackend implements Backend {
   active = 0;
   maxActive = 0;
   starts: string[] = [];
+  policies: BackendRequest["policy"][] = [];
   cancels: string[] = [];
   sends: Array<{ id: string; message: string; behavior: string }> = [];
   readonly runs = new Map<string, { emit: (event: BackendEvent) => void; resolve: () => void }>();
@@ -16,6 +17,7 @@ class FakeBackend implements Backend {
     this.active++;
     this.maxActive = Math.max(this.maxActive, this.active);
     this.starts.push(request.jobId);
+    this.policies.push(request.policy);
     let resolve!: () => void;
     const completed = new Promise<void>((done) => { resolve = () => { this.active--; done(); }; });
     this.runs.set(request.jobId, { emit, resolve });
@@ -56,6 +58,20 @@ test("manager enforces concurrency cap four and pumps queued work", async () => 
   await tick(); await tick();
   backend.complete(jobs[5]!.id);
   await manager.wait(jobs[5]!.id);
+  await manager.shutdown();
+});
+
+test("manager propagates its injected tier mapping to backend starts", async () => {
+  const backend = new FakeBackend();
+  const manager = new JobManager({ backends: [backend], mappings: {
+    codex: { economy: "cheap", balanced: "configured", quality: "best" },
+    claude: { economy: "h", balanced: "s", quality: "o" },
+    pi: { economy: "p1", balanced: "p2", quality: "p3" },
+  } });
+  const job = manager.spawn(request(1));
+  await tick();
+  assert.equal(backend.policies[0]?.model, "configured");
+  backend.complete(job.id);
   await manager.shutdown();
 });
 
