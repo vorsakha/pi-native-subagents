@@ -9,7 +9,7 @@ Standalone Pi package for native Pi, Claude Code, and Codex subagents plus sandb
 - Background `subagent_spawn`, `subagent_wait`, `subagent_check`, `subagent_send`, `subagent_cancel`, and `subagent_list` tools.
 - Compatibility foreground `subagent` tool plus native steering/follow-up control.
 - Outcome-first conversation cards plus a `/subagents` dashboard with Pi-native Markdown detail rendering, smoothly fading activity dots, cancellation, steering, queued follow-ups, and normalized user/assistant/thinking/tool state.
-- Sandboxed `workflow` orchestration with phases, sequential and bounded-parallel role-based agents, structured schemas, usage budgets, foreground/background execution, durable artifacts, automatic background result delivery, and `/workflows` inspection.
+- Sandboxed `workflow` orchestration with phases, sequential and bounded-parallel role-based agents, structured schemas, foreground/background execution, durable artifacts, automatic background result delivery, and `/workflows` inspection.
 - Unconsumed ordinary background results are delivered once as bounded parent follow-ups; `subagent_wait`, foreground runs, and workflow-owned jobs consume or suppress duplicate delivery.
 - Bounded in-memory subagent state. Workflow scripts, checkpoints, results, normalized transcripts, and generated reports are stored privately under `~/.pi/agent/workflows/`, never in the project tree.
 - Process-group teardown with TERM/KILL escalation.
@@ -36,7 +36,7 @@ Claude children do not inherit Anthropic endpoint/header overrides, `CLAUDE_CODE
 
 Nested delegation is capped at depth two. The worker may delegate only to `scout` and `researcher`; the allowlist is carried in child environment metadata. A Pi child is approved only because its parent already passed Pi's project-trust gate, and it loads only this package extension rather than unrelated global extensions. Native Claude/Codex agents do not receive this package's subagent tool, so nested package delegation is available only through Pi.
 
-Workflow JavaScript runs in a separate Node process with the permission model enabled, 128 MiB memory, a hard deadline, authenticated and size-bounded IPC, no inherited environment, no imports, and no filesystem/network/subprocess access. The sandbox can only announce phases, request role-based agents, and return JSON. Every requested agent still passes through the same trusted-project gate, `JobManager`, global four-job cap, role policy compiler, and backend sandbox. Limits are 256 KiB source, 128 KiB args, 1 MiB result, 32 agent calls, 128 phase events/64 retained unique phases, and four-way `parallel()` concurrency.
+Workflow JavaScript runs in a separate Node process with the permission model enabled, 128 MiB memory, authenticated and size-bounded IPC, no inherited environment, no imports, and no filesystem/network/subprocess access. The sandbox can only announce phases, request role-based agents, and return JSON. Every requested agent still passes through the same trusted-project gate, `JobManager`, global four-job cap, role policy compiler, and backend sandbox. Limits are 512 KiB source, 256 KiB args, 1 MiB result, 32 agent calls, 128 phase events/64 retained unique phases, and four-way `parallel()` concurrency. Runs have no overall deadline; cancellation and process-tree shutdown remain bounded.
 
 ## Roles and defaults
 
@@ -98,7 +98,7 @@ The session backend is a compatibility default for the foreground `subagent` too
 
 ## Workflows
 
-The `workflow` tool accepts a name, optional description and JSON args, a sandboxed module script, an optional deadline, and `background`. Scripts export a default async function and may export JSON metadata:
+The `workflow` tool accepts a name, optional description and JSON args, a sandboxed module script, and `background`. Scripts export a default async function and may export JSON metadata:
 
 ```js
 export const meta = { name: "implement-and-review" };
@@ -122,8 +122,6 @@ export default async function () {
 ```
 
 `agent()` always resolves to `{ ok, output, structured?, jobId?, error?, usage? }`; scripts branch explicitly on `ok`. Each call requires a role. Optional `backend`, `modelTier`, request-scoped `effort`, `label`, `phase`, and bounded JSON `schema` cannot loosen that role's policy. Schema requests instruct the native agent to return JSON and validate it before exposing `structured`. `parallel()` accepts task functions and enforces concurrency 1–4 while the shared `JobManager` remains the authoritative global scheduler.
-
-The workflow tool accepts optional `budget` limits for input tokens, output tokens, turns, and cost. Crossing a reported limit aborts the run and cancels remaining members; parallel work can overshoot by the usage of already-running members.
 
 Foreground runs update one bounded tool card. Background runs return immediately and deliver one follow-up result when settled. `/workflows` opens the persistent run dashboard with phase agent rosters, status filtering, per-agent route/effort/usage/duration, bounded caller prompts, recent activity, and a read-only Markdown transcript/result inspector. Operators may cancel the selected queued/running agent or the whole active run. Workflow-owned jobs remain inspectable in `/subagents` but reject steering and follow-ups so external messages cannot corrupt script-controlled results. Terminal runs generate `report.md` alongside `workflow.json`, `result.json`, and bounded `transcripts.json`. V1 persists inspection artifacts but deliberately does not resume interrupted execution after Pi exits—stale running checkpoints become `aborted`.
 

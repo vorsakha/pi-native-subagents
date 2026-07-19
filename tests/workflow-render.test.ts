@@ -54,7 +54,6 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
     status: "failed",
     timestamps: { createdAt: 1_000, updatedAt: 5_000, startedAt: 2_000, endedAt: 5_000 },
     error: `${ESC}[31mworkflow failed${ESC}[0m\nsecond\nthird\nfourth`,
-    budget: { maxInputTokens: 50_000, maxTurns: 40, maxCost: 1 },
     result: Array.from({ length: 2_000 }, (_, index) => `result ${index} ${ESC}[2K`).join("\n"),
     phases: Array.from({ length: 30 }, (_, index) => ({
       index, name: `phase ${index}\u0000`, status: index < 29 ? "completed" as const : "failed" as const,
@@ -74,7 +73,6 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
   assert.ok(collapsed.some((line) => line.includes("phase")));
   assert.ok(collapsed.some((line) => line.includes("agent")));
   assert.ok(collapsed.some((line) => line.includes("↑")));
-  assert.ok(collapsed.some((line) => line.includes("budget")));
 
   const expanded = buildWorkflowCardLines(huge, theme, { expanded: true, now: 6_000 });
   assert.ok(expanded.length <= MAX_EXPANDED_LINES);

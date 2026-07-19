@@ -316,7 +316,7 @@ export class WorkflowsDashboardOverlay {
       this.theme.fg("dim", sanitizeInline(run.description) || "(no workflow description)"),
       phase ? this.renderPhase(phase, run.phases.length) : this.theme.fg("dim", "Phase · waiting for the first phase"),
     ];
-    if (usage) lines.push(this.theme.fg("dim", `Usage · ${usage}${formatBudget(run)}`));
+    if (usage) lines.push(this.theme.fg("dim", `Usage · ${usage}`));
     lines.push(this.theme.fg("muted", `Agents · ${agents.length}/${allAgents.length} shown · filter ${this.#agentFilter} · Tab select · Enter inspect`));
 
     if (!agents.length) {
@@ -683,18 +683,6 @@ function formatAgentElapsed(agent: WorkflowAgentRecord, now: number): string {
   const elapsed = Math.max(0, (agent.timestamps.endedAt ?? now) - (agent.timestamps.startedAt ?? agent.timestamps.createdAt));
   const seconds = Math.floor(elapsed / 1_000);
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
-}
-
-function formatBudget(run: WorkflowSnapshot): string {
-  const budget = run.budget;
-  if (!budget) return "";
-  const limits = [
-    budget.maxInputTokens === undefined ? "" : `↑≤${budget.maxInputTokens}`,
-    budget.maxOutputTokens === undefined ? "" : `↓≤${budget.maxOutputTokens}`,
-    budget.maxTurns === undefined ? "" : `${budget.maxTurns}t`,
-    budget.maxCost === undefined ? "" : `$${budget.maxCost.toFixed(2)}`,
-  ].filter(Boolean);
-  return limits.length ? ` · budget ${limits.join("/")}` : "";
 }
 
 function statusMeta(status: WorkflowStatus | WorkflowAgentState): { glyph: string; color: StatusColor } {

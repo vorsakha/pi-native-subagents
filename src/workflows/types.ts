@@ -17,13 +17,6 @@ export interface WorkflowTimestamps {
   endedAt?: number;
 }
 
-export interface WorkflowBudget {
-  maxInputTokens?: number;
-  maxOutputTokens?: number;
-  maxTurns?: number;
-  maxCost?: number;
-}
-
 export interface WorkflowUsage {
   input: number;
   output: number;
@@ -86,5 +79,4 @@ export interface WorkflowSnapshot {
   artifactDir: string;
   transcriptArtifact?: string;
   reportArtifact?: string;
-  budget?: WorkflowBudget;
 }

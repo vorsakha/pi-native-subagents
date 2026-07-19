@@ -15,7 +15,6 @@ import { runWorkflowSandbox, type WorkflowAgentResult } from "./sandbox.ts";
 import type {
   WorkflowAgentRecord,
   WorkflowAgentState,
-  WorkflowBudget,
   WorkflowPhase,
   WorkflowSnapshot,
   WorkflowStatus,
@@ -25,8 +24,6 @@ import type {
 const BACKENDS = new Set<BackendName>(["pi", "claude", "codex"]);
 const TIERS = new Set<ModelTier>(["economy", "balanced", "quality"]);
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
-const DEFAULT_TIMEOUT_MS = 60 * 60 * 1_000;
-const MAX_TIMEOUT_MS = 2 * 60 * 60 * 1_000;
 const CHECKPOINT_DELAY_MS = 150;
 const MAX_RETAINED_RUNS = 64;
 export const MAX_WORKFLOW_PHASES = 64;
@@ -38,12 +35,10 @@ export interface StartWorkflowRequest {
   script: string;
   args?: unknown;
   background?: boolean;
-  timeoutMs?: number;
   cwd: string;
   trusted: boolean;
   parentProvider?: ProviderFamily;
   depth?: number;
-  budget?: WorkflowBudget;
 }
 
 export interface StartedWorkflow {
@@ -168,7 +163,6 @@ export class WorkflowManager {
       currentPhase: null,
       phases: [],
       agents: [],
-      budget: request.budget,
     };
     const snapshot = await createWorkflowArtifacts(this.#artifactRoot, {
       script: request.script,
@@ -233,14 +227,12 @@ export class WorkflowManager {
   }
 
   async #execute(entry: RunEntry, request: StartWorkflowRequest): Promise<WorkflowSnapshot> {
-    const timeoutMs = Math.max(1_000, Math.min(MAX_TIMEOUT_MS, request.timeoutMs ?? DEFAULT_TIMEOUT_MS));
     try {
       const sandbox = await runWorkflowSandbox({
         source: request.script,
         args: request.args ?? null,
         cwd: request.cwd,
         signal: entry.controller.signal,
-        timeoutMs,
         onPhase: (title) => this.#activatePhase(entry, title),
         onAgent: (prompt, options, signal) => this.#runAgent(entry, request, prompt, options, signal),
       });
@@ -289,8 +281,6 @@ export class WorkflowManager {
     signal: AbortSignal,
   ): Promise<WorkflowAgentResult> {
     if (!prompt.trim()) return { ok: false, output: "", error: "agent() requires a non-empty prompt" };
-    const existingBudgetError = workflowBudgetError(entry.snapshot);
-    if (existingBudgetError) return { ok: false, output: "", error: existingBudgetError };
     const role = typeof options.role === "string" ? options.role.trim() : "";
     if (!role) return { ok: false, output: "", error: "agent() requires options.role" };
     const backend = options.backend === undefined ? undefined : String(options.backend) as BackendName;
@@ -381,12 +371,6 @@ export class WorkflowManager {
     try {
       const final = await this.#jobs.wait(job.id, { signal });
       this.#updateAgentFromJob(final);
-      const budgetError = workflowBudgetError(entry.snapshot);
-      if (budgetError) {
-        entry.snapshot.error = budgetError;
-        entry.controller.abort(new Error(budgetError));
-        return { ok: false, output: final.output, jobId: final.id, error: budgetError, usage: clone(final.usage) };
-      }
       if (final.status === "completed") {
         if (schema) {
           const structured = parseStructuredOutput(final.output);
@@ -592,17 +576,6 @@ export function aggregateWorkflowUsage(snapshot: WorkflowSnapshot): WorkflowUsag
     cost: total.cost + agent.usage.cost,
     turns: total.turns + agent.usage.turns,
   }), workflowUsage());
-}
-
-export function workflowBudgetError(snapshot: WorkflowSnapshot): string | undefined {
-  const budget = snapshot.budget;
-  if (!budget) return undefined;
-  const usage = aggregateWorkflowUsage(snapshot);
-  if (budget.maxInputTokens !== undefined && usage.input > budget.maxInputTokens) return `Workflow input-token budget exceeded (${usage.input}/${budget.maxInputTokens})`;
-  if (budget.maxOutputTokens !== undefined && usage.output > budget.maxOutputTokens) return `Workflow output-token budget exceeded (${usage.output}/${budget.maxOutputTokens})`;
-  if (budget.maxTurns !== undefined && usage.turns > budget.maxTurns) return `Workflow turn budget exceeded (${usage.turns}/${budget.maxTurns})`;
-  if (budget.maxCost !== undefined && usage.cost > budget.maxCost) return `Workflow cost budget exceeded ($${usage.cost.toFixed(4)}/$${budget.maxCost.toFixed(4)})`;
-  return undefined;
 }
 
 function workflowSchema(value: unknown): TSchema | undefined {

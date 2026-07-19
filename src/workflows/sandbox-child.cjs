@@ -4,8 +4,8 @@ const vm = require("node:vm");
 
 const KIB = 1024;
 const MIB = 1024 * KIB;
-const MAX_SOURCE_BYTES = 256 * KIB;
-const MAX_ARGS_BYTES = 128 * KIB;
+const MAX_SOURCE_BYTES = 512 * KIB;
+const MAX_ARGS_BYTES = 256 * KIB;
 const MAX_RESULT_BYTES = MIB;
 const MAX_IPC_BYTES = 512 * KIB;
 const MAX_AGENT_CALLS = 32;
@@ -258,7 +258,8 @@ async function execute(source, argsJson) {
 }
 
 process.on("message", (message) => {
-  if (!message || typeof message !== "object" || message.token !== token || frameSize(message) > MAX_IPC_BYTES) return;
+  if (!message || typeof message !== "object" || message.token !== token) return;
+  if (message.type !== "init" && frameSize(message) > MAX_IPC_BYTES) return;
   if (message.type === "agent-result") {
     const resolve = pendingAgents.get(message.id);
     if (!resolve) return;

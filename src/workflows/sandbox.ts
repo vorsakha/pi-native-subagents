@@ -4,8 +4,8 @@ import { fileURLToPath } from "node:url";
 
 const KIB = 1024;
 const MIB = 1024 * KIB;
-const MAX_SOURCE_BYTES = 256 * KIB;
-const MAX_ARGS_BYTES = 128 * KIB;
+const MAX_SOURCE_BYTES = 512 * KIB;
+const MAX_ARGS_BYTES = 256 * KIB;
 const MAX_RESULT_BYTES = MIB;
 const MAX_IPC_BYTES = 512 * KIB;
 const MAX_AGENT_CALLS = 32;
@@ -26,7 +26,6 @@ export interface WorkflowSandboxOptions {
   args: unknown;
   cwd: string;
   signal: AbortSignal;
-  timeoutMs: number;
   onAgent(
     prompt: string,
     options: Record<string, unknown>,
@@ -71,12 +70,6 @@ function abortError(): Error {
   return error;
 }
 
-function timeoutError(timeoutMs: number): Error {
-  const error = new Error(`Workflow sandbox timed out after ${timeoutMs} ms`);
-  error.name = "TimeoutError";
-  return error;
-}
-
 function frameSize(message: unknown): number {
   try { return byteLength(JSON.stringify(message)); }
   catch { return MAX_IPC_BYTES + 1; }
@@ -116,14 +109,11 @@ function safeAgentFailure(error: unknown): WorkflowAgentResult {
 export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promise<WorkflowSandboxResult> {
   if (typeof options.source !== "string") throw new TypeError("Workflow source must be a string");
   if (byteLength(options.source) > MAX_SOURCE_BYTES) {
-    throw new RangeError("Workflow source exceeds the 256 KiB limit");
+    throw new RangeError("Workflow source exceeds the 512 KiB limit");
   }
   const argsJson = serializeArgs(options.args);
   if (byteLength(argsJson) > MAX_ARGS_BYTES) {
-    throw new RangeError("Workflow args exceed the 128 KiB limit");
-  }
-  if (!Number.isFinite(options.timeoutMs) || options.timeoutMs <= 0) {
-    throw new RangeError("Workflow timeoutMs must be a positive finite number");
+    throw new RangeError("Workflow args exceed the 256 KiB limit");
   }
   if (options.signal.aborted) throw abortError();
 
@@ -154,7 +144,6 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
     let stderr = "";
 
     const clear = () => {
-      clearTimeout(timeout);
       options.signal.removeEventListener("abort", onAbort);
       child.removeListener("message", onMessage);
       child.removeListener("error", onChildError);
@@ -193,7 +182,6 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
       catch { return false; }
     };
     const onAbort = () => fail(abortError());
-    const timeout = setTimeout(() => fail(timeoutError(options.timeoutMs)), options.timeoutMs);
     const onChildError = (error: Error) => fail(error);
     const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
       const detail = stderr.trim();
@@ -306,7 +294,16 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
       if (stderr.length < 64 * KIB) stderr += chunk.toString().slice(0, 64 * KIB - stderr.length);
     });
 
-    const initialized = send({ type: "init", source: options.source, argsJson });
-    if (!initialized) fail(new Error("Unable to initialize workflow sandbox within the 512 KiB IPC limit"));
+    // Source and args are individually bounded above. The combined init frame may
+    // legitimately exceed the ordinary 512 KiB agent-message limit. A false
+    // child.send() return only signals backpressure, so completion is callback-based.
+    try {
+      if (!child.connected) fail(new Error("Unable to initialize workflow sandbox"));
+      else child.send({ token, type: "init", source: options.source, argsJson }, (error) => {
+        if (error) fail(error);
+      });
+    } catch (error) {
+      fail(error instanceof Error ? error : new Error(String(error)));
+    }
   });
 }

@@ -17,7 +17,6 @@ async function fixture(
     args: { value: 7 },
     cwd,
     signal: controller.signal,
-    timeoutMs: 2_000,
     onAgent: async (prompt, agentOptions) => ({
       ok: true,
       output: `${prompt}:${String(agentOptions.tag ?? "")}`,
@@ -82,7 +81,6 @@ test("aborts a running workflow and aborts in-flight agent work", async () => {
   let markStuckStarted!: () => void;
   const stuckStarted = new Promise<void>((resolve) => { markStuckStarted = resolve; });
   const stuck = await fixture(`export default async () => agent("stuck", {})`, {
-    timeoutMs: 5_000,
     onAgent: async () => new Promise(() => { markStuckStarted(); }),
   });
   try {
@@ -93,6 +91,20 @@ test("aborts a running workflow and aborts in-flight agent work", async () => {
     await assert.rejects(running, (error: Error) => error.name === "AbortError");
     assert.ok(Date.now() - startedAt < 1_500, "stuck agent drain must remain bounded");
   } finally { await cleanup(stuck.cwd); }
+});
+
+test("has no overall deadline and runs until explicitly aborted", async () => {
+  const f = await fixture(`export default async () => new Promise(() => {})`);
+  try {
+    const running = runWorkflowSandbox(f.options);
+    const state = await Promise.race([
+      running.then(() => "settled", () => "settled"),
+      new Promise<string>((resolve) => setTimeout(() => resolve("running"), 75)),
+    ]);
+    assert.equal(state, "running");
+    f.controller.abort();
+    await assert.rejects(running, (error: Error) => error.name === "AbortError");
+  } finally { await cleanup(f.cwd); }
 });
 
 test("rejects workflows that return before all agent calls are awaited", async () => {
@@ -116,13 +128,23 @@ test("rejects workflows that return before all agent calls are awaited", async (
   } finally { await cleanup(f.cwd); }
 });
 
-test("enforces payload, execution, call, phase, and parallel limits", async () => {
-  const source = await fixture("x".repeat(256 * 1024 + 1));
-  try { await assert.rejects(runWorkflowSandbox(source.options), /source.*256 KiB/i); }
+test("accepts Davis-sized source and args even when their combined init frame exceeds 512 KiB", async () => {
+  const largeArgs = "y".repeat(200 * 1024);
+  const largeSource = `/*${"x".repeat(400 * 1024)}*/\nexport default async () => args.length`;
+  const f = await fixture(largeSource, { args: largeArgs });
+  try {
+    const value = await runWorkflowSandbox(f.options);
+    assert.equal(value.result, largeArgs.length);
+  } finally { await cleanup(f.cwd); }
+});
+
+test("enforces payload, call, phase, and parallel limits", async () => {
+  const source = await fixture("x".repeat(512 * 1024 + 1));
+  try { await assert.rejects(runWorkflowSandbox(source.options), /source.*512 KiB/i); }
   finally { await cleanup(source.cwd); }
 
-  const args = await fixture(`export default async () => null`, { args: "x".repeat(128 * 1024) });
-  try { await assert.rejects(runWorkflowSandbox(args.options), /args.*128 KiB/i); }
+  const args = await fixture(`export default async () => null`, { args: "x".repeat(256 * 1024) });
+  try { await assert.rejects(runWorkflowSandbox(args.options), /args.*256 KiB/i); }
   finally { await cleanup(args.cwd); }
 
   const result = await fixture(`export default async () => "x".repeat(1024 * 1024)`);
@@ -134,10 +156,6 @@ test("enforces payload, execution, call, phase, and parallel limits", async () =
     const value = await runWorkflowSandbox(ipc.options);
     assert.match((value.result as { error: string }).error, /512 KiB IPC/i);
   } finally { await cleanup(ipc.cwd); }
-  const timeout = await fixture(`export default async () => new Promise(() => {})`, { timeoutMs: 40 });
-  try { await assert.rejects(runWorkflowSandbox(timeout.options), (error: Error) => error.name === "TimeoutError"); }
-  finally { await cleanup(timeout.cwd); }
-
   const phases = await fixture(`
     export default async () => {
       for (let index = 0; index < 129; index++) phase("phase-" + index);

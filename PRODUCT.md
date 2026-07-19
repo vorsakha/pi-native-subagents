@@ -22,7 +22,7 @@ Flat unframed debug output, modal traps, hidden exit behavior, decorative termin
 - Separate job navigation, selected-job detail, and action guidance with clear hierarchy.
 - Use color only for focus, selection, and lifecycle status.
 - Keep every line width-safe and useful on constrained terminals.
-- Make workflow phase, agent, policy, budget, and result state legible without exposing raw scripts or transcripts by default.
+- Make workflow phase, agent, policy, usage, and result state legible without exposing raw scripts or transcripts by default.
 - Support progressive disclosure: bounded cards → operational dashboard → normalized interactive takeover/transcript.
 - Preserve role policy and one global concurrency budget regardless of whether work starts manually or through a workflow.
 

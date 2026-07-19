@@ -531,7 +531,7 @@ test("aggregates usage across all workflow agents", async () => {
         const two = await agent("usage two", { role: "worker" });
         return [one.ok, two.ok];
       }
-    `, { budget: { maxTurns: 2 } }));
+    `));
     await waitFor(() => f.backend.requests.length === 1, "first usage agent");
     f.backend.completeTask("usage one", "one", {
       input: 2, output: 3, cacheRead: 5, cacheWrite: 7, cost: 1.25, turns: 1,
@@ -554,8 +554,8 @@ test("aggregates usage across all workflow agents", async () => {
       cost: 3.75,
       turns: 3,
     });
-    assert.equal(final.status, "aborted");
-    assert.match(final.error ?? "", /turn budget exceeded/);
+    assert.equal(final.status, "completed");
+    assert.equal(final.error, undefined);
   } finally {
     await f.cleanup();
   }
