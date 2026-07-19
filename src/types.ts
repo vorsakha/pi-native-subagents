@@ -41,14 +41,11 @@ export interface BackendPolicy {
   claudeTools: string[];
   approvalPolicy: "never";
   codexSandbox: { type: "dangerFullAccess" } | { type: "readOnly"; networkAccess: false };
-  nestedAgents: string[];
-  depth: number;
-  maxDepth: number;
 }
 
 export interface BackendRequest {
   jobId: string;
-  role: string;
+  name: string;
   task: string;
   systemPrompt: string;
   cwd: string;
@@ -85,27 +82,26 @@ export interface Backend {
   start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun>;
 }
 
-export interface RoleRoute {
-  model: string;
-  thinking: ThinkingLevel;
-  /** Deprecated compatibility metadata; runtime effort is request-scoped and provider-adaptive by default. */
-  effort?: EffortLevel;
-}
+export type ProfileOrigin = "global" | "project";
 
-export interface RoleDefinition {
+export interface ProfileDefinition {
   name: string;
   description: string;
-  access: AccessMode;
-  defaultBackend: BackendName;
+  access?: AccessMode;
+  backend?: BackendName;
+  modelTier?: ModelTier;
+  effort?: EffortLevel;
+  independent?: boolean;
   lockedBackend?: BackendName;
-  /** Route onto a native provider different from the parent model when possible. */
-  differentProviderFromParent?: boolean;
-  nestedAgents: string[];
-  piTools: string[];
-  claudeTools: string[];
-  routes: Record<BackendName, RoleRoute>;
   systemPrompt: string;
   filePath: string;
+  origin: ProfileOrigin;
+}
+
+export interface ProfileValidationWarning {
+  filePath: string;
+  origin: ProfileOrigin;
+  message: string;
 }
 
 export interface WorkflowJobReference {
@@ -116,15 +112,19 @@ export interface WorkflowJobReference {
 }
 
 export interface SpawnRequest {
-  role: string;
+  name?: string;
   task: string;
   cwd: string;
   trusted: boolean;
   backend?: BackendName;
-  tier?: ModelTier;
+  modelTier?: ModelTier;
   effort?: EffortLevel;
+  access?: AccessMode;
+  independent?: boolean;
+  profile?: string;
+  /** Internal configured fallback; not exposed as a model-facing tool field. */
+  defaultBackend?: BackendName;
   parentProvider?: ProviderFamily;
-  depth?: number;
   /** Internal ownership metadata supplied by the workflow runtime, never by a backend. */
   workflow?: WorkflowJobReference;
 }
@@ -138,7 +138,10 @@ export interface ToolTrace {
 
 export interface JobSnapshot {
   id: string;
-  role: string;
+  name: string;
+  access: AccessMode;
+  profile?: string;
+  independent: boolean;
   backend: BackendName;
   model: string;
   /** Explicit request-scoped provider effort; omitted means provider-adaptive. */

@@ -1,4 +1,4 @@
-import type { EffortLevel, ToolTrace, TranscriptEntry } from "../types.ts";
+import type { AccessMode, EffortLevel, ToolTrace, TranscriptEntry } from "../types.ts";
 
 export type WorkflowStatus = "pending" | "running" | "completed" | "failed" | "aborted";
 
@@ -28,8 +28,10 @@ export interface WorkflowUsage {
 
 export interface WorkflowAgentRecord {
   index: number;
-  label: string;
-  role: string;
+  name: string;
+  access: AccessMode;
+  profile?: string;
+  independent: boolean;
   phase: number;
   jobId?: string;
   state: WorkflowAgentState;

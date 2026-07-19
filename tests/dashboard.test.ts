@@ -29,7 +29,7 @@ const theme = {
 function job(id: string, status: JobSnapshot["status"] = "running"): JobSnapshot {
   return {
     id,
-    role: "worker",
+    name: "worker", access: "full", independent: false,
     backend: "codex",
     model: "gpt-5.6",
     effort: "high",

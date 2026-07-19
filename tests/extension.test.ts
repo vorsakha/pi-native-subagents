@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
@@ -74,6 +74,7 @@ const theme = {
 };
 
 function context(branch: unknown[] = [], provider?: string) {
+  const notifications: string[] = [];
   return {
     cwd: process.cwd(),
     model: provider ? { provider, id: "parent-model" } : undefined,
@@ -82,18 +83,23 @@ function context(branch: unknown[] = [], provider?: string) {
     isIdle: () => false,
     sessionManager: { getBranch: () => branch, getSessionId: () => "extension-session" },
     ui: {
+      notifications,
       setStatus() {},
-      notify() {},
+      notify(message: string) { notifications.push(message); },
     },
   } as any;
 }
 
-test("extension registers once and spawn uses role default while foreground uses legacy session profile", async () => {
+test("extension exposes generic direct tools, configured routing, independence, and one-shot delivery", async () => {
   const pi = fakePi();
   const registry = {};
   const backends = [new ImmediateBackend("pi"), new ImmediateBackend("claude"), new ImmediateBackend("codex")];
-  const workflowArtifactRoot = join(await mkdtemp(join(tmpdir(), "extension-workflows-")), "runs");
-  registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot });
+  const extensionRoot = await mkdtemp(join(tmpdir(), "extension-workflows-"));
+  const workflowArtifactRoot = join(extensionRoot, "runs");
+  const globalProfilesDir = join(extensionRoot, "profiles");
+  await mkdir(globalProfilesDir);
+  await writeFile(join(globalProfilesDir, "audit.md"), "---\nname: audit\naccess: readOnly\n---\nAudit carefully.\n");
+  registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir });
 
   assert.deepEqual([...pi.tools.keys()].sort(), [
     "subagent", "subagent_cancel", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
@@ -103,52 +109,63 @@ test("extension registers once and spawn uses role default while foreground uses
   assert.ok(pi.messageRenderers.has("native-subagent-result"));
   assert.throws(() => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }), /loaded more than once/);
 
-  const ctx = context([{ type: "custom", customType: "subagents-profile", data: { profile: "pi" } }]);
+  const ctx = context([{ type: "custom", customType: "native-subagents-profile", data: { backend: "pi" } }]);
   pi.handlers.get("session_start")?.({}, ctx);
+  await pi.commands.get("subagents").handler("profiles", ctx);
+  assert.match(ctx.ui.notifications.at(-1) ?? "", /audit \(global\)/);
 
-  const background = await pi.tools.get("subagent_spawn").execute("spawn", { role: "researcher", task: "background" }, undefined, undefined, ctx);
-  assert.equal(background.details.job.backend, "claude", "background spawn must preserve researcher.defaultBackend");
+  const background = await pi.tools.get("subagent_spawn").execute("spawn", { name: "research", task: "background" }, undefined, undefined, ctx);
+  assert.equal(background.details.job.backend, "pi", "background spawn uses the configured backend");
+  assert.equal(background.details.job.access, "full", "trusted generic agents default to full access");
   await new Promise((resolve) => setImmediate(resolve));
   pi.handlers.get("agent_settled")?.();
   assert.equal((pi.messages[0] as any)?.customType, "native-subagent-result", "unconsumed background result is delivered once");
 
-  const consumed = await pi.tools.get("subagent_spawn").execute("spawn", { role: "researcher", task: "consumed", effort: "high" }, undefined, undefined, ctx);
+  const consumed = await pi.tools.get("subagent_spawn").execute("spawn", { name: "reader", task: "consumed", access: "readOnly", effort: "high" }, undefined, undefined, ctx);
   assert.equal(consumed.details.job.effort, "high");
   await pi.tools.get("subagent_wait").execute("wait", { jobId: consumed.details.job.id }, undefined, undefined, ctx);
   pi.handlers.get("agent_settled")?.();
   assert.equal(pi.messages.length, 1, "wait consumes deferred delivery without duplication");
   const historicalContext = { args: {}, state: {}, invalidate() {} };
   const generationZero = pi.tools.get("subagent_spawn").renderResult(consumed, { expanded: true, isPartial: false }, theme, historicalContext).render(100).join("\n");
-  assert.match(generationZero, /claude-ok/);
+  assert.match(generationZero, /pi-ok/);
   const reused = await pi.tools.get("subagent_send").execute("send", { jobId: consumed.details.job.id, message: "second generation", behavior: "followUp" }, undefined, undefined, ctx);
   assert.equal(reused.details.job.effort, "high", "retained-session generations preserve request effort metadata");
   await new Promise((resolve) => setImmediate(resolve));
   pi.handlers.get("agent_settled")?.();
   assert.equal(pi.messages.length, 2, "consumption is scoped to one generation; reused-session output still delivers once");
   const historicalAfterFollowUp = pi.tools.get("subagent_spawn").renderResult(consumed, { expanded: true, isPartial: false }, theme, historicalContext).render(100).join("\n");
-  assert.match(historicalAfterFollowUp, /claude-ok/);
+  assert.match(historicalAfterFollowUp, /pi-ok/);
   assert.doesNotMatch(historicalAfterFollowUp, /second generation/, "older thread cards stay pinned to their own generation");
 
   const explicitClaude = await pi.tools.get("subagent_spawn").execute("claude-tier", {
-    role: "worker", task: "explicit Claude wins", backend: "claude", modelTier: "economy", effort: "max",
+    name: "implementation", task: "explicit Claude wins", backend: "claude", modelTier: "economy", effort: "max",
   }, undefined, undefined, ctx);
   assert.equal(explicitClaude.details.job.backend, "claude", "explicit backend must outrank modelTier");
   assert.equal(explicitClaude.details.job.model, "haiku", "Claude resolves economy within its provider family");
   await pi.tools.get("subagent_wait").execute("wait-claude-tier", { jobId: explicitClaude.details.job.id }, undefined, undefined, ctx);
   assert.equal(backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "explicit Claude wins")?.policy.effort, "max");
 
-  const foreground = await pi.tools.get("subagent").execute("foreground", { agent: "researcher", task: "foreground" }, undefined, undefined, ctx);
-  assert.equal(foreground.details.job.backend, "pi", "compatibility foreground uses the restored session profile");
-  const adversaryDefault = await pi.tools.get("subagent").execute("foreground-adversary", { agent: "adversary", task: "cross-provider default" }, undefined, undefined, ctx);
-  assert.equal(adversaryDefault.details.job.backend, "claude", "unknown parent provider uses the adversary's Claude fallback");
-  assert.equal(adversaryDefault.details.job.model, "opus");
+  const profiled = await pi.tools.get("subagent").execute("profiled", { task: "profiled audit", profile: "audit", access: "full" }, undefined, undefined, ctx);
+  assert.equal(profiled.details.job.access, "readOnly", "profile access is a ceiling in direct tools");
+  assert.match(backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "profiled audit")?.systemPrompt ?? "", /Audit carefully/);
+
+  const foreground = await pi.tools.get("subagent").execute("foreground", { name: "foreground", task: "foreground" }, undefined, undefined, ctx);
+  assert.equal(foreground.details.job.backend, "pi", "foreground uses the same configured generic route");
+  const independentDefault = await pi.tools.get("subagent").execute("foreground-independent", { name: "independent", independent: true, task: "cross-provider default" }, undefined, undefined, ctx);
+  assert.equal(independentDefault.details.job.backend, "claude", "unknown parent provider uses native Claude for independent work");
+  assert.equal(independentDefault.details.job.model, "sonnet");
   const claudeParent = context([], "anthropic");
-  const adversaryAgainstClaude = await pi.tools.get("subagent_spawn").execute("adversary-codex", { role: "adversary", task: "review Claude independently" }, undefined, undefined, claudeParent);
-  assert.equal(adversaryAgainstClaude.details.job.backend, "codex");
-  assert.equal(adversaryAgainstClaude.details.job.model, "gpt-5.6-sol");
+  const independentAgainstClaude = await pi.tools.get("subagent_spawn").execute("independent-codex", { name: "second-opinion", independent: true, task: "review Claude independently" }, undefined, undefined, claudeParent);
+  assert.equal(independentAgainstClaude.details.job.backend, "codex");
+  assert.equal(independentAgainstClaude.details.job.model, "gpt-5.6-terra");
   await assert.rejects(
-    pi.tools.get("subagent_spawn").execute("adversary-same", { role: "adversary", backend: "claude", task: "invalid same provider" }, undefined, undefined, claudeParent),
+    pi.tools.get("subagent_spawn").execute("independent-same", { independent: true, backend: "claude", task: "invalid same provider" }, undefined, undefined, claudeParent),
     /different from the parent claude/,
+  );
+  await assert.rejects(
+    pi.tools.get("subagent_spawn").execute("legacy", { role: "worker", task: "old contract" }, undefined, undefined, ctx),
+    /Legacy role, agent, and modelProfile arguments are not supported/,
   );
 
   await pi.handlers.get("session_shutdown")?.();
@@ -168,12 +185,13 @@ test("extension registers once and spawn uses role default while foreground uses
     legacyRoot: false,
     backends: [new HoldingBackend("pi"), new HoldingBackend("claude"), new HoldingBackend("codex")],
     workflowArtifactRoot: join(await mkdtemp(join(tmpdir(), "extension-pulse-workflows-")), "runs"),
+    globalProfilesDir: join(await mkdtemp(join(tmpdir(), "extension-pulse-profiles-")), "profiles"),
     setInterval: fakeSetInterval,
     clearInterval: fakeClearInterval,
   });
   const pulseCtx = context();
   pulsePi.handlers.get("session_start")?.({}, pulseCtx);
-  const active = await pulsePi.tools.get("subagent_spawn").execute("pulse", { role: "researcher", task: "show pulse" }, undefined, undefined, pulseCtx);
+  const active = await pulsePi.tools.get("subagent_spawn").execute("pulse", { name: "pulse", task: "show pulse" }, undefined, undefined, pulseCtx);
   await new Promise((resolve) => setImmediate(resolve));
   let invalidations = 0;
   const renderContext = { args: {}, state: {}, invalidate: () => { invalidations++; } };

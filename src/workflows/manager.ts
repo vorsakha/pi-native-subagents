@@ -3,7 +3,7 @@ import type { TSchema } from "typebox";
 import { Check } from "typebox/value";
 import type { JobManager } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
-import type { BackendEvent, BackendName, EffortLevel, JobSnapshot, ModelTier, ProviderFamily, Usage } from "../types.ts";
+import type { AccessMode, BackendEvent, BackendName, EffortLevel, JobSnapshot, ModelTier, ProviderFamily, Usage } from "../types.ts";
 import {
   checkpointWorkflow,
   createWorkflowArtifacts,
@@ -24,6 +24,7 @@ import type {
 const BACKENDS = new Set<BackendName>(["pi", "claude", "codex"]);
 const TIERS = new Set<ModelTier>(["economy", "balanced", "quality"]);
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
+const ACCESS = new Set<AccessMode>(["readOnly", "full"]);
 const CHECKPOINT_DELAY_MS = 150;
 const MAX_RETAINED_RUNS = 64;
 export const MAX_WORKFLOW_PHASES = 64;
@@ -38,7 +39,7 @@ export interface StartWorkflowRequest {
   cwd: string;
   trusted: boolean;
   parentProvider?: ProviderFamily;
-  depth?: number;
+  defaultBackend?: BackendName;
 }
 
 export interface StartedWorkflow {
@@ -197,7 +198,7 @@ export class WorkflowManager {
     if (!entry) throw new Error(`Unknown workflow: ${runId}`);
     const agent = entry.snapshot.agents.find((candidate) => candidate.index === agentIndex);
     if (!agent) throw new Error(`Unknown workflow agent: ${agentIndex}`);
-    if (!agent.jobId) throw new Error(`Workflow agent ${agent.label} has not started`);
+    if (!agent.jobId) throw new Error(`Workflow agent ${agent.name} has not started`);
     if (["completed", "failed", "cancelled", "aborted"].includes(agent.state)) return this.check(runId);
     await this.#jobs.cancel(agent.jobId, reason);
     return this.check(runId);
@@ -281,27 +282,34 @@ export class WorkflowManager {
     signal: AbortSignal,
   ): Promise<WorkflowAgentResult> {
     if (!prompt.trim()) return { ok: false, output: "", error: "agent() requires a non-empty prompt" };
-    const role = typeof options.role === "string" ? options.role.trim() : "";
-    if (!role) return { ok: false, output: "", error: "agent() requires options.role" };
+    if (["role", "agent", "tier", "modelProfile"].some((key) => Object.hasOwn(options, key))) {
+      return { ok: false, output: "", error: "Legacy workflow role, agent, tier, and modelProfile options are not supported" };
+    }
     const backend = options.backend === undefined ? undefined : String(options.backend) as BackendName;
     if (backend && !BACKENDS.has(backend)) return { ok: false, output: "", error: `Unknown backend: ${backend}` };
-    const tierValue = options.modelTier ?? options.tier;
-    const tier = tierValue === undefined ? undefined : String(tierValue) as ModelTier;
+    const tier = options.modelTier === undefined ? undefined : String(options.modelTier) as ModelTier;
     if (tier && !TIERS.has(tier)) return { ok: false, output: "", error: `Unknown model tier: ${tier}` };
     const effortValue = options.effort;
     const effort = effortValue === undefined ? undefined : String(effortValue) as EffortLevel;
     if (effort && !EFFORTS.has(effort)) return { ok: false, output: "", error: `Unknown effort: ${effort}` };
+    const access = options.access === undefined ? undefined : String(options.access) as AccessMode;
+    if (access && !ACCESS.has(access)) return { ok: false, output: "", error: `Unknown access: ${access}` };
+    if (options.independent !== undefined && typeof options.independent !== "boolean") return { ok: false, output: "", error: "independent must be boolean" };
+    if (options.profile !== undefined && (typeof options.profile !== "string" || !options.profile.trim())) return { ok: false, output: "", error: "profile must be a non-empty string" };
 
     const phase = typeof options.phase === "string"
       ? this.#ensurePhase(entry, options.phase)
       : entry.snapshot.currentPhase ?? this.#ensurePhase(entry, "Agents");
     this.#markPhaseRunning(entry, phase);
     const index = entry.snapshot.agents.length;
+    const name = label(options.name ?? options.label, `agent-${index + 1}`);
     const now = Date.now();
     const record: WorkflowAgentRecord = {
       index,
-      label: label(options.label, `${role}-${index + 1}`),
-      role,
+      name,
+      access: access ?? "full",
+      profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
+      independent: options.independent === true,
       phase,
       state: "queued",
       timestamps: { createdAt: now, updatedAt: now },
@@ -330,19 +338,22 @@ export class WorkflowManager {
     let job: JobSnapshot;
     try {
       job = this.#jobs.spawn({
-        role,
+        name,
         task,
         cwd: request.cwd,
         trusted: request.trusted,
         backend,
-        tier,
+        modelTier: tier,
         effort,
+        access,
+        independent: options.independent === true,
+        profile: record.profile,
+        defaultBackend: request.defaultBackend,
         parentProvider: request.parentProvider,
-        depth: request.depth,
         workflow: {
           runId: entry.snapshot.runId,
           agentIndex: index,
-          label: record.label,
+          label: record.name,
           phase: entry.snapshot.phases[phase]?.name,
         },
       });
@@ -356,6 +367,10 @@ export class WorkflowManager {
     }
 
     record.jobId = job.id;
+    record.name = job.name;
+    record.access = job.access;
+    record.profile = job.profile;
+    record.independent = job.independent;
     record.backend = job.backend;
     record.model = job.model;
     record.timestamps.updatedAt = Date.now();
@@ -407,6 +422,10 @@ export class WorkflowManager {
     catch { return agent; }
     return {
       ...agent,
+      name: job.name,
+      access: job.access,
+      profile: job.profile,
+      independent: job.independent,
       state: agentState(job),
       backend: job.backend,
       model: job.model,
@@ -441,6 +460,10 @@ export class WorkflowManager {
 
     const now = Date.now();
     agent.state = agentState(job);
+    agent.name = job.name;
+    agent.access = job.access;
+    agent.profile = job.profile;
+    agent.independent = job.independent;
     agent.backend = job.backend;
     agent.model = job.model;
     agent.effort = job.effort;

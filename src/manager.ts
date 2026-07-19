@@ -1,12 +1,13 @@
 import { randomUUID } from "node:crypto";
-import { childDelegationEnv } from "./env.ts";
 import { compilePolicy } from "./policy.ts";
 import { emptyUsage, reduceJob } from "./reducer.ts";
-import type { Backend, BackendEvent, BackendRun, JobSnapshot, RoleDefinition, SendBehavior, SpawnRequest } from "./types.ts";
+import type { Backend, BackendEvent, BackendRun, JobSnapshot, ProfileDefinition, SendBehavior, SpawnRequest } from "./types.ts";
+
+const GENERIC_SYSTEM_PROMPT = `You are an isolated, task-driven subagent. Work only on the supplied task and return a concise, evidence-based result. You do not have access to parent conversation context beyond the task. Do not spawn subagents or workflows.`;
 
 interface InternalJob {
   snapshot: JobSnapshot;
-  role: RoleDefinition;
+  profile?: ProfileDefinition;
   request: SpawnRequest;
   policy: ReturnType<typeof compilePolicy>["policy"];
   run?: BackendRun;
@@ -43,36 +44,40 @@ const REUSABLE_SESSION_TTL_MS = 15 * 60_000;
 
 export class JobManager {
   readonly #backends: Map<string, Backend>;
-  readonly #roles: Map<string, RoleDefinition>;
+  readonly #profiles: Map<string, ProfileDefinition>;
   readonly #jobs = new Map<string, InternalJob>();
   readonly #queue: string[] = [];
   readonly #waiters = new Map<string, Set<() => void>>();
   readonly #listeners = new Set<(job: JobSnapshot, event: BackendEvent) => void>();
   readonly #launches = new Set<Promise<void>>();
   readonly #concurrency: number;
-  readonly #maxDepth: number;
   #active = 0;
   #closed = false;
 
-  constructor(options: { backends: Backend[]; roles: Map<string, RoleDefinition>; concurrency?: number; maxDepth?: number }) {
+  constructor(options: { backends: Backend[]; profiles?: Map<string, ProfileDefinition>; concurrency?: number }) {
     this.#backends = new Map(options.backends.map((backend) => [backend.name, backend]));
-    this.#roles = options.roles;
+    this.#profiles = options.profiles ?? new Map();
     this.#concurrency = Math.max(1, Math.min(4, options.concurrency ?? 4));
-    this.#maxDepth = options.maxDepth ?? 2;
   }
 
   spawn(request: SpawnRequest): JobSnapshot {
     if (this.#closed) throw new Error("Job manager is closed");
     if (!request.task.trim()) throw new Error("Task must not be empty");
-    const role = this.#roles.get(request.role);
-    if (!role) throw new Error(`Unknown subagent role: ${request.role}`);
-    const { policy } = compilePolicy(role, request, this.#maxDepth);
+    const profileName = request.profile?.trim();
+    if (request.profile !== undefined && !profileName) throw new Error("Profile must be a non-empty string");
+    const profile = profileName ? this.#profiles.get(profileName) : undefined;
+    if (profileName && !profile) throw new Error(`Unknown subagent profile: ${profileName}`);
+    const { policy, independent } = compilePolicy(request, profile);
     if (!this.#backends.has(policy.backend)) throw new Error(`Backend is unavailable: ${policy.backend}`);
     this.#evictOldJobs();
     const id = randomUUID();
+    const name = request.name?.replace(/\s+/g, " ").trim().slice(0, 160) || `agent-${id.slice(0, 8)}`;
     const snapshot: JobSnapshot = {
       id,
-      role: role.name,
+      name,
+      access: policy.access,
+      profile: profile?.name,
+      independent,
       backend: policy.backend,
       model: policy.model,
       effort: policy.effort,
@@ -90,7 +95,7 @@ export class JobManager {
       queuedMessages: [],
       workflow: request.workflow ? { ...request.workflow } : undefined,
     };
-    this.#jobs.set(id, { snapshot, role, request, policy });
+    this.#jobs.set(id, { snapshot, profile, request, policy });
     this.#queue.push(id);
     this.#pump();
     return clone(snapshot);
@@ -283,15 +288,15 @@ export class JobManager {
     job.startupController = startupController;
     this.#emit(job, { type: "started" });
     try {
-      const env = childDelegationEnv(process.env, job.policy.depth, job.policy.nestedAgents);
+      const systemPrompt = [GENERIC_SYSTEM_PROMPT, job.profile?.systemPrompt].filter(Boolean).join("\n\n");
       job.run = await backend.start({
         jobId: job.snapshot.id,
-        role: job.role.name,
+        name: job.snapshot.name,
         task: job.request.task,
-        systemPrompt: job.role.systemPrompt,
+        systemPrompt,
         cwd: job.request.cwd,
         policy: job.policy,
-        env,
+        env: process.env,
         signal: startupController.signal,
       }, (event) => this.#handleBackendEvent(job, event));
       job.startupController = undefined;

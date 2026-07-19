@@ -100,13 +100,12 @@ async function fixture(source: string): Promise<{ dir: string; command: string }
 
 function request(backend: BackendName, cwd: string, env: NodeJS.ProcessEnv): BackendRequest {
   return {
-    jobId: `job-${backend}`, role: "worker", task: "fixture task", systemPrompt: "fixture system", cwd, env,
+    jobId: `job-${backend}`, name: "worker", task: "fixture task", systemPrompt: "fixture system", cwd, env,
     signal: new AbortController().signal,
     policy: {
       backend, access: "readOnly", model: "fixture-model", thinking: "low",
       piTools: [], claudeTools: [], approvalPolicy: "never",
       codexSandbox: { type: "readOnly", networkAccess: false },
-      nestedAgents: [], depth: 1, maxDepth: 2,
     },
   };
 }
@@ -125,7 +124,7 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
   const envFile = join(fake.dir, "env.json");
   const events: BackendEvent[] = [];
   try {
-    const backend = new PiRpcBackend(fake.command, { requestTimeoutMs: 500, runTimeoutMs: 2_000 });
+    const backend = new PiRpcBackend(fake.command, { requestTimeoutMs: 1_000, runTimeoutMs: 2_000 });
     const run = await backend.start(request("pi", fake.dir, {
       ...process.env, MODE: "complete", ARG_FILE: argFile, ENV_FILE: envFile,
       OPENAI_API_KEY: "must-not-leak", CODEX_API_KEY: "must-not-leak",
@@ -161,7 +160,7 @@ test("Pi RPC maps assistant, stream, extension, and exhausted-retry errors at se
       const fake = await fixture(PI_FIXTURE);
       const events: BackendEvent[] = [];
       try {
-        const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 500, runTimeoutMs: 2_000 })
+        const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 1_000, runTimeoutMs: 2_000 })
           .start(request("pi", fake.dir, { ...process.env, MODE: mode }), (event) => events.push(event));
         await run.completed;
         const event = terminal(events) as Extract<BackendEvent, { type: "failed" | "cancelled" }>;

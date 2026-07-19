@@ -34,12 +34,12 @@ function workflow(overrides: Partial<WorkflowSnapshot> = {}): WorkflowSnapshot {
     ],
     agents: [
       {
-        index: 0, label: "reviewer", role: "reviewer", phase: 0, state: "completed",
+        index: 0, name: "reviewer", access: "readOnly", independent: true, phase: 0, state: "completed",
         timestamps: { createdAt, updatedAt: 2_000 }, backend: "claude", model: "sonnet",
         preview: "Review complete", output: "Review complete", usage: { input: 1_200, output: 300, cacheRead: 50, cacheWrite: 0, cost: 0.01, turns: 2 },
       },
       {
-        index: 1, label: "tests", role: "worker", phase: 1, state: "running",
+        index: 1, name: "tests", access: "full", independent: false, phase: 1, state: "running",
         timestamps: { createdAt, updatedAt: 3_000 }, backend: "codex", model: "gpt-5",
         preview: "Running targeted tests", usage: { input: 800, output: 200, cacheRead: 0, cacheWrite: 20, cost: 0.02, turns: 1 },
       },
@@ -60,7 +60,7 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
       timestamps: { createdAt: 1_000, updatedAt: 5_000 }, agents: [index],
     })),
     agents: Array.from({ length: 30 }, (_, index) => ({
-      index, label: `agent ${index}\u0007`, role: "worker", phase: index,
+      index, name: `agent ${index}\u0007`, access: "full", independent: false, phase: index,
       state: index < 29 ? "completed" as const : "failed" as const,
       timestamps: { createdAt: 1_000, updatedAt: 5_000 }, preview: `preview ${index}`,
       usage: { input: 1_000, output: 500, cacheRead: 100, cacheWrite: 10, cost: 0.01, turns: 1 },
@@ -78,6 +78,7 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
   assert.ok(expanded.length <= MAX_EXPANDED_LINES);
   assert.ok(expanded.at(-1)?.includes("/workflows"));
   assert.ok(expanded.every((line) => !CONTROL_CHARS.test(line)));
+  assert.ok(buildWorkflowCardLines(workflow(), theme, { expanded: true, now: 6_000 }).some((line) => line.includes("independent")), "cross-provider independence is visible in workflow cards");
   const partial = workflow({
     agents: workflow().agents.map((agent, index) => ({
       ...agent,

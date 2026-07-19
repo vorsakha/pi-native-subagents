@@ -352,7 +352,7 @@ export class WorkflowsDashboardOverlay {
     const duration = formatAgentElapsed(agent, this.#now());
     const usage = formatUsage(agent.usage);
     const lines: string[] = [
-      `${this.theme.fg("accent", this.theme.bold(sanitizeInline(agent.label || agent.role)))} ${this.theme.fg(status.color, `· ${status.glyph} ${agent.state}`)} ${this.theme.fg("dim", `· ${sanitizeInline(agent.role)}`)}`,
+      `${this.theme.fg("accent", this.theme.bold(sanitizeInline(agent.name)))} ${this.theme.fg(status.color, `· ${status.glyph} ${agent.state}`)} ${this.theme.fg("dim", `· ${agent.access}${agent.profile ? ` · profile ${sanitizeInline(agent.profile)}` : ""}${agent.independent ? " · independent" : ""}`)}`,
       this.theme.fg("dim", `${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${route} · effort ${effort} · ${duration}`),
       this.theme.fg("dim", `${phase ? `${sanitizeInline(run.name)} · ${sanitizeInline(phase.name)}` : sanitizeInline(run.name)}${usage ? ` · ${usage}` : ""}`),
     ];
@@ -426,10 +426,10 @@ export class WorkflowsDashboardOverlay {
   private renderAgentRow(agent: WorkflowAgentRecord, selected: boolean): string {
     const status = statusMeta(agent.state);
     const marker = selected ? this.theme.fg("accent", "›") : " ";
-    const label = selected ? this.theme.fg("accent", sanitizeInline(agent.label || agent.role)) : this.theme.fg("text", sanitizeInline(agent.label || agent.role));
+    const label = selected ? this.theme.fg("accent", sanitizeInline(agent.name)) : this.theme.fg("text", sanitizeInline(agent.name));
     const route = agent.backend || agent.model ? `${sanitizeInline(agent.backend ?? "backend")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
     const usage = formatUsage(agent.usage);
-    return `${marker} ${this.theme.fg(status.color, status.glyph)} ${label} ${this.theme.fg("dim", `· ${sanitizeInline(agent.role)} · ${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}${usage ? ` · ${usage}` : ""}`)}`;
+    return `${marker} ${this.theme.fg(status.color, status.glyph)} ${label} ${this.theme.fg("dim", `· ${agent.access}${agent.profile ? ` · profile ${sanitizeInline(agent.profile)}` : ""}${agent.independent ? " · independent" : ""} · ${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}${usage ? ` · ${usage}` : ""}`)}`;
   }
 
   private allPhaseAgents(run: WorkflowSnapshot, phase: WorkflowPhase | undefined): WorkflowAgentRecord[] {

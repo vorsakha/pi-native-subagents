@@ -83,18 +83,3 @@ export function sanitizeSubscriptionEnv(
   }
   return env;
 }
-
-export function childDelegationEnv(
-  source: NodeJS.ProcessEnv,
-  depth: number,
-  allowedAgents: string[],
-): NodeJS.ProcessEnv {
-  const env = { ...source };
-  for (const key of Object.keys(env)) {
-    const normalized = key.toUpperCase();
-    if (normalized === "PI_NATIVE_SUBAGENTS_DEPTH" || normalized === "PI_NATIVE_SUBAGENTS_ALLOWED" || normalized === "PI_SUBAGENTS_ALLOWED" || normalized === "PI_SUBAGENT_ALLOWED") delete env[key];
-  }
-  env.PI_NATIVE_SUBAGENTS_DEPTH = String(depth);
-  if (allowedAgents.length > 0) env.PI_NATIVE_SUBAGENTS_ALLOWED = allowedAgents.join(",");
-  return env;
-}

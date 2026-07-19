@@ -23,8 +23,8 @@ export interface WorkflowRegistration {
 }
 
 export interface RegisterWorkflowOptions {
-  roleNames: string[];
   artifactRoot?: string;
+  defaultBackend?: () => "pi" | "claude" | "codex";
 }
 
 function expandHint(): string {
@@ -40,8 +40,10 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
     result,
     agents: snapshot.agents.map((agent) => ({
       index: agent.index,
-      label: agent.label,
-      role: agent.role,
+      name: agent.name,
+      access: agent.access,
+      profile: agent.profile,
+      independent: agent.independent,
       phase: agent.phase,
       jobId: agent.jobId,
       state: agent.state,
@@ -129,15 +131,17 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   pi.registerTool({
     name: "workflow",
     label: "Workflow",
-    description: `Run sandboxed JavaScript orchestration over native role-based subagents. Available roles: ${options.roleNames.join(", ") || "none"}. Scripts export a default async function and may call phase(title), agent(prompt,{role,label?,backend?,modelTier?,effort?,phase?,schema?}), and parallel(tasks,{concurrency?}). Runs are limited to 32 agent calls and four concurrent agents.`,
+    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Scripts export a default async function and may call phase(title), agent(prompt,{name?,label?,access?,backend?,modelTier?,effort?,independent?,profile?,phase?,schema?}), and parallel(tasks,{concurrency?}). agent(prompt) works without options. Runs are limited to 32 agent calls and four concurrent agents.",
     promptSnippet: "Run a sandboxed multi-agent workflow with phases and bounded parallelism",
     promptGuidelines: [
       "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls.",
-      "Every agent() call must include an explicit role; workflow scripts cannot override role access policies.",
+      "agent(prompt) is generic and defaults to full access after project trust; set access=readOnly for inspection.",
+      "Use independent=true when a review or critique must run on a native provider different from the parent.",
+      "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
       "Scripts cannot access files, network, environment variables, subprocesses, imports, or credentials; only agent, parallel, phase, and JSON args are available.",
       "Use background=true for independent long work; completion is delivered automatically as a follow-up.",
       "Keep workflow results JSON-serializable and branch explicitly on each agent result's ok field.",
-      "Use agent schema for validated JSON output when downstream phases need structure; schema cannot change role permissions.",
+      "Use agent schema for validated JSON output when downstream phases need structure; schema cannot change access policy.",
     ],
     parameters: Type.Object({
       name: Type.String({ minLength: 1, maxLength: 160 }),
@@ -148,7 +152,6 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const workflows = getManager();
-      const depth = Number.parseInt(process.env.PI_NATIVE_SUBAGENTS_DEPTH ?? "0", 10) || 0;
       const request: StartWorkflowRequest = {
         sessionId: sessionId(ctx),
         name: params.name,
@@ -159,7 +162,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         cwd: ctx.cwd,
         trusted: ctx.isProjectTrusted(),
         parentProvider: providerFamily(ctx.model?.provider),
-        depth,
+        defaultBackend: options.defaultBackend?.() ?? "codex",
       };
       const started = await workflows.start(request);
       const runGeneration = generation;

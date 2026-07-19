@@ -27,13 +27,13 @@ function workflow(id: string, status: WorkflowSnapshot["status"] = "running"): W
     phases: [{ index: 0, name: "Verification", status, timestamps: { createdAt: 1_000, updatedAt: 3_000 }, agents: [0, 1] }],
     agents: [
       {
-        index: 0, label: "review", role: "reviewer", phase: 0, state: status === "running" ? "completed" : settledAgentState,
+        index: 0, name: "review", access: "readOnly", independent: false, phase: 0, state: status === "running" ? "completed" : settledAgentState,
         timestamps: { createdAt: 1_000, updatedAt: 3_000, startedAt: 2_000 }, backend: "claude", model: "sonnet", effort: "high",
         jobId: "review-job-0001", prompt: "Review the implementation", tools: [{ id: "read-1", name: "read", summary: "src/index.ts", status: "completed" }],
         output: "review result", preview: "review result", usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.01, turns: 1 },
       },
       {
-        index: 1, label: "tests", role: "worker", phase: 0, state: status === "running" ? "running" : settledAgentState,
+        index: 1, name: "tests", access: "full", independent: false, phase: 0, state: status === "running" ? "running" : settledAgentState,
         timestamps: { createdAt: 1_000, updatedAt: 3_000, startedAt: 2_000 }, backend: "codex", model: "gpt-5", effort: "medium",
         jobId: "tests-job-0002", prompt: "\u001b[31mRun the affected tests\u001b[0m", liveThinking: "\u001b]0;bad\u0007checking failures", tools: [{ id: "bash-1", name: "bash", summary: "npm test", status: "running" }],
         output: Array.from({ length: 60 }, (_, index) => `test result ${index}`).join("\n"), preview: "test result 59",
@@ -207,7 +207,7 @@ test("dashboard navigation, cancellation, and scrolling share one interaction co
 
   overlay.render(52);
   overlay.handleInput("\t");
-  assert.ok(overlay.render(52).some((line) => line.includes("worker")));
+  assert.ok(overlay.render(52).some((line) => line.includes("tests")));
   overlay.handleInput("\r");
   const workerHeader = overlay.render(52);
   assert.ok(workerHeader.some((line) => line.includes("Run the affected tests")));

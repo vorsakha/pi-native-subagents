@@ -279,8 +279,7 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
     })),
     agents: snapshot.agents.slice(0, 32).map((agent) => ({
       ...agent,
-      label: truncateUtf8(agent.label, 1_000),
-      role: truncateUtf8(agent.role, 1_000),
+      name: truncateUtf8(agent.name, 1_000),
       prompt: agent.prompt ? truncateUtf8(agent.prompt, 2 * 1024) : undefined,
       tools: agent.tools?.slice(-8).map((tool) => ({
         ...tool,
@@ -408,7 +407,7 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
     ...snapshot.phases.map((phase) => `- ${phase.name}: ${phase.status} (${phase.agents.length} agents)`),
     "",
     "## Agents",
-    ...snapshot.agents.map((agent) => `### ${agent.label}\n\n- Role: ${agent.role}\n- Status: ${agent.state}\n- Route: ${agent.backend ?? "?"}/${agent.model ?? "?"}\n\n${truncateUtf8(String(agent.output ?? agent.preview ?? agent.error ?? "(no output)"), 8 * 1024)}\n`),
+    ...snapshot.agents.map((agent) => `### ${agent.name}\n\n- Access: ${agent.access}\n- Profile: ${agent.profile ?? "none"}\n- Independent: ${agent.independent ? "yes" : "no"}\n- Status: ${agent.state}\n- Route: ${agent.backend ?? "?"}/${agent.model ?? "?"}\n- Effort: ${agent.effort ?? "adaptive"}\n\n${truncateUtf8(String(agent.output ?? agent.preview ?? agent.error ?? "(no output)"), 8 * 1024)}\n`),
     "## Result",
     "",
     "```json",
@@ -449,7 +448,11 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
     && typeof candidate.timestamps.createdAt === "number"
     && typeof candidate.timestamps.updatedAt === "number"
     && Array.isArray(candidate.phases)
-    && Array.isArray(candidate.agents);
+    && Array.isArray(candidate.agents)
+    && candidate.agents.every((agent) => !!agent && typeof agent === "object"
+      && typeof agent.name === "string"
+      && (agent.access === "readOnly" || agent.access === "full")
+      && typeof agent.independent === "boolean");
 }
 
 function abortStaleWorkflow(snapshot: WorkflowSnapshot, now: number, staleAfterMs: number): WorkflowSnapshot {

@@ -29,8 +29,10 @@ function snapshot(sessionId: string, now = Date.now()): Omit<WorkflowSnapshot, "
     }],
     agents: [{
       index: 0,
-      label: "security",
-      role: "reviewer",
+      name: "security",
+      access: "readOnly",
+      profile: "reviewer",
+      independent: false,
       phase: 0,
       jobId: "job-1",
       state: "running",

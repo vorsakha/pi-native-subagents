@@ -1,30 +1,24 @@
 # Product
 
-## Register
-
-product
-
 ## Users
-Pi users supervising native coding subagents and repeatable multi-agent workflows from a terminal while staying inside their primary working session.
 
-## Product Purpose
-Provide a reliable, glanceable control surface for inspecting, steering, following up with, and cancelling subagents, plus safely orchestrating them through sandboxed phased workflows without leaving Pi or losing keyboard control.
+Pi users supervising native coding subagents and repeatable multi-agent workflows from a terminal while staying inside their primary session.
 
-## Brand Personality
-Focused, operational, familiar.
+## Product purpose
 
-## Anti-references
-Flat unframed debug output, modal traps, hidden exit behavior, decorative terminal chrome, noisy dashboards, and interfaces that invent keyboard conventions when Pi already provides them.
+Provide a reliable control surface for starting generic task-driven agents, inspecting their policy and progress, steering retained native sessions, and safely orchestrating phased workflows.
 
-## Design Principles
-- Match Pi's established TUI vocabulary so controls feel native.
-- Make escape routes obvious and reliable before adding secondary actions.
-- Separate job navigation, selected-job detail, and action guidance with clear hierarchy.
-- Use color only for focus, selection, and lifecycle status.
-- Keep every line width-safe and useful on constrained terminals.
-- Make workflow phase, agent, policy, usage, and result state legible without exposing raw scripts or transcripts by default.
-- Support progressive disclosure: bounded cards → operational dashboard → normalized interactive takeover/transcript.
-- Preserve role policy and one global concurrency budget regardless of whether work starts manually or through a workflow.
+## Principles
 
-## Accessibility & Inclusion
-All functionality must be keyboard accessible, support standard Pi cancel keybindings plus Escape, preserve visible focus and selection, avoid color-only status communication, and render correctly with Unicode and narrow terminal widths.
+- Make the task—not a mandatory persona—the normal unit of delegation.
+- Keep access, provider, model tier, effort, independence, and optional human profile explicit and composable.
+- Default trusted generic agents to autonomous full access; make read-only an enforceable sandbox policy.
+- Keep optional profiles human-selected and visible, never automatically inferred.
+- Preserve one global four-job budget whether work starts directly or through a workflow.
+- Use progressive disclosure: bounded cards → operational dashboard → normalized transcript/takeover.
+- Make name, access, optional profile, backend/model, effort, usage, and result state legible.
+- Keep private scripts/transcripts/artifacts out of the project and out of ordinary model-facing results.
+
+## Accessibility
+
+All functionality must be keyboard accessible, support Pi's cancel bindings plus Escape, preserve visible focus and selection, avoid color-only status communication, and render correctly with Unicode and narrow terminal widths.

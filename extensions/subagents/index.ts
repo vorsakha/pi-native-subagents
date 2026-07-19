@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { keyHint } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ClaudeBackend, CodexAppServerBackend, PiRpcBackend } from "../../src/backends/index.ts";
@@ -21,8 +21,8 @@ import {
   shortId,
   truncatePreview,
 } from "./render.ts";
-import { loadRoles, parseAllowedRoles } from "../../src/roles.ts";
-import type { Backend, BackendName, EffortLevel, JobSnapshot, ModelTier, ProviderFamily, SendBehavior } from "../../src/types.ts";
+import { loadProfiles, type ProfileCatalog } from "../../src/profiles.ts";
+import type { AccessMode, Backend, BackendName, EffortLevel, JobSnapshot, ModelTier, ProviderFamily, SendBehavior } from "../../src/types.ts";
 import { registerWorkflows } from "../workflows/index.ts";
 
 /** The configured expand-key hint (e.g. "ctrl+o to expand"), threaded into render options so render.ts stays testable without live keybinding state. */
@@ -33,13 +33,12 @@ function expandHint(): string {
 }
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const AGENTS_DIR = resolve(ROOT, "agents");
 const STATE_ENTRY = "native-subagents-profile";
-const LEGACY_STATE_ENTRY = "subagents-profile";
 const SUBAGENT_RESULT_MESSAGE = "native-subagent-result";
 const BACKENDS = ["codex", "claude", "pi"] as const;
 const TIERS = ["economy", "balanced", "quality"] as const;
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+const ACCESS = ["readOnly", "full"] as const;
 
 interface RegistrationOptions {
   registry?: object;
@@ -48,6 +47,7 @@ interface RegistrationOptions {
   workflowArtifactRoot?: string;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
+  globalProfilesDir?: string;
 }
 
 interface LiveCardPulse {
@@ -74,11 +74,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     ? undefined
     : options.legacyRoot ?? resolve(homedir(), ".pi/agent/extensions/subagents");
   const releaseInstall = claimExtensionInstall(ROOT, options.registry ?? globalThis, legacyRoot);
-  const roles = loadRoles(AGENTS_DIR, parseAllowedRoles(process.env));
-  const roleNames = [...roles.keys()];
-  const roleSchema = roleNames.length > 0
-    ? StringEnum(roleNames as [string, ...string[]])
-    : Type.String();
+  const globalProfilesDir = options.globalProfilesDir ?? resolve(getAgentDir(), "subagents");
+  let profileCatalog: ProfileCatalog = loadProfiles(globalProfilesDir);
   const configuredBackend = configuredBackendFromEnv(process.env);
   let activeBackend = configuredBackend;
   let manager: JobManager | undefined;
@@ -95,9 +92,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const resultKey = (id: string, generation: number) => `${id}:${generation}`;
 
   const createManager = () => new JobManager({
-    roles,
+    profiles: profileCatalog.profiles,
     concurrency: 4,
-    maxDepth: 2,
     backends: options.backends ?? [new PiRpcBackend(), new ClaudeBackend(), new CodexAppServerBackend()],
   });
   const getManager = () => manager ??= createManager();
@@ -213,7 +209,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     );
     return renderJobListCard(jobs, theme, { expanded, now: Date.now() });
   };
-  const workflows = registerWorkflows(pi, { roleNames, artifactRoot: options.workflowArtifactRoot });
+  const workflows = registerWorkflows(pi, { artifactRoot: options.workflowArtifactRoot, defaultBackend: () => activeBackend });
 
   pi.registerMessageRenderer(SUBAGENT_RESULT_MESSAGE, (message, { expanded }, theme) => {
     const job = (message.details as { job?: JobSnapshot } | undefined)?.job;
@@ -267,6 +263,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 
   pi.on("session_start", (_event, ctx) => {
     clearCardPulses();
+    profileCatalog = loadProfiles(
+      globalProfilesDir,
+      ctx.isProjectTrusted() ? resolve(ctx.cwd, CONFIG_DIR_NAME, "subagents") : undefined,
+    );
     manager = createManager();
     sessionContext = ctx;
     deferredResults.clear();
@@ -276,12 +276,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     activeBackend = configuredBackend;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom") continue;
-      const data = entry.data as { backend?: unknown; profile?: unknown } | undefined;
-      const restored = entry.customType === STATE_ENTRY
-        ? normalizeBackend(data?.backend)
-        : entry.customType === LEGACY_STATE_ENTRY
-          ? normalizeBackend(data?.profile)
-          : undefined;
+      const data = entry.data as { backend?: unknown } | undefined;
+      const restored = entry.customType === STATE_ENTRY ? normalizeBackend(data?.backend) : undefined;
       if (restored) activeBackend = restored;
     }
     const sessionManager = manager;
@@ -327,15 +323,21 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       updateStatus(ctx, getManager(), activeBackend);
       ctx.ui.notify(`Default subagent backend: ${selected}`, "info");
     } else if (value === "status") {
-      ctx.ui.notify(`Default backend: ${activeBackend}\nRoles: ${roleNames.join(", ") || "none"}`, "info");
+      ctx.ui.notify(`Default backend: ${activeBackend}\nProfiles: ${profileCatalog.profiles.size}`, "info");
+    } else if (value === "profiles") {
+      const resolved = [...profileCatalog.profiles.values()]
+        .sort((a, b) => a.name.localeCompare(b.name))
+        .map((profile) => `${profile.name} (${profile.origin}) — ${profile.filePath}`);
+      const warnings = profileCatalog.warnings.map((warning) => `Warning (${warning.origin}) ${warning.filePath}: ${warning.message}`);
+      ctx.ui.notify([...resolved, ...warnings].join("\n") || "No subagent profiles configured.", warnings.length ? "warning" : "info");
     } else {
-      ctx.ui.notify("Usage: /subagents [status|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <backend>", "warning");
+      ctx.ui.notify("Usage: /subagents [status|profiles|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <backend>", "warning");
     }
   };
 
   pi.registerCommand("subagents", {
     description: "Open the subagent dashboard; status/backend arguments retain configuration behavior.",
-    getArgumentCompletions: (prefix) => ["status", ...BACKENDS, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    getArgumentCompletions: (prefix) => ["status", "profiles", ...BACKENDS, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (args.trim()) await configure(args, ctx);
       else await openSubagentsDashboard(ctx, getManager());
@@ -349,30 +351,39 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   });
 
   const spawnParameters = Type.Object({
-    role: roleSchema,
     task: Type.String({ minLength: 1, maxLength: 100_000 }),
+    name: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
     cwd: Type.Optional(Type.String()),
     backend: Type.Optional(StringEnum(BACKENDS)),
     modelTier: Type.Optional(StringEnum(TIERS)),
     effort: Type.Optional(StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" })),
+    access: Type.Optional(StringEnum(ACCESS, { description: "Access policy; defaults to full after project trust is established" })),
+    independent: Type.Optional(Type.Boolean({ description: "Require a native provider different from the parent" })),
+    profile: Type.Optional(Type.String({ minLength: 1, maxLength: 160, description: "Human-authored profile name; omit unless the human explicitly requested one" })),
   });
 
   pi.registerTool({
     name: "subagent_spawn",
     label: "Spawn Subagent",
-    description: `Spawn a native background subagent. Roles: ${roleNames.join(", ") || "none"}. Maximum four jobs run concurrently. Unconsumed results are delivered automatically as one follow-up.`,
+    description: "Spawn a generic task-driven native background subagent. Maximum four jobs run concurrently. Unconsumed results are delivered automatically as one follow-up.",
     promptSnippet: "Spawn a native Pi, Claude Code, or Codex subagent in the background",
+    promptGuidelines: [
+      "Give each isolated agent a complete task with all relevant paths, requirements, constraints, and expected verification.",
+      "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
+      "Use access=readOnly for inspection and independent=true for a cross-provider second opinion.",
+    ],
     parameters: spawnParameters,
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), undefined, providerFamily(ctx.model?.provider));
-      return result(snapshot, `Spawned ${snapshot.id} (${snapshot.role}, ${snapshot.backend}/${snapshot.model}, effort ${formatEffort(snapshot.effort)})`);
+      rejectLegacyParams(params);
+      const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), activeBackend, providerFamily(ctx.model?.provider));
+      return result(snapshot, `Spawned ${snapshot.id} (${snapshot.name}, ${snapshot.access}, ${snapshot.backend}/${snapshot.model}, effort ${formatEffort(snapshot.effort)})`);
     },
     renderCall(args, theme) {
-      const route = args.backend
+      const route = args.independent ? "independent" : args.backend
         ? `${args.backend}${args.modelTier ? `/${args.modelTier}` : ""}`
-        : roles.get(args.role)?.differentProviderFromParent ? "cross-provider" : args.modelTier ?? "";
-      const detail = [route, args.effort ? `effort:${args.effort}` : "", truncatePreview(args.task)].filter(Boolean).join(" · ");
-      return renderToolCallLine(theme, "Spawn", args.role, detail);
+        : args.modelTier ?? "";
+      const detail = [args.access ?? "full", args.profile ? `profile:${args.profile}` : "", route, args.effort ? `effort:${args.effort}` : "", truncatePreview(args.task)].filter(Boolean).join(" · ");
+      return renderToolCallLine(theme, "Spawn", args.name ?? "agent", detail);
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
@@ -520,27 +531,19 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   pi.registerTool({
     name: "subagent",
     label: "Subagent",
-    description: `Compatibility foreground subagent call. Runs one role and waits for completion. Default backend: ${activeBackend}.`,
-    promptSnippet: `Run an isolated subagent: ${roleNames.join(", ") || "none"}`,
+    description: `Foreground convenience for one generic task-driven subagent. Default backend: ${activeBackend}.`,
+    promptSnippet: "Run one isolated generic subagent and wait for its result",
     promptGuidelines: [
       "Use subagent_spawn for independent work that can run in parallel; use subagent_wait before consuming its result.",
-      "Use subagent for a single compatibility foreground delegation.",
+      "Use subagent for a single foreground delegation.",
       "Subagents have isolated context; include all required paths, requirements, constraints, and verification evidence in task.",
+      "Use access=readOnly for inspection and independent=true for a cross-provider second opinion.",
+      "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
     ],
-    parameters: Type.Object({
-      agent: roleSchema,
-      task: Type.String({ minLength: 1, maxLength: 100_000 }),
-      cwd: Type.Optional(Type.String()),
-      backend: Type.Optional(StringEnum(BACKENDS)),
-      modelProfile: Type.Optional(StringEnum(BACKENDS)),
-      modelTier: Type.Optional(StringEnum(TIERS)),
-      effort: Type.Optional(StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" })),
-    }),
+    parameters: spawnParameters,
     async execute(_id, params, signal, onUpdate, ctx) {
-      const snapshot = spawn(getManager(), {
-        role: params.agent, task: params.task, cwd: params.cwd,
-        backend: params.backend ?? params.modelProfile, modelTier: params.modelTier, effort: params.effort,
-      }, ctx.cwd, ctx.isProjectTrusted(), roles.get(params.agent)?.lockedBackend || roles.get(params.agent)?.differentProviderFromParent ? undefined : activeBackend, providerFamily(ctx.model?.provider));
+      rejectLegacyParams(params);
+      const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), activeBackend, providerFamily(ctx.model?.provider));
       const generation = beginResultConsumption(snapshot.id);
       let consumed = false;
       const timer = setInterval(() => {
@@ -563,11 +566,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
     },
     renderCall(args, theme) {
-      const role = roles.get(args.agent);
-      const backend = args.backend ?? args.modelProfile ?? role?.lockedBackend ?? (role?.differentProviderFromParent ? "cross-provider" : activeBackend);
+      const backend = args.independent ? "independent" : args.backend ?? activeBackend;
       const route = args.modelTier ? `${backend}/${args.modelTier}` : backend;
       const effort = args.effort ? ` · effort:${args.effort}` : "";
-      return renderToolCallLine(theme, "Run", args.agent, `[${route}${effort}] ${truncatePreview(args.task)}`);
+      const profile = args.profile ? ` · profile:${args.profile}` : "";
+      return renderToolCallLine(theme, "Run", args.name ?? "agent", `[${route}${effort}${profile}] ${truncatePreview(args.task)}`);
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
@@ -577,30 +580,38 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   });
 }
 
+function rejectLegacyParams(params: object): void {
+  if (Object.hasOwn(params, "role") || Object.hasOwn(params, "agent") || Object.hasOwn(params, "modelProfile")) {
+    throw new Error("Legacy role, agent, and modelProfile arguments are not supported");
+  }
+}
+
 function sendTitle(behavior: SendBehavior): "Steer" | "Follow up" {
   return behavior === "followUp" ? "Follow up" : "Steer";
 }
 
 function spawn(
   manager: JobManager,
-  params: { role: string; task: string; cwd?: string; backend?: BackendName; modelTier?: ModelTier; effort?: EffortLevel },
+  params: { task: string; name?: string; cwd?: string; backend?: BackendName; modelTier?: ModelTier; effort?: EffortLevel; access?: AccessMode; independent?: boolean; profile?: string },
   parentCwd: string,
   trusted: boolean,
-  compatibilityBackend?: BackendName,
+  defaultBackend?: BackendName,
   parentProvider?: ProviderFamily,
 ): JobSnapshot {
   const cwd = secureCwd(parentCwd, params.cwd);
-  const depth = Number.parseInt(process.env.PI_NATIVE_SUBAGENTS_DEPTH ?? "0", 10) || 0;
   return manager.spawn({
-    role: params.role,
+    name: params.name,
     task: params.task,
     cwd,
     trusted,
-    backend: resolveBackendOverride(params.backend, params.modelTier, compatibilityBackend),
-    tier: params.modelTier,
+    backend: params.backend,
+    modelTier: params.modelTier,
     effort: params.effort,
+    access: params.access,
+    independent: params.independent,
+    profile: params.profile,
+    defaultBackend,
     parentProvider,
-    depth,
   });
 }
 
@@ -617,17 +628,7 @@ function secureCwd(parentCwd: string, requested?: string): string {
 }
 
 export function configuredBackendFromEnv(env: NodeJS.ProcessEnv): BackendName {
-  return normalizeBackend(env.PI_NATIVE_SUBAGENTS_BACKEND)
-    ?? normalizeBackend(env.PI_SUBAGENTS_PROFILE)
-    ?? "codex";
-}
-
-export function resolveBackendOverride(
-  requested: BackendName | undefined,
-  tier: ModelTier | undefined,
-  compatibilityBackend?: BackendName,
-): BackendName | undefined {
-  return requested ?? (tier ? undefined : compatibilityBackend);
+  return normalizeBackend(env.PI_NATIVE_SUBAGENTS_BACKEND) ?? "codex";
 }
 
 export function normalizeBackend(value: unknown): BackendName | undefined {
@@ -646,7 +647,8 @@ function updateStatus(ctx: { ui: { setStatus(key: string, text: string | undefin
 }
 
 function statusLine(job: JobSnapshot): string {
-  return `${job.id} ${job.status} ${job.role} [${job.backend}/${job.model}; effort ${formatEffort(job.effort)}]`;
+  const profile = job.profile ? `; profile ${job.profile}` : "";
+  return `${job.id} ${job.status} ${job.name} [${job.access}; ${job.backend}/${job.model}; effort ${formatEffort(job.effort)}${profile}]`;
 }
 function terminalText(job: JobSnapshot): string {
   if (job.status === "completed") return job.output || "(completed with no text output)";

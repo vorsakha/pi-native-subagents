@@ -11,7 +11,7 @@ class ImmediateBackend implements Backend {
   constructor(name: BackendName) { this.name = name; }
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     emit({ type: "usage", usage: { input: 12, output: 3, cost: 0.01, turns: 1 } });
-    emit({ type: "completed", output: `${request.role}:${request.task}` });
+    emit({ type: "completed", output: `${request.name}:${request.task}` });
     return { completed: Promise.resolve(), async send() {}, async cancel() {}, async close() {} };
   }
 }
@@ -62,9 +62,10 @@ function context(trusted = true) {
 
 async function setup() {
   const root = join(await mkdtemp(join(tmpdir(), "workflow-extension-")), "runs");
+  const globalProfilesDir = join(await mkdtemp(join(tmpdir(), "workflow-extension-profiles-")), "profiles");
   const pi = fakePi();
   const backends = [new ImmediateBackend("pi"), new ImmediateBackend("claude"), new ImmediateBackend("codex")];
-  registerNativeSubagents(pi.api, { registry: {}, legacyRoot: false, backends, workflowArtifactRoot: root });
+  registerNativeSubagents(pi.api, { registry: {}, legacyRoot: false, backends, workflowArtifactRoot: root, globalProfilesDir });
   return { root, pi };
 }
 
@@ -74,7 +75,7 @@ test("background workflows return immediately and deliver one follow-up result f
   pi.handlers.get("session_start")?.({}, ctx);
   const result = await pi.tools.get("workflow").execute("wf", {
     name: "Background review",
-    script: `export default async () => agent("inspect", { role: "reviewer" })`,
+    script: `export default async () => agent("inspect", { name: "reviewer", access: "readOnly" })`,
     background: true,
   }, new AbortController().signal, undefined, ctx);
   assert.match(result.content[0].text, /Workflow started/);

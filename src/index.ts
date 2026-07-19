@@ -4,6 +4,6 @@ export * from "./framing.ts";
 export * from "./manager.ts";
 export * from "./policy.ts";
 export * from "./reducer.ts";
-export * from "./roles.ts";
+export * from "./profiles.ts";
 export * from "./types.ts";
 export * from "./backends/index.ts";

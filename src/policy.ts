@@ -1,4 +1,4 @@
-import type { BackendName, BackendPolicy, ModelTier, ProviderFamily, RoleDefinition, SpawnRequest } from "./types.ts";
+import type { BackendName, BackendPolicy, ModelTier, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
 
 export function providerFamily(provider: unknown): ProviderFamily {
   const normalized = String(provider ?? "").trim().toLowerCase();
@@ -14,66 +14,53 @@ const TIER_MODELS: Record<ModelTier, { codex: string; claude: string; pi: string
 };
 
 export interface CompiledJob {
-  role: RoleDefinition;
+  profile?: ProfileDefinition;
   policy: BackendPolicy;
+  independent: boolean;
 }
 
-export function compilePolicy(role: RoleDefinition, request: SpawnRequest, maxDepth = 2): CompiledJob {
+export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition): CompiledJob {
   if (!request.trusted) throw new Error("Subagents are disabled for untrusted projects");
-  const parentDepth = request.depth ?? 0;
-  if (!Number.isInteger(parentDepth) || parentDepth < 0 || parentDepth >= maxDepth) {
-    throw new Error(`Nested subagent depth limit reached (${maxDepth})`);
-  }
-
-  // Explicit routing is authoritative. A tier selects native Codex only when the caller
-  // did not choose a backend; this prevents `{ backend: "claude", tier: "economy" }`
-  // from silently crossing providers.
-  let selected: BackendName = request.backend ?? (request.tier ? "codex" : role.defaultBackend);
-  if (role.lockedBackend) {
-    if (request.backend && request.backend !== role.lockedBackend) {
-      throw new Error(`${role.name} locks its backend to ${role.lockedBackend}`);
+  const independent = request.independent === true || profile?.independent === true;
+  let selected: BackendName = request.backend ?? profile?.backend ?? request.defaultBackend ?? "codex";
+  if (profile?.lockedBackend) {
+    if (request.backend && request.backend !== profile.lockedBackend) {
+      throw new Error(`Profile ${profile.name} locks its backend to ${profile.lockedBackend}`);
     }
-    selected = role.lockedBackend;
+    selected = profile.lockedBackend;
   }
-  if (role.differentProviderFromParent) {
-    if (role.lockedBackend) throw new Error(`${role.name} cannot lock a backend and require cross-provider routing`);
-    if (request.backend === "pi") throw new Error(`${role.name} requires a native Claude or Codex backend`);
+  if (independent) {
+    if (request.backend === "pi" || profile?.lockedBackend === "pi") throw new Error("independent agents require a native Claude or Codex backend");
     const parent = request.parentProvider;
-    if (request.backend && parent !== "other" && request.backend === parent) {
-      throw new Error(`${role.name} must use a provider different from the parent ${parent} model`);
+    const explicitRoute = request.backend !== undefined || profile?.lockedBackend !== undefined;
+    if (explicitRoute && parent !== "other" && selected === parent) {
+      throw new Error(`independent agent must use a provider different from the parent ${parent} model`);
     }
-    selected = request.backend
-      ?? (parent === "claude" ? "codex" : parent === "codex" ? "claude" : role.defaultBackend === "codex" ? "codex" : "claude");
+    if (!explicitRoute) selected = parent === "claude" ? "codex" : "claude";
   }
 
-  const route = { ...role.routes[selected] };
-  if (request.tier) {
-    const tier = TIER_MODELS[request.tier];
-    route.model = selected === "pi" ? tier.pi : selected === "claude" ? tier.claude : tier.codex;
-  }
-
-  const readOnly = role.access === "readOnly";
+  const tierName = request.modelTier ?? profile?.modelTier ?? "balanced";
+  const tier = TIER_MODELS[tierName];
+  const model = selected === "pi" ? tier.pi : selected === "claude" ? tier.claude : tier.codex;
+  const access = profile?.access === "readOnly" ? "readOnly" : request.access ?? profile?.access ?? "full";
+  const readOnly = access === "readOnly";
   return {
-    role,
+    profile,
+    independent,
     policy: {
       backend: selected,
-      access: role.access,
-      model: route.model,
-      thinking: route.thinking,
-      effort: request.effort,
-      piTools: readOnly
-        ? role.piTools.filter((tool) => ["read", "grep", "find", "ls"].includes(tool))
-        : [...new Set(role.piTools)],
+      access,
+      model,
+      thinking: "medium",
+      effort: request.effort ?? profile?.effort,
+      piTools: readOnly ? ["read", "grep", "find", "ls"] : ["read", "write", "edit", "bash", "grep", "find", "ls"],
       claudeTools: readOnly
-        ? role.claudeTools.filter((tool) => ["Read", "Glob", "Grep", "WebSearch", "WebFetch"].includes(tool))
-        : [...new Set(role.claudeTools)],
+        ? ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
+        : ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"],
       approvalPolicy: "never",
       codexSandbox: readOnly
         ? { type: "readOnly", networkAccess: false }
         : { type: "dangerFullAccess" },
-      nestedAgents: parentDepth + 1 < maxDepth ? role.nestedAgents : [],
-      depth: parentDepth + 1,
-      maxDepth,
     },
   };
 }

@@ -1,100 +1,37 @@
 # Design System
 
-## Theme
-Inherit Pi's active theme. The subagent dashboard must feel like the interactive-shell overlay: restrained terminal chrome, a complete border, clear separators, dense operational information, and no independent brand palette.
+## Visual language
 
-## Color
-Use Pi semantic theme tokens only:
-- `borderAccent` for focused outer chrome
-- `borderMuted` for unfocused chrome
-- `accent` for selected jobs and primary labels
-- `success`, `warning`, and `error` for lifecycle states
-- `text`, `muted`, and `dim` for content hierarchy
-- `selectedBg` for compact focus/selection badges where useful
+Inherit Pi's active theme and TUI vocabulary. Use semantic colors, compact bold titles, dim metadata, width-safe text, complete borders, visible focus, and status glyphs that do not rely on color alone.
 
-## Typography
-Use terminal-native text and Pi theme weight helpers. Titles are bold but compact. Metadata and keyboard guidance are dim. Avoid decorative glyphs except structural borders, selection arrows, and status symbols.
+## Subagent surfaces
 
-## Layout
-A single bordered overlay with:
-1. title and focus/status metadata,
-2. concise keyboard guidance,
-3. job list,
-4. separator,
-5. selected-job metadata and transcript viewport,
-6. footer with exit and action shortcuts.
+The `/subagents` overlay contains title/status, keyboard guidance, a job list, selected-job detail, a bounded transcript viewport, and an exit/action footer. Rows and detail headers show generic agent name, access, optional profile, backend/model, effort, status, and elapsed time—never a role taxonomy.
 
-The outer frame uses the same focused double-line and unfocused rounded-line vocabulary as interactive-shell. Every line must fit the provided display width.
+Escape and Pi's cancel binding close the overlay. Arrow keys or `j`/`k` navigate; Shift+Up/Down and Page Up/Down scroll. Enter opens takeover; `s` steers, `f` queues a follow-up, and `x` cancels. Workflow-owned agents remain inspectable but cannot be steered.
 
-## Components
-- **Outer frame:** full top, side, separator, and bottom borders.
-- **Job row:** selection marker, status glyph and text, short id, role, backend/model, elapsed time.
-- **Detail header:** role, job id, lifecycle state, access/backend metadata.
-- **Transcript:** bounded tail with empty-state copy.
-- **Footer:** always includes `Esc close`; shows steering/follow-up/cancel shortcuts only when applicable.
+Takeover normalizes bounded user, thinking, assistant, tool, live-thinking, and queued-message state. Active jobs accept steering; retained completed jobs accept follow-ups; failed/cancelled/expired jobs remain read-only.
 
-## Interaction
-- Escape and the configured `tui.select.cancel` binding close the overlay.
-- Arrow keys and `j`/`k` navigate; Shift+Up/Down and Page Up/Down scroll the selected job's full bounded output. Long logical lines wrap into width-safe visual rows so no retained text is hidden.
-- Enter opens takeover; `s` steers, `f` queues a follow-up, and `x` cancels a running job.
-- Takeover shows bounded normalized user, thinking, assistant, tool, live-thinking, and queued-message state. Active jobs expose steering input; successfully settled jobs expose follow-up input while their native session remains retained. Failed/cancelled/expired sessions remain read-only.
-- State changes redraw without stealing input or trapping focus. Running-job glyphs fade through width-stable `blank → · → • → ● → • → · → blank` frames at 200 ms per frame in conversation thread cards, the dashboard, and takeover. Pi semantic `dim`, `muted`, and `accent` colors reinforce the fade without terminal-specific blink escapes. Queued and terminal glyphs remain still so motion communicates execution rather than decoration.
-- Dashboard assistant output is sanitized first, then rendered through Pi's native Markdown component so headings, lists, emphasis, and code blocks inherit the active theme while remaining width-safe and scrollable. Thread cards share one session-scoped ticker and invalidate only their own Pi tool rows. Each row is pinned to its job id and generation, with a bounded session snapshot ledger preserving terminal history across retained-session follow-ups and manager eviction. Manager events settle rows and prune their pulse registrations directly, so cleanup never depends on a detached or no-op row rerender.
+Running glyphs use width-stable fade frames every 200 ms. Output is sanitized before Pi-native Markdown rendering. Cards are pinned to job id and generation so retained-session follow-ups do not rewrite historical rows.
 
-## Tool call/result rendering
+## Tool rendering
 
-Every `subagent_*` tool and the compatibility `subagent` tool define custom `renderCall`/`renderResult` (`extensions/subagents/render.ts`); none fall back to the default raw-text tool shell shown in `extensions/subagents/index.ts` before this system existed. The shared floor is: no bare tool name, no unbounded text dump, one coherent job card per result.
+Every direct tool has custom bounded rendering. Collapsed results are at most 10 lines; expanded results are at most 36. Lines truncate to actual width. Job cards prioritize status/policy, task, workflow ownership/error, outcome, recent activity, informational usage, and a single `/subagents` disclosure footer.
 
-### Line budgets
-- Collapsed result: **≤10 rendered lines**.
-- Expanded result: **≤36 rendered lines**.
-- Both are hard caps enforced by `buildJobCardLines`, not soft guidance: content is clamped and the final line points to `/subagents` for the live dashboard and full bounded output. This mirrors the dashboard's own bounded-output philosophy instead of inventing a second one.
-- Lines are produced by a small `Component` that truncates (never wraps) each line to the actual render width, so the budget holds regardless of terminal width — word-wrap would otherwise silently multiply line counts.
+`subagent_spawn` owns the live card. Check/wait/send/cancel use one-line receipts when collapsed. List shows bounded rows. Unconsumed background completions reuse the same card as a single follow-up.
 
-### Job card anatomy (`renderJobCard`)
-1. Optional lead line (e.g. `✓ Sent steer message`) for `subagent_send`.
-2. Header: status glyph + role + short id + `backend/model` + status word + elapsed/duration, one line.
-3. `Task` summary (sanitized and collapsed to one line).
-4. `Workflow` ownership when applicable, then `Error` (collapsed: 1 line; expanded: up to 3 lines).
-5. **Outcome first:** `Result` for terminal jobs or `Latest` for active jobs. Streaming cards show the last 3/16 lines; settled cards show a head/tail conclusion preview within the same budget.
-6. `Activity`: only the latest tool call when collapsed; a labeled tail of up to 8 calls plus omitted count when expanded. Queued/running empty states explain what the job is waiting for.
-7. `Usage` metadata (tokens, cache, cost, turns), omitted when all zero. It never displaces the result above it.
-8. Footer: always present, either the configured expand-key hint plus `/subagents` (collapsed, settled), `updating…` (collapsed, streaming/partial), or `full bounded output: /subagents` (expanded).
+## Workflow surfaces
 
-The same card renders live partial tool updates (`onUpdate` polling in `subagent_wait` and the compatibility `subagent` tool) and settled results — there is no separate "(subagent running...)" placeholder text.
+Workflow cards use the same sanitizers, colors, glyphs, 10/36-line budgets, and one `/workflows` pointer. They show phase position, generic agent count/state, access/profile/route/effort, informational aggregate usage, result, and errors.
 
-### Other tool renderers
-- `subagent_spawn` owns the full live job card. `subagent_check`, `subagent_wait`, `subagent_send`, and `subagent_cancel` render one-line receipts when collapsed so multiple operations on the same job do not duplicate the card; expanding a receipt reveals the full bounded job context.
-- `subagent_list`: `renderResult` shows a header count line plus capped rows (8 collapsed / 20 expanded) with a `+N more — see /subagents` note when the session has more jobs than fit.
-- Unconsumed background completions render through the same job card as one parent follow-up. Active waits, foreground calls, cancellations, and workflow-owned jobs suppress duplicate delivery.
-- All tool text is sanitized (`sanitizeText`/`sanitizeInline`): ANSI/OSC/DCS escape sequences and C0/C1 control characters are stripped before rendering, matching the dashboard's transcript sanitation.
+There are no configured workflow token, turn, cost, or overall deadline limits. Usage is reporting only. The enforced workflow bounds are 512 KiB source, 256 KiB args, 1 MiB result, 32 agent calls, 128 phase events/64 retained phases, and four-way parallelism; backend lifecycle and shutdown deadlines remain separate and bounded.
 
-## Workflow experience
+The `/workflows` dashboard supports run/phase/agent navigation, status filtering, a read-only agent inspector, per-agent cancellation, and whole-run cancellation. The inspector separates caller prompt, thinking/tools, transcript, structured output, and result. Artifact paths and raw scripts are not shown in normal dashboard content.
 
-Workflows reuse the subagent system rather than presenting a separate visual language. `workflow` call and result renderers use the same semantic colors, glyphs, sanitizers, width-safe line component, **≤10 collapsed / ≤36 expanded** budgets, configured expand hint, and one `/workflows` disclosure pointer.
+## Policy and sandbox
 
-### Workflow card anatomy
-1. Status glyph, workflow name, short run id, foreground/background mode, status, and elapsed time.
-2. Optional description.
-3. Current phase and phase position.
-4. Aggregate agent counts and the active/latest agent when collapsed; bounded phase and agent rows when expanded.
-5. Aggregate usage across member jobs plus configured token/turn/cost limits.
-6. Bounded active or final result preview, structured-output state, and errors.
-7. A single `/workflows` footer; live cards say `updating…` rather than emitting repeated progress blocks.
+Workflow JavaScript is control-plane code with no filesystem, network, subprocess, import, environment, or credential access. It can announce phases, request generic agents, and return JSON. Every request is validated by `WorkflowManager` and dispatched through the shared `JobManager`, preserving trust, profile ceilings, routing, subscription-auth sanitation, access sandboxes, the four-job cap, cancellation, and cleanup.
 
-### `/workflows` dashboard
-- Uses the same focused double-border and unfocused rounded-border frame as `/subagents`.
-- Up/Down or `j`/`k` selects runs; Left/Right or `h`/`l` selects phases; Tab cycles agents in the selected phase; `f` filters the visible roster by lifecycle state.
-- The workflow overview exposes every visible agent in the selected phase with role, backend/model, effort, duration, and per-agent usage. Enter opens a read-only agent inspector; `h`/Left returns to the overview.
-- The inspector separates bounded caller prompt, live thinking/recent tools, transcript, structured output, and final result. Shift+Up/Down and Page Up/Down scroll the bounded detail so long logical lines remain reachable.
-- `x` cancels the selected queued/running agent; `X` cancels the active workflow. Workflow-owned jobs cannot be steered or followed up outside the script-controlled run. Escape and the configured cancel binding always close.
-- Assistant messages and standalone results are sanitized and rendered through Pi's native Markdown theme; user, thinking, and tool transcript entries retain explicit role prefixes and semantic colors. Artifact paths and raw scripts are not shown in the dashboard.
+`agent(prompt, options?)` needs no role. Options are `name`/`label`, `access`, `backend`, `modelTier`, `effort`, `independent`, explicit `profile`, `phase`, and bounded `schema`. Profiles are human-selected overlays, not automatically chosen personas. Provider independence is an enforceable route constraint, not prompt wording.
 
-### Sandboxed execution
-The JavaScript sandbox is a control-plane component, not a new permission authority. It has no filesystem, network, subprocess, import, environment, or credential access. It communicates over authenticated size-bounded IPC and can only announce phases, request agents, and return JSON. `WorkflowManager` validates every request and delegates it to the shared `JobManager`, preserving project trust, role access, routing, nesting depth, cancellation, and the global four-job cap.
-
-Model tier, thinking policy, and effort are independent controls. Tiers choose provider-native models without rewriting role thinking; runtime effort is omitted by default so Claude/Codex remain provider-adaptive, with an explicit request-scoped effort hint available to orchestrators when warranted. Legacy role-frontmatter effort values are accepted as inert compatibility metadata rather than enforced policy.
-
-Provider diversity is a role policy, not a prompt convention. The `adversary` role receives the parent model's normalized provider family and must route to the other native provider (Claude ↔ Codex); same-provider and Pi-backend overrides fail closed. Unknown providers use Claude Opus as the independent fallback. Provider-neutral roles replace the former `claudio` alias and may select Claude directly through normal backend/tier routing.
-
-Workflow artifacts are private operational state under the Pi agent directory, never project UI content or configuration backup material. Each terminal run writes a compact summary, separate bounded transcript/result artifacts, and `report.md`. Foreground runs stay inside one updating tool card. Explicitly backgrounded runs deliver one bounded follow-up result when settled; session shutdown aborts runs without delivery.
+Workflow artifacts are private operational state under the Pi agent directory. Terminal runs write compact summary/result/transcript/report artifacts. Background runs deliver one bounded follow-up; session shutdown aborts without delivery.

@@ -1,11 +1,8 @@
-import { fileURLToPath } from "node:url";
 import { sanitizeSubscriptionEnv } from "../env.ts";
 import { JsonlFramer, parseJsonRecord } from "../framing.ts";
 import { spawnManaged } from "../process-tree.ts";
 import { boundedAppend } from "../reducer.ts";
 import type { Backend, BackendEvent, BackendRequest, BackendRun, SendBehavior } from "../types.ts";
-
-const NESTED_EXTENSION = fileURLToPath(new URL("../../extensions/subagents/index.ts", import.meta.url));
 
 interface PiBackendOptions {
   requestTimeoutMs?: number;
@@ -35,16 +32,11 @@ export class PiRpcBackend implements Backend {
     request.signal.throwIfAborted();
     const args = [
       "--mode", "rpc", "--approve", "--no-skills", "--no-prompt-templates", "--no-extensions",
-      "--name", `subagent-${request.role}-${request.jobId.slice(0, 8)}`,
+      "--name", `subagent-${request.name}-${request.jobId.slice(0, 8)}`,
       "--model", request.policy.model,
       "--thinking", request.policy.thinking,
       "--append-system-prompt", request.systemPrompt,
     ];
-    // Load only this package for explicitly allowed nested delegation. This
-    // avoids unrelated global extensions while preserving the role allowlist.
-    if (request.policy.nestedAgents.length > 0 && request.policy.depth < request.policy.maxDepth) {
-      args.push("--extension", NESTED_EXTENSION);
-    }
     if (request.policy.piTools.length > 0) args.push("--tools", request.policy.piTools.join(","));
     else args.push("--no-tools");
 

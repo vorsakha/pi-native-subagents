@@ -9,7 +9,7 @@ import type {
   BackendEvent,
   BackendRequest,
   BackendRun,
-  RoleDefinition,
+  ProfileDefinition,
   Usage,
 } from "../src/types.ts";
 import { createWorkflowArtifacts } from "../src/workflows/artifacts.ts";
@@ -92,50 +92,14 @@ class ControlledBackend implements Backend {
   }
 }
 
-const routes: RoleDefinition["routes"] = {
-  pi: { model: "pi-model", thinking: "medium", effort: "medium" },
-  claude: { model: "claude-model", thinking: "medium", effort: "medium" },
-  codex: { model: "codex-model", thinking: "medium", effort: "medium" },
-};
-
-const worker: RoleDefinition = {
-  name: "worker",
-  description: "write-capable worker",
-  access: "full",
-  defaultBackend: "codex",
-  nestedAgents: ["reviewer"],
-  piTools: ["read", "write", "bash"],
-  claudeTools: ["Read", "Write", "Bash"],
-  routes,
-  systemPrompt: "worker system prompt",
-  filePath: "worker.md",
-};
-
-const adversary: RoleDefinition = {
-  name: "adversary",
-  description: "cross-provider adversary",
-  access: "readOnly",
-  defaultBackend: "claude",
-  differentProviderFromParent: true,
-  nestedAgents: [],
-  piTools: ["read"],
-  claudeTools: ["Read"],
-  routes,
-  systemPrompt: "adversary system prompt",
-  filePath: "adversary.md",
-};
-
-const reviewer: RoleDefinition = {
+const reviewer: ProfileDefinition = {
   name: "reviewer",
-  description: "read-only reviewer",
+  description: "human-authored audit profile",
   access: "readOnly",
-  defaultBackend: "codex",
-  nestedAgents: [],
-  piTools: ["read", "grep", "write", "bash"],
-  claudeTools: ["Read", "Glob", "Write", "Bash"],
-  routes,
+  backend: "codex",
   systemPrompt: "reviewer system prompt",
   filePath: "reviewer.md",
+  origin: "global",
 };
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -160,7 +124,7 @@ async function fixture(concurrency = 4) {
   const backend = new ControlledBackend();
   const jobs = new JobManager({
     backends: [backend],
-    roles: new Map([[worker.name, worker], [reviewer.name, reviewer], [adversary.name, adversary]]),
+    profiles: new Map([[reviewer.name, reviewer]]),
     concurrency,
   });
   const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1" });
@@ -203,15 +167,41 @@ test("rejects untrusted workflows before creating artifact storage", async () =>
   }
 });
 
+test("rejects every legacy workflow agent option without spawning jobs", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        const results = [];
+        for (const options of [
+          { role: "worker" },
+          { agent: "reviewer" },
+          { tier: "quality" },
+          { modelProfile: "codex" },
+        ]) results.push(await agent("legacy call", options));
+        return results;
+      }
+    `));
+    const final = await started.completion;
+    const results = final.result as Array<{ ok: boolean; error?: string }>;
+    assert.equal(final.status, "completed");
+    assert.equal(results.length, 4);
+    assert.ok(results.every((result) => !result.ok && /Legacy workflow/.test(result.error ?? "")));
+    assert.equal(f.backend.requests.length, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("runs sequential and parallel agents through one JobManager and its global cap", async () => {
   const f = await fixture(2);
   try {
     const started = await f.workflows.start(f.request(`
       export default async () => {
-        const first = await agent("seq-1", { role: "worker" });
-        const second = await agent("seq-2:" + first.output, { role: "worker" });
+        const first = await agent("seq-1");
+        const second = await agent("seq-2:" + first.output, { name: "worker" });
         const batch = await parallel(["par-1", "par-2", "par-3", "par-4"].map(
-          (prompt) => () => agent(prompt, { role: "worker" })
+          (prompt) => () => agent(prompt, { name: "worker" })
         ), 4);
         return { first: first.output, second: second.output, batch: batch.map((item) => item.output) };
       }
@@ -251,13 +241,13 @@ test("runs sequential and parallel agents through one JobManager and its global 
   }
 });
 
-test("preserves reviewer read-only role policy in the backend request", async () => {
+test("workflow agent options preserve generic read-only/profile policy in the backend request", async () => {
   const f = await fixture();
   try {
     const started = await f.workflows.start(f.request(`
       export default async () => {
         const reviewed = await agent("audit", {
-          role: "reviewer",
+          name: "reviewer", access: "readOnly", profile: "reviewer",
           effort: "high",
           schema: { type: "object", required: ["clean"], properties: { clean: { type: "boolean" } } }
         });
@@ -266,12 +256,12 @@ test("preserves reviewer read-only role policy in the backend request", async ()
     `));
     await waitFor(() => f.backend.requests.length === 1, "reviewer backend request");
     const request = f.backend.requests[0]!;
-    assert.equal(request.role, "reviewer");
-    assert.equal(request.systemPrompt, "reviewer system prompt");
+    assert.equal(request.name, "reviewer");
+    assert.match(request.systemPrompt, /isolated, task-driven subagent[\s\S]*reviewer system prompt/);
     assert.equal(request.policy.access, "readOnly");
     assert.deepEqual(request.policy.codexSandbox, { type: "readOnly", networkAccess: false });
-    assert.deepEqual(request.policy.piTools, ["read", "grep"]);
-    assert.deepEqual(request.policy.claudeTools, ["Read", "Glob"]);
+    assert.deepEqual(request.policy.piTools, ["read", "grep", "find", "ls"]);
+    assert.deepEqual(request.policy.claudeTools, ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]);
     assert.equal(request.policy.approvalPolicy, "never");
     assert.equal(request.policy.effort, "high");
     const run = f.backend.runs.get(request.jobId)!;
@@ -291,7 +281,7 @@ test("preserves reviewer read-only role policy in the backend request", async ()
     assert.equal(final.agents[0]?.tools?.at(-1)?.status, "completed");
 
     const malformed = await f.workflows.start(f.request(`
-      export default async () => agent("invalid schema", { role: "reviewer", schema: { type: "nonsense" } });
+      export default async () => agent("invalid schema", { name: "reviewer", access: "readOnly", profile: "reviewer", schema: { type: "nonsense" } });
     `));
     const malformedFinal = await malformed.completion;
     assert.equal((malformedFinal.result as { ok: boolean }).ok, false);
@@ -300,7 +290,7 @@ test("preserves reviewer read-only role policy in the backend request", async ()
 
     const mismatch = await f.workflows.start(f.request(`
       export default async () => agent("schema mismatch", {
-        role: "reviewer",
+        name: "reviewer", access: "readOnly", profile: "reviewer",
         schema: { type: "object", required: ["clean"], properties: { clean: { type: "boolean" } } }
       });
     `));
@@ -313,12 +303,12 @@ test("preserves reviewer read-only role policy in the backend request", async ()
     assert.match(mismatchAgent.error ?? "", /did not match/);
 
     const crossProvider = await f.workflows.start(f.request(`
-      export default async () => agent("challenge parent", { role: "adversary" });
+      export default async () => agent("challenge parent", { name: "adversary", access: "readOnly", independent: true });
     `, { parentProvider: "claude" }));
     await waitFor(() => f.backend.requests.length === 3, "cross-provider workflow adversary");
     const adversaryRequest = f.backend.requests[2]!;
-    assert.equal(adversaryRequest.role, "adversary");
-    assert.equal(adversaryRequest.policy.backend, "codex", "Claude-parent workflow routes adversary to Codex");
+    assert.equal(adversaryRequest.name, "adversary");
+    assert.equal(adversaryRequest.policy.backend, "codex", "independent Claude-parent workflow agent routes to Codex");
     f.backend.completeTask(adversaryRequest.task, "independent review");
     assert.equal((await crossProvider.completion).status, "completed");
   } finally {
@@ -332,13 +322,13 @@ test("records phases, results, and final workflow artifacts", async () => {
     export const meta = { name: "release review", description: "two-phase review" };
     export default async (input) => {
       phase("Inspect");
-      const reviewed = await agent("inspect " + input.subject, { role: "reviewer", label: "security" });
+      const reviewed = await agent("inspect " + input.subject, { label: "security", access: "readOnly", independent: true, profile: "reviewer" });
       phase("Summarize");
       return { accepted: reviewed.ok, report: reviewed.output, subject: input.subject };
     }
   `;
   try {
-    const started = await f.workflows.start(f.request(script, { args: { subject: "change" } }));
+    const started = await f.workflows.start(f.request(script, { args: { subject: "change" }, parentProvider: "claude" }));
     await waitFor(() => f.backend.requests.length === 1, "phase agent");
     f.backend.completeTask("inspect change", "looks good");
     const final = await started.completion;
@@ -369,7 +359,9 @@ test("records phases, results, and final workflow artifacts", async () => {
     assert.equal(persisted.agents[0]?.liveThinking, undefined, "live-only supervision state is not persisted");
     const transcripts = JSON.parse(await readFile(join(final.artifactDir, "transcripts.json"), "utf8"));
     assert.equal(transcripts["0"].at(-1).kind, "assistant");
-    assert.match(await readFile(join(final.artifactDir, "report.md"), "utf8"), /# release review[\s\S]*looks good/);
+    const report = await readFile(join(final.artifactDir, "report.md"), "utf8");
+    assert.match(report, /# release review[\s\S]*looks good/);
+    assert.match(report, /- Independent: yes/);
   } finally {
     await f.cleanup();
   }
@@ -379,7 +371,7 @@ test("returns an immediate background-style start snapshot and a separate comple
   const f = await fixture();
   try {
     const started = await f.workflows.start(f.request(
-      `export default async () => agent("background work", { role: "worker" });`,
+      `export default async () => agent("background work", { name: "worker" });`,
       { background: true },
     ));
     assert.equal(started.snapshot.background, true);
@@ -404,8 +396,8 @@ test("cancels both running and queued workflow jobs", async () => {
   try {
     const started = await f.workflows.start(f.request(`
       export default async () => parallel([
-        () => agent("running member", { role: "worker" }),
-        () => agent("queued member", { role: "worker" })
+        () => agent("running member", { name: "worker" }),
+        () => agent("queued member", { name: "worker" })
       ], 2)
     `));
     await waitFor(() => f.jobs.list().length === 2, "running and queued workflow jobs");
@@ -433,7 +425,7 @@ test("shutdown aborts active workflows, cancels their jobs, and closes new start
   const f = await fixture();
   try {
     const started = await f.workflows.start(f.request(
-      `export default async () => agent("shutdown member", { role: "worker" });`,
+      `export default async () => agent("shutdown member", { name: "worker" });`,
       { background: true },
     ));
     await waitFor(() => f.backend.requests.length === 1, "active workflow member");
@@ -478,8 +470,9 @@ test("restores persisted running summaries as durably aborted stale workflows", 
         }],
         agents: [{
           index: 0,
-          label: "stale member",
-          role: "worker",
+          name: "stale member",
+          access: "full",
+          independent: false,
           phase: 0,
           state: "running",
           timestamps: { createdAt: old, updatedAt: old, startedAt: old },
@@ -527,8 +520,8 @@ test("aggregates usage across all workflow agents", async () => {
   try {
     const started = await f.workflows.start(f.request(`
       export default async () => {
-        const one = await agent("usage one", { role: "worker" });
-        const two = await agent("usage two", { role: "worker" });
+        const one = await agent("usage one", { name: "worker" });
+        const two = await agent("usage two", { name: "worker" });
         return [one.ok, two.ok];
       }
     `));

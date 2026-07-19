@@ -49,7 +49,6 @@ function policy(name, access = "readOnly") {
       : accessMode && name === "claude" ? ["Read", "Glob", "Grep", "Write", "Bash"] : [],
     approvalPolicy: "never",
     codexSandbox: access === "full" ? { type: "dangerFullAccess" } : { type: "readOnly", networkAccess: false },
-    nestedAgents: [], depth: 1, maxDepth: 2,
   };
   return {
     ...common,
@@ -115,7 +114,7 @@ async function execute(name, cwd, task, systemPrompt, access) {
   const terminal = [];
   const startupController = new AbortController();
   const run = await backend(name).start({
-    jobId: `smoke-${name}-${access}`, role: `smoke-${access}`, task, systemPrompt, cwd,
+    jobId: `smoke-${name}-${access}`, name: `smoke-${access}`, task, systemPrompt, cwd,
     policy: policy(name, access), env: name === "pi" ? sanitizeSubscriptionEnv(process.env, "codex") : process.env,
     signal: startupController.signal,
   }, (event) => {
@@ -186,7 +185,7 @@ async function runAccess(name) {
   );
   if (!existsSync(writtenFile) || readFileSync(writtenFile, "utf8") !== "FULL_WRITE_OK") {
     const summary = String(fullResult.event.output ?? "").replace(/\s+/g, " ").slice(0, 300);
-    throw new Error(`${name} full worker did not create the controlled proof file${summary ? `; model output: ${summary}` : ""}`);
+    throw new Error(`${name} full-access agent did not create the controlled proof file${summary ? `; model output: ${summary}` : ""}`);
   }
   console.log(`PASS ${name}: ${auth}, read-only write denied and full write confined to temporary directories`);
 }

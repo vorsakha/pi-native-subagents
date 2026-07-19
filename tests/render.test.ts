@@ -41,7 +41,7 @@ function tool(id: string, status: ToolTrace["status"] = "completed"): ToolTrace 
 function job(overrides: Partial<JobSnapshot> = {}): JobSnapshot {
   return {
     id: "0123456789abcdef",
-    role: "worker",
+    name: "worker", access: "full", independent: false,
     backend: "codex",
     model: "gpt-5.6-terra",
     task: "Implement the widget",
@@ -92,6 +92,8 @@ test("renderer sanitizes output, enforces line budgets, and registers runtime re
   const adaptiveLines = buildJobCardLines(job(), theme, { expanded: false, now: 5_000 });
   assert.ok(adaptiveLines[0]?.includes("effort adaptive"), "default effort is visible in the main thread card");
   assert.ok(renderJobCard(job(), theme, { expanded: false, now: 5_000 }).render(48)[0]?.includes("effort adaptive"), "adaptive effort survives bounded-width rendering");
+  const independentLines = buildJobCardLines(job({ independent: true }), theme, { expanded: false, now: 5_000 });
+  assert.ok(independentLines[0]?.includes("independent"), "cross-provider independence is visible in the main thread card");
 
   const outcomeLines = buildJobCardLines(job({
     status: "completed",
@@ -112,7 +114,7 @@ test("renderer sanitizes output, enforces line budgets, and registers runtime re
   const receipt = renderJobReceipt(job({ status: "running" }), theme, { action: "Waiting on", now: 5_000 }).render(48);
   assert.equal(receipt.length, 1);
   assert.match(receipt[0]!, /Waiting on worker 01234567/);
-  assert.match(receipt[0]!, /effort adaptive/);
+  assert.match(receipt[0]!, /full/);
 
   const expandedLines = buildJobCardLines(bigJob, theme, { expanded: true, now: 4_000 });
   assert.ok(expandedLines.length <= MAX_EXPANDED_LINES, `expanded produced ${expandedLines.length} lines`);
@@ -156,13 +158,13 @@ function assertRuntimeRenderers(): void {
   assert.deepEqual([...pi.tools.keys()].filter((name) => name !== "workflow").sort(), expected);
   assert.ok(pi.tools.has("workflow"));
   const args: Record<string, Record<string, unknown>> = {
-    subagent_spawn: { role: "worker", task: "\u001b[31mdo work\u001b[0m", backend: "codex" },
+    subagent_spawn: { name: "worker", access: "full", independent: false, task: "\u001b[31mdo work\u001b[0m", backend: "codex" },
     subagent_check: { jobId: "\u001b[31m123456789\u001b[0m" },
     subagent_wait: { jobId: "123456789", timeoutMs: 1_000 },
     subagent_send: { jobId: "123456789", message: "\u001b]0;bad\u0007hello", behavior: "steer" },
     subagent_cancel: { jobId: "123456789" },
     subagent_list: {},
-    subagent: { agent: "worker", task: "\u001b[31mdo work\u001b[0m", backend: "codex" },
+    subagent: { name: "implementation", task: "\u001b[31mdo work\u001b[0m", backend: "codex" },
   };
   for (const name of expected) {
     const toolDef = pi.tools.get(name);

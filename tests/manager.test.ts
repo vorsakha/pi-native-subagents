@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { JobManager } from "../src/manager.ts";
-import type { Backend, BackendEvent, BackendRequest, BackendRun, JobSnapshot, RoleDefinition } from "../src/types.ts";
+import type { Backend, BackendEvent, BackendRequest, BackendRun, JobSnapshot, ProfileDefinition } from "../src/types.ts";
 
 class FakeBackend implements Backend {
   readonly name = "codex" as const;
@@ -34,22 +34,13 @@ class FakeBackend implements Backend {
   }
 }
 
-const role: RoleDefinition = {
-  name: "worker", description: "", access: "full", defaultBackend: "codex", nestedAgents: [],
-  piTools: [], claudeTools: [], systemPrompt: "worker", filePath: "worker.md",
-  routes: {
-    pi: { model: "p", thinking: "medium", effort: "medium" },
-    claude: { model: "c", thinking: "medium", effort: "medium" },
-    codex: { model: "x", thinking: "medium", effort: "medium" },
-  },
-};
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 function setup(concurrency = 4) {
   const backend = new FakeBackend();
-  const manager = new JobManager({ backends: [backend], roles: new Map([[role.name, role]]), concurrency });
+  const manager = new JobManager({ backends: [backend], concurrency });
   return { backend, manager };
 }
-function request(n: number) { return { role: "worker", task: `task ${n}`, cwd: "/tmp", trusted: true, backend: "codex" as const }; }
+function request(n: number) { return { name: "worker", task: `task ${n}`, cwd: "/tmp", trusted: true, backend: "codex" as const }; }
 
 test("manager enforces concurrency cap four and pumps queued work", async () => {
   const { backend, manager } = setup(4);
@@ -120,7 +111,7 @@ test("cancellation aborts a pending backend start before returning", async () =>
       assert.fail("aborted startup must not return a run");
     },
   };
-  const manager = new JobManager({ backends: [backend], roles: new Map([[role.name, role]]) });
+  const manager = new JobManager({ backends: [backend] });
   const job = manager.spawn(request(1));
   await tick();
   const final = await manager.cancel(job.id, "race cancellation");
@@ -143,7 +134,7 @@ test("shutdown aborts delayed startup with no late run or resource resurrection"
       assert.fail("startup continued after shutdown abort");
     },
   };
-  const manager = new JobManager({ backends: [backend], roles: new Map([[role.name, role]]) });
+  const manager = new JobManager({ backends: [backend] });
   const job = manager.spawn(request(1));
   await tick();
   await manager.shutdown(100);
@@ -170,7 +161,7 @@ test("shutdown deadline force-closes a backend whose cancellation hangs", async 
       };
     },
   };
-  const manager = new JobManager({ backends: [backend], roles: new Map([[role.name, role]]) });
+  const manager = new JobManager({ backends: [backend] });
   const job = manager.spawn(request(1));
   await tick();
   const started = Date.now();
@@ -203,7 +194,7 @@ test("manager serializes send and cancel and publishes cancellation after teardo
       };
     },
   };
-  const manager = new JobManager({ backends: [backend], roles: new Map([[role.name, role]]) });
+  const manager = new JobManager({ backends: [backend] });
   const job = manager.spawn(request(1));
   await tick();
   const sending = manager.send(job.id, "in flight");
@@ -233,7 +224,7 @@ test("manager terminalizes a job when backend cancellation rejects", async () =>
       };
     },
   };
-  const manager = new JobManager({ backends: [backend], roles: new Map([[role.name, role]]) });
+  const manager = new JobManager({ backends: [backend] });
   const job = manager.spawn(request(1));
   await tick();
   await assert.rejects(manager.cancel(job.id), /teardown broke/);
@@ -284,9 +275,12 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
   await manager.shutdown();
 });
 
-test("manager rejects unknown roles, untrusted execution, and empty tasks", () => {
-  const { manager } = setup();
-  assert.throws(() => manager.spawn({ ...request(1), role: "missing" }), /Unknown/);
+test("manager rejects unknown explicit profiles, untrusted execution, and empty tasks", () => {
+  const backend = new FakeBackend();
+  const audit: ProfileDefinition = { name: "audit", description: "", systemPrompt: "audit", filePath: "audit.md", origin: "global" };
+  const manager = new JobManager({ backends: [backend], profiles: new Map([[audit.name, audit]]) });
+  assert.throws(() => manager.spawn({ ...request(1), profile: "missing" }), /Unknown subagent profile/);
+  assert.throws(() => manager.spawn({ ...request(1), profile: "  " }), /non-empty/);
   assert.throws(() => manager.spawn({ ...request(1), trusted: false }), /untrusted/);
   assert.throws(() => manager.spawn({ ...request(1), task: " " }), /empty/);
 });
