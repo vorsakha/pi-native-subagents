@@ -10,10 +10,10 @@ Provide a reliable control surface for starting generic task-driven agents, insp
 
 ## Principles
 
-- Make the task—not a mandatory persona—the normal unit of delegation.
+- Make the task the unit of delegation.
 - Keep access, provider, model tier, effort, independence, and optional human profile explicit and composable.
 - Default trusted generic agents to autonomous full access; make read-only an enforceable sandbox policy.
-- Keep optional profiles human-selected and visible, never automatically inferred.
+- Keep optional profiles explicitly human-selected and visible.
 - Preserve one global four-job budget whether work starts directly or through a workflow.
 - Use progressive disclosure: bounded cards → operational dashboard → normalized transcript/takeover.
 - Make name, access, optional profile, backend/model, effort, usage, and result state legible.

@@ -6,7 +6,7 @@ Inherit Pi's active theme and TUI vocabulary. Use semantic colors, compact bold 
 
 ## Subagent surfaces
 
-The `/subagents` overlay contains title/status, keyboard guidance, a job list, selected-job detail, a bounded transcript viewport, and an exit/action footer. Rows and detail headers show generic agent name, access, optional profile, backend/model, effort, status, and elapsed time—never a role taxonomy.
+The `/subagents` overlay contains title/status, keyboard guidance, a job list, selected-job detail, a bounded transcript viewport, and an exit/action footer. Rows and detail headers show agent name, access, optional profile, backend/model, effort, status, and elapsed time.
 
 Escape and Pi's cancel binding close the overlay. Arrow keys or `j`/`k` navigate; Shift+Up/Down and Page Up/Down scroll. Enter opens takeover; `s` steers, `f` queues a follow-up, and `x` cancels. Workflow-owned agents remain inspectable but cannot be steered.
 
@@ -32,6 +32,6 @@ The `/workflows` dashboard supports run/phase/agent navigation, status filtering
 
 Workflow JavaScript is control-plane code with no filesystem, network, subprocess, import, environment, or credential access. It can announce phases, request generic agents, and return JSON. Every request is validated by `WorkflowManager` and dispatched through the shared `JobManager`, preserving trust, profile ceilings, routing, subscription-auth sanitation, access sandboxes, the four-job cap, cancellation, and cleanup.
 
-`agent(prompt, options?)` needs no role. Options are `name`/`label`, `access`, `backend`, `modelTier`, `effort`, `independent`, explicit `profile`, `phase`, and bounded `schema`. Profiles are human-selected overlays, not automatically chosen personas. Provider independence is an enforceable route constraint, not prompt wording.
+`agent(prompt, options?)` accepts `name`/`label`, `access`, `backend`, `modelTier`, `effort`, `independent`, explicit `profile`, `phase`, and bounded `schema`. Profiles are human-selected overlays. Provider independence is an enforceable route constraint, not prompt wording.
 
 Workflow artifacts are private operational state under the Pi agent directory. Terminal runs write compact summary/result/transcript/report artifacts. Background runs deliver one bounded follow-up; session shutdown aborts without delivery.

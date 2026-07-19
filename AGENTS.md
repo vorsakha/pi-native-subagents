@@ -6,7 +6,7 @@ Build a standalone Pi extension providing first-class generic subagent lifecycle
 
 ## Required behavior
 
-- Use generic task-driven agents by default; do not introduce mandatory built-in roles or hidden personas.
+- Use generic task-driven agents by default.
 - Keep access, backend, model tier, effort, provider independence, and optional explicit profiles as composable policy fields.
 - Load global profiles from the Pi agent directory and trusted project profiles from `.pi/subagents`, with project precedence and validation warnings.
 - Preserve subscription authentication for Claude and Codex and never inherit environment state that could silently switch billing modes.

@@ -13,7 +13,7 @@ Standalone Pi package for generic task-driven Pi, Claude Code, and Codex subagen
 - Pi persistent JSONL RPC, Claude Code through the official Agent SDK and installed CLI, and Codex through the installed app-server.
 - Abortable startup, bounded shutdown, and process-tree cleanup.
 
-There are no bundled roles or hidden scout/worker/reviewer/adversary personas. Behavior comes from the task plus a short isolation baseline. Give every child a complete task containing the relevant paths, requirements, constraints, and verification expectations.
+Behavior comes from the task plus a short isolation baseline. Give every child a complete task containing the relevant paths, requirements, constraints, and verification expectations.
 
 ## Generic request contract
 
@@ -26,8 +26,6 @@ There are no bundled roles or hidden scout/worker/reviewer/adversary personas. B
 
 `independent: true` forces a different native provider from the parent: OpenAI/GPT/Codex parent → Claude, Claude parent → Codex. Explicit Pi or same-provider routes are rejected. For an unknown parent provider, Claude is the native fallback.
 
-Old `role`, `agent`, `modelProfile`, and workflow `role`/`tier` arguments are rejected; they are not translated.
-
 | Tier | Native Codex | Native Claude | Pi Codex route |
 | --- | --- | --- | --- |
 | `economy` | Luna | Haiku | `openai-codex/gpt-5.6-luna` |
@@ -38,7 +36,7 @@ Claude and Codex omit effort by default so provider behavior remains adaptive. C
 
 ## Optional profiles
 
-Profiles are optional human-authored policy/instruction overlays, selected only by explicit name. Model guidance says to omit `profile` unless the human explicitly requests one; profiles are not an automatic orchestration taxonomy.
+Profiles are optional human-authored policy and instruction overlays selected only by explicit name. Model guidance says to omit `profile` unless the human explicitly requests one.
 
 Global profiles load from `getAgentDir()/subagents/*.md` (normally `~/.pi/agent/subagents/`). Trusted-project profiles load from `<cwd>/.pi/subagents/*.md` and override global profiles by name. `/subagents profiles` lists resolved names, origins, paths, and validation warnings.
 
@@ -88,7 +86,7 @@ Workflow JavaScript runs in a separate permission-restricted Node process with 1
 
 The default backend applies to both direct tools and workflow `agent()` calls. Successfully completed ordinary jobs retain their native session for 15 minutes; follow-up sends reopen the same job/session. Failed, cancelled, expired, evicted, and workflow-owned sessions are not reusable.
 
-Workflow scripts use generic agents without a role:
+Workflow scripts compose task-driven agents directly:
 
 ```js
 export default async function () {
@@ -118,8 +116,6 @@ npm run typecheck
 npm test
 npm run pack:check
 ```
-
-Do not load this package alongside the legacy `~/.pi/agent/extensions/subagents` tree; duplicate installs fail closed with migration guidance.
 
 The suite intentionally stays around 55–70 broad, risk-based tests. Opt-in subscription-auth smoke commands are `npm run smoke`, `npm run smoke:{pi,claude,codex}`, and `npm run smoke:access:{claude,codex}`; set `PI_NATIVE_SUBAGENTS_LIVE=1` to invoke models.
 
