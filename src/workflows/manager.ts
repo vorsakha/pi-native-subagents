@@ -283,7 +283,7 @@ export class WorkflowManager {
   ): Promise<WorkflowAgentResult> {
     if (!prompt.trim()) return { ok: false, output: "", error: "agent() requires a non-empty prompt" };
     if (["role", "agent", "tier", "modelProfile"].some((key) => Object.hasOwn(options, key))) {
-      return { ok: false, output: "", error: "Legacy workflow role, agent, tier, and modelProfile options are not supported" };
+      return { ok: false, output: "", error: "Workflow agent() API schema mismatch: use the current task-driven schema." };
     }
     const backend = options.backend === undefined ? undefined : String(options.backend) as BackendName;
     if (backend && !BACKENDS.has(backend)) return { ok: false, output: "", error: `Unknown backend: ${backend}` };

@@ -187,8 +187,8 @@ test("extension exposes generic direct tools, configured routing, independence, 
     /different from the parent claude/,
   );
   await assert.rejects(
-    pi.tools.get("subagent_spawn").execute("legacy", { role: "worker", task: "old contract" }, undefined, undefined, ctx),
-    /Legacy role, agent, and modelProfile arguments are not supported/,
+    pi.tools.get("subagent_spawn").execute("schema-mismatch", { role: "worker", task: "wrong schema" }, undefined, undefined, ctx),
+    /Subagent API schema mismatch: reload Pi to use the current task-driven schema\./,
   );
 
   await pi.handlers.get("session_shutdown")?.();

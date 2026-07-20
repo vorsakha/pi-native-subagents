@@ -167,7 +167,7 @@ test("rejects untrusted workflows before creating artifact storage", async () =>
   }
 });
 
-test("rejects every legacy workflow agent option without spawning jobs", async () => {
+test("rejects mismatched workflow agent schemas without spawning jobs", async () => {
   const f = await fixture();
   try {
     const started = await f.workflows.start(f.request(`
@@ -178,7 +178,7 @@ test("rejects every legacy workflow agent option without spawning jobs", async (
           { agent: "reviewer" },
           { tier: "quality" },
           { modelProfile: "codex" },
-        ]) results.push(await agent("legacy call", options));
+        ]) results.push(await agent("schema mismatch", options));
         return results;
       }
     `));
@@ -186,7 +186,7 @@ test("rejects every legacy workflow agent option without spawning jobs", async (
     const results = final.result as Array<{ ok: boolean; error?: string }>;
     assert.equal(final.status, "completed");
     assert.equal(results.length, 4);
-    assert.ok(results.every((result) => !result.ok && /Legacy workflow/.test(result.error ?? "")));
+    assert.ok(results.every((result) => !result.ok && /Workflow agent\(\) API schema mismatch/.test(result.error ?? "")));
     assert.equal(f.backend.requests.length, 0);
   } finally {
     await f.cleanup();

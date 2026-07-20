@@ -407,7 +407,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     ],
     parameters: spawnParameters,
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      rejectLegacyParams(params);
+      rejectSchemaMismatch(params);
       const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), activeBackend, providerFamily(ctx.model?.provider));
       return result(snapshot, `Spawned ${snapshot.id} (${snapshot.name}, ${snapshot.access}, ${snapshot.backend}/${snapshot.model}, effort ${formatEffort(snapshot.effort)})`);
     },
@@ -583,7 +583,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     ],
     parameters: spawnParameters,
     async execute(_id, params, signal, onUpdate, ctx) {
-      rejectLegacyParams(params);
+      rejectSchemaMismatch(params);
       const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), activeBackend, providerFamily(ctx.model?.provider));
       const generation = beginResultConsumption(snapshot.id);
       let consumed = false;
@@ -621,9 +621,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   });
 }
 
-function rejectLegacyParams(params: object): void {
+function rejectSchemaMismatch(params: object): void {
   if (Object.hasOwn(params, "role") || Object.hasOwn(params, "agent") || Object.hasOwn(params, "modelProfile")) {
-    throw new Error("Legacy role, agent, and modelProfile arguments are not supported");
+    throw new Error("Subagent API schema mismatch: reload Pi to use the current task-driven schema.");
   }
 }
 
