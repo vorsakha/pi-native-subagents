@@ -1,7 +1,7 @@
 {
   "name": "@vorsakha/pi-native-subagents",
   "version": "0.1.0",
-  "description": "Native multi-backend subagents and sandboxed workflows for Pi.",
+  "description": "Native multi-harness subagents and sandboxed workflows for Pi.",
   "type": "module",
   "main": "extensions/subagents/index.ts",
   "license": "MIT",

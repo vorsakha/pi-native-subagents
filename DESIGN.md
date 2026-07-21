@@ -6,7 +6,7 @@ Inherit Pi's active theme and TUI vocabulary. Use semantic colors, compact bold 
 
 ## Subagent surfaces
 
-The `/subagents` overlay contains title/status, keyboard guidance, a job list, selected-job detail, a bounded transcript viewport, and an exit/action footer. Rows and detail headers show agent name, access, optional profile, backend/requested model (or `default`), effort, status, and elapsed time. Concrete model recommendations live in the separately editable `subagents` skill; the runtime accepts a bounded backend-local ID or omits model selection so the native backend chooses its configured default.
+The `/subagents` overlay contains title/status, keyboard guidance, a job list, selected-job detail, a bounded transcript viewport, and an exit/action footer. Rows and detail headers show agent name, access, optional profile, harness/requested model (or `default`), effort, status, and elapsed time. Concrete model recommendations live in the separately editable `subagents` skill; the runtime accepts a bounded harness-local ID or omits model selection so the native harness chooses its configured default.
 
 Escape and Pi's cancel binding close the overlay. Arrow keys or `j`/`k` navigate; Shift+Up/Down and Page Up/Down scroll. Enter opens takeover; `s` steers, `f` queues a follow-up, and `x` cancels. Workflow-owned agents remain inspectable but cannot be steered.
 
@@ -24,7 +24,7 @@ Every direct tool uses the inline trace shell: `⌁` opens the call row and `│
 
 Workflow calls and results use the same `⌁`/`│` trace grammar, sanitizers, colors, glyphs, 10/36-line budgets, and one `/workflows` pointer. Collapsed cards show the current phase, active agent, result preview, and essential policy; expanded cards reveal description, summaries, and phase history.
 
-There are no configured workflow token, turn, cost, or overall deadline limits. Usage is reporting only. The enforced workflow bounds are 512 KiB source, 256 KiB args, 1 MiB result, 32 agent calls, 128 phase events/64 retained phases, and four-way parallelism; backend lifecycle and shutdown deadlines remain separate and bounded.
+There are no configured workflow token, turn, cost, or overall deadline limits. Usage is reporting only. The enforced workflow bounds are 512 KiB source, 256 KiB args, 1 MiB result, 32 agent calls, 128 phase events/64 retained phases, and four-way parallelism; harness lifecycle and shutdown deadlines remain separate and bounded.
 
 The `/workflows` dashboard supports run/phase/agent navigation, status filtering, a read-only agent inspector, per-agent cancellation, and whole-run cancellation. The inspector separates caller prompt, thinking/tools, transcript, structured output, and result. Artifact paths and raw scripts are not shown in normal dashboard content.
 
@@ -32,6 +32,6 @@ The `/workflows` dashboard supports run/phase/agent navigation, status filtering
 
 Workflow JavaScript is control-plane code with no filesystem, network, subprocess, import, environment, or credential access. It can announce phases, request generic agents, and return JSON. Every request is validated by `WorkflowManager` and dispatched through the shared `JobManager`, preserving trust, profile ceilings, routing, subscription-auth sanitation, access sandboxes, the four-job cap, cancellation, and cleanup.
 
-`agent(prompt, options?)` accepts `name`/`label`, `access`, `backend`, exact backend-local `model`, `effort`, `independent`, explicit `profile`, `phase`, and bounded `schema`. Profiles are human-selected overlays. Provider independence is an enforceable route constraint, not prompt wording.
+`agent(prompt, options?)` accepts `name`/`label`, `access`, `harness`, exact harness-local `model`, `effort`, `independent`, explicit `profile`, `phase`, and bounded `schema`. Profiles are human-selected overlays. Provider independence is an enforceable route constraint, not prompt wording.
 
 Workflow artifacts are private operational state under the Pi agent directory. Terminal runs write compact summary/result/transcript/report artifacts. Background runs deliver one bounded follow-up; session shutdown aborts without delivery.

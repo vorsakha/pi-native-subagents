@@ -36,7 +36,7 @@ export interface WorkflowAgentRecord {
   jobId?: string;
   state: WorkflowAgentState;
   timestamps: WorkflowTimestamps;
-  backend?: string;
+  harness?: string;
   model?: string;
   effort?: EffortLevel;
   /** Original caller prompt, bounded before persistence; excludes schema scaffolding. */

@@ -24,7 +24,7 @@ import {
   truncatePreview,
 } from "./render.ts";
 import { loadProfiles, type ProfileCatalog } from "../../src/profiles.ts";
-import type { AccessMode, Backend, BackendName, EffortLevel, JobSnapshot, ProviderFamily, SendBehavior } from "../../src/types.ts";
+import type { AccessMode, Backend, HarnessName, EffortLevel, JobSnapshot, ProviderFamily, SendBehavior } from "../../src/types.ts";
 import { registerWorkflows } from "../workflows/index.ts";
 
 /** The configured expand-key hint (e.g. "ctrl+o to expand"), threaded into render options so render.ts stays testable without live keybinding state. */
@@ -35,9 +35,9 @@ function expandHint(): string {
 }
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
-const STATE_ENTRY = "native-subagents-profile";
+const STATE_ENTRY = "native-subagents-harness";
 const SUBAGENT_RESULT_MESSAGE = "native-subagent-result";
-const BACKENDS = ["codex", "claude", "pi"] as const;
+const HARNESSES = ["codex", "claude", "pi"] as const;
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const ACCESS = ["readOnly", "full"] as const;
 
@@ -77,8 +77,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const releaseInstall = claimExtensionInstall(ROOT, options.registry ?? globalThis, legacyRoot);
   const globalProfilesDir = options.globalProfilesDir ?? resolve(getAgentDir(), "subagents");
   let profileCatalog: ProfileCatalog = loadProfiles(globalProfilesDir);
-  const configuredBackend = configuredBackendFromEnv(process.env);
-  let activeBackend = configuredBackend;
+  const configuredHarness = configuredHarnessFromEnv(process.env);
+  let activeHarness = configuredHarness;
   let manager: JobManager | undefined;
   let unsubscribeManager: (() => void) | undefined;
   let sessionContext: { isIdle(): boolean } | undefined;
@@ -222,7 +222,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   };
   const workflows = registerWorkflows(pi, {
     artifactRoot: options.workflowArtifactRoot,
-    defaultBackend: () => activeBackend,
+    defaultHarness: () => activeHarness,
     setInterval: options.setInterval,
     clearInterval: options.clearInterval,
   });
@@ -289,23 +289,23 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     cardSnapshots.clear();
     waitInterest.clear();
     consumedResults.clear();
-    activeBackend = configuredBackend;
+    activeHarness = configuredHarness;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom") continue;
-      const data = entry.data as { backend?: unknown } | undefined;
-      const restored = entry.customType === STATE_ENTRY ? normalizeBackend(data?.backend) : undefined;
-      if (restored) activeBackend = restored;
+      const data = entry.data as { harness?: unknown } | undefined;
+      const restored = entry.customType === STATE_ENTRY ? normalizeHarness(data?.harness) : undefined;
+      if (restored) activeHarness = restored;
     }
     const sessionManager = manager;
     unsubscribeManager = sessionManager.subscribe((job, event) => {
       rememberCardSnapshot(job);
       refreshCardBlinks();
-      updateStatus(ctx, sessionManager, activeBackend);
+      updateStatus(ctx, sessionManager, activeHarness);
       if (event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown")) {
         deferResult(job);
       }
     });
-    updateStatus(ctx, sessionManager, activeBackend);
+    updateStatus(ctx, sessionManager, activeHarness);
     workflows.sessionStart(ctx, sessionManager);
   });
 
@@ -332,14 +332,14 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 
   const configure = async (args: string, ctx: ExtensionCommandContext) => {
     const value = args.trim().toLowerCase();
-    const selected = normalizeBackend(value);
+    const selected = normalizeHarness(value);
     if (selected) {
-      activeBackend = selected;
-      pi.appendEntry(STATE_ENTRY, { backend: selected });
-      updateStatus(ctx, getManager(), activeBackend);
-      ctx.ui.notify(`Default subagent backend: ${selected}`, "info");
+      activeHarness = selected;
+      pi.appendEntry(STATE_ENTRY, { harness: selected });
+      updateStatus(ctx, getManager(), activeHarness);
+      ctx.ui.notify(`Default subagent harness: ${selected}`, "info");
     } else if (value === "status") {
-      ctx.ui.notify(`Default backend: ${activeBackend}\nProfiles: ${profileCatalog.profiles.size}\nModels: caller-selected or native backend default`, "info");
+      ctx.ui.notify(`Default harness: ${activeHarness}\nProfiles: ${profileCatalog.profiles.size}\nModels: caller-selected or native harness default`, "info");
     } else if (value === "profiles") {
       const resolved = [...profileCatalog.profiles.values()]
         .sort((a, b) => a.name.localeCompare(b.name))
@@ -347,13 +347,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const warnings = profileCatalog.warnings.map((warning) => `Warning (${warning.origin}) ${warning.filePath}: ${warning.message}`);
       ctx.ui.notify([...resolved, ...warnings].join("\n") || "No subagent profiles configured.", warnings.length ? "warning" : "info");
     } else {
-      ctx.ui.notify("Usage: /subagents [status|profiles|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <backend>", "warning");
+      ctx.ui.notify("Usage: /subagents [status|profiles|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <harness>", "warning");
     }
   };
 
   pi.registerCommand("subagents", {
     description: "Open the subagent dashboard; inspect optional profiles with /subagents profiles.",
-    getArgumentCompletions: (prefix) => ["status", "profiles", ...BACKENDS, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    getArgumentCompletions: (prefix) => ["status", "profiles", ...HARNESSES, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (args.trim()) await configure(args, ctx);
       else await openSubagentsDashboard(ctx, getManager());
@@ -361,8 +361,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   });
 
   pi.registerCommand("subagents-config", {
-    description: "Show or switch the default native subagent backend.",
-    getArgumentCompletions: (prefix) => ["status", ...BACKENDS].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    description: "Show or switch the default native subagent harness.",
+    getArgumentCompletions: (prefix) => ["status", ...HARNESSES].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
     handler: configure,
   });
 
@@ -370,8 +370,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     task: Type.String({ minLength: 1, maxLength: 100_000 }),
     name: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
     cwd: Type.Optional(Type.String()),
-    backend: Type.Optional(StringEnum(BACKENDS)),
-    model: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Backend-local model ID; omit to use the backend default" })),
+    harness: Type.Optional(StringEnum(HARNESSES)),
+    model: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Harness-local model ID; omit to use the harness default" })),
     effort: Type.Optional(StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" })),
     access: Type.Optional(StringEnum(ACCESS, { description: "Access policy; defaults to full after project trust is established" })),
     independent: Type.Optional(Type.Boolean({ description: "Require a native provider different from the parent" })),
@@ -392,12 +392,12 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     parameters: spawnParameters,
     async execute(_id, params, _signal, _onUpdate, ctx) {
       rejectSchemaMismatch(params);
-      const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), activeBackend, providerFamily(ctx.model?.provider));
-      return result(snapshot, `Spawned ${snapshot.id} (${snapshot.name}, ${snapshot.access}, ${snapshot.backend}/${snapshot.model}, effort ${formatEffort(snapshot.effort)})`);
+      const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), activeHarness, providerFamily(ctx.model?.provider));
+      return result(snapshot, `Spawned ${snapshot.id} (${snapshot.name}, ${snapshot.access}, ${snapshot.harness}/${snapshot.model}, effort ${formatEffort(snapshot.effort)})`);
     },
     renderCall(args, theme) {
-      const route = args.independent ? "independent" : args.backend
-        ? `${args.backend}${args.model ? `/${args.model}` : ""}`
+      const route = args.independent ? "independent" : args.harness
+        ? `${args.harness}${args.model ? `/${args.model}` : ""}`
         : args.model ?? "";
       const detail = [args.access ?? "full", args.profile ? `profile:${args.profile}` : "", route, args.effort ? `effort:${args.effort}` : "", truncatePreview(args.task)].filter(Boolean).join(" · ");
       return renderToolCallLine(theme, "Spawn", args.name ?? "agent", detail);
@@ -556,7 +556,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     name: "subagent",
     renderShell: "self",
     label: "Subagent",
-    description: `Foreground convenience for one generic task-driven subagent. Default backend: ${activeBackend}.`,
+    description: `Foreground convenience for one generic task-driven subagent. Default harness: ${activeHarness}.`,
     promptSnippet: "Run one isolated generic subagent and wait for its result",
     promptGuidelines: [
       "Use subagent_spawn for independent work that can run in parallel; use subagent_wait before consuming its result.",
@@ -568,7 +568,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     parameters: spawnParameters,
     async execute(_id, params, signal, onUpdate, ctx) {
       rejectSchemaMismatch(params);
-      const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), activeBackend, providerFamily(ctx.model?.provider));
+      const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), activeHarness, providerFamily(ctx.model?.provider));
       const generation = beginResultConsumption(snapshot.id);
       let consumed = false;
       const timer = setInterval(() => {
@@ -591,8 +591,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
     },
     renderCall(args, theme) {
-      const backend = args.independent ? "independent" : args.backend ?? activeBackend;
-      const route = args.model ? `${backend}/${args.model}` : backend;
+      const harness = args.independent ? "independent" : args.harness ?? activeHarness;
+      const route = args.model ? `${harness}/${args.model}` : harness;
       const effort = args.effort ? ` · effort:${args.effort}` : "";
       const profile = args.profile ? ` · profile:${args.profile}` : "";
       return renderToolCallLine(theme, "Run", args.name ?? "agent", `[${route}${effort}${profile}] ${truncatePreview(args.task)}`);
@@ -606,7 +606,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 }
 
 function rejectSchemaMismatch(params: object): void {
-  if (["role", "agent", "modelProfile", "modelTier", "tier"].some((key) => Object.hasOwn(params, key))) {
+  if (["role", "agent", "modelProfile", "modelTier", "tier", "backend"].some((key) => Object.hasOwn(params, key))) {
     throw new Error("Subagent API schema mismatch: reload Pi to use the current task-driven schema.");
   }
 }
@@ -617,10 +617,10 @@ function sendTitle(behavior: SendBehavior): "Steer" | "Follow up" {
 
 function spawn(
   manager: JobManager,
-  params: { task: string; name?: string; cwd?: string; backend?: BackendName; model?: string; effort?: EffortLevel; access?: AccessMode; independent?: boolean; profile?: string },
+  params: { task: string; name?: string; cwd?: string; harness?: HarnessName; model?: string; effort?: EffortLevel; access?: AccessMode; independent?: boolean; profile?: string },
   parentCwd: string,
   trusted: boolean,
-  defaultBackend?: BackendName,
+  defaultHarness?: HarnessName,
   parentProvider?: ProviderFamily,
 ): JobSnapshot {
   const cwd = secureCwd(parentCwd, params.cwd);
@@ -629,13 +629,13 @@ function spawn(
     task: params.task,
     cwd,
     trusted,
-    backend: params.backend,
+    harness: params.harness,
     model: params.model,
     effort: params.effort,
     access: params.access,
     independent: params.independent,
     profile: params.profile,
-    defaultBackend,
+    defaultHarness,
     parentProvider,
   });
 }
@@ -652,11 +652,11 @@ function secureCwd(parentCwd: string, requested?: string): string {
   return candidate;
 }
 
-export function configuredBackendFromEnv(env: NodeJS.ProcessEnv): BackendName {
-  return normalizeBackend(env.PI_NATIVE_SUBAGENTS_BACKEND) ?? "codex";
+export function configuredHarnessFromEnv(env: NodeJS.ProcessEnv): HarnessName {
+  return normalizeHarness(env.PI_NATIVE_SUBAGENTS_HARNESS) ?? "codex";
 }
 
-export function normalizeBackend(value: unknown): BackendName | undefined {
+export function normalizeHarness(value: unknown): HarnessName | undefined {
   const text = String(value ?? "").trim().toLowerCase().replace(/^--use-/, "");
   if (text === "codex" || text === "openai" || text === "gpt") return "codex";
   if (text === "claude" || text === "anthropic") return "claude";
@@ -664,16 +664,16 @@ export function normalizeBackend(value: unknown): BackendName | undefined {
   return undefined;
 }
 
-function updateStatus(ctx: { ui: { setStatus(key: string, text: string | undefined): void } }, manager: JobManager, backend: BackendName): void {
+function updateStatus(ctx: { ui: { setStatus(key: string, text: string | undefined): void } }, manager: JobManager, harness: HarnessName): void {
   const jobs = manager.list();
   const running = jobs.filter((job) => job.status === "running" || job.status === "queued").length;
   const finished = jobs.filter((job) => isTerminal(job.status)).length;
-  ctx.ui.setStatus("native-subagents", `subagents:${backend}${running ? ` ${running}↻` : ""}${finished ? ` ${finished}✓` : ""}`);
+  ctx.ui.setStatus("native-subagents", `subagents:${harness}${running ? ` ${running}↻` : ""}${finished ? ` ${finished}✓` : ""}`);
 }
 
 function statusLine(job: JobSnapshot): string {
   const profile = job.profile ? `; profile ${job.profile}` : "";
-  return `${job.id} ${job.status} ${job.name} [${job.access}; ${job.backend}/${job.model}; effort ${formatEffort(job.effort)}${profile}]`;
+  return `${job.id} ${job.status} ${job.name} [${job.access}; ${job.harness}/${job.model}; effort ${formatEffort(job.effort)}${profile}]`;
 }
 function terminalText(job: JobSnapshot): string {
   if (job.status === "completed") return job.output || "(completed with no text output)";

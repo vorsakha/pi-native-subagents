@@ -68,7 +68,7 @@ export class JobManager {
     const profile = profileName ? this.#profiles.get(profileName) : undefined;
     if (profileName && !profile) throw new Error(`Unknown subagent profile: ${profileName}`);
     const { policy, independent } = compilePolicy(request, profile);
-    if (!this.#backends.has(policy.backend)) throw new Error(`Backend is unavailable: ${policy.backend}`);
+    if (!this.#backends.has(policy.harness)) throw new Error(`Harness is unavailable: ${policy.harness}`);
     this.#evictOldJobs();
     const id = randomUUID();
     const name = request.name?.replace(/\s+/g, " ").trim().slice(0, 160) || `agent-${id.slice(0, 8)}`;
@@ -78,7 +78,7 @@ export class JobManager {
       access: policy.access,
       profile: profile?.name,
       independent,
-      backend: policy.backend,
+      harness: policy.harness,
       model: policy.model ?? "default",
       effort: policy.effort,
       task: request.task,
@@ -155,7 +155,7 @@ export class JobManager {
       const timer = setTimeout(() => ready(undefined), 30_000);
       waiters.add(ready);
     });
-    if (!run) throw new Error(`Cannot send to ${id}: backend did not become ready`);
+    if (!run) throw new Error(`Cannot send to ${id}: harness did not become ready`);
     await this.#serialize(job, async () => {
       if (job.cancelRequested || isTerminal(job.snapshot.status) || job.run !== run) {
         throw new Error(`Cannot send to ${id}: job is cancelling or settled`);
@@ -283,7 +283,7 @@ export class JobManager {
   }
 
   async #launch(job: InternalJob): Promise<void> {
-    const backend = this.#backends.get(job.policy.backend)!;
+    const backend = this.#backends.get(job.policy.harness)!;
     const startupController = new AbortController();
     job.startupController = startupController;
     this.#emit(job, { type: "started" });
@@ -310,7 +310,7 @@ export class JobManager {
       if (!isTerminal(job.snapshot.status) && !job.cancelRequested) this.#emit(job, { type: "completed" });
     } catch (error) {
       if (!isTerminal(job.snapshot.status)) {
-        if (job.cancelRequested || startupController.signal.aborted) this.#emit(job, { type: "cancelled", reason: job.cancelRequested ?? "Backend startup aborted" });
+        if (job.cancelRequested || startupController.signal.aborted) this.#emit(job, { type: "cancelled", reason: job.cancelRequested ?? "Harness startup aborted" });
         else this.#emit(job, { type: "failed", error: error instanceof Error ? error.message : String(error) });
       }
     } finally {
@@ -394,7 +394,7 @@ export class JobManager {
         await run.cancel(reason);
       } catch (error) {
         job.deferredCancellation = undefined;
-        this.#emit(job, { type: "failed", error: `Backend cancellation failed: ${error instanceof Error ? error.message : String(error)}` });
+        this.#emit(job, { type: "failed", error: `Harness cancellation failed: ${error instanceof Error ? error.message : String(error)}` });
         throw error;
       } finally {
         job.cancelling = false;

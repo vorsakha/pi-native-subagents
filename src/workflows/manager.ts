@@ -4,7 +4,7 @@ import { Check } from "typebox/value";
 import type { JobManager } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
 import { normalizeModel } from "../policy.ts";
-import type { AccessMode, BackendEvent, BackendName, EffortLevel, JobSnapshot, ProviderFamily, Usage } from "../types.ts";
+import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProviderFamily, Usage } from "../types.ts";
 import {
   checkpointWorkflow,
   createWorkflowArtifacts,
@@ -22,7 +22,7 @@ import type {
   WorkflowUsage,
 } from "./types.ts";
 
-const BACKENDS = new Set<BackendName>(["pi", "claude", "codex"]);
+const HARNESSES = new Set<HarnessName>(["pi", "claude", "codex"]);
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
 const ACCESS = new Set<AccessMode>(["readOnly", "full"]);
 const CHECKPOINT_DELAY_MS = 150;
@@ -39,7 +39,7 @@ export interface StartWorkflowRequest {
   cwd: string;
   trusted: boolean;
   parentProvider?: ProviderFamily;
-  defaultBackend?: BackendName;
+  defaultHarness?: HarnessName;
 }
 
 export interface StartedWorkflow {
@@ -282,11 +282,11 @@ export class WorkflowManager {
     signal: AbortSignal,
   ): Promise<WorkflowAgentResult> {
     if (!prompt.trim()) return { ok: false, output: "", error: "agent() requires a non-empty prompt" };
-    if (["role", "agent", "tier", "modelTier", "modelProfile"].some((key) => Object.hasOwn(options, key))) {
+    if (["role", "agent", "tier", "modelTier", "modelProfile", "backend"].some((key) => Object.hasOwn(options, key))) {
       return { ok: false, output: "", error: "Workflow agent() API schema mismatch: use the current task-driven schema." };
     }
-    const backend = options.backend === undefined ? undefined : String(options.backend) as BackendName;
-    if (backend && !BACKENDS.has(backend)) return { ok: false, output: "", error: `Unknown backend: ${backend}` };
+    const harness = options.harness === undefined ? undefined : String(options.harness) as HarnessName;
+    if (harness && !HARNESSES.has(harness)) return { ok: false, output: "", error: `Unknown harness: ${harness}` };
     let model: string | undefined;
     try { model = normalizeModel(options.model); }
     catch (error) { return { ok: false, output: "", error: boundedText(error) }; }
@@ -343,13 +343,13 @@ export class WorkflowManager {
         task,
         cwd: request.cwd,
         trusted: request.trusted,
-        backend,
+        harness,
         model,
         effort,
         access,
         independent: options.independent === true,
         profile: record.profile,
-        defaultBackend: request.defaultBackend,
+        defaultHarness: request.defaultHarness,
         parentProvider: request.parentProvider,
         workflow: {
           runId: entry.snapshot.runId,
@@ -372,7 +372,7 @@ export class WorkflowManager {
     record.access = job.access;
     record.profile = job.profile;
     record.independent = job.independent;
-    record.backend = job.backend;
+    record.harness = job.harness;
     record.model = job.model;
     record.timestamps.updatedAt = Date.now();
     this.#jobOwners.set(job.id, { runId: entry.snapshot.runId, agentIndex: index });
@@ -428,7 +428,7 @@ export class WorkflowManager {
       profile: job.profile,
       independent: job.independent,
       state: agentState(job),
-      backend: job.backend,
+      harness: job.harness,
       model: job.model,
       effort: job.effort,
       preview: job.output.slice(-500),
@@ -465,7 +465,7 @@ export class WorkflowManager {
     agent.access = job.access;
     agent.profile = job.profile;
     agent.independent = job.independent;
-    agent.backend = job.backend;
+    agent.harness = job.harness;
     agent.model = job.model;
     agent.effort = job.effort;
     agent.preview = job.output.slice(-500);

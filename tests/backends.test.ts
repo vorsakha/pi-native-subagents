@@ -7,7 +7,7 @@ import { ClaudeBackend } from "../src/backends/claude.ts";
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
 import { CodexAppServerBackend } from "../src/backends/codex.ts";
 import { MAX_OUTPUT_BYTES } from "../src/reducer.ts";
-import type { BackendEvent, BackendName, BackendRequest } from "../src/types.ts";
+import type { BackendEvent, HarnessName, BackendRequest } from "../src/types.ts";
 
 const PI_FIXTURE = `#!/usr/bin/env node
 import fs from "node:fs";
@@ -98,12 +98,12 @@ async function fixture(source: string): Promise<{ dir: string; command: string }
   return { dir, command };
 }
 
-function request(backend: BackendName, cwd: string, env: NodeJS.ProcessEnv): BackendRequest {
+function request(harness: HarnessName, cwd: string, env: NodeJS.ProcessEnv): BackendRequest {
   return {
-    jobId: `job-${backend}`, name: "worker", task: "fixture task", systemPrompt: "fixture system", cwd, env,
+    jobId: `job-${harness}`, name: "worker", task: "fixture task", systemPrompt: "fixture system", cwd, env,
     signal: new AbortController().signal,
     policy: {
-      backend, access: "readOnly", model: "fixture-model", thinking: "low",
+      harness, access: "readOnly", model: "fixture-model", thinking: "low",
       piTools: [], claudeTools: [], approvalPolicy: "never",
       codexSandbox: { type: "readOnly", networkAccess: false },
     },

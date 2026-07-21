@@ -125,8 +125,8 @@ function phaseLine(snapshot: WorkflowSnapshot, index: number, theme: Theme, now:
 
 function agentLine(agent: WorkflowAgentRecord, theme: Theme, now: number): string {
   const status = traceStatusMeta(agent.state, now);
-  const route = agent.backend || agent.model
-    ? ` · ${sanitizeInline(agent.backend ?? "backend")}/${sanitizeInline(agent.model ?? "model")}`
+  const route = agent.harness || agent.model
+    ? ` · ${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}`
     : "";
   const profile = agent.profile ? ` · profile ${sanitizeInline(agent.profile)}` : "";
   const independent = agent.independent ? " · independent" : "";

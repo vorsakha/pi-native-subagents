@@ -1,4 +1,4 @@
-import type { BackendName, BackendPolicy, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
+import type { HarnessName, BackendPolicy, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
 
 export function normalizeModel(value: unknown): string | undefined {
   if (value === undefined) return undefined;
@@ -24,17 +24,17 @@ export interface CompiledJob {
 export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition): CompiledJob {
   if (!request.trusted) throw new Error("Subagents are disabled for untrusted projects");
   const independent = request.independent === true || profile?.independent === true;
-  let selected: BackendName = request.backend ?? profile?.backend ?? request.defaultBackend ?? "codex";
-  if (profile?.lockedBackend) {
-    if (request.backend && request.backend !== profile.lockedBackend) {
-      throw new Error(`Profile ${profile.name} locks its backend to ${profile.lockedBackend}`);
+  let selected: HarnessName = request.harness ?? profile?.harness ?? request.defaultHarness ?? "codex";
+  if (profile?.lockedHarness) {
+    if (request.harness && request.harness !== profile.lockedHarness) {
+      throw new Error(`Profile ${profile.name} locks its harness to ${profile.lockedHarness}`);
     }
-    selected = profile.lockedBackend;
+    selected = profile.lockedHarness;
   }
   if (independent) {
-    if (request.backend === "pi" || profile?.lockedBackend === "pi") throw new Error("independent agents require a native Claude or Codex backend");
+    if (request.harness === "pi" || profile?.lockedHarness === "pi") throw new Error("independent agents require a native Claude or Codex harness");
     const parent = request.parentProvider;
-    const explicitRoute = request.backend !== undefined || profile?.lockedBackend !== undefined;
+    const explicitRoute = request.harness !== undefined || profile?.lockedHarness !== undefined;
     if (explicitRoute && parent !== "other" && selected === parent) {
       throw new Error(`independent agent must use a provider different from the parent ${parent} model`);
     }
@@ -48,7 +48,7 @@ export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition
     profile,
     independent,
     policy: {
-      backend: selected,
+      harness: selected,
       access,
       model,
       thinking: "medium",

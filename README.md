@@ -4,7 +4,7 @@ Standalone Pi package for generic task-driven Pi, Claude Code, and Codex subagen
 
 ## What it provides
 
-- A normalized `Backend` / `BackendEvent` API and session-scoped `JobManager` with a hard four-job concurrency cap.
+- Normalized native harness adapters and events plus a session-scoped `JobManager` with a hard four-job concurrency cap.
 - Background `subagent_spawn`, `subagent_wait`, `subagent_check`, `subagent_send`, `subagent_cancel`, and `subagent_list` tools.
 - A foreground `subagent` convenience tool using the same generic request contract.
 - Native session steering and retained-session follow-ups, plus one-shot delivery of unconsumed background results.
@@ -20,9 +20,9 @@ Behavior comes from the task plus a short isolation baseline. Give every child a
 `subagent_spawn` and foreground `subagent` accept:
 
 - required `task`;
-- optional `name`, `cwd`, `backend`, exact backend-local `model`, `effort`, `access`, `independent`, and `profile`.
+- optional `name`, `cwd`, `harness`, exact harness-local `model`, `effort`, `access`, `independent`, and `profile`.
 
-`access` is `readOnly` or `full` and defaults to `full` only after Pi's project-trust gate succeeds. The configured backend defaults to Codex. `model` never selects or changes a backend; it is forwarded only to the chosen native backend. Omitting it uses that backend's configured default. Claude and Codex also omit effort by default so provider behavior remains adaptive; callers may set `low`, `medium`, `high`, `xhigh`, or `max`.
+`access` is `readOnly` or `full` and defaults to `full` only after Pi's project-trust gate succeeds. The configured harness defaults to Codex. `model` never selects or changes a harness; it is forwarded only to the chosen native harness. Omitting it uses that harness's configured default. Claude and Codex also omit effort by default so provider behavior remains adaptive; callers may set `low`, `medium`, `high`, `xhigh`, or `max`.
 
 The extension contains no concrete model names or model recommendation table. The separately installed, easy-to-edit `subagents` skill owns current cost/capability guidance and supplies exact models when useful. Runtime code remains responsible for trust, access, provider diversity, subscription authentication, sandboxing, and lifecycle constraints.
 
@@ -39,14 +39,14 @@ Global profiles load from `getAgentDir()/subagents/*.md` (normally `~/.pi/agent/
 name: security-audit
 description: Read-only security review policy
 access: readOnly
-backend: claude
+harness: claude
 effort: high
 independent: true
 ---
 Focus on concrete security boundaries and evidence. Do not suggest unrelated changes.
 ```
 
-Supported fields are `name`, `description`, `access`, `backend`, `effort`, `independent`, and optional `locked_backend`. The body is appended to the durable system instructions. A profile's `readOnly` access is a ceiling and cannot be elevated per call. Locked-backend and independence contradictions fail before dispatch.
+Supported fields are `name`, `description`, `access`, `harness`, `effort`, `independent`, and optional `locked_harness`. The body is appended to the durable system instructions. A profile's `readOnly` access is a ceiling and cannot be elevated per call. Locked-harness and independence contradictions fail before dispatch.
 
 ## Security model
 
@@ -62,7 +62,7 @@ Full-access Claude uses `bypassPermissions`, and full-access Codex uses `dangerF
 
 Subscription-authenticated children do not inherit API keys, OAuth-token overrides, custom endpoints, cloud provider selectors, or provider billing selectors that could silently change authentication mode. Claude must report a logged-in `claude.ai` subscription. Codex pins the built-in OpenAI provider and requires a ChatGPT account. Credentials are never read, copied, logged, or packaged.
 
-Workflow JavaScript runs in a separate permission-restricted Node process with 128 MiB memory, authenticated size-bounded IPC, no inherited environment, imports, filesystem, network, subprocess, or credential access. Every `agent()` request still crosses the trust gate, generic policy compiler, shared scheduler, and backend sandbox. Limits remain 512 KiB source, 256 KiB args, 1 MiB result, 32 agent calls, 128 phase events/64 retained phases, and four-way `parallel()` concurrency. Workflows have no overall deadline; cancellation and process shutdown remain bounded.
+Workflow JavaScript runs in a separate permission-restricted Node process with 128 MiB memory, authenticated size-bounded IPC, no inherited environment, imports, filesystem, network, subprocess, or credential access. Every `agent()` request still crosses the trust gate, generic policy compiler, shared scheduler, and harness sandbox. Limits remain 512 KiB source, 256 KiB args, 1 MiB result, 32 agent calls, 128 phase events/64 retained phases, and four-way `parallel()` concurrency. Workflows have no overall deadline; cancellation and process shutdown remain bounded.
 
 ## Configuration and supervision
 
@@ -77,7 +77,7 @@ Workflow JavaScript runs in a separate permission-restricted Node process with 1
 /workflows
 ```
 
-The default backend applies to both direct tools and workflow `agent()` calls. Exact model selection stays request-scoped; `/subagents status` reports that models are caller-selected or native-default. Successfully completed ordinary jobs retain their native session for 15 minutes; follow-up sends reopen the same job/session. Failed, cancelled, expired, evicted, and workflow-owned sessions are not reusable.
+The default harness applies to both direct tools and workflow `agent()` calls. Exact model selection stays request-scoped; `/subagents status` reports that models are caller-selected or native-default. Successfully completed ordinary jobs retain their native session for 15 minutes; follow-up sends reopen the same job/session. Failed, cancelled, expired, evicted, and workflow-owned sessions are not reusable.
 
 Workflow scripts compose task-driven agents directly:
 
@@ -94,7 +94,7 @@ export default async function () {
 }
 ```
 
-`agent(prompt, options?)` resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. Options support `name`/`label`, `access`, `backend`, exact backend-local `model`, `effort`, `independent`, `profile`, `phase`, and bounded JSON `schema`. `parallel()` accepts task functions with concurrency 1–4; the shared manager remains the authoritative global scheduler.
+`agent(prompt, options?)` resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. Options support `name`/`label`, `access`, `harness`, exact harness-local `model`, `effort`, `independent`, `profile`, `phase`, and bounded JSON `schema`. `parallel()` accepts task functions with concurrency 1–4; the shared manager remains the authoritative global scheduler.
 
 Workflow scripts, checkpoints, results, bounded transcripts, and reports are private under `~/.pi/agent/workflows/`, never the project. V1 does not resume interrupted execution; stale running checkpoints become `aborted`.
 
@@ -116,7 +116,7 @@ The suite intentionally stays around 55–70 broad, risk-based tests. Opt-in sub
 
 - `extensions/subagents/` — direct tools, trust/cwd gate, delivery, cards, dashboard, and takeover.
 - `src/manager.ts`, `src/types.ts`, `src/reducer.ts` — generic lifecycle contracts and bounded state.
-- `src/profiles.ts`, `src/policy.ts` — explicit profile loading and composable backend policy.
+- `src/profiles.ts`, `src/policy.ts` — explicit profile loading and composable harness policy.
 - `src/backends/` — native Pi, Claude, and Codex adapters.
 - `src/workflows/`, `extensions/workflows/` — sandboxed orchestration, private artifacts, rendering, and supervision.
 - `src/env.ts`, `src/process-tree.ts` — subscription-auth sanitation and bounded cleanup.

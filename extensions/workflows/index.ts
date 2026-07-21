@@ -24,7 +24,7 @@ export interface WorkflowRegistration {
 
 export interface RegisterWorkflowOptions {
   artifactRoot?: string;
-  defaultBackend?: () => "pi" | "claude" | "codex";
+  defaultHarness?: () => "pi" | "claude" | "codex";
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
 }
@@ -63,7 +63,7 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
       jobId: agent.jobId,
       state: agent.state,
       timestamps: structuredClone(agent.timestamps),
-      backend: agent.backend,
+      harness: agent.harness,
       model: agent.model,
       effort: agent.effort,
       preview: agent.preview?.slice(-500),
@@ -217,7 +217,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     name: "workflow",
     renderShell: "self",
     label: "Workflow",
-    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Scripts export a default async function and may call phase(title), agent(prompt,{name?,label?,access?,backend?,model?,effort?,independent?,profile?,phase?,schema?}), and parallel(tasks,{concurrency?}). agent(prompt) works without options. Runs are limited to 32 agent calls and four concurrent agents.",
+    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Scripts export a default async function and may call phase(title), agent(prompt,{name?,label?,access?,harness?,model?,effort?,independent?,profile?,phase?,schema?}), and parallel(tasks,{concurrency?}). agent(prompt) works without options. Runs are limited to 32 agent calls and four concurrent agents.",
     promptSnippet: "Run a sandboxed multi-agent workflow with phases and bounded parallelism",
     promptGuidelines: [
       "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls.",
@@ -248,7 +248,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         cwd: ctx.cwd,
         trusted: ctx.isProjectTrusted(),
         parentProvider: providerFamily(ctx.model?.provider),
-        defaultBackend: options.defaultBackend?.() ?? "codex",
+        defaultHarness: options.defaultHarness?.() ?? "codex",
       };
       const started = await workflows.start(request);
       const runGeneration = generation;

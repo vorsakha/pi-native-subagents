@@ -1,4 +1,4 @@
-export type BackendName = "pi" | "claude" | "codex";
+export type HarnessName = "pi" | "claude" | "codex";
 export type ProviderFamily = "claude" | "codex" | "other";
 export type AccessMode = "readOnly" | "full";
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
@@ -30,9 +30,9 @@ export type BackendEvent =
   | { type: "cancelled"; reason?: string; at?: number };
 
 export interface BackendPolicy {
-  backend: BackendName;
+  harness: HarnessName;
   access: AccessMode;
-  /** Optional backend-local model ID. Omitted to use the backend's native default. */
+  /** Optional harness-local model ID. Omitted to use the harness's native default. */
   model?: string;
   thinking: ThinkingLevel;
   /** Optional provider hint. Omitted by default so the model/provider remains adaptive. */
@@ -51,7 +51,7 @@ export interface BackendRequest {
   cwd: string;
   policy: BackendPolicy;
   env: NodeJS.ProcessEnv;
-  /** Aborts backend initialization before a usable run has been returned. */
+  /** Aborts harness initialization before a usable run has been returned. */
   signal: AbortSignal;
 }
 
@@ -78,7 +78,7 @@ export interface BackendRun {
 }
 
 export interface Backend {
-  readonly name: BackendName;
+  readonly name: HarnessName;
   start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun>;
 }
 
@@ -88,10 +88,10 @@ export interface ProfileDefinition {
   name: string;
   description: string;
   access?: AccessMode;
-  backend?: BackendName;
+  harness?: HarnessName;
   effort?: EffortLevel;
   independent?: boolean;
-  lockedBackend?: BackendName;
+  lockedHarness?: HarnessName;
   systemPrompt: string;
   filePath: string;
   origin: ProfileOrigin;
@@ -115,17 +115,17 @@ export interface SpawnRequest {
   task: string;
   cwd: string;
   trusted: boolean;
-  backend?: BackendName;
-  /** Backend-local model ID selected by the caller, skill, or explicit profile. */
+  harness?: HarnessName;
+  /** Harness-local model ID selected by the caller or routing skill. */
   model?: string;
   effort?: EffortLevel;
   access?: AccessMode;
   independent?: boolean;
   profile?: string;
   /** Internal configured fallback; not exposed as a model-facing tool field. */
-  defaultBackend?: BackendName;
+  defaultHarness?: HarnessName;
   parentProvider?: ProviderFamily;
-  /** Internal ownership metadata supplied by the workflow runtime, never by a backend. */
+  /** Internal ownership metadata supplied by the workflow runtime, never by a harness adapter. */
   workflow?: WorkflowJobReference;
 }
 
@@ -142,7 +142,7 @@ export interface JobSnapshot {
   access: AccessMode;
   profile?: string;
   independent: boolean;
-  backend: BackendName;
+  harness: HarnessName;
   model: string;
   /** Explicit request-scoped provider effort; omitted means provider-adaptive. */
   effort?: EffortLevel;

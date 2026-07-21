@@ -3,14 +3,14 @@ import { join } from "node:path";
 import YAML from "yaml";
 import type {
   AccessMode,
-  BackendName,
+  HarnessName,
   EffortLevel,
   ProfileDefinition,
   ProfileOrigin,
   ProfileValidationWarning,
 } from "./types.ts";
 
-const BACKENDS = new Set<BackendName>(["pi", "claude", "codex"]);
+const HARNESSES = new Set<HarnessName>(["pi", "claude", "codex"]);
 const ACCESS = new Set<AccessMode>(["readOnly", "full"]);
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
 
@@ -48,26 +48,26 @@ function readDirectory(directory: string, origin: ProfileOrigin, catalog: Profil
       const { meta, body } = splitFrontmatter(readFileSync(filePath, "utf8"));
       const name = String(meta.name ?? "").trim();
       if (!name) throw new Error("Profile name is required");
-      if (["model", "modelTier", "tier"].some((key) => Object.hasOwn(meta, key))) {
-        throw new Error("Profiles cannot select models; use the request-scoped model field through the routing skill");
+      if (["model", "modelTier", "tier", "backend", "locked_backend"].some((key) => Object.hasOwn(meta, key))) {
+        throw new Error("Profile uses an obsolete routing field; use harness/locked_harness and request-scoped model selection");
       }
       if (meta.independent !== undefined && typeof meta.independent !== "boolean") throw new Error("Invalid independent: expected boolean");
-      const backend = optionalEnum(meta, "backend", BACKENDS);
-      const lockedBackend = optionalEnum(meta, "locked_backend", BACKENDS);
+      const harness = optionalEnum(meta, "harness", HARNESSES);
+      const lockedHarness = optionalEnum(meta, "locked_harness", HARNESSES);
       const profile: ProfileDefinition = {
         name,
         description: String(meta.description ?? "").trim(),
         access: optionalEnum(meta, "access", ACCESS),
-        backend,
+        harness,
         effort: optionalEnum(meta, "effort", EFFORTS),
         independent: meta.independent as boolean | undefined,
-        lockedBackend,
+        lockedHarness,
         systemPrompt: body.trim(),
         filePath,
         origin,
       };
-      if (profile.independent && profile.lockedBackend === "pi") {
-        throw new Error("independent profiles cannot lock backend to pi");
+      if (profile.independent && profile.lockedHarness === "pi") {
+        throw new Error("independent profiles cannot lock harness to pi");
       }
       catalog.profiles.set(name, profile);
     } catch (error) {

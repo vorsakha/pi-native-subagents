@@ -37,12 +37,12 @@ function workflow(overrides: Partial<WorkflowSnapshot> = {}): WorkflowSnapshot {
     agents: [
       {
         index: 0, name: "reviewer", access: "readOnly", independent: true, phase: 0, state: "completed",
-        timestamps: { createdAt, updatedAt: 2_000 }, backend: "claude", model: "claude-fixture-model",
+        timestamps: { createdAt, updatedAt: 2_000 }, harness: "claude", model: "claude-fixture-model",
         preview: "Review complete", output: "Review complete", usage: { input: 1_200, output: 300, cacheRead: 50, cacheWrite: 0, cost: 0.01, turns: 2 },
       },
       {
         index: 1, name: "tests", access: "full", independent: false, phase: 1, state: "running",
-        timestamps: { createdAt, updatedAt: 3_000 }, backend: "codex", model: "codex-fixture-model",
+        timestamps: { createdAt, updatedAt: 3_000 }, harness: "codex", model: "codex-fixture-model",
         preview: "Running targeted tests", usage: { input: 800, output: 200, cacheRead: 0, cacheWrite: 20, cost: 0.02, turns: 1 },
       },
     ],

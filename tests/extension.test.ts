@@ -3,12 +3,12 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerNativeSubagents } from "../extensions/subagents/index.ts";
-import type { Backend, BackendEvent, BackendName, BackendRequest, BackendRun } from "../src/types.ts";
+import { configuredHarnessFromEnv, registerNativeSubagents } from "../extensions/subagents/index.ts";
+import type { Backend, BackendEvent, HarnessName, BackendRequest, BackendRun } from "../src/types.ts";
 
 class HoldingBackend implements Backend {
-  readonly name: BackendName;
-  constructor(name: BackendName) { this.name = name; }
+  readonly name: HarnessName;
+  constructor(name: HarnessName) { this.name = name; }
   async start(_request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     let resolveCompleted!: () => void;
     const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
@@ -25,8 +25,8 @@ class HoldingBackend implements Backend {
 
 class ImmediateBackend implements Backend {
   readonly starts: BackendRequest[] = [];
-  readonly name: BackendName;
-  constructor(name: BackendName) { this.name = name; }
+  readonly name: HarnessName;
+  constructor(name: HarnessName) { this.name = name; }
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     this.starts.push(request);
     emit({ type: "completed", output: `${this.name}-ok` });
@@ -101,26 +101,30 @@ test("extension exposes generic direct tools, caller models, independence, and o
   await writeFile(join(globalProfilesDir, "audit.md"), "---\nname: audit\naccess: readOnly\n---\nAudit carefully.\n");
   registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir });
 
+  assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_HARNESS: "claude" }), "claude");
+  assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_BACKEND: "pi" }), "codex", "obsolete backend env is ignored");
   assert.deepEqual([...pi.tools.keys()].sort(), [
     "subagent", "subagent_cancel", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
   ]);
   assert.deepEqual([...pi.commands.keys()].sort(), ["subagents", "subagents-config", "workflows"]);
   const spawnProperties = pi.tools.get("subagent_spawn").parameters.properties;
+  assert.ok(spawnProperties.harness);
   assert.ok(spawnProperties.model);
+  assert.equal(spawnProperties.backend, undefined, "backend compatibility is intentionally absent");
   assert.equal(spawnProperties.modelTier, undefined, "tier compatibility is intentionally absent");
   assert.ok(pi.messageRenderers.has("native-workflow-result"));
   assert.ok(pi.messageRenderers.has("native-subagent-result"));
   assert.throws(() => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }), /loaded more than once/);
 
-  const ctx = context([{ type: "custom", customType: "native-subagents-profile", data: { backend: "pi" } }]);
+  const ctx = context([{ type: "custom", customType: "native-subagents-harness", data: { harness: "pi" } }]);
   ctx.cwd = extensionRoot;
   pi.handlers.get("session_start")?.({}, ctx);
   await pi.commands.get("subagents").handler("profiles", ctx);
   assert.match(ctx.ui.notifications.at(-1) ?? "", /audit \(global\)/);
 
   const background = await pi.tools.get("subagent_spawn").execute("spawn", { name: "research", task: "background" }, undefined, undefined, ctx);
-  assert.equal(background.details.job.backend, "pi", "background spawn uses the configured backend");
-  assert.equal(background.details.job.model, "default", "omitted models use the native backend default");
+  assert.equal(background.details.job.harness, "pi", "background spawn uses the configured harness");
+  assert.equal(background.details.job.model, "default", "omitted models use the native harness default");
   assert.equal(background.details.job.access, "full", "trusted generic agents default to full access");
   await new Promise((resolve) => setImmediate(resolve));
   pi.handlers.get("agent_settled")?.();
@@ -149,9 +153,9 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.doesNotMatch(historicalAfterFollowUp, /second generation/, "older thread cards stay pinned to their own generation");
 
   const explicitClaude = await pi.tools.get("subagent_spawn").execute("claude-model", {
-    name: "implementation", task: "explicit Claude model", backend: "claude", model: "caller-model", effort: "max",
+    name: "implementation", task: "explicit Claude model", harness: "claude", model: "caller-model", effort: "max",
   }, undefined, undefined, ctx);
-  assert.equal(explicitClaude.details.job.backend, "claude");
+  assert.equal(explicitClaude.details.job.harness, "claude");
   assert.equal(explicitClaude.details.job.model, "caller-model");
   await pi.tools.get("subagent_wait").execute("wait-claude-model", { jobId: explicitClaude.details.job.id }, undefined, undefined, ctx);
   const explicitRequest = backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "explicit Claude model");
@@ -167,22 +171,24 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.match(backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "profiled audit")?.systemPrompt ?? "", /Audit carefully/);
 
   const foreground = await pi.tools.get("subagent").execute("foreground", { name: "foreground", task: "foreground" }, undefined, undefined, ctx);
-  assert.equal(foreground.details.job.backend, "pi", "foreground uses the same configured generic route");
+  assert.equal(foreground.details.job.harness, "pi", "foreground uses the same configured generic route");
   const independentDefault = await pi.tools.get("subagent").execute("foreground-independent", { name: "independent", independent: true, task: "cross-provider default" }, undefined, undefined, ctx);
-  assert.equal(independentDefault.details.job.backend, "claude", "unknown parent provider uses native Claude for independent work");
+  assert.equal(independentDefault.details.job.harness, "claude", "unknown parent provider uses native Claude for independent work");
   assert.equal(independentDefault.details.job.model, "default");
   const claudeParent = context([], "anthropic");
   const independentAgainstClaude = await pi.tools.get("subagent_spawn").execute("independent-codex", { name: "second-opinion", independent: true, task: "review Claude independently" }, undefined, undefined, claudeParent);
-  assert.equal(independentAgainstClaude.details.job.backend, "codex");
+  assert.equal(independentAgainstClaude.details.job.harness, "codex");
   assert.equal(independentAgainstClaude.details.job.model, "default");
   await assert.rejects(
-    pi.tools.get("subagent_spawn").execute("independent-same", { independent: true, backend: "claude", task: "invalid same provider" }, undefined, undefined, claudeParent),
+    pi.tools.get("subagent_spawn").execute("independent-same", { independent: true, harness: "claude", task: "invalid same provider" }, undefined, undefined, claudeParent),
     /different from the parent claude/,
   );
-  await assert.rejects(
-    pi.tools.get("subagent_spawn").execute("schema-mismatch", { role: "worker", task: "wrong schema" }, undefined, undefined, ctx),
-    /Subagent API schema mismatch: reload Pi to use the current task-driven schema\./,
-  );
+  for (const stale of [{ role: "worker" }, { backend: "codex" }]) {
+    await assert.rejects(
+      pi.tools.get("subagent_spawn").execute("schema-mismatch", { ...stale, task: "wrong schema" }, undefined, undefined, ctx),
+      /Subagent API schema mismatch: reload Pi to use the current task-driven schema\./,
+    );
+  }
 
   await pi.handlers.get("session_shutdown")?.();
 

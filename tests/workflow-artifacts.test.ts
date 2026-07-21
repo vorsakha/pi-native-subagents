@@ -37,7 +37,7 @@ function snapshot(sessionId: string, now = Date.now()): Omit<WorkflowSnapshot, "
       jobId: "job-1",
       state: "running",
       timestamps: { createdAt: now, startedAt: now, updatedAt: now },
-      backend: "codex",
+      harness: "codex",
       model: "review-model",
       preview: "working",
       transcript: [{ kind: "user", text: "inspect" }, { kind: "assistant", text: "working" }],

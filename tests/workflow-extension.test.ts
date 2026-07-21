@@ -4,7 +4,7 @@ import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
-import type { Backend, BackendEvent, BackendName, BackendRequest, BackendRun } from "../src/types.ts";
+import type { Backend, BackendEvent, HarnessName, BackendRequest, BackendRun } from "../src/types.ts";
 
 const theme = {
   fg: (_color: string, text: string) => text,
@@ -13,9 +13,9 @@ const theme = {
 } as any;
 
 class ImmediateBackend implements Backend {
-  readonly name: BackendName;
+  readonly name: HarnessName;
   readonly requests: BackendRequest[] = [];
-  constructor(name: BackendName) { this.name = name; }
+  constructor(name: HarnessName) { this.name = name; }
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     this.requests.push(request);
     emit({ type: "usage", usage: { input: 12, output: 3, cost: 0.01, turns: 1 } });
@@ -25,7 +25,7 @@ class ImmediateBackend implements Backend {
 }
 
 class HoldingBackend implements Backend {
-  readonly name: BackendName = "codex";
+  readonly name: HarnessName = "codex";
   starts = 0;
   private emit: ((event: BackendEvent) => void) | undefined;
   private settle: (() => void) | undefined;

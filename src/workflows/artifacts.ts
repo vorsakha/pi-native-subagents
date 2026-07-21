@@ -259,7 +259,7 @@ function transcriptArtifact(snapshot: WorkflowSnapshot): Record<string, Transcri
 
 /** Keep the workflow summary structurally valid even when 32 agents each
  * produce their maximum retained output. Full native transcripts remain in
- * backend session files; workflow.json is an inspectable bounded summary. */
+ * harness session files; workflow.json is an inspectable bounded summary. */
 export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
   const compact = serializeWorkflowValue({
     ...snapshot,
@@ -407,7 +407,7 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
     ...snapshot.phases.map((phase) => `- ${phase.name}: ${phase.status} (${phase.agents.length} agents)`),
     "",
     "## Agents",
-    ...snapshot.agents.map((agent) => `### ${agent.name}\n\n- Access: ${agent.access}\n- Profile: ${agent.profile ?? "none"}\n- Independent: ${agent.independent ? "yes" : "no"}\n- Status: ${agent.state}\n- Route: ${agent.backend ?? "?"}/${agent.model ?? "?"}\n- Effort: ${agent.effort ?? "adaptive"}\n\n${truncateUtf8(String(agent.output ?? agent.preview ?? agent.error ?? "(no output)"), 8 * 1024)}\n`),
+    ...snapshot.agents.map((agent) => `### ${agent.name}\n\n- Access: ${agent.access}\n- Profile: ${agent.profile ?? "none"}\n- Independent: ${agent.independent ? "yes" : "no"}\n- Status: ${agent.state}\n- Route: ${agent.harness ?? "?"}/${agent.model ?? "?"}\n- Effort: ${agent.effort ?? "adaptive"}\n\n${truncateUtf8(String(agent.output ?? agent.preview ?? agent.error ?? "(no output)"), 8 * 1024)}\n`),
     "## Result",
     "",
     "```json",

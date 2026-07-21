@@ -167,7 +167,7 @@ class DashboardOverlay {
     const owner = job.workflow ? ` · wf:${sanitizeInline(job.workflow.label)}` : "";
     const profile = job.profile ? ` · profile ${sanitizeInline(job.profile)}` : "";
     const independent = job.independent ? " · independent" : "";
-    const label = `${status.glyph} ${job.status.padEnd(9)} ${shortId(sanitizeText(job.id))} ${sanitizeInline(job.name)} · ${job.access}${profile}${independent} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)}${owner} · ${formatElapsed(job, this.#now())}`;
+    const label = `${status.glyph} ${job.status.padEnd(9)} ${shortId(sanitizeText(job.id))} ${sanitizeInline(job.name)} · ${job.access}${profile}${independent} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}${owner} · ${formatElapsed(job, this.#now())}`;
     return marker + " " + this.theme.fg(status.color, label);
   }
 
@@ -191,7 +191,7 @@ class DashboardOverlay {
     }
     const status = statusMeta(chosen.status, this.#now());
     const lines = [
-      this.theme.fg("accent", this.theme.bold(`${sanitizeInline(chosen.name)} · ${shortId(sanitizeText(chosen.id))}`)) + this.theme.fg("dim", ` · ${chosen.access}${chosen.profile ? ` · profile ${sanitizeInline(chosen.profile)}` : ""}${chosen.independent ? " · independent" : ""} · effort ${formatEffort(chosen.effort)} · ${sanitizeInline(chosen.backend)}/${sanitizeInline(chosen.model)}`),
+      this.theme.fg("accent", this.theme.bold(`${sanitizeInline(chosen.name)} · ${shortId(sanitizeText(chosen.id))}`)) + this.theme.fg("dim", ` · ${chosen.access}${chosen.profile ? ` · profile ${sanitizeInline(chosen.profile)}` : ""}${chosen.independent ? " · independent" : ""} · effort ${formatEffort(chosen.effort)} · ${sanitizeInline(chosen.harness)}/${sanitizeInline(chosen.model)}`),
       this.theme.fg(status.color, `${status.glyph} ${chosen.status}`) + this.theme.fg("dim", ` · ${formatElapsed(chosen, this.#now())}`),
       this.theme.fg("dim", sanitizeInline(chosen.task) || "(no task description)"),
     ];
@@ -285,4 +285,4 @@ export function truncateDashboardLine(value: string, width: number): string {
 function truncate(value: string, width: number, ellipsis = "…"): string {
   return truncateToWidth(value, Math.max(0, width), ellipsis);
 }
-function statusLine(job: JobSnapshot): string { return `${job.id} ${job.status} ${job.name} [${job.access}${job.independent ? "; independent" : ""}; ${job.backend}/${job.model}; effort ${formatEffort(job.effort)}]`; }
+function statusLine(job: JobSnapshot): string { return `${job.id} ${job.status} ${job.name} [${job.access}${job.independent ? "; independent" : ""}; ${job.harness}/${job.model}; effort ${formatEffort(job.effort)}]`; }

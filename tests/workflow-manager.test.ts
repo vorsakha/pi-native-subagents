@@ -96,7 +96,7 @@ const reviewer: ProfileDefinition = {
   name: "reviewer",
   description: "human-authored audit profile",
   access: "readOnly",
-  backend: "codex",
+  harness: "codex",
   systemPrompt: "reviewer system prompt",
   filePath: "reviewer.md",
   origin: "global",
@@ -179,6 +179,7 @@ test("rejects mismatched workflow agent schemas without spawning jobs", async ()
           { tier: "obsolete" },
           { modelTier: "obsolete" },
           { modelProfile: "codex" },
+          { backend: "codex" },
         ]) results.push(await agent("schema mismatch", options));
         return results;
       }
@@ -186,7 +187,7 @@ test("rejects mismatched workflow agent schemas without spawning jobs", async ()
     const final = await started.completion;
     const results = final.result as Array<{ ok: boolean; error?: string }>;
     assert.equal(final.status, "completed");
-    assert.equal(results.length, 5);
+    assert.equal(results.length, 6);
     assert.ok(results.every((result) => !result.ok && /Workflow agent\(\) API schema mismatch/.test(result.error ?? "")));
     const blank = await f.workflows.start(f.request(`export default async () => agent("blank", { model: "   " });`));
     assert.match(((await blank.completion).result as { error?: string }).error ?? "", /1–256/);
@@ -318,7 +319,7 @@ test("workflow agent options preserve generic read-only/profile policy in the ba
     await waitFor(() => f.backend.requests.length === 3, "cross-provider workflow adversary");
     const adversaryRequest = f.backend.requests[2]!;
     assert.equal(adversaryRequest.name, "adversary");
-    assert.equal(adversaryRequest.policy.backend, "codex", "independent Claude-parent workflow agent routes to Codex");
+    assert.equal(adversaryRequest.policy.harness, "codex", "independent Claude-parent workflow agent routes to Codex");
     f.backend.completeTask(adversaryRequest.task, "independent review");
     assert.equal((await crossProvider.completion).status, "completed");
   } finally {

@@ -42,7 +42,7 @@ function setup(concurrency = 4) {
   const manager = new JobManager({ backends: [backend], concurrency });
   return { backend, manager };
 }
-function request(n: number) { return { name: "worker", task: `task ${n}`, cwd: "/tmp", trusted: true, backend: "codex" as const }; }
+function request(n: number) { return { name: "worker", task: `task ${n}`, cwd: "/tmp", trusted: true, harness: "codex" as const }; }
 
 test("manager enforces concurrency cap four and pumps queued work", async () => {
   const { backend, manager } = setup(4);
@@ -246,7 +246,7 @@ test("manager terminalizes a job when backend cancellation rejects", async () =>
   await tick();
   await assert.rejects(manager.cancel(job.id), /teardown broke/);
   assert.equal(manager.check(job.id).status, "failed");
-  assert.match(manager.check(job.id).error ?? "", /Backend cancellation failed: teardown broke/);
+  assert.match(manager.check(job.id).error ?? "", /Harness cancellation failed: teardown broke/);
   await manager.shutdown(5);
 });
 

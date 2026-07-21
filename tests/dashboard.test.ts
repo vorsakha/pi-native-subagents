@@ -30,7 +30,7 @@ function job(id: string, status: JobSnapshot["status"] = "running"): JobSnapshot
   return {
     id,
     name: "worker", access: "full", independent: false,
-    backend: "codex",
+    harness: "codex",
     model: "fixture-model",
     effort: "high",
     task: "Review Unicode output 你好世界",

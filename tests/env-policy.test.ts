@@ -5,7 +5,7 @@ import { compilePolicy, providerFamily } from "../src/policy.ts";
 import type { ProfileDefinition } from "../src/types.ts";
 
 const profile: ProfileDefinition = {
-  name: "audit", description: "", access: "readOnly", backend: "claude",
+  name: "audit", description: "", access: "readOnly", harness: "claude",
   systemPrompt: "audit carefully", filePath: "audit.md", origin: "global",
 };
 const request = { task: "x", cwd: "/tmp", trusted: true } as const;
@@ -44,41 +44,41 @@ test("subscription environments remove billing-switch credentials without mutati
   assert.equal(source.ANTHROPIC_API_KEY, "secret-a");
 });
 
-test("generic policy uses caller models or native backend defaults", () => {
+test("generic policy uses caller models or native harness defaults", () => {
   assert.throws(() => compilePolicy({ ...request, trusted: false }), /untrusted/);
   const compiled = compilePolicy(request);
-  assert.equal(compiled.policy.backend, "codex");
+  assert.equal(compiled.policy.harness, "codex");
   assert.equal(compiled.policy.model, undefined);
   assert.equal(compiled.policy.access, "full");
   assert.deepEqual(compiled.policy.codexSandbox, { type: "dangerFullAccess" });
   assert.ok(!("nestedAgents" in compiled.policy));
 
-  const claude = compilePolicy({ ...request, defaultBackend: "claude", model: "caller-model", effort: "high" });
-  assert.equal(claude.policy.backend, "claude");
+  const claude = compilePolicy({ ...request, defaultHarness: "claude", model: "caller-model", effort: "high" });
+  assert.equal(claude.policy.harness, "claude");
   assert.equal(claude.policy.model, "caller-model");
   assert.equal(claude.policy.effort, "high");
   assert.throws(() => compilePolicy({ ...request, model: "   " }), /1–256/);
   assert.throws(() => compilePolicy({ ...request, model: "x".repeat(257) }), /1–256/);
 });
 
-test("profiles compose defaults while read-only and locked backend constraints fail closed", () => {
+test("profiles compose defaults while read-only and locked harness constraints fail closed", () => {
   const compiled = compilePolicy({ ...request, access: "full", model: "caller-model" }, profile);
-  assert.equal(compiled.policy.backend, "claude");
+  assert.equal(compiled.policy.harness, "claude");
   assert.equal(compiled.policy.model, "caller-model", "caller model remains independent from profile policy");
   assert.equal(compiled.policy.access, "readOnly", "profile read-only access is a ceiling");
   assert.deepEqual(compiled.policy.codexSandbox, { type: "readOnly", networkAccess: false });
   assert.deepEqual(compiled.policy.piTools, ["read", "grep", "find", "ls"]);
 
-  const locked = { ...profile, lockedBackend: "claude" as const };
-  assert.throws(() => compilePolicy({ ...request, backend: "codex" }, locked), /locks its backend to claude/);
+  const locked = { ...profile, lockedHarness: "claude" as const };
+  assert.throws(() => compilePolicy({ ...request, harness: "codex" }, locked), /locks its harness to claude/);
 });
 
 test("independent forces a different native provider and rejects contradictions", () => {
-  assert.equal(compilePolicy({ ...request, independent: true, parentProvider: "codex" }).policy.backend, "claude");
-  assert.equal(compilePolicy({ ...request, independent: true, parentProvider: "claude" }).policy.backend, "codex");
-  assert.throws(() => compilePolicy({ ...request, independent: true, parentProvider: "claude", backend: "claude" }), /different from the parent claude/);
-  assert.throws(() => compilePolicy({ ...request, independent: true, parentProvider: "codex", backend: "pi" }), /native Claude or Codex/);
-  assert.throws(() => compilePolicy({ ...request, parentProvider: "claude" }, { ...profile, independent: true, lockedBackend: "claude" }), /different from the parent claude/);
+  assert.equal(compilePolicy({ ...request, independent: true, parentProvider: "codex" }).policy.harness, "claude");
+  assert.equal(compilePolicy({ ...request, independent: true, parentProvider: "claude" }).policy.harness, "codex");
+  assert.throws(() => compilePolicy({ ...request, independent: true, parentProvider: "claude", harness: "claude" }), /different from the parent claude/);
+  assert.throws(() => compilePolicy({ ...request, independent: true, parentProvider: "codex", harness: "pi" }), /native Claude or Codex harness/);
+  assert.throws(() => compilePolicy({ ...request, parentProvider: "claude" }, { ...profile, independent: true, lockedHarness: "claude" }), /different from the parent claude/);
   assert.equal(providerFamily("openai-codex"), "codex");
   assert.equal(providerFamily("anthropic"), "claude");
   assert.equal(providerFamily("google"), "other");

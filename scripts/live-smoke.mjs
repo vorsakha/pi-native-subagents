@@ -39,7 +39,7 @@ function verifyAuth(name) {
 
 function policy(name, access = "readOnly") {
   const common = {
-    backend: name,
+    harness: name,
     access,
     thinking: accessMode ? "medium" : "low",
     effort: accessMode ? "medium" : "low",
@@ -53,7 +53,7 @@ function policy(name, access = "readOnly") {
   return common;
 }
 
-function backend(name) {
+function harnessAdapter(name) {
   return name === "pi" ? new PiRpcBackend() : name === "claude" ? new ClaudeBackend() : new CodexAppServerBackend();
 }
 
@@ -106,7 +106,7 @@ async function probeCodexReadOnlySandbox(cwd, deniedFile) {
 async function execute(name, cwd, task, systemPrompt, access) {
   const terminal = [];
   const startupController = new AbortController();
-  const run = await backend(name).start({
+  const run = await harnessAdapter(name).start({
     jobId: `smoke-${name}-${access}`, name: `smoke-${access}`, task, systemPrompt, cwd,
     policy: policy(name, access), env: name === "pi" ? sanitizeSubscriptionEnv(process.env, "codex") : process.env,
     signal: startupController.signal,
@@ -161,7 +161,7 @@ async function runAccess(name) {
     "readOnly",
   );
   if (existsSync(deniedFile)) throw new Error(`${name} read-only policy allowed a write`);
-  // Claude is deny-by-construction: the backend validates the live init tool
+  // Claude is deny-by-construction: the harness adapter validates the live init tool
   // inventory contains no mutating tool. Codex gets an additional direct,
   // sandboxed command/exec write attempt against the installed app-server.
   if (name === "codex") await probeCodexReadOnlySandbox(readOnlyDir, deniedFile);
@@ -185,7 +185,7 @@ async function runAccess(name) {
 
 try {
   for (const name of names) {
-    if (!(accessMode ? ["claude", "codex"] : ["pi", "claude", "codex"]).includes(name)) throw new Error(`Unknown backend: ${name}`);
+    if (!(accessMode ? ["claude", "codex"] : ["pi", "claude", "codex"]).includes(name)) throw new Error(`Unknown harness: ${name}`);
     await (accessMode ? runAccess(name) : runBasic(name));
   }
 } finally {

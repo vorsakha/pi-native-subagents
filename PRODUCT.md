@@ -12,12 +12,12 @@ Provide a reliable control surface for starting generic task-driven agents, insp
 
 - Make the task the unit of delegation.
 - Keep access, provider, optional exact model, effort, independence, and optional human profile explicit and composable.
-- Keep concrete model recommendations in the editable routing skill; runtime accepts backend-local IDs or uses native defaults.
+- Keep concrete model recommendations in the editable routing skill; runtime accepts harness-local IDs or uses native defaults.
 - Default trusted generic agents to autonomous full access; make read-only an enforceable sandbox policy.
 - Keep optional profiles explicitly human-selected and visible.
 - Preserve one global four-job budget whether work starts directly or through a workflow.
 - Use progressive disclosure: bounded cards → operational dashboard → normalized transcript/takeover.
-- Make name, access, optional profile, backend/model, effort, usage, and result state legible.
+- Make name, access, optional profile, harness/model, effort, usage, and result state legible.
 - Keep private scripts/transcripts/artifacts out of the project and out of ordinary model-facing results.
 
 ## Accessibility

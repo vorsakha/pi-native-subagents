@@ -68,17 +68,17 @@ function isCodexProviderOverride(key: string): boolean {
 
 export function sanitizeSubscriptionEnv(
   source: NodeJS.ProcessEnv,
-  backend: "claude" | "codex" | "pi",
+  harness: "claude" | "codex" | "pi",
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...source };
-  if (backend === "pi") return env;
+  if (harness === "pi") return env;
   for (const key of Object.keys(env)) {
     const normalized = key.toUpperCase();
     if (
       API_KEY_ENV.has(normalized)
       || CREDENTIAL_SUFFIX.test(normalized)
-      || backend === "claude" && isClaudeProviderOverride(normalized)
-      || backend === "codex" && isCodexProviderOverride(normalized)
+      || harness === "claude" && isClaudeProviderOverride(normalized)
+      || harness === "codex" && isCodexProviderOverride(normalized)
     ) delete env[key];
   }
   return env;

@@ -193,7 +193,7 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
   const profile = job.profile ? ` · profile ${sanitizeInline(job.profile)}` : "";
   const independent = job.independent ? " · independent" : "";
   const header = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(job.name)))} ${theme.fg("dim", `${shortId(sanitizeText(job.id))} · ${job.status} · ${formatElapsed(job, now)}`)}`;
-  const policy = theme.fg("dim", `${job.access}${profile}${independent} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)}`);
+  const policy = theme.fg("dim", `${job.access}${profile}${independent} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}`);
   lines.push(header, policy);
 
   const task = sanitizeInline(job.task);
@@ -269,7 +269,7 @@ export function renderJobReceipt(job: JobSnapshot, theme: Theme, options: { acti
 
 function jobRow(job: JobSnapshot, theme: Theme, now: number): string {
   const status = statusMeta(job.status, now);
-  return `${theme.fg(status.color, status.glyph)} ${theme.fg("dim", job.status.padEnd(9))} ${theme.fg("toolTitle", shortId(sanitizeText(job.id)))} ${sanitizeInline(job.name)} ${theme.fg("dim", `· ${job.access}${job.independent ? " · independent" : ""} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.backend)}/${sanitizeInline(job.model)} · ${formatElapsed(job, now)}`)}`;
+  return `${theme.fg(status.color, status.glyph)} ${theme.fg("dim", job.status.padEnd(9))} ${theme.fg("toolTitle", shortId(sanitizeText(job.id)))} ${sanitizeInline(job.name)} ${theme.fg("dim", `· ${job.access}${job.independent ? " · independent" : ""} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)} · ${formatElapsed(job, now)}`)}`;
 }
 
 export function renderJobListCard(jobs: JobSnapshot[], theme: Theme, options: { expanded: boolean; now: number }): Component {

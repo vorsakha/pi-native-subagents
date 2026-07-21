@@ -13,7 +13,7 @@ import {
   statusMeta,
 } from "../extensions/subagents/render.ts";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
-import type { Backend, BackendEvent, BackendName, BackendRequest, BackendRun, JobSnapshot, ToolTrace } from "../src/types.ts";
+import type { Backend, BackendEvent, HarnessName, BackendRequest, BackendRun, JobSnapshot, ToolTrace } from "../src/types.ts";
 
 const ESC = "\u001B";
 const CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;
@@ -42,7 +42,7 @@ function job(overrides: Partial<JobSnapshot> = {}): JobSnapshot {
   return {
     id: "0123456789abcdef",
     name: "worker", access: "full", independent: false,
-    backend: "codex",
+    harness: "codex",
     model: "fixture-model",
     task: "Implement the widget",
     cwd: "/tmp",
@@ -124,8 +124,8 @@ test("renderer sanitizes output, enforces line budgets, and registers runtime re
 });
 
 class ImmediateBackend implements Backend {
-  readonly name: BackendName;
-  constructor(name: BackendName) { this.name = name; }
+  readonly name: HarnessName;
+  constructor(name: HarnessName) { this.name = name; }
   async start(_request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     emit({ type: "completed", output: `${this.name}-ok` });
     return { completed: Promise.resolve(), async send() {}, async cancel() {}, async close() {} };
@@ -158,13 +158,13 @@ function assertRuntimeRenderers(): void {
   assert.deepEqual([...pi.tools.keys()].filter((name) => name !== "workflow").sort(), expected);
   assert.ok(pi.tools.has("workflow"));
   const args: Record<string, Record<string, unknown>> = {
-    subagent_spawn: { name: "worker", access: "full", independent: false, task: "\u001b[31mdo work\u001b[0m", backend: "codex" },
+    subagent_spawn: { name: "worker", access: "full", independent: false, task: "\u001b[31mdo work\u001b[0m", harness: "codex" },
     subagent_check: { jobId: "\u001b[31m123456789\u001b[0m" },
     subagent_wait: { jobId: "123456789", timeoutMs: 1_000 },
     subagent_send: { jobId: "123456789", message: "\u001b]0;bad\u0007hello", behavior: "steer" },
     subagent_cancel: { jobId: "123456789" },
     subagent_list: {},
-    subagent: { name: "implementation", task: "\u001b[31mdo work\u001b[0m", backend: "codex" },
+    subagent: { name: "implementation", task: "\u001b[31mdo work\u001b[0m", harness: "codex" },
   };
   for (const name of expected) {
     const toolDef = pi.tools.get(name);

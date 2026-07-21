@@ -342,8 +342,8 @@ export class WorkflowsDashboardOverlay {
     }
 
     const status = traceStatusMeta(agent.state, this.#now());
-    const route = agent.backend || agent.model
-      ? `${sanitizeInline(agent.backend ?? "backend")}/${sanitizeInline(agent.model ?? "model")}`
+    const route = agent.harness || agent.model
+      ? `${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}`
       : "route pending";
     const effort = agent.effort ?? "adaptive";
     const duration = formatAgentElapsed(agent, this.#now());
@@ -424,7 +424,7 @@ export class WorkflowsDashboardOverlay {
     const status = traceStatusMeta(agent.state, this.#now());
     const marker = selected ? this.theme.fg("accent", "›") : " ";
     const label = selected ? this.theme.fg("accent", sanitizeInline(agent.name)) : this.theme.fg("text", sanitizeInline(agent.name));
-    const route = agent.backend || agent.model ? `${sanitizeInline(agent.backend ?? "backend")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
+    const route = agent.harness || agent.model ? `${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
     const usage = formatUsage(agent.usage);
     return `${marker} ${this.theme.fg(status.color, status.glyph)} ${label} ${this.theme.fg("dim", `· ${agent.access}${agent.profile ? ` · profile ${sanitizeInline(agent.profile)}` : ""}${agent.independent ? " · independent" : ""} · ${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}${usage ? ` · ${usage}` : ""}`)}`;
   }
