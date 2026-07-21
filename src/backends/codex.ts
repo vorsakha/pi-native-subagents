@@ -1,3 +1,4 @@
+import { createActivityWatchdog } from "../activity-watchdog.ts";
 import { sanitizeSubscriptionEnv } from "../env.ts";
 import { asObject, JsonRpcPeer } from "../jsonrpc.ts";
 import { spawnManaged } from "../process-tree.ts";
@@ -6,19 +7,19 @@ import type { Backend, BackendEvent, BackendRequest, BackendRun, SendBehavior } 
 
 interface CodexBackendOptions {
   requestTimeoutMs?: number;
-  runTimeoutMs?: number;
+  inactivityTimeoutMs?: number;
 }
 
 export class CodexAppServerBackend implements Backend {
   readonly name = "codex" as const;
   readonly #command: string;
   readonly #requestTimeoutMs: number;
-  readonly #runTimeoutMs: number;
+  readonly #inactivityTimeoutMs: number;
 
   constructor(command = "codex", options: CodexBackendOptions = {}) {
     this.#command = command;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
-    this.#runTimeoutMs = options.runTimeoutMs ?? 15 * 60_000;
+    this.#inactivityTimeoutMs = options.inactivityTimeoutMs ?? 15 * 60_000;
   }
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
@@ -38,24 +39,25 @@ export class CodexAppServerBackend implements Backend {
     const followUps: string[] = [];
     let resolveCompleted!: () => void;
     const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
-    let runTimer: NodeJS.Timeout | undefined;
-    const armRunTimer = () => {
-      if (runTimer) clearTimeout(runTimer);
-      runTimer = setTimeout(() => {
-        finish({ type: "failed", error: `Codex run timed out after ${this.#runTimeoutMs}ms` });
-        void peer.close();
-      }, this.#runTimeoutMs);
-    };
+    let peer!: JsonRpcPeer;
+    let closePromise: Promise<void> | undefined;
+    const closePeer = () => closePromise ??= peer.close();
+    const watchdog = createActivityWatchdog(this.#inactivityTimeoutMs, () => {
+      closing = true;
+      finish({ type: "failed", error: `Codex produced no activity for ${this.#inactivityTimeoutMs}ms` });
+      void closePeer();
+    });
     const finish = (event: BackendEvent) => {
       if (settled) return;
       settled = true;
-      if (runTimer) clearTimeout(runTimer);
+      watchdog.clear();
       emit(event);
       resolveCompleted();
     };
     const input = (text: string) => [{ type: "text", text }];
     const startTurn = async (text: string): Promise<void> => {
       turnOutput = "";
+      watchdog.touch();
       emit({ type: "user_message", text });
       const turnResult = asObject(await peer.request("turn/start", {
         threadId,
@@ -65,12 +67,14 @@ export class CodexAppServerBackend implements Backend {
         sandboxPolicy: request.policy.codexSandbox,
         cwd: request.cwd,
       }, this.#requestTimeoutMs));
+      watchdog.touch();
       turnId = String(asObject(turnResult.turn).id ?? "");
       if (!turnId) throw new Error("Codex turn/start returned no turn id");
     };
 
-    const peer = new JsonRpcPeer({
+    peer = new JsonRpcPeer({
       process: managed,
+      onActivity: () => watchdog.touch(),
       onRequest: (_id, method) => {
         if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") return { decision: "decline" };
         if (method === "item/permissions/requestApproval") return { permissions: { network: false, fileSystem: { read: [], write: [] } }, scope: "turn" };
@@ -122,11 +126,12 @@ export class CodexAppServerBackend implements Backend {
       },
     });
 
-    armRunTimer();
+    watchdog.arm();
     let startupAbortTeardown: Promise<void> | undefined;
     const abortStartup = () => {
       closing = true;
-      startupAbortTeardown ??= peer.close();
+      watchdog.clear();
+      startupAbortTeardown ??= closePeer();
     };
     request.signal.addEventListener("abort", abortStartup, { once: true });
 
@@ -185,11 +190,12 @@ export class CodexAppServerBackend implements Backend {
       if (settled) {
         settled = false;
         output = "";
-        armRunTimer();
+        watchdog.arm();
         emit({ type: "started" });
         await startTurn(message);
         return;
       }
+      watchdog.touch();
       if (behavior === "followUp") {
         followUps.push(message);
         emit({ type: "queue_changed", messages: followUps.map((text) => ({ text, behavior: "followUp" })) });
@@ -207,24 +213,26 @@ export class CodexAppServerBackend implements Backend {
       async cancel(reason = "Cancelled") {
         cancellingReason = reason;
         closing = true;
+        watchdog.clear();
         if (!settled && threadId && turnId) {
           await peer.request("turn/interrupt", { threadId, turnId }, 5_000).catch(() => undefined);
         }
-        await peer.close();
+        await closePeer();
         await initialization;
         finish({ type: "cancelled", reason });
       },
       async close() {
-        if (closing) return;
-        closing = true;
-        clearTimeout(runTimer);
-        if (threadId) await peer.request("thread/backgroundTerminals/clean", { threadId }, 2_000).catch(() => undefined);
-        await peer.close();
+        if (!closing) {
+          closing = true;
+          watchdog.clear();
+          if (threadId) await peer.request("thread/backgroundTerminals/clean", { threadId }, 2_000).catch(() => undefined);
+        }
+        await closePeer();
         await initialization;
       },
       async forceClose() {
         closing = true;
-        clearTimeout(runTimer);
+        watchdog.clear();
         await managed.terminate(0);
         finish({ type: "cancelled", reason: "Codex force-closed after shutdown deadline" });
       },

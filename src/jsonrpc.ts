@@ -13,6 +13,7 @@ export class JsonRpcPeer {
   readonly #process: ManagedProcess;
   readonly #pending = new Map<JsonRpcId, Pending>();
   readonly #onNotification: (method: string, params: Record<string, unknown>) => void;
+  readonly #onActivity: () => void;
   readonly #onRequest: (id: JsonRpcId, method: string, params: Record<string, unknown>) => unknown | Promise<unknown>;
   readonly #requestId: () => JsonRpcId;
   #nextId = 1;
@@ -22,12 +23,14 @@ export class JsonRpcPeer {
   constructor(options: {
     process: ManagedProcess;
     onNotification?: (method: string, params: Record<string, unknown>) => void;
+    onActivity?: () => void;
     onRequest?: (id: JsonRpcId, method: string, params: Record<string, unknown>) => unknown | Promise<unknown>;
     requestId?: () => JsonRpcId;
     maxFrameBytes?: number;
   }) {
     this.#process = options.process;
     this.#onNotification = options.onNotification ?? (() => undefined);
+    this.#onActivity = options.onActivity ?? (() => undefined);
     this.#onRequest = options.onRequest ?? (() => ({ decision: "decline" }));
     this.#requestId = options.requestId ?? (() => this.#nextId++);
     const framer = new JsonlFramer(options.maxFrameBytes);
@@ -111,6 +114,7 @@ export class JsonRpcPeer {
       if (record.trim()) this.#protocolFailure(new Error("invalid JSON object"));
       return;
     }
+    try { this.#onActivity(); } catch { /* activity observers cannot break protocol handling */ }
     if ((typeof message.id === "number" || typeof message.id === "string") && !("method" in message)) {
       const pending = this.#pending.get(message.id);
       if (!pending) return;

@@ -24,7 +24,7 @@ Every direct tool uses the inline trace shell: `⌁` opens the call row and `│
 
 Workflow calls and results use the same `⌁`/`│` trace grammar, sanitizers, colors, glyphs, 10/36-line budgets, and one `/workflows` pointer. Collapsed cards show the current phase, active agent, result preview, and essential policy; expanded cards reveal description, summaries, and phase history.
 
-There are no configured workflow token, turn, cost, or overall deadline limits. Usage is reporting only. The enforced workflow bounds are 512 KiB source, 256 KiB args, 1 MiB result, 32 agent calls, 128 phase events/64 retained phases, and four-way parallelism; harness lifecycle and shutdown deadlines remain separate and bounded.
+There are no configured workflow token, turn, cost, or overall wall-clock deadline limits. Native turns likewise have no total-duration cap; Pi, Claude, and Codex reset a 15-minute inactivity watchdog on provider activity. Usage is reporting only. The enforced workflow bounds are 512 KiB source, 256 KiB args, 1 MiB result, 32 agent calls, 128 phase events/64 retained phases, and four-way parallelism; protocol, cancellation, and shutdown deadlines remain separate and bounded.
 
 The `/workflows` dashboard supports run/phase/agent navigation, status filtering, a read-only agent inspector, per-agent cancellation, and whole-run cancellation. The inspector separates caller prompt, thinking/tools, transcript, structured output, and result. Artifact paths and raw scripts are not shown in normal dashboard content.
 

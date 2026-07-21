@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { createActivityWatchdog } from "../activity-watchdog.ts";
 import { sanitizeSubscriptionEnv } from "../env.ts";
 import { boundedAppend } from "../reducer.ts";
 import type { Backend, BackendEvent, BackendRequest, BackendRun, SendBehavior } from "../types.ts";
@@ -11,7 +12,7 @@ const execFileAsync = promisify(execFile);
 type ClaudeQuery = typeof query;
 type ClaudeAuthVerifier = (command: string, cwd: string, env: NodeJS.ProcessEnv, signal: AbortSignal) => Promise<void>;
 interface ClaudeBackendOptions {
-  runTimeoutMs?: number;
+  inactivityTimeoutMs?: number;
   queryFn?: ClaudeQuery;
   verifyAuth?: ClaudeAuthVerifier;
 }
@@ -19,13 +20,13 @@ interface ClaudeBackendOptions {
 export class ClaudeBackend implements Backend {
   readonly name = "claude" as const;
   readonly #command: string;
-  readonly #runTimeoutMs: number;
+  readonly #inactivityTimeoutMs: number;
   readonly #query: ClaudeQuery;
   readonly #verifyAuth: ClaudeAuthVerifier;
 
   constructor(command = "claude", options: ClaudeBackendOptions = {}) {
     this.#command = command;
-    this.#runTimeoutMs = options.runTimeoutMs ?? 15 * 60_000;
+    this.#inactivityTimeoutMs = options.inactivityTimeoutMs ?? 15 * 60_000;
     this.#query = options.queryFn ?? query;
     this.#verifyAuth = options.verifyAuth ?? verifyClaudeSubscription;
   }
@@ -47,20 +48,17 @@ export class ClaudeBackend implements Backend {
     const queuedMessages: Array<{ text: string; behavior: SendBehavior }> = [];
     let resolveCompleted!: () => void;
     const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
-    let runTimer: NodeJS.Timeout | undefined;
-    const armRunTimer = () => {
-      if (runTimer) clearTimeout(runTimer);
-      runTimer = setTimeout(() => {
-        finish({ type: "failed", error: `Claude run timed out after ${this.#runTimeoutMs}ms` });
-        controller.abort();
-        input.close();
-        stream.close();
-      }, this.#runTimeoutMs);
-    };
+    const watchdog = createActivityWatchdog(this.#inactivityTimeoutMs, () => {
+      closing = true;
+      finish({ type: "failed", error: `Claude produced no activity for ${this.#inactivityTimeoutMs}ms` });
+      controller.abort();
+      input.close();
+      stream.close();
+    });
     const finish = (event: BackendEvent) => {
       if (terminal) return;
       terminal = true;
-      if (runTimer) clearTimeout(runTimer);
+      watchdog.clear();
       emit(event);
       resolveCompleted();
     };
@@ -87,11 +85,12 @@ export class ClaudeBackend implements Backend {
         maxTurns: 80,
       },
     });
-    armRunTimer();
+    watchdog.arm();
 
     const consuming = (async () => {
       try {
         for await (const message of stream) {
+          watchdog.touch();
           const result = handleMessage(message, emit, controller, request.policy.access === "readOnly");
           if (!result) continue;
           resultCount++;
@@ -118,7 +117,7 @@ export class ClaudeBackend implements Backend {
 
     const stop = async () => {
       closing = true;
-      clearTimeout(runTimer);
+      watchdog.clear();
       input.close();
       if (!controller.signal.aborted) controller.abort();
       stream.close();
@@ -129,14 +128,16 @@ export class ClaudeBackend implements Backend {
       completed,
       async send(message: string, behavior: SendBehavior = "steer") {
         if (closing) throw new Error("Claude session is closed");
-        if (terminal) {
+        const restarting = terminal;
+        if (restarting) {
           terminal = false;
           output = "";
           expectedResults = resultCount + 1;
           behavior = "followUp";
-          armRunTimer();
           emit({ type: "started" });
         } else if (behavior === "followUp") expectedResults++;
+        if (restarting) watchdog.arm();
+        else watchdog.touch();
         input.push(userMessage(message, behavior === "steer" ? "now" : "later"));
         emit({ type: "user_message", text: message });
         queuedMessages.push({ text: message, behavior });
@@ -149,7 +150,7 @@ export class ClaudeBackend implements Backend {
       close: stop,
       async forceClose() {
         closing = true;
-        clearTimeout(runTimer);
+        watchdog.clear();
         input.close();
         controller.abort();
         stream.close();

@@ -39,9 +39,11 @@ test("JSON-RPC peer correlates chunked numeric and string-ID responses", async (
       fake.stdout.write(response.slice(7));
     }
   });
-  const peer = new JsonRpcPeer({ process: fake.managed });
+  let activities = 0;
+  const peer = new JsonRpcPeer({ process: fake.managed, onActivity: () => { activities++; } });
   assert.deepEqual(await peer.request("echo", { value: 1 }), { text: "a b" });
   assert.equal(writes[0]?.method, "echo");
+  assert.equal(activities, 1, "valid JSON-RPC responses count as provider activity");
   await peer.close();
   const stringIdPeer = new JsonRpcPeer({ process: fake.managed, requestId: () => "request-one" });
   assert.equal(await stringIdPeer.request("echo"), "string-ok");

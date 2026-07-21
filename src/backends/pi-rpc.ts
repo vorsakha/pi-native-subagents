@@ -1,3 +1,4 @@
+import { createActivityWatchdog } from "../activity-watchdog.ts";
 import { sanitizeSubscriptionEnv } from "../env.ts";
 import { JsonlFramer, parseJsonRecord } from "../framing.ts";
 import { spawnManaged } from "../process-tree.ts";
@@ -6,7 +7,7 @@ import type { Backend, BackendEvent, BackendRequest, BackendRun, SendBehavior } 
 
 interface PiBackendOptions {
   requestTimeoutMs?: number;
-  runTimeoutMs?: number;
+  inactivityTimeoutMs?: number;
 }
 
 interface PendingCommand {
@@ -20,12 +21,12 @@ export class PiRpcBackend implements Backend {
   readonly name = "pi" as const;
   readonly #command: string;
   readonly #requestTimeoutMs: number;
-  readonly #runTimeoutMs: number;
+  readonly #inactivityTimeoutMs: number;
 
   constructor(command = "pi", options: PiBackendOptions = {}) {
     this.#command = command;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
-    this.#runTimeoutMs = options.runTimeoutMs ?? 15 * 60_000;
+    this.#inactivityTimeoutMs = options.inactivityTimeoutMs ?? 15 * 60_000;
   }
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
@@ -55,14 +56,12 @@ export class PiRpcBackend implements Backend {
     let tearingDown = false;
     let resolveCompleted!: () => void;
     const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
-    let runTimer: NodeJS.Timeout | undefined;
-    const armRunTimer = () => {
-      if (runTimer) clearTimeout(runTimer);
-      runTimer = setTimeout(() => {
-        finish({ type: "failed", error: `Pi RPC run timed out after ${this.#runTimeoutMs}ms` });
-        void managed.terminate();
-      }, this.#runTimeoutMs);
-    };
+    const watchdog = createActivityWatchdog(this.#inactivityTimeoutMs, () => {
+      closed = true;
+      tearingDown = true;
+      finish({ type: "failed", error: `Pi RPC produced no activity for ${this.#inactivityTimeoutMs}ms` });
+      void managed.terminate();
+    });
 
     const rejectPending = (error: Error) => {
       for (const item of pending.values()) {
@@ -74,7 +73,7 @@ export class PiRpcBackend implements Backend {
     const finish = (event: BackendEvent) => {
       if (settled) return;
       settled = true;
-      clearTimeout(runTimer);
+      watchdog.clear();
       emit(event);
       resolveCompleted();
     };
@@ -100,7 +99,7 @@ export class PiRpcBackend implements Backend {
       });
     };
 
-    armRunTimer();
+    watchdog.arm();
     const framer = new JsonlFramer();
     const handle = (record: string) => {
       const event = parseJsonRecord(record);
@@ -108,6 +107,7 @@ export class PiRpcBackend implements Backend {
         if (record.trim()) throw new Error("invalid JSON object");
         return;
       }
+      watchdog.touch();
       if (event.type === "response" && typeof event.id === "string") {
         const item = pending.get(event.id);
         if (item) {
@@ -206,7 +206,11 @@ export class PiRpcBackend implements Backend {
     });
 
     let startupAbortTeardown: Promise<void> | undefined;
-    const abortStartup = () => { startupAbortTeardown ??= managed.terminate(0); };
+    const abortStartup = () => {
+      tearingDown = true;
+      watchdog.clear();
+      startupAbortTeardown ??= managed.terminate(0);
+    };
     request.signal.addEventListener("abort", abortStartup, { once: true });
 
     emit({ type: "user_message", text: `Task: ${request.task}` });
@@ -219,12 +223,13 @@ export class PiRpcBackend implements Backend {
     const send = async (message: string, behavior: SendBehavior = "steer") => {
       if (closed) throw new Error("Pi RPC process is closed");
       const restarting = settled;
+      if (restarting) watchdog.arm();
+      else watchdog.touch();
       if (restarting) {
         settled = false;
         output = "";
         terminalProblem = undefined;
         retryableAssistantProblem = false;
-        armRunTimer();
         emit({ type: "started" });
         behavior = "followUp";
       }
@@ -236,9 +241,10 @@ export class PiRpcBackend implements Backend {
       completed,
       send,
       async cancel(reason = "Cancelled") {
+        tearingDown = true;
+        watchdog.clear();
         if (!settled) await command("abort", {}, 5_000).catch(() => undefined);
         closed = true;
-        tearingDown = true;
         rejectPending(new Error(reason));
         await managed.terminate();
         finish({ type: "cancelled", reason });
@@ -247,14 +253,14 @@ export class PiRpcBackend implements Backend {
         if (closed && managed.child.exitCode !== null) return;
         closed = true;
         tearingDown = true;
-        clearTimeout(runTimer);
+        watchdog.clear();
         rejectPending(new Error("Pi RPC run closed"));
         await managed.terminate();
       },
       async forceClose() {
         closed = true;
         tearingDown = true;
-        clearTimeout(runTimer);
+        watchdog.clear();
         rejectPending(new Error("Pi RPC run force-closed"));
         await managed.terminate(0);
         finish({ type: "cancelled", reason: "Pi RPC force-closed after shutdown deadline" });
@@ -268,7 +274,7 @@ export class PiRpcBackend implements Backend {
     if (request.signal.aborted) {
       closed = true;
       tearingDown = true;
-      clearTimeout(runTimer);
+      watchdog.clear();
       rejectPending(new Error("Pi RPC startup aborted"));
       await startupAbortTeardown;
       finish({ type: "cancelled", reason: "Pi RPC startup aborted" });
