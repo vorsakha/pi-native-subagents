@@ -10,6 +10,7 @@ class FakeBackend implements Backend {
   starts: string[] = [];
   policies: BackendRequest["policy"][] = [];
   cancels: string[] = [];
+  closes: string[] = [];
   sends: Array<{ id: string; message: string; behavior: string }> = [];
   readonly runs = new Map<string, { emit: (event: BackendEvent) => void; resolve: () => void }>();
 
@@ -25,7 +26,7 @@ class FakeBackend implements Backend {
       completed,
       send: async (message, behavior = "steer") => { this.sends.push({ id: request.jobId, message, behavior }); },
       cancel: async (reason) => { this.cancels.push(request.jobId); emit({ type: "cancelled", reason }); resolve(); },
-      close: async () => undefined,
+      close: async () => { this.closes.push(request.jobId); },
     };
   }
 
@@ -58,6 +59,61 @@ test("manager enforces concurrency cap four and pumps queued work", async () => 
   await tick(); await tick();
   backend.complete(jobs[5]!.id);
   await manager.wait(jobs[5]!.id);
+  await manager.shutdown();
+});
+
+test("completed native sessions live until session shutdown or oldest-terminal capacity eviction", async () => {
+  const { backend, manager } = setup(4);
+  const jobs = Array.from({ length: 100 }, (_, index) => manager.spawn(request(index)));
+  const completed = new Set<string>();
+  while (completed.size < jobs.length) {
+    await tick();
+    for (const id of backend.starts) {
+      if (completed.has(id)) continue;
+      backend.complete(id);
+      completed.add(id);
+    }
+  }
+  await Promise.all(jobs.map((job) => manager.wait(job.id)));
+  assert.deepEqual(backend.closes, [], "completed native sessions remain open without an idle TTL");
+
+  const replacement = manager.spawn(request(100));
+  await tick();
+  assert.throws(() => manager.check(jobs[0]!.id), /Unknown job/, "oldest terminal job is evicted at capacity");
+  assert.deepEqual(backend.closes, [jobs[0]!.id], "capacity eviction closes the retained native session");
+  backend.complete(replacement.id);
+  await manager.wait(replacement.id);
+  await manager.shutdown();
+});
+
+test("an evicted terminal job closes a native run that returns after eviction", async () => {
+  let releaseStart!: () => void;
+  const startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
+  let starts = 0;
+  const closes: string[] = [];
+  const backend: Backend = {
+    name: "codex",
+    async start(request, emit) {
+      starts++;
+      emit({ type: "completed", output: "early completion" });
+      if (starts === 1) await startGate;
+      return {
+        completed: Promise.resolve(),
+        async send() {},
+        async cancel() {},
+        async close() { closes.push(request.jobId); },
+      };
+    },
+  };
+  const manager = new JobManager({ backends: [backend], concurrency: 1 });
+  const jobs = Array.from({ length: 100 }, (_, index) => manager.spawn(request(index)));
+  const replacement = manager.spawn(request(100));
+  assert.throws(() => manager.check(jobs[0]!.id), /Unknown job/);
+
+  releaseStart();
+  while (!closes.includes(jobs[0]!.id)) await tick();
+  assert.deepEqual(closes, [jobs[0]!.id], "late native run is closed instead of orphaned");
+  await manager.wait(replacement.id);
   await manager.shutdown();
 });
 

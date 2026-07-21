@@ -10,7 +10,7 @@ The `/subagents` overlay contains title/status, keyboard guidance, a job list, s
 
 Escape and Pi's cancel binding close the overlay. Arrow keys or `j`/`k` navigate; Shift+Up/Down and Page Up/Down scroll. Enter opens takeover; `s` steers, `f` queues a follow-up, and `x` cancels. Workflow-owned agents remain inspectable but cannot be steered.
 
-Takeover normalizes bounded user, thinking, assistant, tool, live-thinking, and queued-message state. Active jobs accept steering; retained completed jobs accept follow-ups; failed/cancelled/expired jobs remain read-only.
+Takeover normalizes bounded user, thinking, assistant, tool, live-thinking, and queued-message state. Active jobs accept steering; completed ordinary jobs retain follow-up-capable native sessions until parent-session shutdown or oldest-terminal eviction at the 100-job capacity. Failed, cancelled, evicted, and workflow-owned jobs remain read-only.
 
 Running glyphs use a width-stable 500 ms blink. Output is sanitized before Pi-native Markdown rendering. Cards are pinned to job id and generation so retained-session follow-ups do not rewrite historical rows.
 

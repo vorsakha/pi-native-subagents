@@ -18,7 +18,6 @@ interface InternalJob {
   runWaiters?: Set<(run?: BackendRun) => void>;
   startupController?: AbortController;
   pendingRestart?: { message: string; behavior: SendBehavior };
-  idleTimer?: NodeJS.Timeout;
   /** Last observer-safe projection, used to reuse unchanged bounded collections on streaming events. */
   publishedSource?: JobSnapshot;
   publishedSnapshot?: JobSnapshot;
@@ -40,7 +39,6 @@ function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: J
 }
 
 const MAX_RETAINED_JOBS = 100;
-const REUSABLE_SESSION_TTL_MS = 15 * 60_000;
 
 export class JobManager {
   readonly #backends: Map<string, Backend>;
@@ -127,10 +125,8 @@ export class JobManager {
       throw new Error(`Cannot reuse ${id}: job is ${job.snapshot.status}`);
     }
     if (job.snapshot.status === "completed") {
-      if (!job.run) throw new Error(`Cannot reuse ${id}: native session retention expired`);
+      if (!job.run) throw new Error(`Cannot reuse ${id}: native session is no longer available`);
       if (job.pendingRestart) throw new Error(`Cannot reuse ${id}: a follow-up is already queued`);
-      if (job.idleTimer) clearTimeout(job.idleTimer);
-      job.idleTimer = undefined;
       job.pendingRestart = { message, behavior: "followUp" };
       job.snapshot = {
         ...job.snapshot,
@@ -223,8 +219,6 @@ export class JobManager {
     this.#closed = true;
     const operations: Promise<unknown>[] = [];
     for (const job of this.#jobs.values()) {
-      if (job.idleTimer) clearTimeout(job.idleTimer);
-      job.idleTimer = undefined;
       operations.push((async () => {
         if (!isTerminal(job.snapshot.status)) await this.cancel(job.snapshot.id, "Session shutdown");
         const run = job.run;
@@ -259,10 +253,9 @@ export class JobManager {
     if (this.#jobs.size < MAX_RETAINED_JOBS) return;
     const terminal = [...this.#jobs.values()]
       .filter((job) => isTerminal(job.snapshot.status))
-      .sort((a, b) => a.snapshot.createdAt - b.snapshot.createdAt);
+      .sort((a, b) => (a.snapshot.endedAt ?? a.snapshot.createdAt) - (b.snapshot.endedAt ?? b.snapshot.createdAt));
     while (this.#jobs.size >= MAX_RETAINED_JOBS && terminal.length > 0) {
       const job = terminal.shift()!;
-      if (job.idleTimer) clearTimeout(job.idleTimer);
       if (job.run) void job.run.close().catch(() => undefined);
       this.#jobs.delete(job.snapshot.id);
       this.#waiters.delete(job.snapshot.id);
@@ -289,7 +282,7 @@ export class JobManager {
     this.#emit(job, { type: "started" });
     try {
       const systemPrompt = [GENERIC_SYSTEM_PROMPT, job.profile?.systemPrompt].filter(Boolean).join("\n\n");
-      job.run = await backend.start({
+      const startedRun = await backend.start({
         jobId: job.snapshot.id,
         name: job.snapshot.name,
         task: job.request.task,
@@ -299,6 +292,11 @@ export class JobManager {
         env: process.env,
         signal: startupController.signal,
       }, (event) => this.#handleBackendEvent(job, event));
+      if (this.#closed || this.#jobs.get(job.snapshot.id) !== job) {
+        await (startedRun.forceClose?.() ?? startedRun.close()).catch(() => undefined);
+        return;
+      }
+      job.run = startedRun;
       job.startupController = undefined;
       this.#resolveRunWaiters(job, job.run);
       if (job.cancelRequested && isTerminal(job.snapshot.status)) {
@@ -317,9 +315,7 @@ export class JobManager {
       job.startupController = undefined;
       this.#resolveRunWaiters(job);
       const run = job.run;
-      if (job.snapshot.status === "completed" && run && !job.cancelRequested && !job.snapshot.workflow) {
-        this.#scheduleIdleClose(job, run);
-      } else {
+      if (job.snapshot.status !== "completed" || !run || job.cancelRequested || job.snapshot.workflow) {
         if (run) await this.#serialize(job, () => run.close()).catch(() => undefined);
         job.run = undefined;
       }
@@ -345,8 +341,7 @@ export class JobManager {
     } catch (error) {
       if (!isTerminal(job.snapshot.status)) this.#emit(job, { type: "failed", error: error instanceof Error ? error.message : String(error) });
     } finally {
-      if (job.snapshot.status === "completed" && job.run === run && !job.snapshot.workflow) this.#scheduleIdleClose(job, run);
-      else {
+      if (job.snapshot.status !== "completed" || job.run !== run || job.snapshot.workflow) {
         await this.#serialize(job, () => run.close()).catch(() => undefined);
         if (job.run === run) job.run = undefined;
       }
@@ -363,18 +358,6 @@ export class JobManager {
       set.add(waiter);
       this.#waiters.set(job.snapshot.id, set);
     });
-  }
-
-  #scheduleIdleClose(job: InternalJob, run: BackendRun): void {
-    if (job.idleTimer) clearTimeout(job.idleTimer);
-    job.idleTimer = setTimeout(() => {
-      job.idleTimer = undefined;
-      if (job.run !== run || job.snapshot.status !== "completed") return;
-      void this.#serialize(job, () => run.close()).finally(() => {
-        if (job.run === run) job.run = undefined;
-      });
-    }, REUSABLE_SESSION_TTL_MS);
-    job.idleTimer.unref();
   }
 
   #handleBackendEvent(job: InternalJob, event: BackendEvent): void {

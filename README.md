@@ -77,7 +77,7 @@ Workflow JavaScript runs in a separate permission-restricted Node process with 1
 /workflows
 ```
 
-The default harness applies to both direct tools and workflow `agent()` calls. Exact model selection stays request-scoped; `/subagents status` reports that models are caller-selected or native-default. Successfully completed ordinary jobs retain their native session for 15 minutes; follow-up sends reopen the same job/session. Failed, cancelled, expired, evicted, and workflow-owned sessions are not reusable.
+The default harness applies to both direct tools and workflow `agent()` calls. Exact model selection stays request-scoped; `/subagents status` reports that models are caller-selected or native-default. Successfully completed ordinary jobs retain their native session for the parent Pi session, bounded by the 100-job capacity; follow-up sends reopen the same job/session. At capacity, the oldest terminal jobs and their native sessions are evicted before new spawns. Failed, cancelled, evicted, and workflow-owned sessions are not reusable.
 
 Workflow scripts compose task-driven agents directly:
 
