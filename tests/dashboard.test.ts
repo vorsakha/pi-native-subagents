@@ -9,7 +9,7 @@ import type { JobSnapshot } from "../src/types.ts";
 
 test("dashboard truncation respects terminal display width for Unicode and ANSI", () => {
   for (const value of [
-    "reviewer · 你好世界 · codex/gpt-5.6-sol",
+    "reviewer · 你好世界 · codex/fixture-model",
     "worker · 👩🏽‍💻 launch 🚀 complete",
     "\u001b[31mfailed 你好世界\u001b[0m",
   ]) {
@@ -31,7 +31,7 @@ function job(id: string, status: JobSnapshot["status"] = "running"): JobSnapshot
     id,
     name: "worker", access: "full", independent: false,
     backend: "codex",
-    model: "gpt-5.6",
+    model: "fixture-model",
     effort: "high",
     task: "Review Unicode output 你好世界",
     cwd: "/tmp",

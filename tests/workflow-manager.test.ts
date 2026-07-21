@@ -176,7 +176,8 @@ test("rejects mismatched workflow agent schemas without spawning jobs", async ()
         for (const options of [
           { role: "worker" },
           { agent: "reviewer" },
-          { tier: "quality" },
+          { tier: "obsolete" },
+          { modelTier: "obsolete" },
           { modelProfile: "codex" },
         ]) results.push(await agent("schema mismatch", options));
         return results;
@@ -185,8 +186,16 @@ test("rejects mismatched workflow agent schemas without spawning jobs", async ()
     const final = await started.completion;
     const results = final.result as Array<{ ok: boolean; error?: string }>;
     assert.equal(final.status, "completed");
-    assert.equal(results.length, 4);
+    assert.equal(results.length, 5);
     assert.ok(results.every((result) => !result.ok && /Workflow agent\(\) API schema mismatch/.test(result.error ?? "")));
+    const blank = await f.workflows.start(f.request(`export default async () => agent("blank", { model: "   " });`));
+    assert.match(((await blank.completion).result as { error?: string }).error ?? "", /1–256/);
+    const invalidModels = await f.workflows.start(f.request(`
+      export default async () => Promise.all([null, 123, [], {}].map((model) => agent("invalid model", { model })));
+    `));
+    const invalidResults = (await invalidModels.completion).result as Array<{ ok: boolean; error?: string }>;
+    assert.equal(invalidResults.length, 4);
+    assert.ok(invalidResults.every((result) => !result.ok && /Model ID must be a string/.test(result.error ?? "")));
     assert.equal(f.backend.requests.length, 0);
   } finally {
     await f.cleanup();
@@ -198,7 +207,7 @@ test("runs sequential and parallel agents through one JobManager and its global 
   try {
     const started = await f.workflows.start(f.request(`
       export default async () => {
-        const first = await agent("seq-1");
+        const first = await agent("seq-1", { model: "workflow-model" });
         const second = await agent("seq-2:" + first.output, { name: "worker" });
         const batch = await parallel(["par-1", "par-2", "par-3", "par-4"].map(
           (prompt) => () => agent(prompt, { name: "worker" })
@@ -209,6 +218,7 @@ test("runs sequential and parallel agents through one JobManager and its global 
 
     await waitFor(() => f.backend.requests.length === 1, "first sequential agent");
     assert.equal(f.backend.requests[0]?.task, "seq-1");
+    assert.equal(f.backend.requests[0]?.policy.model, "workflow-model");
     assert.equal(f.backend.requests[0]?.policy.effort, undefined, "workflow agents default to provider-adaptive effort");
     f.backend.completeTask("seq-1", "one");
     await waitFor(() => f.backend.requests.length === 2, "second sequential agent");

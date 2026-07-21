@@ -71,7 +71,7 @@ export class ClaudeBackend implements Backend {
         cwd: request.cwd,
         env: { ...env, CLAUDE_AGENT_SDK_CLIENT_APP: "pi-native-subagents/0.1.0" },
         pathToClaudeCodeExecutable: this.#command,
-        model: request.policy.model,
+        ...(request.policy.model ? { model: request.policy.model } : {}),
         ...(request.policy.effort ? { effort: request.policy.effort } : {}),
         thinking: request.policy.thinking === "off" ? { type: "disabled" } : { type: "adaptive" },
         systemPrompt: { type: "preset", preset: "claude_code", append: request.systemPrompt },

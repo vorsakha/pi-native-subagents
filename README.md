@@ -20,37 +20,13 @@ Behavior comes from the task plus a short isolation baseline. Give every child a
 `subagent_spawn` and foreground `subagent` accept:
 
 - required `task`;
-- optional `name`, `cwd`, `backend`, `modelTier`, `effort`, `access`, `independent`, and `profile`.
+- optional `name`, `cwd`, `backend`, exact backend-local `model`, `effort`, `access`, `independent`, and `profile`.
 
-`access` is `readOnly` or `full` and defaults to `full` only after Pi's project-trust gate succeeds. The configured backend defaults to Codex, and the default model tier is `balanced`, resolved through the effective global mapping. Explicit backend, tier, and effort values override those defaults.
+`access` is `readOnly` or `full` and defaults to `full` only after Pi's project-trust gate succeeds. The configured backend defaults to Codex. `model` never selects or changes a backend; it is forwarded only to the chosen native backend. Omitting it uses that backend's configured default. Claude and Codex also omit effort by default so provider behavior remains adaptive; callers may set `low`, `medium`, `high`, `xhigh`, or `max`.
+
+The extension contains no concrete model names or model recommendation table. The separately installed, easy-to-edit `subagents` skill owns current cost/capability guidance and supplies exact models when useful. Runtime code remains responsible for trust, access, provider diversity, subscription authentication, sandboxing, and lifecycle constraints.
 
 `independent: true` forces a different native provider from the parent: OpenAI/GPT/Codex parent → Claude, Claude parent → Codex. Explicit Pi or same-provider routes are rejected. For an unknown parent provider, Claude is the native fallback.
-
-`economy`, `balanced`, and `quality` are the stable model-routing API for tools, workflows, and profiles. An administrator maps them globally in `getAgentDir()/subagents.json`; project files never control concrete model selection. The mapping is loaded for the next session, strictly validated, and falls back as one safe built-in map if absent or invalid:
-
-```json
-{
-  "modelTiers": {
-    "codex": {
-      "economy": "gpt-5.6-luna",
-      "balanced": "gpt-5.6-terra",
-      "quality": "gpt-5.6-sol"
-    },
-    "claude": {
-      "economy": "haiku",
-      "balanced": "sonnet",
-      "quality": "opus"
-    },
-    "pi": {
-      "economy": "openai-codex/gpt-5.6-luna",
-      "balanced": "openai-codex/gpt-5.6-terra",
-      "quality": "openai-codex/gpt-5.6-sol"
-    }
-  }
-}
-```
-
-Claude and Codex omit effort by default so provider behavior remains adaptive. Callers may set `low`, `medium`, `high`, `xhigh`, or `max`.
 
 ## Optional profiles
 
@@ -64,14 +40,13 @@ name: security-audit
 description: Read-only security review policy
 access: readOnly
 backend: claude
-modelTier: quality
 effort: high
 independent: true
 ---
 Focus on concrete security boundaries and evidence. Do not suggest unrelated changes.
 ```
 
-Supported fields are `name`, `description`, `access`, `backend`, `modelTier`, `effort`, `independent`, and optional `locked_backend`. The body is appended to the durable system instructions. A profile's `readOnly` access is a ceiling and cannot be elevated per call. Locked-backend and independence contradictions fail before dispatch.
+Supported fields are `name`, `description`, `access`, `backend`, `effort`, `independent`, and optional `locked_backend`. The body is appended to the durable system instructions. A profile's `readOnly` access is a ceiling and cannot be elevated per call. Locked-backend and independence contradictions fail before dispatch.
 
 ## Security model
 
@@ -94,7 +69,6 @@ Workflow JavaScript runs in a separate permission-restricted Node process with 1
 ```text
 /subagents
 /subagents status
-/subagents models
 /subagents profiles
 /subagents codex
 /subagents claude
@@ -103,7 +77,7 @@ Workflow JavaScript runs in a separate permission-restricted Node process with 1
 /workflows
 ```
 
-The default backend and effective tier mapping apply to both direct tools and workflow `agent()` calls. `/subagents models` shows the effective mappings, source, and validation warnings; `/subagents status` gives the concise source and warning count. Successfully completed ordinary jobs retain their native session for 15 minutes; follow-up sends reopen the same job/session. Failed, cancelled, expired, evicted, and workflow-owned sessions are not reusable.
+The default backend applies to both direct tools and workflow `agent()` calls. Exact model selection stays request-scoped; `/subagents status` reports that models are caller-selected or native-default. Successfully completed ordinary jobs retain their native session for 15 minutes; follow-up sends reopen the same job/session. Failed, cancelled, expired, evicted, and workflow-owned sessions are not reusable.
 
 Workflow scripts compose task-driven agents directly:
 
@@ -120,7 +94,7 @@ export default async function () {
 }
 ```
 
-`agent(prompt, options?)` resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. Options support `name`/`label`, `access`, `backend`, `modelTier`, `effort`, `independent`, `profile`, `phase`, and bounded JSON `schema`. `parallel()` accepts task functions with concurrency 1–4; the shared manager remains the authoritative global scheduler.
+`agent(prompt, options?)` resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. Options support `name`/`label`, `access`, `backend`, exact backend-local `model`, `effort`, `independent`, `profile`, `phase`, and bounded JSON `schema`. `parallel()` accepts task functions with concurrency 1–4; the shared manager remains the authoritative global scheduler.
 
 Workflow scripts, checkpoints, results, bounded transcripts, and reports are private under `~/.pi/agent/workflows/`, never the project. V1 does not resume interrupted execution; stale running checkpoints become `aborted`.
 

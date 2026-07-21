@@ -50,14 +50,7 @@ function policy(name, access = "readOnly") {
     approvalPolicy: "never",
     codexSandbox: access === "full" ? { type: "dangerFullAccess" } : { type: "readOnly", networkAccess: false },
   };
-  return {
-    ...common,
-    model: name === "pi"
-      ? "openai-codex/gpt-5.6-luna"
-      : name === "claude"
-        ? accessMode ? "sonnet" : "haiku"
-        : accessMode && access === "readOnly" ? "gpt-5.6-sol" : access === "full" ? "gpt-5.6-terra" : "gpt-5.6-luna",
-  };
+  return common;
 }
 
 function backend(name) {

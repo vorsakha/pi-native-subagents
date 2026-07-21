@@ -1,6 +1,5 @@
 import { randomUUID } from "node:crypto";
 import { compilePolicy } from "./policy.ts";
-import { BUILT_IN_MODEL_TIERS, type ModelTierMappings } from "./model-routing.ts";
 import { emptyUsage, reduceJob } from "./reducer.ts";
 import type { Backend, BackendEvent, BackendRun, JobSnapshot, ProfileDefinition, SendBehavior, SpawnRequest } from "./types.ts";
 
@@ -52,15 +51,13 @@ export class JobManager {
   readonly #listeners = new Set<(job: JobSnapshot, event: BackendEvent) => void>();
   readonly #launches = new Set<Promise<void>>();
   readonly #concurrency: number;
-  readonly #mappings: ModelTierMappings;
   #active = 0;
   #closed = false;
 
-  constructor(options: { backends: Backend[]; profiles?: Map<string, ProfileDefinition>; concurrency?: number; mappings?: ModelTierMappings }) {
+  constructor(options: { backends: Backend[]; profiles?: Map<string, ProfileDefinition>; concurrency?: number }) {
     this.#backends = new Map(options.backends.map((backend) => [backend.name, backend]));
     this.#profiles = options.profiles ?? new Map();
     this.#concurrency = Math.max(1, Math.min(4, options.concurrency ?? 4));
-    this.#mappings = options.mappings ?? BUILT_IN_MODEL_TIERS;
   }
 
   spawn(request: SpawnRequest): JobSnapshot {
@@ -70,7 +67,7 @@ export class JobManager {
     if (request.profile !== undefined && !profileName) throw new Error("Profile must be a non-empty string");
     const profile = profileName ? this.#profiles.get(profileName) : undefined;
     if (profileName && !profile) throw new Error(`Unknown subagent profile: ${profileName}`);
-    const { policy, independent } = compilePolicy(request, profile, this.#mappings);
+    const { policy, independent } = compilePolicy(request, profile);
     if (!this.#backends.has(policy.backend)) throw new Error(`Backend is unavailable: ${policy.backend}`);
     this.#evictOldJobs();
     const id = randomUUID();
@@ -82,7 +79,7 @@ export class JobManager {
       profile: profile?.name,
       independent,
       backend: policy.backend,
-      model: policy.model,
+      model: policy.model ?? "default",
       effort: policy.effort,
       task: request.task,
       cwd: request.cwd,

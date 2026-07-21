@@ -90,34 +90,24 @@ function context(branch: unknown[] = [], provider?: string) {
   } as any;
 }
 
-test("extension exposes generic direct tools, configured routing, independence, and one-shot delivery", async () => {
+test("extension exposes generic direct tools, caller models, independence, and one-shot delivery", async () => {
   const pi = fakePi();
   const registry = {};
   const backends = [new ImmediateBackend("pi"), new ImmediateBackend("claude"), new ImmediateBackend("codex")];
   const extensionRoot = await mkdtemp(join(tmpdir(), "extension-workflows-"));
   const workflowArtifactRoot = join(extensionRoot, "runs");
   const globalProfilesDir = join(extensionRoot, "profiles");
-  const globalConfigPath = join(extensionRoot, "subagents.json");
   await mkdir(globalProfilesDir);
-  await writeFile(globalConfigPath, JSON.stringify({ modelTiers: {
-    codex: { economy: "stale-c-e", balanced: "stale-c-b", quality: "stale-c-q" },
-    claude: { economy: "stale-a-e", balanced: "stale-a-b", quality: "stale-a-q" },
-    pi: { economy: "stale-p-e", balanced: "stale-p-b", quality: "stale-p-q" },
-  } }));
-  await mkdir(join(extensionRoot, ".pi"));
-  await writeFile(join(extensionRoot, ".pi", "subagents.json"), JSON.stringify({ modelTiers: { codex: { economy: "project-controlled" } } }));
   await writeFile(join(globalProfilesDir, "audit.md"), "---\nname: audit\naccess: readOnly\n---\nAudit carefully.\n");
-  registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir, globalConfigPath });
-  await writeFile(globalConfigPath, JSON.stringify({ modelTiers: {
-    codex: { economy: "c-e", balanced: "c-b", quality: "c-q" },
-    claude: { economy: "a-e", balanced: "a-b", quality: "a-q" },
-    pi: { economy: "p-e", balanced: "p-b", quality: "p-q" },
-  } }));
+  registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir });
 
   assert.deepEqual([...pi.tools.keys()].sort(), [
     "subagent", "subagent_cancel", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
   ]);
   assert.deepEqual([...pi.commands.keys()].sort(), ["subagents", "subagents-config", "workflows"]);
+  const spawnProperties = pi.tools.get("subagent_spawn").parameters.properties;
+  assert.ok(spawnProperties.model);
+  assert.equal(spawnProperties.modelTier, undefined, "tier compatibility is intentionally absent");
   assert.ok(pi.messageRenderers.has("native-workflow-result"));
   assert.ok(pi.messageRenderers.has("native-subagent-result"));
   assert.throws(() => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }), /loaded more than once/);
@@ -127,13 +117,10 @@ test("extension exposes generic direct tools, configured routing, independence, 
   pi.handlers.get("session_start")?.({}, ctx);
   await pi.commands.get("subagents").handler("profiles", ctx);
   assert.match(ctx.ui.notifications.at(-1) ?? "", /audit \(global\)/);
-  await pi.commands.get("subagents").handler("models", ctx);
-  assert.match(ctx.ui.notifications.at(-1) ?? "", /Source: .*subagents\.json/);
-  assert.match(ctx.ui.notifications.at(-1) ?? "", /codex: economy=c-e, balanced=c-b, quality=c-q/);
 
   const background = await pi.tools.get("subagent_spawn").execute("spawn", { name: "research", task: "background" }, undefined, undefined, ctx);
   assert.equal(background.details.job.backend, "pi", "background spawn uses the configured backend");
-  assert.equal(background.details.job.model, "p-b", "direct jobs use the session's global tier mapping");
+  assert.equal(background.details.job.model, "default", "omitted models use the native backend default");
   assert.equal(background.details.job.access, "full", "trusted generic agents default to full access");
   await new Promise((resolve) => setImmediate(resolve));
   pi.handlers.get("agent_settled")?.();
@@ -161,13 +148,19 @@ test("extension exposes generic direct tools, configured routing, independence, 
   assert.match(historicalAfterFollowUp, /pi-ok/);
   assert.doesNotMatch(historicalAfterFollowUp, /second generation/, "older thread cards stay pinned to their own generation");
 
-  const explicitClaude = await pi.tools.get("subagent_spawn").execute("claude-tier", {
-    name: "implementation", task: "explicit Claude wins", backend: "claude", modelTier: "economy", effort: "max",
+  const explicitClaude = await pi.tools.get("subagent_spawn").execute("claude-model", {
+    name: "implementation", task: "explicit Claude model", backend: "claude", model: "caller-model", effort: "max",
   }, undefined, undefined, ctx);
-  assert.equal(explicitClaude.details.job.backend, "claude", "explicit backend must outrank modelTier");
-  assert.equal(explicitClaude.details.job.model, "a-e", "Claude resolves economy from the global mapping within its provider family");
-  await pi.tools.get("subagent_wait").execute("wait-claude-tier", { jobId: explicitClaude.details.job.id }, undefined, undefined, ctx);
-  assert.equal(backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "explicit Claude wins")?.policy.effort, "max");
+  assert.equal(explicitClaude.details.job.backend, "claude");
+  assert.equal(explicitClaude.details.job.model, "caller-model");
+  await pi.tools.get("subagent_wait").execute("wait-claude-model", { jobId: explicitClaude.details.job.id }, undefined, undefined, ctx);
+  const explicitRequest = backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "explicit Claude model");
+  assert.equal(explicitRequest?.policy.model, "caller-model");
+  assert.equal(explicitRequest?.policy.effort, "max");
+  await assert.rejects(
+    pi.tools.get("subagent_spawn").execute("blank-model", { task: "invalid", model: "   " }, undefined, undefined, ctx),
+    /1–256/,
+  );
 
   const profiled = await pi.tools.get("subagent").execute("profiled", { task: "profiled audit", profile: "audit", access: "full" }, undefined, undefined, ctx);
   assert.equal(profiled.details.job.access, "readOnly", "profile access is a ceiling in direct tools");
@@ -177,11 +170,11 @@ test("extension exposes generic direct tools, configured routing, independence, 
   assert.equal(foreground.details.job.backend, "pi", "foreground uses the same configured generic route");
   const independentDefault = await pi.tools.get("subagent").execute("foreground-independent", { name: "independent", independent: true, task: "cross-provider default" }, undefined, undefined, ctx);
   assert.equal(independentDefault.details.job.backend, "claude", "unknown parent provider uses native Claude for independent work");
-  assert.equal(independentDefault.details.job.model, "a-b");
+  assert.equal(independentDefault.details.job.model, "default");
   const claudeParent = context([], "anthropic");
   const independentAgainstClaude = await pi.tools.get("subagent_spawn").execute("independent-codex", { name: "second-opinion", independent: true, task: "review Claude independently" }, undefined, undefined, claudeParent);
   assert.equal(independentAgainstClaude.details.job.backend, "codex");
-  assert.equal(independentAgainstClaude.details.job.model, "c-b");
+  assert.equal(independentAgainstClaude.details.job.model, "default");
   await assert.rejects(
     pi.tools.get("subagent_spawn").execute("independent-same", { independent: true, backend: "claude", task: "invalid same provider" }, undefined, undefined, claudeParent),
     /different from the parent claude/,

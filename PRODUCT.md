@@ -11,8 +11,8 @@ Provide a reliable control surface for starting generic task-driven agents, insp
 ## Principles
 
 - Make the task the unit of delegation.
-- Keep access, provider, model tier, effort, independence, and optional human profile explicit and composable.
-- Keep economy/balanced/quality stable across tools and profiles while letting administrators set concrete backend models globally for each new session, with validated safe fallbacks.
+- Keep access, provider, optional exact model, effort, independence, and optional human profile explicit and composable.
+- Keep concrete model recommendations in the editable routing skill; runtime accepts backend-local IDs or uses native defaults.
 - Default trusted generic agents to autonomous full access; make read-only an enforceable sandbox policy.
 - Keep optional profiles explicitly human-selected and visible.
 - Preserve one global four-job budget whether work starts directly or through a workflow.

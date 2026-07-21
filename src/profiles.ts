@@ -5,7 +5,6 @@ import type {
   AccessMode,
   BackendName,
   EffortLevel,
-  ModelTier,
   ProfileDefinition,
   ProfileOrigin,
   ProfileValidationWarning,
@@ -13,7 +12,6 @@ import type {
 
 const BACKENDS = new Set<BackendName>(["pi", "claude", "codex"]);
 const ACCESS = new Set<AccessMode>(["readOnly", "full"]);
-const TIERS = new Set<ModelTier>(["economy", "balanced", "quality"]);
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
 
 export interface ProfileCatalog {
@@ -50,6 +48,9 @@ function readDirectory(directory: string, origin: ProfileOrigin, catalog: Profil
       const { meta, body } = splitFrontmatter(readFileSync(filePath, "utf8"));
       const name = String(meta.name ?? "").trim();
       if (!name) throw new Error("Profile name is required");
+      if (["model", "modelTier", "tier"].some((key) => Object.hasOwn(meta, key))) {
+        throw new Error("Profiles cannot select models; use the request-scoped model field through the routing skill");
+      }
       if (meta.independent !== undefined && typeof meta.independent !== "boolean") throw new Error("Invalid independent: expected boolean");
       const backend = optionalEnum(meta, "backend", BACKENDS);
       const lockedBackend = optionalEnum(meta, "locked_backend", BACKENDS);
@@ -58,7 +59,6 @@ function readDirectory(directory: string, origin: ProfileOrigin, catalog: Profil
         description: String(meta.description ?? "").trim(),
         access: optionalEnum(meta, "access", ACCESS),
         backend,
-        modelTier: optionalEnum(meta, "modelTier", TIERS),
         effort: optionalEnum(meta, "effort", EFFORTS),
         independent: meta.independent as boolean | undefined,
         lockedBackend,

@@ -61,17 +61,18 @@ test("manager enforces concurrency cap four and pumps queued work", async () => 
   await manager.shutdown();
 });
 
-test("manager propagates its injected tier mapping to backend starts", async () => {
+test("manager forwards caller models and labels omitted models as native defaults", async () => {
   const backend = new FakeBackend();
-  const manager = new JobManager({ backends: [backend], mappings: {
-    codex: { economy: "cheap", balanced: "configured", quality: "best" },
-    claude: { economy: "h", balanced: "s", quality: "o" },
-    pi: { economy: "p1", balanced: "p2", quality: "p3" },
-  } });
-  const job = manager.spawn(request(1));
+  const manager = new JobManager({ backends: [backend] });
+  const selected = manager.spawn({ ...request(1), model: "configured-model" });
+  const nativeDefault = manager.spawn(request(2));
+  assert.equal(selected.model, "configured-model");
+  assert.equal(nativeDefault.model, "default");
   await tick();
-  assert.equal(backend.policies[0]?.model, "configured");
-  backend.complete(job.id);
+  assert.equal(backend.policies[0]?.model, "configured-model");
+  assert.equal(backend.policies[1]?.model, undefined);
+  backend.complete(selected.id);
+  backend.complete(nativeDefault.id);
   await manager.shutdown();
 });
 

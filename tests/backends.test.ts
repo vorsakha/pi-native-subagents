@@ -125,10 +125,12 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
   const events: BackendEvent[] = [];
   try {
     const backend = new PiRpcBackend(fake.command, { requestTimeoutMs: 1_000, runTimeoutMs: 2_000 });
-    const run = await backend.start(request("pi", fake.dir, {
+    const piRequest = request("pi", fake.dir, {
       ...process.env, MODE: "complete", ARG_FILE: argFile, ENV_FILE: envFile,
       OPENAI_API_KEY: "must-not-leak", CODEX_API_KEY: "must-not-leak",
-    }), (event) => events.push(event));
+    });
+    delete piRequest.policy.model;
+    const run = await backend.start(piRequest, (event) => events.push(event));
     await run.completed;
     assert.deepEqual(terminal(events), { type: "completed", output: "PI_OK" });
     await run.send("SECOND", "followUp");
@@ -141,6 +143,7 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
     assert.equal(args.includes("--no-session"), false);
     assert.equal(args.includes("--approve"), true);
     assert.equal(args.includes("--no-extensions"), true);
+    assert.equal(args.includes("--model"), false, "Pi uses its native default when no model is requested");
     assert.deepEqual(JSON.parse(await readFile(envFile, "utf8")), {});
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
@@ -203,6 +206,7 @@ test("Claude emits live events and reopens a completed subscription session", as
     CLAUDE_CODE_USE_BEDROCK: "1",
     AWS_ACCESS_KEY_ID: "must-not-leak",
   });
+  delete claudeRequest.policy.model;
   const run = await backend.start(claudeRequest, (event) => events.push(event));
   await run.completed;
   await run.send("second turn", "followUp");
@@ -213,6 +217,7 @@ test("Claude emits live events and reopens a completed subscription session", as
   }
   const final = terminal(events) as Extract<BackendEvent, { type: "completed" }>;
   assert.equal(capturedOptions?.includePartialMessages, true);
+  assert.equal(capturedOptions?.model, undefined, "Claude uses its native default when no model is requested");
   assert.equal(capturedOptions?.effort, undefined, "Claude effort is provider-adaptive unless explicitly requested");
   const childEnv = capturedOptions?.env as NodeJS.ProcessEnv;
   for (const env of [verifiedEnv, childEnv]) {
@@ -257,6 +262,7 @@ test("Codex reuses its native thread for queued and post-settlement follow-ups",
   const threadParamFile = join(fake.dir, "thread-params.json");
   try {
     const codexRequest = request("codex", fake.dir, { ...process.env, MODE: "normal", PARAM_FILE: paramFile, THREAD_PARAM_FILE: threadParamFile });
+    delete codexRequest.policy.model;
     codexRequest.policy.effort = "high";
     const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 500, runTimeoutMs: 2_000 })
       .start(codexRequest, (event) => events.push(event));
@@ -270,7 +276,9 @@ test("Codex reuses its native thread for queued and post-settlement follow-ups",
     assert.deepEqual(terminal(events), { type: "completed", output: "SECOND" });
     const turns = (await readFile(paramFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(turns.length, 2);
-    assert.equal(JSON.parse(await readFile(threadParamFile, "utf8")).modelProvider, "openai");
+    const threadParams = JSON.parse(await readFile(threadParamFile, "utf8"));
+    assert.equal(threadParams.modelProvider, "openai");
+    assert.equal(threadParams.model, undefined, "Codex uses its native default when no model is requested");
     for (const params of turns) {
       assert.deepEqual(params.sandboxPolicy, { type: "readOnly", networkAccess: false });
       assert.equal(params.approvalPolicy, "never");

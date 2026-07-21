@@ -2,7 +2,6 @@ export * from "./backend.ts";
 export * from "./env.ts";
 export * from "./framing.ts";
 export * from "./manager.ts";
-export * from "./model-routing.ts";
 export * from "./policy.ts";
 export * from "./reducer.ts";
 export * from "./profiles.ts";

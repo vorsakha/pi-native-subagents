@@ -12,15 +12,17 @@ test("profiles load from global and trusted project directories with project pre
   mkdirSync(global);
   mkdirSync(project);
   try {
-    writeFileSync(join(global, "audit.md"), "---\nname: audit\ndescription: global\naccess: readOnly\nbackend: claude\nmodelTier: quality\neffort: high\n---\nglobal instructions\n");
+    writeFileSync(join(global, "audit.md"), "---\nname: audit\ndescription: global\naccess: readOnly\nbackend: claude\neffort: high\n---\nglobal instructions\n");
     writeFileSync(join(project, "audit.md"), "---\nname: audit\ndescription: project\naccess: full\nbackend: codex\nindependent: false\n---\nproject instructions\n");
     writeFileSync(join(project, "bad.md"), "---\nname: bad\naccess: root\n---\ninvalid\n");
+    writeFileSync(join(project, "stale-model.md"), "---\nname: stale-model\nmodelTier: quality\n---\ninvalid\n");
     const loaded = loadProfiles(global, project);
     assert.equal(loaded.profiles.size, 1);
     assert.equal(loaded.profiles.get("audit")?.origin, "project");
     assert.equal(loaded.profiles.get("audit")?.systemPrompt, "project instructions");
-    assert.equal(loaded.warnings.length, 1);
-    assert.match(loaded.warnings[0]?.message ?? "", /Invalid access/);
+    assert.equal(loaded.warnings.length, 2);
+    assert.ok(loaded.warnings.some((warning) => /Invalid access/.test(warning.message)));
+    assert.ok(loaded.warnings.some((warning) => /Profiles cannot select models/.test(warning.message)));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -1,7 +1,6 @@
 export type BackendName = "pi" | "claude" | "codex";
 export type ProviderFamily = "claude" | "codex" | "other";
 export type AccessMode = "readOnly" | "full";
-export type ModelTier = "economy" | "balanced" | "quality";
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
@@ -33,7 +32,8 @@ export type BackendEvent =
 export interface BackendPolicy {
   backend: BackendName;
   access: AccessMode;
-  model: string;
+  /** Optional backend-local model ID. Omitted to use the backend's native default. */
+  model?: string;
   thinking: ThinkingLevel;
   /** Optional provider hint. Omitted by default so the model/provider remains adaptive. */
   effort?: EffortLevel;
@@ -89,7 +89,6 @@ export interface ProfileDefinition {
   description: string;
   access?: AccessMode;
   backend?: BackendName;
-  modelTier?: ModelTier;
   effort?: EffortLevel;
   independent?: boolean;
   lockedBackend?: BackendName;
@@ -117,7 +116,8 @@ export interface SpawnRequest {
   cwd: string;
   trusted: boolean;
   backend?: BackendName;
-  modelTier?: ModelTier;
+  /** Backend-local model ID selected by the caller, skill, or explicit profile. */
+  model?: string;
   effort?: EffortLevel;
   access?: AccessMode;
   independent?: boolean;

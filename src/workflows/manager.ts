@@ -3,7 +3,8 @@ import type { TSchema } from "typebox";
 import { Check } from "typebox/value";
 import type { JobManager } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
-import type { AccessMode, BackendEvent, BackendName, EffortLevel, JobSnapshot, ModelTier, ProviderFamily, Usage } from "../types.ts";
+import { normalizeModel } from "../policy.ts";
+import type { AccessMode, BackendEvent, BackendName, EffortLevel, JobSnapshot, ProviderFamily, Usage } from "../types.ts";
 import {
   checkpointWorkflow,
   createWorkflowArtifacts,
@@ -22,7 +23,6 @@ import type {
 } from "./types.ts";
 
 const BACKENDS = new Set<BackendName>(["pi", "claude", "codex"]);
-const TIERS = new Set<ModelTier>(["economy", "balanced", "quality"]);
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
 const ACCESS = new Set<AccessMode>(["readOnly", "full"]);
 const CHECKPOINT_DELAY_MS = 150;
@@ -282,13 +282,14 @@ export class WorkflowManager {
     signal: AbortSignal,
   ): Promise<WorkflowAgentResult> {
     if (!prompt.trim()) return { ok: false, output: "", error: "agent() requires a non-empty prompt" };
-    if (["role", "agent", "tier", "modelProfile"].some((key) => Object.hasOwn(options, key))) {
+    if (["role", "agent", "tier", "modelTier", "modelProfile"].some((key) => Object.hasOwn(options, key))) {
       return { ok: false, output: "", error: "Workflow agent() API schema mismatch: use the current task-driven schema." };
     }
     const backend = options.backend === undefined ? undefined : String(options.backend) as BackendName;
     if (backend && !BACKENDS.has(backend)) return { ok: false, output: "", error: `Unknown backend: ${backend}` };
-    const tier = options.modelTier === undefined ? undefined : String(options.modelTier) as ModelTier;
-    if (tier && !TIERS.has(tier)) return { ok: false, output: "", error: `Unknown model tier: ${tier}` };
+    let model: string | undefined;
+    try { model = normalizeModel(options.model); }
+    catch (error) { return { ok: false, output: "", error: boundedText(error) }; }
     const effortValue = options.effort;
     const effort = effortValue === undefined ? undefined : String(effortValue) as EffortLevel;
     if (effort && !EFFORTS.has(effort)) return { ok: false, output: "", error: `Unknown effort: ${effort}` };
@@ -343,7 +344,7 @@ export class WorkflowManager {
         cwd: request.cwd,
         trusted: request.trusted,
         backend,
-        modelTier: tier,
+        model,
         effort,
         access,
         independent: options.independent === true,

@@ -7,9 +7,9 @@ Build a standalone Pi extension providing first-class generic subagent lifecycle
 ## Required behavior
 
 - Use generic task-driven agents by default.
-- Keep access, backend, model tier, effort, provider independence, and optional explicit profiles as composable policy fields.
+- Keep access, backend, optional exact model, effort, provider independence, and optional explicit profiles as composable policy fields.
 - Load global profiles from the Pi agent directory and trusted project profiles from `.pi/subagents`, with project precedence and validation warnings.
-- Resolve concrete tier-to-model routing only from `getAgentDir()/subagents.json`; tools and profiles expose stable economy/balanced/quality tiers, and invalid global routing uses the complete bundled fallback map.
+- Keep concrete model names and recommendations out of runtime code and profiles; the editable routing skill supplies request-scoped backend-local IDs, while omission uses native backend defaults.
 - Preserve subscription authentication for Claude and Codex and never inherit environment state that could silently switch billing modes.
 - Provide background spawn/wait/check/send/cancel/list, retained-session follow-up, foreground `subagent`, and one-shot delivery for unconsumed background results.
 - Provide sandboxed workflows with phases, sequential/bounded-parallel generic agents, schemas, foreground/background execution, private durable artifacts, delivery, and `/workflows` inspection.

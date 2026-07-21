@@ -149,7 +149,7 @@ export class CodexAppServerBackend implements Backend {
         if (account.type !== "chatgpt") throw new Error(`Codex ChatGPT login required; account type is ${String(account.type ?? "none")}`);
         const threadResult = asObject(await peer.request("thread/start", {
           cwd: request.cwd,
-          model: request.policy.model,
+          ...(request.policy.model ? { model: request.policy.model } : {}),
           modelProvider: "openai",
           approvalPolicy: request.policy.approvalPolicy,
           sandboxPolicy: request.policy.codexSandbox,

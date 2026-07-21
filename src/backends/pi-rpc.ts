@@ -33,10 +33,12 @@ export class PiRpcBackend implements Backend {
     const args = [
       "--mode", "rpc", "--approve", "--no-skills", "--no-prompt-templates", "--no-extensions",
       "--name", `subagent-${request.name}-${request.jobId.slice(0, 8)}`,
-      "--model", request.policy.model,
+    ];
+    if (request.policy.model) args.push("--model", request.policy.model);
+    args.push(
       "--thinking", request.policy.thinking,
       "--append-system-prompt", request.systemPrompt,
-    ];
+    );
     if (request.policy.piTools.length > 0) args.push("--tools", request.policy.piTools.join(","));
     else args.push("--no-tools");
 

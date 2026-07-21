@@ -5,7 +5,7 @@ import { compilePolicy, providerFamily } from "../src/policy.ts";
 import type { ProfileDefinition } from "../src/types.ts";
 
 const profile: ProfileDefinition = {
-  name: "audit", description: "", access: "readOnly", backend: "claude", modelTier: "quality",
+  name: "audit", description: "", access: "readOnly", backend: "claude",
   systemPrompt: "audit carefully", filePath: "audit.md", origin: "global",
 };
 const request = { task: "x", cwd: "/tmp", trusted: true } as const;
@@ -44,27 +44,27 @@ test("subscription environments remove billing-switch credentials without mutati
   assert.equal(source.ANTHROPIC_API_KEY, "secret-a");
 });
 
-test("generic policy defaults to trusted full Codex with the balanced fallback mapping", () => {
+test("generic policy uses caller models or native backend defaults", () => {
   assert.throws(() => compilePolicy({ ...request, trusted: false }), /untrusted/);
   const compiled = compilePolicy(request);
   assert.equal(compiled.policy.backend, "codex");
-  assert.equal(compiled.policy.model, "gpt-5.6-terra");
+  assert.equal(compiled.policy.model, undefined);
   assert.equal(compiled.policy.access, "full");
   assert.deepEqual(compiled.policy.codexSandbox, { type: "dangerFullAccess" });
   assert.ok(!("nestedAgents" in compiled.policy));
 
-  const claude = compilePolicy({ ...request, defaultBackend: "claude", modelTier: "economy", effort: "high" });
+  const claude = compilePolicy({ ...request, defaultBackend: "claude", model: "caller-model", effort: "high" });
   assert.equal(claude.policy.backend, "claude");
-  assert.equal(claude.policy.model, "haiku");
+  assert.equal(claude.policy.model, "caller-model");
   assert.equal(claude.policy.effort, "high");
-  const pi = compilePolicy({ ...request, backend: "pi", modelTier: "quality" });
-  assert.equal(pi.policy.model, "openai-codex/gpt-5.6-sol");
+  assert.throws(() => compilePolicy({ ...request, model: "   " }), /1–256/);
+  assert.throws(() => compilePolicy({ ...request, model: "x".repeat(257) }), /1–256/);
 });
 
 test("profiles compose defaults while read-only and locked backend constraints fail closed", () => {
-  const compiled = compilePolicy({ ...request, access: "full", modelTier: "economy" }, profile);
+  const compiled = compilePolicy({ ...request, access: "full", model: "caller-model" }, profile);
   assert.equal(compiled.policy.backend, "claude");
-  assert.equal(compiled.policy.model, "haiku", "per-call tier overrides the profile default within its provider");
+  assert.equal(compiled.policy.model, "caller-model", "caller model remains independent from profile policy");
   assert.equal(compiled.policy.access, "readOnly", "profile read-only access is a ceiling");
   assert.deepEqual(compiled.policy.codexSandbox, { type: "readOnly", networkAccess: false });
   assert.deepEqual(compiled.policy.piTools, ["read", "grep", "find", "ls"]);

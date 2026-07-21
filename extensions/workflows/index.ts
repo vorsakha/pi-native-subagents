@@ -217,7 +217,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     name: "workflow",
     renderShell: "self",
     label: "Workflow",
-    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Scripts export a default async function and may call phase(title), agent(prompt,{name?,label?,access?,backend?,modelTier?,effort?,independent?,profile?,phase?,schema?}), and parallel(tasks,{concurrency?}). agent(prompt) works without options. Runs are limited to 32 agent calls and four concurrent agents.",
+    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Scripts export a default async function and may call phase(title), agent(prompt,{name?,label?,access?,backend?,model?,effort?,independent?,profile?,phase?,schema?}), and parallel(tasks,{concurrency?}). agent(prompt) works without options. Runs are limited to 32 agent calls and four concurrent agents.",
     promptSnippet: "Run a sandboxed multi-agent workflow with phases and bounded parallelism",
     promptGuidelines: [
       "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls.",

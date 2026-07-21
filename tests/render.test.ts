@@ -43,7 +43,7 @@ function job(overrides: Partial<JobSnapshot> = {}): JobSnapshot {
     id: "0123456789abcdef",
     name: "worker", access: "full", independent: false,
     backend: "codex",
-    model: "gpt-5.6-terra",
+    model: "fixture-model",
     task: "Implement the widget",
     cwd: "/tmp",
     status: "running",

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
@@ -91,7 +91,6 @@ async function setup(options: {
   backends?: Backend[];
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
-  globalConfigPath?: string;
 } = {}) {
   const root = join(await mkdtemp(join(tmpdir(), "workflow-extension-")), "runs");
   const globalProfilesDir = join(await mkdtemp(join(tmpdir(), "workflow-extension-profiles-")), "profiles");
@@ -99,48 +98,27 @@ async function setup(options: {
   const backends = options.backends ?? [new ImmediateBackend("pi"), new ImmediateBackend("claude"), new ImmediateBackend("codex")];
   registerNativeSubagents(pi.api, {
     registry: {}, legacyRoot: false, backends, workflowArtifactRoot: root, globalProfilesDir,
-    globalConfigPath: options.globalConfigPath,
     setInterval: options.setInterval, clearInterval: options.clearInterval,
   });
   return { root, pi };
 }
 
-test("workflow agents share the configured global tier mapping with direct agents", async () => {
-  const root = await mkdtemp(join(tmpdir(), "workflow-routing-"));
-  const globalConfigPath = join(root, "subagents.json");
-  await writeFile(globalConfigPath, JSON.stringify({ modelTiers: {
-    codex: { economy: "configured-e", balanced: "configured-b", quality: "configured-q" },
-    claude: { economy: "claude-e", balanced: "claude-b", quality: "claude-q" },
-    pi: { economy: "pi-e", balanced: "pi-b", quality: "pi-q" },
-  } }));
+test("direct and workflow agents forward exact models or use native defaults", async () => {
   const codex = new ImmediateBackend("codex");
-  const { pi } = await setup({ backends: [codex], globalConfigPath });
+  const { pi } = await setup({ backends: [codex] });
   const { ctx } = context();
   pi.handlers.get("session_start")?.({}, ctx);
-  const direct = await pi.tools.get("subagent").execute("direct", { task: "direct" }, undefined, undefined, ctx);
-  assert.equal(direct.details.job.model, "configured-b");
-  const workflow = await pi.tools.get("workflow").execute("wf", { name: "routing", script: `export default async () => agent("workflow agent")` }, undefined, undefined, ctx);
-  assert.equal(workflow.details.workflow.agents[0].model, "configured-b");
-  assert.equal(codex.requests.at(-1)?.policy.model, "configured-b");
-  await pi.handlers.get("session_shutdown")?.();
-});
-
-test("global model routing reloads on the next session", async () => {
-  const root = await mkdtemp(join(tmpdir(), "routing-reload-"));
-  const globalConfigPath = join(root, "subagents.json");
-  const writeRouting = (model: string) => writeFile(globalConfigPath, JSON.stringify({ modelTiers: {
-    codex: { economy: model, balanced: model, quality: model }, claude: { economy: "h", balanced: "s", quality: "o" }, pi: { economy: "p-e", balanced: "p-b", quality: "p-q" },
-  } }));
-  await writeRouting("first-session");
-  const codex = new ImmediateBackend("codex");
-  const { pi } = await setup({ backends: [codex], globalConfigPath });
-  const { ctx } = context();
-  pi.handlers.get("session_start")?.({}, ctx);
-  assert.equal((await pi.tools.get("subagent").execute("one", { task: "one" }, undefined, undefined, ctx)).details.job.model, "first-session");
-  await pi.handlers.get("session_shutdown")?.();
-  await writeRouting("next-session");
-  pi.handlers.get("session_start")?.({}, ctx);
-  assert.equal((await pi.tools.get("subagent").execute("two", { task: "two" }, undefined, undefined, ctx)).details.job.model, "next-session");
+  const direct = await pi.tools.get("subagent").execute("direct", { task: "direct", model: "direct-model" }, undefined, undefined, ctx);
+  assert.equal(direct.details.job.model, "direct-model");
+  const workflow = await pi.tools.get("workflow").execute("wf", {
+    name: "routing",
+    script: `export default async () => agent("workflow agent", { model: "workflow-model" })`,
+  }, undefined, undefined, ctx);
+  assert.equal(workflow.details.workflow.agents[0].model, "workflow-model");
+  assert.equal(codex.requests.at(-1)?.policy.model, "workflow-model");
+  const nativeDefault = await pi.tools.get("subagent").execute("default", { task: "default" }, undefined, undefined, ctx);
+  assert.equal(nativeDefault.details.job.model, "default");
+  assert.equal(codex.requests.at(-1)?.policy.model, undefined);
   await pi.handlers.get("session_shutdown")?.();
 });
 

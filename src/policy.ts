@@ -1,5 +1,12 @@
-import type { BackendName, BackendPolicy, ModelTier, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
-import { BUILT_IN_MODEL_TIERS, type ModelTierMappings } from "./model-routing.ts";
+import type { BackendName, BackendPolicy, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
+
+export function normalizeModel(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error("Model ID must be a string containing 1–256 characters");
+  const model = value.trim();
+  if (!model || model.length > 256) throw new Error("Model ID must be a string containing 1–256 characters");
+  return model;
+}
 
 export function providerFamily(provider: unknown): ProviderFamily {
   const normalized = String(provider ?? "").trim().toLowerCase();
@@ -14,7 +21,7 @@ export interface CompiledJob {
   independent: boolean;
 }
 
-export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition, mappings: ModelTierMappings = BUILT_IN_MODEL_TIERS): CompiledJob {
+export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition): CompiledJob {
   if (!request.trusted) throw new Error("Subagents are disabled for untrusted projects");
   const independent = request.independent === true || profile?.independent === true;
   let selected: BackendName = request.backend ?? profile?.backend ?? request.defaultBackend ?? "codex";
@@ -34,8 +41,7 @@ export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition
     if (!explicitRoute) selected = parent === "claude" ? "codex" : "claude";
   }
 
-  const tierName = request.modelTier ?? profile?.modelTier ?? "balanced";
-  const model = mappings[selected][tierName];
+  const model = normalizeModel(request.model);
   const access = profile?.access === "readOnly" ? "readOnly" : request.access ?? profile?.access ?? "full";
   const readOnly = access === "readOnly";
   return {

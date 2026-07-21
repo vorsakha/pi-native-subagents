@@ -10,7 +10,6 @@ import { ClaudeBackend, CodexAppServerBackend, PiRpcBackend } from "../../src/ba
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { claimExtensionInstall } from "../../src/install-guard.ts";
 import { providerFamily } from "../../src/policy.ts";
-import { loadModelRouting, type ModelRoutingConfig } from "../../src/model-routing.ts";
 import { openSubagentsDashboard } from "./dashboard.ts";
 import {
   formatEffort,
@@ -25,7 +24,7 @@ import {
   truncatePreview,
 } from "./render.ts";
 import { loadProfiles, type ProfileCatalog } from "../../src/profiles.ts";
-import type { AccessMode, Backend, BackendName, EffortLevel, JobSnapshot, ModelTier, ProviderFamily, SendBehavior } from "../../src/types.ts";
+import type { AccessMode, Backend, BackendName, EffortLevel, JobSnapshot, ProviderFamily, SendBehavior } from "../../src/types.ts";
 import { registerWorkflows } from "../workflows/index.ts";
 
 /** The configured expand-key hint (e.g. "ctrl+o to expand"), threaded into render options so render.ts stays testable without live keybinding state. */
@@ -39,7 +38,6 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const STATE_ENTRY = "native-subagents-profile";
 const SUBAGENT_RESULT_MESSAGE = "native-subagent-result";
 const BACKENDS = ["codex", "claude", "pi"] as const;
-const TIERS = ["economy", "balanced", "quality"] as const;
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const ACCESS = ["readOnly", "full"] as const;
 
@@ -51,8 +49,6 @@ export interface RegistrationOptions {
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   globalProfilesDir?: string;
-  /** Test seam for the administrator-owned, global-only model routing file. */
-  globalConfigPath?: string;
 }
 
 interface LiveCardBlink {
@@ -80,9 +76,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     : options.legacyRoot ?? resolve(homedir(), ".pi/agent/extensions/subagents");
   const releaseInstall = claimExtensionInstall(ROOT, options.registry ?? globalThis, legacyRoot);
   const globalProfilesDir = options.globalProfilesDir ?? resolve(getAgentDir(), "subagents");
-  const globalConfigPath = options.globalConfigPath ?? resolve(getAgentDir(), "subagents.json");
   let profileCatalog: ProfileCatalog = loadProfiles(globalProfilesDir);
-  let modelRouting: ModelRoutingConfig = loadModelRouting(globalConfigPath);
   const configuredBackend = configuredBackendFromEnv(process.env);
   let activeBackend = configuredBackend;
   let manager: JobManager | undefined;
@@ -100,7 +94,6 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 
   const createManager = () => new JobManager({
     profiles: profileCatalog.profiles,
-    mappings: modelRouting.mappings,
     concurrency: 4,
     backends: options.backends ?? [new PiRpcBackend(), new ClaudeBackend(), new CodexAppServerBackend()],
   });
@@ -290,7 +283,6 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       globalProfilesDir,
       ctx.isProjectTrusted() ? resolve(ctx.cwd, CONFIG_DIR_NAME, "subagents") : undefined,
     );
-    modelRouting = loadModelRouting(globalConfigPath);
     manager = createManager();
     sessionContext = ctx;
     deferredResults.clear();
@@ -347,15 +339,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       updateStatus(ctx, getManager(), activeBackend);
       ctx.ui.notify(`Default subagent backend: ${selected}`, "info");
     } else if (value === "status") {
-      ctx.ui.notify(`Default backend: ${activeBackend}\nProfiles: ${profileCatalog.profiles.size}\nModel routing: ${modelRouting.source === "global" ? modelRouting.path : "built-in"} (${modelRouting.warnings.length} warnings)`, modelRouting.warnings.length ? "warning" : "info");
-    } else if (value === "models") {
-      const mappings = ["codex", "claude", "pi"].map((backend) => {
-        const tiers = modelRouting.mappings[backend as BackendName];
-        return `${backend}: economy=${tiers.economy}, balanced=${tiers.balanced}, quality=${tiers.quality}`;
-      });
-      const source = `Source: ${modelRouting.source === "global" ? modelRouting.path : "built-in fallback"}`;
-      const warnings = modelRouting.warnings.map((warning) => `Warning [${warning.code}] ${warning.path}: ${warning.message}`);
-      ctx.ui.notify([source, ...mappings, ...warnings].join("\n"), warnings.length ? "warning" : "info");
+      ctx.ui.notify(`Default backend: ${activeBackend}\nProfiles: ${profileCatalog.profiles.size}\nModels: caller-selected or native backend default`, "info");
     } else if (value === "profiles") {
       const resolved = [...profileCatalog.profiles.values()]
         .sort((a, b) => a.name.localeCompare(b.name))
@@ -363,13 +347,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const warnings = profileCatalog.warnings.map((warning) => `Warning (${warning.origin}) ${warning.filePath}: ${warning.message}`);
       ctx.ui.notify([...resolved, ...warnings].join("\n") || "No subagent profiles configured.", warnings.length ? "warning" : "info");
     } else {
-      ctx.ui.notify("Usage: /subagents [status|models|profiles|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <backend>", "warning");
+      ctx.ui.notify("Usage: /subagents [status|profiles|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <backend>", "warning");
     }
   };
 
   pi.registerCommand("subagents", {
-    description: "Open the subagent dashboard; inspect model tiers with /subagents models.",
-    getArgumentCompletions: (prefix) => ["status", "models", "profiles", ...BACKENDS, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    description: "Open the subagent dashboard; inspect optional profiles with /subagents profiles.",
+    getArgumentCompletions: (prefix) => ["status", "profiles", ...BACKENDS, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (args.trim()) await configure(args, ctx);
       else await openSubagentsDashboard(ctx, getManager());
@@ -387,7 +371,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     name: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
     cwd: Type.Optional(Type.String()),
     backend: Type.Optional(StringEnum(BACKENDS)),
-    modelTier: Type.Optional(StringEnum(TIERS)),
+    model: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Backend-local model ID; omit to use the backend default" })),
     effort: Type.Optional(StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" })),
     access: Type.Optional(StringEnum(ACCESS, { description: "Access policy; defaults to full after project trust is established" })),
     independent: Type.Optional(Type.Boolean({ description: "Require a native provider different from the parent" })),
@@ -413,8 +397,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     },
     renderCall(args, theme) {
       const route = args.independent ? "independent" : args.backend
-        ? `${args.backend}${args.modelTier ? `/${args.modelTier}` : ""}`
-        : args.modelTier ?? "";
+        ? `${args.backend}${args.model ? `/${args.model}` : ""}`
+        : args.model ?? "";
       const detail = [args.access ?? "full", args.profile ? `profile:${args.profile}` : "", route, args.effort ? `effort:${args.effort}` : "", truncatePreview(args.task)].filter(Boolean).join(" · ");
       return renderToolCallLine(theme, "Spawn", args.name ?? "agent", detail);
     },
@@ -608,7 +592,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     },
     renderCall(args, theme) {
       const backend = args.independent ? "independent" : args.backend ?? activeBackend;
-      const route = args.modelTier ? `${backend}/${args.modelTier}` : backend;
+      const route = args.model ? `${backend}/${args.model}` : backend;
       const effort = args.effort ? ` · effort:${args.effort}` : "";
       const profile = args.profile ? ` · profile:${args.profile}` : "";
       return renderToolCallLine(theme, "Run", args.name ?? "agent", `[${route}${effort}${profile}] ${truncatePreview(args.task)}`);
@@ -622,7 +606,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 }
 
 function rejectSchemaMismatch(params: object): void {
-  if (Object.hasOwn(params, "role") || Object.hasOwn(params, "agent") || Object.hasOwn(params, "modelProfile")) {
+  if (["role", "agent", "modelProfile", "modelTier", "tier"].some((key) => Object.hasOwn(params, key))) {
     throw new Error("Subagent API schema mismatch: reload Pi to use the current task-driven schema.");
   }
 }
@@ -633,7 +617,7 @@ function sendTitle(behavior: SendBehavior): "Steer" | "Follow up" {
 
 function spawn(
   manager: JobManager,
-  params: { task: string; name?: string; cwd?: string; backend?: BackendName; modelTier?: ModelTier; effort?: EffortLevel; access?: AccessMode; independent?: boolean; profile?: string },
+  params: { task: string; name?: string; cwd?: string; backend?: BackendName; model?: string; effort?: EffortLevel; access?: AccessMode; independent?: boolean; profile?: string },
   parentCwd: string,
   trusted: boolean,
   defaultBackend?: BackendName,
@@ -646,7 +630,7 @@ function spawn(
     cwd,
     trusted,
     backend: params.backend,
-    modelTier: params.modelTier,
+    model: params.model,
     effort: params.effort,
     access: params.access,
     independent: params.independent,
