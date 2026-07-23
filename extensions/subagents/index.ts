@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { CONFIG_DIR_NAME, getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir, keyHint, SessionManager } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ClaudeBackend, CodexAppServerBackend, PiRpcBackend } from "../../src/backends/index.ts";
@@ -16,6 +16,7 @@ import {
   linesComponent,
   renderJobCard,
   renderJobListCard,
+  renderPeerListCard,
   renderJobReceipt,
   renderToolCallLine,
   sendBehaviorLabel,
@@ -24,8 +25,41 @@ import {
   truncatePreview,
 } from "./render.ts";
 import { loadProfiles, type ProfileCatalog } from "../../src/profiles.ts";
+import {
+  DEFAULT_PEER_LIST_LIMIT,
+  forkPeerSession,
+  listPeerSessions,
+  MAX_PEER_LIST_LIMIT,
+  type PeerSessionSummary,
+  type SessionPeerSource,
+} from "../../src/session-peers.ts";
 import type { AccessMode, Backend, HarnessName, EffortLevel, JobSnapshot, ProviderFamily, SendBehavior } from "../../src/types.ts";
 import { registerWorkflows } from "../workflows/index.ts";
+
+/** Production session-peer source backed by Pi's real SessionManager. Never mutates the source session. */
+export function createRealSessionPeerSource(): SessionPeerSource {
+  return {
+    async listAll(sessionDir) {
+      const sessions = await SessionManager.listAll(sessionDir);
+      return sessions.map((session) => ({
+        id: session.id,
+        path: session.path,
+        cwd: session.cwd,
+        name: session.name,
+        createdAt: session.created.getTime(),
+        modifiedAt: session.modified.getTime(),
+        messageCount: session.messageCount,
+        firstMessage: session.firstMessage,
+      }));
+    },
+    fork(sourcePath, targetCwd, sessionDir) {
+      const forked = SessionManager.forkFrom(sourcePath, targetCwd, sessionDir);
+      const sessionFile = forked.getSessionFile();
+      if (!sessionFile) throw new Error("Session peer fork could not be persisted");
+      return { sessionFile, sessionId: forked.getSessionId() };
+    },
+  };
+}
 
 /** The configured expand-key hint (e.g. "ctrl+o to expand"), threaded into render options so render.ts stays testable without live keybinding state. */
 function expandHint(): string {
@@ -49,6 +83,8 @@ export interface RegistrationOptions {
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   globalProfilesDir?: string;
+  /** Injectable for tests; production uses the real Pi SessionManager. */
+  sessionPeerSource?: SessionPeerSource;
 }
 
 interface LiveCardBlink {
@@ -76,6 +112,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     : options.legacyRoot ?? resolve(homedir(), ".pi/agent/extensions/subagents");
   const releaseInstall = claimExtensionInstall(ROOT, options.registry ?? globalThis, legacyRoot);
   const globalProfilesDir = options.globalProfilesDir ?? resolve(getAgentDir(), "subagents");
+  const sessionPeers = options.sessionPeerSource ?? createRealSessionPeerSource();
   let profileCatalog: ProfileCatalog = loadProfiles(globalProfilesDir);
   const configuredHarness = configuredHarnessFromEnv(process.env);
   let activeHarness = configuredHarness;
@@ -600,6 +637,91 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
       if (!job) return renderFailure(theme, "subagent failed");
+      return renderLiveJob(job, theme, { expanded, isPartial }, context);
+    },
+  });
+
+  pi.registerTool({
+    name: "session_peer_list",
+    renderShell: "self",
+    label: "List Session Peers",
+    description: "List saved Pi sessions available to fork as a read-only clarification peer, excluding the current session. Bounded and optionally filtered by query.",
+    promptSnippet: "List saved Pi sessions that can be forked as a read-only clarification peer",
+    promptGuidelines: [
+      "Use this before session_peer_fork to find the exact sessionId of a saved conversation.",
+      "Filter with query when you know part of the session's name, first message, or project directory.",
+    ],
+    parameters: Type.Object({
+      query: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Case-insensitive filter over session name, first message, and project cwd" })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_PEER_LIST_LIMIT, description: `Maximum sessions to return (default ${DEFAULT_PEER_LIST_LIMIT})` })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (!ctx.isProjectTrusted()) throw new Error("Session peers are disabled for untrusted projects");
+      const peers = await listPeerSessions(sessionPeers, {
+        query: params.query,
+        limit: params.limit,
+        excludeSessionId: ctx.sessionManager.getSessionId(),
+      });
+      const text = peers.length
+        ? peers.map((peer) => `${peer.sessionId} ${peer.name ?? "(unnamed)"} · ${peer.cwd} · ${peer.messageCount} messages`).join("\n")
+        : "No other saved sessions available to fork.";
+      return { content: [{ type: "text", text }], details: { peers } };
+    },
+    renderCall(args, theme) {
+      const detail = [args.query ? `query:${args.query}` : "", args.limit ? `limit:${args.limit}` : ""].filter(Boolean).join(" · ");
+      return renderToolCallLine(theme, "List", "session peers", detail);
+    },
+    renderResult(res, { expanded }, theme) {
+      const peers = (res.details as { peers?: PeerSessionSummary[] } | undefined)?.peers ?? [];
+      return renderPeerListCard(peers, theme, { expanded });
+    },
+  });
+
+  pi.registerTool({
+    name: "session_peer_fork",
+    renderShell: "self",
+    label: "Fork Session Peer",
+    description: "Fork a saved Pi session (chosen from session_peer_list) into a new read-only, tool-less background job under the current trusted project, without mutating the source session. The peer retains the source conversation's context; continue talking to it with subagent_send/wait/check/cancel using the returned jobId.",
+    promptSnippet: "Fork a saved Pi session as a read-only clarification peer and ask it an initial question",
+    promptGuidelines: [
+      "Call session_peer_list first and pass the exact sessionId it returns; arbitrary paths are never accepted.",
+      "The peer has no tools and cannot delegate; use it only to ask clarification questions about its retained context.",
+      "Use subagent_wait for its reply, then subagent_send for follow-up turns on the same jobId.",
+    ],
+    parameters: Type.Object({
+      sessionId: Type.String({ minLength: 1, maxLength: 128, description: "Stable session id returned by session_peer_list" }),
+      message: Type.String({ minLength: 1, maxLength: 100_000, description: "Initial clarification question sent to the forked peer" }),
+      name: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+    }),
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (!ctx.isProjectTrusted()) throw new Error("Session peers are disabled for untrusted projects");
+      const forked = await forkPeerSession(sessionPeers, {
+        sessionId: params.sessionId,
+        targetCwd: ctx.cwd,
+        currentSessionId: ctx.sessionManager.getSessionId(),
+      });
+      const snapshot = getManager().spawn({
+        name: params.name,
+        task: params.message,
+        cwd: ctx.cwd,
+        trusted: ctx.isProjectTrusted(),
+        harness: "pi",
+        access: "readOnly",
+        peer: {
+          sourceSessionId: forked.source.id,
+          sourceCwd: forked.source.cwd,
+          sourceName: forked.source.name,
+          sessionFile: forked.sessionFile,
+        },
+      });
+      return result(snapshot, `Forked session peer ${snapshot.id} (${snapshot.name}) from ${forked.source.id}`);
+    },
+    renderCall(args, theme) {
+      return renderToolCallLine(theme, "Fork", args.name ?? "peer", [args.sessionId, truncatePreview(args.message)].filter(Boolean).join(" · "));
+    },
+    renderResult(res, { expanded, isPartial }, theme, context) {
+      const job = jobOf(res);
+      if (!job) return renderFailure(theme, "session peer fork failed");
       return renderLiveJob(job, theme, { expanded, isPartial }, context);
     },
   });

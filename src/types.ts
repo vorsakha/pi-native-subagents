@@ -53,6 +53,10 @@ export interface BackendRequest {
   env: NodeJS.ProcessEnv;
   /** Aborts harness initialization before a usable run has been returned. */
   signal: AbortSignal;
+  /** Existing Pi session file to resume instead of starting fresh. Pi-only; other backends ignore it. */
+  resumeSessionFile?: string;
+  /** When true, the initial message is sent verbatim instead of prefixed with the generic "Task:" wrapper. */
+  rawInitialMessage?: boolean;
 }
 
 export type SendBehavior = "steer" | "followUp";
@@ -110,6 +114,13 @@ export interface WorkflowJobReference {
   phase?: string;
 }
 
+/** Provenance for a job forked from a saved Pi session (a "session peer"). */
+export interface PeerSessionReference {
+  sourceSessionId: string;
+  sourceCwd: string;
+  sourceName?: string;
+}
+
 export interface SpawnRequest {
   name?: string;
   task: string;
@@ -127,6 +138,8 @@ export interface SpawnRequest {
   parentProvider?: ProviderFamily;
   /** Internal ownership metadata supplied by the workflow runtime, never by a harness adapter. */
   workflow?: WorkflowJobReference;
+  /** Internal session-peer fork data (source provenance plus the already-forked session file to resume). Pi-only; never set by a harness adapter. */
+  peer?: PeerSessionReference & { sessionFile: string };
 }
 
 export interface ToolTrace {
@@ -165,4 +178,6 @@ export interface JobSnapshot {
   backendSessionId?: string;
   sessionFile?: string;
   workflow?: WorkflowJobReference;
+  /** Present when this job is a read-only session peer forked from a saved Pi session. */
+  peer?: PeerSessionReference;
 }

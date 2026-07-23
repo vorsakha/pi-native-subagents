@@ -8,6 +8,7 @@ Standalone Pi package for generic task-driven Pi, Claude Code, and Codex subagen
 - Background `subagent_spawn`, `subagent_wait`, `subagent_check`, `subagent_send`, `subagent_cancel`, and `subagent_list` tools.
 - A foreground `subagent` convenience tool using the same generic request contract.
 - Native session steering and retained-session follow-ups, plus one-shot delivery of unconsumed background results.
+- Forked Pi session peers: discover a saved thread, fork it immutably, ask it clarifying questions, and continue through the same managed send/wait lifecycle.
 - Bounded conversation cards, `/subagents` supervision, and normalized user/assistant/thinking/tool/queued-message state.
 - Sandboxed `workflow` orchestration with phases, sequential or bounded-parallel `agent()` calls, structured schemas, foreground/background execution, private artifacts, and `/workflows` inspection.
 - Pi persistent JSONL RPC, Claude Code through the official Agent SDK and installed CLI, and Codex through the installed app-server.
@@ -16,6 +17,14 @@ Standalone Pi package for generic task-driven Pi, Claude Code, and Codex subagen
 Behavior comes from the task plus a short isolation baseline. Give every child a complete task containing the relevant paths, requirements, constraints, and verification expectations.
 
 ## Generic request contract
+
+### Forked session peers
+
+`session_peer_list` returns a bounded, optionally filtered set of saved Pi sessions, excluding the current thread. `session_peer_fork` accepts one exact session ID from that list plus an initial clarification question. It copies the source thread's active context into a new persisted session under the current trusted project; the source file is never mutated.
+
+The fork is registered as a Pi-backed managed job. Its returned `jobId` works with `subagent_send`, `subagent_wait`, `subagent_check`, and `subagent_cancel`, enabling a real multi-turn exchange rather than one-time context injection. Session peers are intentionally read-only and tool-less: they can reason from retained conversation context but cannot read or modify either project's files, delegate, or perform external actions. Arbitrary session paths are never accepted, and the feature is denied in untrusted projects.
+
+### Generic request contract
 
 `subagent_spawn` and foreground `subagent` accept:
 

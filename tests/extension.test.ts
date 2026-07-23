@@ -73,13 +73,13 @@ const theme = {
   bold: (text: string) => text,
 };
 
-function context(branch: unknown[] = [], provider?: string) {
+function context(branch: unknown[] = [], provider?: string, trusted = true) {
   const notifications: string[] = [];
   return {
     cwd: process.cwd(),
     model: provider ? { provider, id: "parent-model" } : undefined,
     mode: "rpc",
-    isProjectTrusted: () => true,
+    isProjectTrusted: () => trusted,
     isIdle: () => false,
     sessionManager: { getBranch: () => branch, getSessionId: () => "extension-session" },
     ui: {
@@ -99,11 +99,23 @@ test("extension exposes generic direct tools, caller models, independence, and o
   const globalProfilesDir = join(extensionRoot, "profiles");
   await mkdir(globalProfilesDir);
   await writeFile(join(globalProfilesDir, "audit.md"), "---\nname: audit\naccess: readOnly\n---\nAudit carefully.\n");
-  registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir });
+  const peerForks: Array<{ sourcePath: string; targetCwd: string }> = [];
+  const sessionPeerSource = {
+    listAll: async () => [{
+      id: "saved-session", path: "/sessions/saved.jsonl", cwd: "/projects/source", name: "Saved design thread",
+      createdAt: 1_000, modifiedAt: 2_000, messageCount: 6, firstMessage: "design the session bridge",
+    }],
+    fork: (sourcePath: string, targetCwd: string) => {
+      peerForks.push({ sourcePath, targetCwd });
+      return { sessionFile: "/sessions/forked.jsonl", sessionId: "forked-session" };
+    },
+  };
+  registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir, sessionPeerSource });
 
   assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_HARNESS: "claude" }), "claude");
   assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_BACKEND: "pi" }), "codex", "obsolete backend env is ignored");
   assert.deepEqual([...pi.tools.keys()].sort(), [
+    "session_peer_fork", "session_peer_list",
     "subagent", "subagent_cancel", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
   ]);
   assert.deepEqual([...pi.commands.keys()].sort(), ["subagents", "subagents-config", "workflows"]);
@@ -121,6 +133,28 @@ test("extension exposes generic direct tools, caller models, independence, and o
   pi.handlers.get("session_start")?.({}, ctx);
   await pi.commands.get("subagents").handler("profiles", ctx);
   assert.match(ctx.ui.notifications.at(-1) ?? "", /audit \(global\)/);
+
+  const listedPeers = await pi.tools.get("session_peer_list").execute("peer-list", { query: "design" }, undefined, undefined, ctx);
+  assert.equal(listedPeers.details.peers[0].sessionId, "saved-session");
+  await assert.rejects(
+    pi.tools.get("session_peer_list").execute("untrusted-list", {}, undefined, undefined, context([], undefined, false)),
+    /disabled for untrusted projects/,
+  );
+  const peer = await pi.tools.get("session_peer_fork").execute("peer-fork", {
+    sessionId: "saved-session", message: "What trade-off did you settle on?", name: "design-peer",
+  }, undefined, undefined, ctx);
+  assert.equal(peer.details.job.peer.sourceSessionId, "saved-session");
+  assert.equal(peer.details.job.access, "readOnly");
+  assert.deepEqual(peerForks, [{ sourcePath: "/sessions/saved.jsonl", targetCwd: extensionRoot }]);
+  await pi.tools.get("subagent_wait").execute("peer-wait", { jobId: peer.details.job.id }, undefined, undefined, ctx);
+  const peerRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.resumeSessionFile === "/sessions/forked.jsonl");
+  assert.equal(peerRequest?.rawInitialMessage, true, "peer questions are sent without the generic Task prefix");
+  assert.deepEqual(peerRequest?.policy.piTools, [], "session peers cannot access child tools");
+  await pi.tools.get("subagent_send").execute("peer-follow-up", {
+    jobId: peer.details.job.id, message: "Why?", behavior: "followUp",
+  }, undefined, undefined, ctx);
+  await pi.tools.get("subagent_wait").execute("peer-follow-up-wait", { jobId: peer.details.job.id }, undefined, undefined, ctx);
+  assert.match(backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.resumeSessionFile === "/sessions/forked.jsonl")?.systemPrompt ?? "", /read-only session peer/);
 
   const background = await pi.tools.get("subagent_spawn").execute("spawn", { name: "research", task: "background" }, undefined, undefined, ctx);
   assert.equal(background.details.job.harness, "pi", "background spawn uses the configured harness");

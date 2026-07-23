@@ -35,6 +35,7 @@ export class PiRpcBackend implements Backend {
       "--mode", "rpc", "--approve", "--no-skills", "--no-prompt-templates", "--no-extensions",
       "--name", `subagent-${request.name}-${request.jobId.slice(0, 8)}`,
     ];
+    if (request.resumeSessionFile) args.push("--session", request.resumeSessionFile);
     if (request.policy.model) args.push("--model", request.policy.model);
     args.push(
       "--thinking", request.policy.thinking,
@@ -213,8 +214,9 @@ export class PiRpcBackend implements Backend {
     };
     request.signal.addEventListener("abort", abortStartup, { once: true });
 
-    emit({ type: "user_message", text: `Task: ${request.task}` });
-    void command("prompt", { message: `Task: ${request.task}` })
+    const initialMessage = request.rawInitialMessage ? request.task : `Task: ${request.task}`;
+    emit({ type: "user_message", text: initialMessage });
+    void command("prompt", { message: initialMessage })
       .then(() => emit({ type: "started" }))
       .catch((error) => {
         if (!request.signal.aborted) finish({ type: "failed", error: error instanceof Error ? error.message : String(error) });

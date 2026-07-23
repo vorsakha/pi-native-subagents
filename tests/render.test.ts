@@ -153,6 +153,7 @@ function assertRuntimeRenderers(): void {
   registerNativeSubagents(pi.api, { registry: {}, legacyRoot: false, backends });
 
   const expected = [
+    "session_peer_fork", "session_peer_list",
     "subagent", "subagent_cancel", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait",
   ];
   assert.deepEqual([...pi.tools.keys()].filter((name) => name !== "workflow").sort(), expected);
@@ -165,6 +166,8 @@ function assertRuntimeRenderers(): void {
     subagent_cancel: { jobId: "123456789" },
     subagent_list: {},
     subagent: { name: "implementation", task: "\u001b[31mdo work\u001b[0m", harness: "codex" },
+    session_peer_list: { query: "\u001b[31mbug\u001b[0m", limit: 5 },
+    session_peer_fork: { sessionId: "peer-1", message: "\u001b[31mclarify\u001b[0m", name: "peer" },
   };
   for (const name of expected) {
     const toolDef = pi.tools.get(name);
@@ -176,7 +179,11 @@ function assertRuntimeRenderers(): void {
     assert.ok(callLines[0].includes("⌁"), `${name} call is missing the trace group prefix`);
     assert.equal(callLines.join("\n").includes("\u001b]"), false, `${name} leaked an OSC sequence`);
     assert.ok(callLines.every((line: string) => visibleWidth(line) <= 48), `${name} call exceeded width`);
-    const details = name === "subagent_list" ? { jobs: [job()] } : { job: job({ status: "completed", endedAt: 3_000, output: "first\nlast" }) };
+    const details = name === "subagent_list"
+      ? { jobs: [job()] }
+      : name === "session_peer_list"
+        ? { peers: [{ sessionId: "peer-1", name: "\u001b[31mnamed\u001b[0m", cwd: "/tmp/project", createdAt: 0, modifiedAt: 0, messageCount: 2, preview: "hi" }] }
+        : { job: job({ status: "completed", endedAt: 3_000, output: "first\nlast" }) };
     const resultLines = toolDef.renderResult({ details }, { expanded: false, isPartial: false }, ansiTheme, { args: args[name] }).render(48);
     assert.ok(resultLines.length <= MAX_COLLAPSED_LINES, `${name} result exceeded budget`);
     assert.ok(resultLines[0]?.includes("│"), `${name} result is missing the trace continuation rail`);

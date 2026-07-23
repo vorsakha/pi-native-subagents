@@ -232,6 +232,27 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
 
+test("Pi RPC resumes a forked session and sends a peer question verbatim", async () => {
+  const fake = await fixture(PI_FIXTURE);
+  const argFile = join(fake.dir, "peer-args.json");
+  const events: BackendEvent[] = [];
+  try {
+    const peerRequest = request("pi", fake.dir, { ...process.env, MODE: "complete", ARG_FILE: argFile });
+    peerRequest.resumeSessionFile = "/sessions/forked-peer.jsonl";
+    peerRequest.rawInitialMessage = true;
+    peerRequest.task = "What decision did this thread reach?";
+    peerRequest.policy.piTools = [];
+    const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 1_000, inactivityTimeoutMs: 2_000 })
+      .start(peerRequest, (event) => events.push(event));
+    await run.completed;
+    assert.deepEqual(terminal(events), { type: "completed", output: peerRequest.task });
+    const args = JSON.parse(await readFile(argFile, "utf8")) as string[];
+    assert.deepEqual(args.slice(args.indexOf("--session"), args.indexOf("--session") + 2), ["--session", peerRequest.resumeSessionFile]);
+    assert.ok(args.includes("--no-tools"), "clarification peers start without child tools");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
 test("Pi RPC maps assistant, stream, extension, and exhausted-retry errors at settlement", async (t) => {
   const cases = [
     ["assistant_error", "failed", /model exploded/],

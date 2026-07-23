@@ -2,6 +2,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { isTerminal } from "../../src/manager.ts";
+import type { PeerSessionSummary } from "../../src/session-peers.ts";
 import type { JobSnapshot, JobStatus, SendBehavior, ToolTrace, Usage } from "../../src/types.ts";
 
 /** Hard rendered-line budgets so no tool call/result can spam the transcript. */
@@ -192,8 +193,9 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
 
   const profile = job.profile ? ` · profile ${sanitizeInline(job.profile)}` : "";
   const independent = job.independent ? " · independent" : "";
+  const peerMarker = job.peer ? " · peer" : "";
   const header = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(job.name)))} ${theme.fg("dim", `${shortId(sanitizeText(job.id))} · ${job.status} · ${formatElapsed(job, now)}`)}`;
-  const policy = theme.fg("dim", `${job.access}${profile}${independent} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}`);
+  const policy = theme.fg("dim", `${job.access}${profile}${independent}${peerMarker} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}`);
   lines.push(header, policy);
 
   const task = sanitizeInline(job.task);
@@ -201,6 +203,10 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
   if (job.workflow) {
     const phase = job.workflow.phase ? ` · ${sanitizeInline(job.workflow.phase)}` : "";
     lines.push(sectionLine(theme, "Workflow", `${shortId(sanitizeText(job.workflow.runId))} · ${sanitizeInline(job.workflow.label)}${phase}`, "muted"));
+  }
+  if (job.peer) {
+    const label = job.peer.sourceName ? sanitizeInline(job.peer.sourceName) : shortId(sanitizeText(job.peer.sourceSessionId));
+    lines.push(sectionLine(theme, "Peer", `forked from ${label} (${sanitizeInline(job.peer.sourceCwd)})`, "muted"));
   }
 
   if (job.error) {
@@ -269,7 +275,8 @@ export function renderJobReceipt(job: JobSnapshot, theme: Theme, options: { acti
 
 function jobRow(job: JobSnapshot, theme: Theme, now: number): string {
   const status = statusMeta(job.status, now);
-  return `${theme.fg(status.color, status.glyph)} ${theme.fg("dim", job.status.padEnd(9))} ${theme.fg("toolTitle", shortId(sanitizeText(job.id)))} ${sanitizeInline(job.name)} ${theme.fg("dim", `· ${job.access}${job.independent ? " · independent" : ""} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)} · ${formatElapsed(job, now)}`)}`;
+  const peerMarker = job.peer ? " · peer" : "";
+  return `${theme.fg(status.color, status.glyph)} ${theme.fg("dim", job.status.padEnd(9))} ${theme.fg("toolTitle", shortId(sanitizeText(job.id)))} ${sanitizeInline(job.name)} ${theme.fg("dim", `· ${job.access}${job.independent ? " · independent" : ""}${peerMarker} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)} · ${formatElapsed(job, now)}`)}`;
 }
 
 export function renderJobListCard(jobs: JobSnapshot[], theme: Theme, options: { expanded: boolean; now: number }): Component {
@@ -291,13 +298,35 @@ export function renderJobListCard(jobs: JobSnapshot[], theme: Theme, options: { 
   return linesComponent(traceResultLines(theme, clampLines(theme, lines, budget)));
 }
 
+const MAX_LIST_PEERS_COLLAPSED = 8;
+const MAX_LIST_PEERS_EXPANDED = 20;
+
+function peerRow(peer: PeerSessionSummary, theme: Theme): string {
+  const name = peer.name ? sanitizeInline(peer.name) : "(unnamed)";
+  return `${theme.fg("toolTitle", shortId(peer.sessionId))} ${theme.fg("accent", name)} ${theme.fg("dim", `· ${sanitizeInline(peer.cwd)} · ${peer.messageCount} msg`)}`;
+}
+
+export function renderPeerListCard(peers: PeerSessionSummary[], theme: Theme, options: { expanded: boolean }): Component {
+  if (!peers.length) return linesComponent([traceResultLine(theme, "○", "No other saved sessions available to fork.", "muted")]);
+  const budget = options.expanded ? MAX_EXPANDED_LINES : MAX_COLLAPSED_LINES;
+  const maxRows = options.expanded ? MAX_LIST_PEERS_EXPANDED : MAX_LIST_PEERS_COLLAPSED;
+  const shown = peers.slice(0, maxRows);
+  const lines = [
+    theme.fg("toolTitle", theme.bold(`${peers.length} peer${peers.length === 1 ? "" : "s"}`)),
+    ...shown.map((peer) => peerRow(peer, theme)),
+  ];
+  const omitted = peers.length - shown.length;
+  if (omitted > 0) lines.push(theme.fg("muted", `+${omitted} more — refine with query`));
+  return linesComponent(traceResultLines(theme, clampLines(theme, lines, budget)));
+}
+
 export function truncatePreview(value: string, maxLength = 80): string {
   const inline = sanitizeInline(value);
   return inline.length > maxLength ? `${inline.slice(0, maxLength)}…` : inline;
 }
 
 /** Restrained icon + title vocabulary shared by every `subagent_*` call/result renderer. */
-export type ToolCallTitle = "Spawn" | "Inspect" | "Wait" | "Steer" | "Follow up" | "Cancel" | "List" | "Run" | "Workflow";
+export type ToolCallTitle = "Spawn" | "Inspect" | "Wait" | "Steer" | "Follow up" | "Cancel" | "List" | "Run" | "Workflow" | "Fork";
 
 const TOOL_CALL_ICON: Record<ToolCallTitle, string> = {
   Spawn: "◇",
@@ -309,6 +338,7 @@ const TOOL_CALL_ICON: Record<ToolCallTitle, string> = {
   List: "≡",
   Run: "◆",
   Workflow: "◆",
+  Fork: "»",
 };
 
 export function renderToolCallLine(theme: Theme, title: ToolCallTitle, accent: string, detail?: string): Component {

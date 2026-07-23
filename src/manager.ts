@@ -5,6 +5,8 @@ import type { Backend, BackendEvent, BackendRun, JobSnapshot, ProfileDefinition,
 
 const GENERIC_SYSTEM_PROMPT = `You are an isolated, task-driven subagent. Work only on the supplied task and return a concise, evidence-based result. You do not have access to parent conversation context beyond the task. Do not spawn subagents or workflows.`;
 
+const PEER_SYSTEM_PROMPT = `You are a read-only session peer: a fork of a saved Pi conversation, opened in the current trusted project so you retain that conversation's full context. Use that retained context to answer clarification questions about it. You have no tools, cannot modify files or any other system, and cannot spawn subagents or workflows. Reply only in this conversation.`;
+
 interface InternalJob {
   snapshot: JobSnapshot;
   profile?: ProfileDefinition;
@@ -35,6 +37,7 @@ function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: J
       ? previous.value.queuedMessages
       : snapshot.queuedMessages.map((message) => ({ ...message })),
     workflow: snapshot.workflow ? { ...snapshot.workflow } : undefined,
+    peer: snapshot.peer ? { ...snapshot.peer } : undefined,
   };
 }
 
@@ -65,8 +68,16 @@ export class JobManager {
     if (request.profile !== undefined && !profileName) throw new Error("Profile must be a non-empty string");
     const profile = profileName ? this.#profiles.get(profileName) : undefined;
     if (profileName && !profile) throw new Error(`Unknown subagent profile: ${profileName}`);
-    const { policy, independent } = compilePolicy(request, profile);
-    if (!this.#backends.has(policy.harness)) throw new Error(`Harness is unavailable: ${policy.harness}`);
+    const compiled = compilePolicy(request, profile);
+    if (!this.#backends.has(compiled.policy.harness)) throw new Error(`Harness is unavailable: ${compiled.policy.harness}`);
+    if (request.peer) {
+      if (compiled.policy.harness !== "pi") throw new Error("Session peers require the pi harness");
+      if (compiled.independent) throw new Error("Session peers cannot be independent");
+    }
+    // Session peers are clarification-only: force read-only access and strip every tool,
+    // regardless of what the generic readOnly policy would otherwise grant.
+    const policy = request.peer ? { ...compiled.policy, access: "readOnly" as const, piTools: [] } : compiled.policy;
+    const independent = compiled.independent;
     this.#evictOldJobs();
     const id = randomUUID();
     const name = request.name?.replace(/\s+/g, " ").trim().slice(0, 160) || `agent-${id.slice(0, 8)}`;
@@ -92,6 +103,10 @@ export class JobManager {
       liveThinking: "",
       queuedMessages: [],
       workflow: request.workflow ? { ...request.workflow } : undefined,
+      sessionFile: request.peer?.sessionFile,
+      peer: request.peer
+        ? { sourceSessionId: request.peer.sourceSessionId, sourceCwd: request.peer.sourceCwd, sourceName: request.peer.sourceName }
+        : undefined,
     };
     this.#jobs.set(id, { snapshot, profile, request, policy });
     this.#queue.push(id);
@@ -281,7 +296,8 @@ export class JobManager {
     job.startupController = startupController;
     this.#emit(job, { type: "started" });
     try {
-      const systemPrompt = [GENERIC_SYSTEM_PROMPT, job.profile?.systemPrompt].filter(Boolean).join("\n\n");
+      const basePrompt = job.request.peer ? PEER_SYSTEM_PROMPT : GENERIC_SYSTEM_PROMPT;
+      const systemPrompt = [basePrompt, job.profile?.systemPrompt].filter(Boolean).join("\n\n");
       const startedRun = await backend.start({
         jobId: job.snapshot.id,
         name: job.snapshot.name,
@@ -291,6 +307,8 @@ export class JobManager {
         policy: job.policy,
         env: process.env,
         signal: startupController.signal,
+        resumeSessionFile: job.request.peer?.sessionFile,
+        rawInitialMessage: job.request.peer ? true : undefined,
       }, (event) => this.#handleBackendEvent(job, event));
       if (this.#closed || this.#jobs.get(job.snapshot.id) !== job) {
         await (startedRun.forceClose?.() ?? startedRun.close()).catch(() => undefined);
