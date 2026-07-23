@@ -25,7 +25,7 @@ class ImmediateBackend implements Backend {
 }
 
 class HoldingBackend implements Backend {
-  readonly name: HarnessName = "codex";
+  readonly name: HarnessName = "pi";
   starts = 0;
   private emit: ((event: BackendEvent) => void) | undefined;
   private settle: (() => void) | undefined;
@@ -103,9 +103,9 @@ async function setup(options: {
   return { root, pi };
 }
 
-test("direct and workflow agents forward exact models or use native defaults", async () => {
-  const codex = new ImmediateBackend("codex");
-  const { pi } = await setup({ backends: [codex] });
+test("direct and workflow agents use Pi by default and forward exact models or native defaults", async () => {
+  const piBackend = new ImmediateBackend("pi");
+  const { pi } = await setup({ backends: [piBackend] });
   const { ctx } = context();
   pi.handlers.get("session_start")?.({}, ctx);
   const direct = await pi.tools.get("subagent").execute("direct", { task: "direct", model: "direct-model" }, undefined, undefined, ctx);
@@ -115,10 +115,12 @@ test("direct and workflow agents forward exact models or use native defaults", a
     script: `export default async () => agent("workflow agent", { model: "workflow-model" })`,
   }, undefined, undefined, ctx);
   assert.equal(workflow.details.workflow.agents[0].model, "workflow-model");
-  assert.equal(codex.requests.at(-1)?.policy.model, "workflow-model");
+  assert.equal(workflow.details.workflow.agents[0].harness, "pi");
+  assert.equal(piBackend.requests.at(-1)?.policy.model, "workflow-model");
   const nativeDefault = await pi.tools.get("subagent").execute("default", { task: "default" }, undefined, undefined, ctx);
+  assert.equal(nativeDefault.details.job.harness, "pi");
   assert.equal(nativeDefault.details.job.model, "default");
-  assert.equal(codex.requests.at(-1)?.policy.model, undefined);
+  assert.equal(piBackend.requests.at(-1)?.policy.model, undefined);
   await pi.handlers.get("session_shutdown")?.();
 });
 

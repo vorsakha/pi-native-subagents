@@ -113,7 +113,8 @@ test("extension exposes generic direct tools, caller models, independence, and o
   registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir, sessionPeerSource });
 
   assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_HARNESS: "claude" }), "claude");
-  assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_BACKEND: "pi" }), "codex", "obsolete backend env is ignored");
+  assert.equal(configuredHarnessFromEnv({}), "pi", "Pi is the provider-agnostic default harness");
+  assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_BACKEND: "codex" }), "pi", "obsolete backend env is ignored");
   assert.deepEqual([...pi.tools.keys()].sort(), [
     "session_peer_fork", "session_peer_list",
     "subagent", "subagent_cancel", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",

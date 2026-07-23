@@ -775,7 +775,7 @@ function secureCwd(parentCwd: string, requested?: string): string {
 }
 
 export function configuredHarnessFromEnv(env: NodeJS.ProcessEnv): HarnessName {
-  return normalizeHarness(env.PI_NATIVE_SUBAGENTS_HARNESS) ?? "codex";
+  return normalizeHarness(env.PI_NATIVE_SUBAGENTS_HARNESS) ?? "pi";
 }
 
 export function normalizeHarness(value: unknown): HarnessName | undefined {

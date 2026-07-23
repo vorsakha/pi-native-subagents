@@ -10,7 +10,7 @@ const profile: ProfileDefinition = {
 };
 const request = { task: "x", cwd: "/tmp", trusted: true } as const;
 
-test("subscription environments remove billing-switch credentials without mutating input", () => {
+test("native subscription harnesses remove billing switches while Pi preserves provider configuration", () => {
   const source = {
     PATH: "/bin", HOME: "/home/test", ANTHROPIC_API_KEY: "secret-a", ANTHROPIC_AUTH_TOKEN: "secret-b",
     ANTHROPIC_BASE_URL: "https://gateway.invalid", ANTHROPIC_CUSTOM_HEADERS: "secret-headers",
@@ -25,6 +25,7 @@ test("subscription environments remove billing-switch credentials without mutati
     THIRD_PARTY_ACCESS_TOKEN: "secret-custom-access", OPENAI_PROJECT_ID: "billing-project",
     model_provider: "custom-provider", AZURE_OPENAI_ENDPOINT: "https://azure.invalid", KEEP_ME: "yes",
   };
+  const pi = sanitizeSubscriptionEnv(source, "pi");
   const claude = sanitizeSubscriptionEnv(source, "claude");
   const codex = sanitizeSubscriptionEnv(source, "codex");
   for (const key of [
@@ -37,6 +38,7 @@ test("subscription environments remove billing-switch credentials without mutati
     "OPENAI_API_KEY", "openai_api_key", "ANTHROPIC_API_KEY", "CUSTOM_VENDOR_API_KEY", "another_auth_token",
     "THIRD_PARTY_ACCESS_TOKEN", "OPENAI_PROJECT_ID", "model_provider", "AZURE_OPENAI_ENDPOINT",
   ]) assert.equal(codex[key], undefined, `${key} must not reach Codex`);
+  assert.deepEqual(pi, source, "Pi preserves provider configuration and chooses authentication through its own config");
   assert.equal(codex.PATH, "/bin");
   assert.equal(codex.HOME, "/home/test");
   assert.equal(codex.KEEP_ME, "yes");
@@ -47,7 +49,7 @@ test("subscription environments remove billing-switch credentials without mutati
 test("generic policy uses caller models or native harness defaults", () => {
   assert.throws(() => compilePolicy({ ...request, trusted: false }), /untrusted/);
   const compiled = compilePolicy(request);
-  assert.equal(compiled.policy.harness, "codex");
+  assert.equal(compiled.policy.harness, "pi");
   assert.equal(compiled.policy.model, undefined);
   assert.equal(compiled.policy.access, "full");
   assert.deepEqual(compiled.policy.codexSandbox, { type: "dangerFullAccess" });

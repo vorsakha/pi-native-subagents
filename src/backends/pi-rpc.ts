@@ -45,7 +45,7 @@ export class PiRpcBackend implements Backend {
     else args.push("--no-tools");
 
     request.signal.throwIfAborted();
-    const managed = spawnManaged(this.#command, args, { cwd: request.cwd, env: sanitizeSubscriptionEnv(request.env, "codex") });
+    const managed = spawnManaged(this.#command, args, { cwd: request.cwd, env: sanitizeSubscriptionEnv(request.env, "pi") });
     const pending = new Map<string, PendingCommand>();
     let commandSequence = 0;
     let output = "";

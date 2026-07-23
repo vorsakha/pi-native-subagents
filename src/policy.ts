@@ -24,7 +24,7 @@ export interface CompiledJob {
 export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition): CompiledJob {
   if (!request.trusted) throw new Error("Subagents are disabled for untrusted projects");
   const independent = request.independent === true || profile?.independent === true;
-  let selected: HarnessName = request.harness ?? profile?.harness ?? request.defaultHarness ?? "codex";
+  let selected: HarnessName = request.harness ?? profile?.harness ?? request.defaultHarness ?? "pi";
   if (profile?.lockedHarness) {
     if (request.harness && request.harness !== profile.lockedHarness) {
       throw new Error(`Profile ${profile.name} locks its harness to ${profile.lockedHarness}`);

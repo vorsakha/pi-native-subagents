@@ -248,7 +248,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         cwd: ctx.cwd,
         trusted: ctx.isProjectTrusted(),
         parentProvider: providerFamily(ctx.model?.provider),
-        defaultHarness: options.defaultHarness?.() ?? "codex",
+        defaultHarness: options.defaultHarness?.() ?? "pi",
       };
       const started = await workflows.start(request);
       const runGeneration = generation;

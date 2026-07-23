@@ -210,7 +210,7 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
     const backend = new PiRpcBackend(fake.command, { requestTimeoutMs: 1_000, inactivityTimeoutMs: 2_000 });
     const piRequest = request("pi", fake.dir, {
       ...process.env, MODE: "complete", ARG_FILE: argFile, ENV_FILE: envFile,
-      OPENAI_API_KEY: "must-not-leak", CODEX_API_KEY: "must-not-leak",
+      OPENAI_API_KEY: "pi-provider-key", CODEX_API_KEY: "pi-provider-token",
     });
     delete piRequest.policy.model;
     const run = await backend.start(piRequest, (event) => events.push(event));
@@ -227,7 +227,10 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
     assert.equal(args.includes("--approve"), true);
     assert.equal(args.includes("--no-extensions"), true);
     assert.equal(args.includes("--model"), false, "Pi uses its native default when no model is requested");
-    assert.deepEqual(JSON.parse(await readFile(envFile, "utf8")), {});
+    assert.deepEqual(JSON.parse(await readFile(envFile, "utf8")), {
+      openai: "pi-provider-key",
+      codex: "pi-provider-token",
+    }, "Pi inherits provider configuration instead of applying a native-harness subscription policy");
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });

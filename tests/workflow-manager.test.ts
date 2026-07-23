@@ -142,6 +142,7 @@ async function fixture(concurrency = 4) {
         script,
         cwd,
         trusted: true,
+        defaultHarness: "codex" as const,
         ...overrides,
       };
     },

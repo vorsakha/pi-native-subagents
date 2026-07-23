@@ -31,7 +31,7 @@ The fork is registered as a Pi-backed managed job. Its returned `jobId` works wi
 - required `task`;
 - optional `name`, `cwd`, `harness`, exact harness-local `model`, `effort`, `access`, `independent`, and `profile`.
 
-`access` is `readOnly` or `full` and defaults to `full` only after Pi's project-trust gate succeeds. The configured harness defaults to Codex. `model` never selects or changes a harness; it is forwarded only to the chosen native harness. Omitting it uses that harness's configured default. Claude and Codex also omit effort by default so provider behavior remains adaptive; callers may set `low`, `medium`, `high`, `xhigh`, or `max`.
+`access` is `readOnly` or `full` and defaults to `full` only after Pi's project-trust gate succeeds. The configured harness defaults to Pi, which delegates through the user's existing Pi provider and model configuration. Native Codex and Claude execution remain equal explicit choices through `harness`. `model` never selects or changes a harness; it is forwarded only to the chosen harness. Omitting it uses that harness's configured default. Claude and Codex also omit effort by default so provider behavior remains adaptive; callers may set `low`, `medium`, `high`, `xhigh`, or `max`.
 
 The extension contains no concrete model names or model recommendation table. The separately installed, easy-to-edit `subagents` skill owns current cost/capability guidance and supplies exact models when useful. Runtime code remains responsible for trust, access, provider diversity, subscription authentication, sandboxing, and lifecycle constraints.
 
@@ -69,7 +69,7 @@ Read-only execution is deny-by-construction:
 
 Full-access Claude uses `bypassPermissions`, and full-access Codex uses `dangerFullAccess`, only after trust succeeds. Generic children cannot delegate: Pi starts with no extensions, Claude never receives the Agent tool, and no child receives this package's subagent/workflow surface.
 
-Subscription-authenticated children do not inherit API keys, OAuth-token overrides, custom endpoints, cloud provider selectors, or provider billing selectors that could silently change authentication mode. Claude must report a logged-in `claude.ai` subscription. Codex pins the built-in OpenAI provider and requires a ChatGPT account. Credentials are never read, copied, logged, or packaged.
+Native Claude and Codex children do not inherit API keys, OAuth-token overrides, custom endpoints, cloud provider selectors, or provider billing selectors that could silently change subscription authentication mode. Claude must report a logged-in `claude.ai` subscription. Codex pins the built-in OpenAI provider and requires a ChatGPT account. Pi children inherit the parent environment and use Pi's own provider/auth configuration, preserving provider neutrality for the default route. The package does not inspect, log, or package credentials.
 
 Workflow JavaScript runs in a separate permission-restricted Node process with 128 MiB memory, authenticated size-bounded IPC, no inherited environment, imports, filesystem, network, subprocess, or credential access. Every `agent()` request still crosses the trust gate, generic policy compiler, shared scheduler, and harness sandbox. Limits remain 512 KiB source, 256 KiB args, 1 MiB result, 32 agent calls, 128 phase events/64 retained phases, and four-way `parallel()` concurrency. Workflows and native turns have no overall wall-clock deadline. Each native harness instead uses a 15-minute inactivity watchdog that resets on provider activity; protocol requests, cancellation, and process shutdown remain separately bounded.
 
@@ -86,7 +86,7 @@ Workflow JavaScript runs in a separate permission-restricted Node process with 1
 /workflows
 ```
 
-The default harness applies to both direct tools and workflow `agent()` calls. Exact model selection stays request-scoped; `/subagents status` reports that models are caller-selected or native-default. Successfully completed ordinary jobs retain their native session for the parent Pi session, bounded by the 100-job capacity; follow-up sends reopen the same job/session. At capacity, the oldest terminal jobs and their native sessions are evicted before new spawns. Failed, cancelled, evicted, and workflow-owned sessions are not reusable.
+The default Pi harness applies to both direct tools and workflow `agent()` calls and can be changed with `/subagents-config` or `PI_NATIVE_SUBAGENTS_HARNESS`. Exact model selection stays request-scoped; `/subagents status` reports that models are caller-selected or native-default. Successfully completed ordinary jobs retain their native session for the parent Pi session, bounded by the 100-job capacity; follow-up sends reopen the same job/session. At capacity, the oldest terminal jobs and their native sessions are evicted before new spawns. Failed, cancelled, evicted, and workflow-owned sessions are not reusable.
 
 Workflow scripts compose task-driven agents directly:
 
@@ -119,7 +119,7 @@ npm test
 npm run pack:check
 ```
 
-The suite intentionally stays around 55–70 broad, risk-based tests. Opt-in subscription-auth smoke commands are `npm run smoke`, `npm run smoke:{pi,claude,codex}`, and `npm run smoke:access:{claude,codex}`; set `PI_NATIVE_SUBAGENTS_LIVE=1` to invoke models.
+The suite uses broad, risk-based tests around the package's security and lifecycle contracts. Opt-in authentication smoke commands are `npm run smoke`, `npm run smoke:{pi,claude,codex}`, and `npm run smoke:access:{claude,codex}`; set `PI_NATIVE_SUBAGENTS_LIVE=1` to invoke models.
 
 ## Architecture
 
