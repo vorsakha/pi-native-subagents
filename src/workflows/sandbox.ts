@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 const KIB = 1024;
 const MIB = 1024 * KIB;
 const MAX_SOURCE_BYTES = 512 * KIB;
-const MAX_ARGS_BYTES = 256 * KIB;
+export const MAX_WORKFLOW_ARGS_BYTES = 256 * KIB;
 const MAX_RESULT_BYTES = MIB;
 const MAX_IPC_BYTES = 512 * KIB;
 const MAX_AGENT_CALLS = 32;
@@ -30,8 +30,11 @@ export interface WorkflowSandboxOptions {
     prompt: string,
     options: Record<string, unknown>,
     signal: AbortSignal,
+    callIndex: number,
   ): Promise<WorkflowAgentResult>;
+  onMeta(meta: unknown): void;
   onPhase(title: string): void;
+  onLog(message: string): void;
 }
 
 export interface WorkflowSandboxResult {
@@ -41,7 +44,9 @@ export interface WorkflowSandboxResult {
 
 type ChildMessage =
   | { token: string; type: "agent"; id: number; prompt: string; options: Record<string, unknown> }
+  | { token: string; type: "meta"; meta: unknown }
   | { token: string; type: "phase"; title: string }
+  | { token: string; type: "log"; message: string }
   | { token: string; type: "result-start"; chunks: number; bytes: number }
   | { token: string; type: "result-chunk"; index: number; data: string }
   | { token: string; type: "result-end" }
@@ -51,11 +56,16 @@ function byteLength(value: string): number {
   return Buffer.byteLength(value, "utf8");
 }
 
-function serializeArgs(args: unknown): string {
+export function serializeWorkflowArgs(args: unknown): string {
   try {
     const serialized = JSON.stringify(args);
-    return serialized === undefined ? "null" : serialized;
+    const normalized = serialized === undefined ? "null" : serialized;
+    if (byteLength(normalized) > MAX_WORKFLOW_ARGS_BYTES) {
+      throw new RangeError("Workflow args exceed the 256 KiB limit");
+    }
+    return normalized;
   } catch (error) {
+    if (error instanceof RangeError) throw error;
     throw new TypeError(`Workflow args must be JSON-serializable: ${errorMessage(error)}`);
   }
 }
@@ -111,10 +121,7 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
   if (byteLength(options.source) > MAX_SOURCE_BYTES) {
     throw new RangeError("Workflow source exceeds the 512 KiB limit");
   }
-  const argsJson = serializeArgs(options.args);
-  if (byteLength(argsJson) > MAX_ARGS_BYTES) {
-    throw new RangeError("Workflow args exceed the 256 KiB limit");
-  }
+  const argsJson = serializeWorkflowArgs(options.args);
   if (options.signal.aborted) throw abortError();
 
   const bootstrap = fileURLToPath(new URL("./sandbox-child.cjs", import.meta.url));
@@ -193,9 +200,20 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
       if (settled || frameSize(raw) > MAX_IPC_BYTES || !raw || typeof raw !== "object") return;
       const message = raw as ChildMessage;
       if (message.token !== token) return;
+      if (message.type === "meta") {
+        try { options.onMeta(message.meta); }
+        catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
+        return;
+      }
       if (message.type === "phase") {
         if (typeof message.title !== "string") return fail(new Error("Invalid phase message from workflow sandbox"));
         try { options.onPhase(message.title); }
+        catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
+        return;
+      }
+      if (message.type === "log") {
+        if (typeof message.message !== "string") return fail(new Error("Invalid log message from workflow sandbox"));
+        try { options.onLog(message.message); }
         catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
         return;
       }
@@ -204,6 +222,7 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
             !message.options || typeof message.options !== "object" || Array.isArray(message.options)) {
           return fail(new Error("Invalid agent request from workflow sandbox"));
         }
+        if (message.id !== agentCalls + 1) return fail(new Error("Workflow sandbox agent call IDs are not contiguous"));
         agentCalls++;
         if (agentCalls > MAX_AGENT_CALLS) {
           fail(new Error(`Workflow sandbox exceeded ${MAX_AGENT_CALLS} agent calls`));
@@ -212,7 +231,7 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
         const controller = new AbortController();
         agentControllers.set(message.id, controller);
         const task = Promise.resolve()
-          .then(() => options.onAgent(message.prompt, message.options, controller.signal))
+          .then(() => options.onAgent(message.prompt, message.options, controller.signal, message.id - 1))
           .catch(safeAgentFailure)
           .then((result) => {
             agentControllers.delete(message.id);

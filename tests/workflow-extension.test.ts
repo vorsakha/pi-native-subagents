@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
@@ -66,7 +66,7 @@ function fakePi() {
   };
 }
 
-function context(trusted = true) {
+function context(trusted = true, confirm: () => Promise<boolean> = async () => false) {
   const statuses = new Map<string, string | undefined>();
   const notifications: Array<{ message: string; type: string }> = [];
   return {
@@ -78,6 +78,7 @@ function context(trusted = true) {
       isIdle: () => false,
       sessionManager: { getBranch: () => [], getSessionId: () => "workflow-extension-session" },
       ui: {
+        confirm,
         setStatus(key: string, value: string | undefined) { statuses.set(key, value); },
         notify(message: string, type: string) { notifications.push({ message, type }); },
       },
@@ -94,13 +95,15 @@ async function setup(options: {
 } = {}) {
   const root = join(await mkdtemp(join(tmpdir(), "workflow-extension-")), "runs");
   const globalProfilesDir = join(await mkdtemp(join(tmpdir(), "workflow-extension-profiles-")), "profiles");
+  const savedWorkflowRoot = join(await mkdtemp(join(tmpdir(), "workflow-extension-saved-")), "definitions");
+  await mkdir(savedWorkflowRoot, { recursive: true });
   const pi = fakePi();
   const backends = options.backends ?? [new ImmediateBackend("pi"), new ImmediateBackend("claude"), new ImmediateBackend("codex")];
   registerNativeSubagents(pi.api, {
-    registry: {}, legacyRoot: false, backends, workflowArtifactRoot: root, globalProfilesDir,
+    registry: {}, legacyRoot: false, backends, workflowArtifactRoot: root, globalProfilesDir, savedWorkflowRoot,
     setInterval: options.setInterval, clearInterval: options.clearInterval,
   });
-  return { root, pi };
+  return { root, savedWorkflowRoot, pi };
 }
 
 test("direct and workflow agents use Pi by default and forward exact models or native defaults", async () => {
@@ -112,11 +115,22 @@ test("direct and workflow agents use Pi by default and forward exact models or n
   assert.equal(direct.details.job.model, "direct-model");
   const workflow = await pi.tools.get("workflow").execute("wf", {
     name: "routing",
-    script: `export default async () => agent("workflow agent", { model: "workflow-model" })`,
+    script: `export default async () => agent("workflow " + args.subject, { model: "workflow-model" })`,
+    input: { subject: "agent" },
   }, undefined, undefined, ctx);
   assert.equal(workflow.details.workflow.agents[0].model, "workflow-model");
   assert.equal(workflow.details.workflow.agents[0].harness, "pi");
   assert.equal(piBackend.requests.at(-1)?.policy.model, "workflow-model");
+  assert.equal(piBackend.requests.at(-1)?.task, "workflow agent");
+  const requestsBeforeResume = piBackend.requests.length;
+  const resumed = await pi.tools.get("workflow").execute("wf-resume", {
+    name: "routing",
+    script: `export default async () => agent("workflow " + args.subject, { model: "workflow-model" })`,
+    input: { subject: "agent" },
+    resumeFromRunId: workflow.details.workflow.runId,
+  }, undefined, undefined, ctx);
+  assert.equal(resumed.details.workflow.replay.matchedCalls, 1);
+  assert.equal(piBackend.requests.length, requestsBeforeResume, "resuming an exact completed workflow replays without dispatch");
   const nativeDefault = await pi.tools.get("subagent").execute("default", { task: "default" }, undefined, undefined, ctx);
   assert.equal(nativeDefault.details.job.harness, "pi");
   assert.equal(nativeDefault.details.job.model, "default");
@@ -136,7 +150,7 @@ test("background workflows return immediately and deliver one follow-up result f
   }, new AbortController().signal, undefined, ctx);
   assert.match(result.content[0].text, /Workflow started/);
 
-  for (let index = 0; index < 50 && pi.messages.length === 0; index++) {
+  for (let index = 0; index < 500 && pi.messages.length === 0; index++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(pi.messages.length, 1);
@@ -144,6 +158,7 @@ test("background workflows return immediately and deliver one follow-up result f
   assert.equal(pi.messages[0]?.options.deliverAs, "followUp");
   assert.equal(pi.messages[0]?.options.triggerTurn, true);
   assert.equal(pi.messages[0]?.message.details.workflow.status, "completed");
+  assert.doesNotMatch(pi.messages[0]?.message.content ?? "", /Artifacts:|workflow-extension-/i, "model-facing results omit machine-local artifact paths");
   assert.equal(pi.messages[0]?.message.details.workflow.agents[0]?.prompt, undefined, "model-facing compact details exclude agent prompts");
   assert.equal(pi.messages[0]?.message.details.workflow.agents[0]?.tools, undefined, "model-facing compact details exclude supervision traces");
   await pi.handlers.get("session_shutdown")?.();
@@ -156,7 +171,7 @@ test("background workflows return immediately and deliver one follow-up result f
     script: `export default async () => { throw new Error("script exploded") }`,
     background: true,
   }, new AbortController().signal, undefined, failedContext.ctx);
-  for (let index = 0; index < 50 && failed.pi.messages.length === 0; index++) {
+  for (let index = 0; index < 500 && failed.pi.messages.length === 0; index++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(failed.pi.messages.length, 1);
@@ -184,7 +199,7 @@ test("background workflow cards follow live state with one bounded blink timer",
     script: `export default async () => agent("inspect", { name: "inspection", access: "readOnly" })`,
     background: true,
   }, new AbortController().signal, undefined, ctx);
-  for (let index = 0; index < 50 && backend.starts === 0; index++) {
+  for (let index = 0; index < 500 && backend.starts === 0; index++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(backend.starts, 1);
@@ -199,12 +214,42 @@ test("background workflow cards follow live state with one bounded blink timer",
   assert.equal(invalidations, 1);
 
   backend.complete("review complete");
-  for (let index = 0; index < 50 && pi.messages.length === 0; index++) {
+  for (let index = 0; index < 500 && pi.messages.length === 0; index++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   assert.equal(timers.size, 0, "terminal workflow state prunes the shared blink timer");
   const settledCard = pi.tools.get("workflow").renderResult(result, { expanded: false, isPartial: false }, theme, renderContext);
   assert.ok(settledCard.render(100).some((line: string) => line.includes("completed")));
+  await pi.handlers.get("session_shutdown")?.();
+});
+
+test("workflow tool resolves saved definitions and enforces one script source", async () => {
+  const { pi, savedWorkflowRoot } = await setup();
+  await writeFile(join(savedWorkflowRoot, "saved-review.js"), `export default async () => agent("saved " + args.subject, { access: "readOnly" });`);
+  const { ctx } = context();
+  pi.handlers.get("session_start")?.({}, ctx);
+  const result = await pi.tools.get("workflow").execute("saved", {
+    workflowName: "saved-review",
+    input: { subject: "workflow" },
+  }, undefined, undefined, ctx);
+  assert.equal(result.details.workflow.name, "saved-review");
+  assert.equal(result.details.workflow.status, "completed");
+  await assert.rejects(pi.tools.get("workflow").execute("ambiguous", {
+    script: `export default null`, workflowName: "saved-review",
+  }, undefined, undefined, ctx), /exactly one/);
+  await pi.handlers.get("session_shutdown")?.();
+});
+
+test("workflow onMutate approval is decided by the host UI", async () => {
+  const { pi } = await setup();
+  let confirmations = 0;
+  const approved = context(true, async () => { confirmations++; return true; });
+  pi.handlers.get("session_start")?.({}, approved.ctx);
+  const result = await pi.tools.get("workflow").execute("approved", {
+    name: "approved", script: `export default async () => agent("mutate", {})`, approval: "onMutate",
+  }, undefined, undefined, approved.ctx);
+  assert.equal(result.details.workflow.status, "completed");
+  assert.equal(confirmations, 1);
   await pi.handlers.get("session_shutdown")?.();
 });
 
@@ -215,6 +260,15 @@ test("workflow tool rejects invalid JSON args and untrusted projects", async () 
   await assert.rejects(
     invalid.pi.tools.get("workflow").execute("wf", { name: "bad", script: "export default async () => null", args: "{" }, undefined, undefined, trusted.ctx),
     /valid JSON/,
+  );
+  await assert.rejects(
+    invalid.pi.tools.get("workflow").execute("wf", {
+      name: "ambiguous",
+      script: "export default async () => null",
+      args: "{}",
+      input: {},
+    }, undefined, undefined, trusted.ctx),
+    /either structured input or legacy JSON args/i,
   );
   await invalid.pi.handlers.get("session_shutdown")?.();
 

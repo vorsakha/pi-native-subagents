@@ -10,6 +10,10 @@ const MAX_RESULT_BYTES = MIB;
 const MAX_IPC_BYTES = 512 * KIB;
 const MAX_AGENT_CALLS = 32;
 const MAX_PHASE_EVENTS = 128;
+const MAX_LOG_EVENTS = 256;
+const MAX_LOG_MESSAGE_BYTES = 4 * KIB;
+const MAX_PIPELINE_ITEMS = 4096;
+const MAX_PIPELINE_CONCURRENCY = 4;
 const RESULT_CHUNK_BYTES = 256 * KIB;
 
 const token = process.argv[2];
@@ -23,6 +27,7 @@ let finished = false;
 let nextAgentId = 1;
 let agentCalls = 0;
 let phaseEvents = 0;
+let logEvents = 0;
 const pendingAgents = new Map();
 
 function byteLength(value) {
@@ -75,6 +80,16 @@ function bridge(operation, payloadJson, resolve) {
     if (!send({ type: "phase", title: payload.title })) return "Phase message exceeds the 512 KiB IPC limit";
     return undefined;
   }
+  if (operation === "log") {
+    if (++logEvents > MAX_LOG_EVENTS) return `Workflow log event limit exceeded (${MAX_LOG_EVENTS})`;
+    if (typeof payloadJson !== "string" || byteLength(payloadJson) > MAX_LOG_MESSAGE_BYTES) return "Log message exceeds the 4 KiB limit";
+    let payload;
+    try { payload = JSON.parse(payloadJson); }
+    catch { return "Log message is not valid JSON"; }
+    if (typeof payload.message !== "string") return "log requires a string message";
+    if (!send({ type: "log", message: payload.message })) return "Unable to emit workflow log message";
+    return undefined;
+  }
   if (operation !== "agent" || typeof resolve !== "function") return;
   if (agentCalls >= MAX_AGENT_CALLS) {
     resolve(failure(`Agent call limit exceeded (${MAX_AGENT_CALLS})`));
@@ -120,6 +135,19 @@ function installApi(context, argsJson) {
       "use strict";
       const callHost = globalThis.__workflowBridge;
       const workflowArgs = JSON.parse(globalThis.__workflowArgsJson);
+      const NativeDate = Date;
+      class WorkflowDate extends NativeDate {
+        constructor(...values) {
+          if (values.length === 0) throw new Error("new Date() is not available in deterministic workflows; pass an explicit value");
+          super(...values);
+        }
+        static now() { throw new Error("Date.now() is not available in deterministic workflows"); }
+      }
+      Object.defineProperty(Math, "random", {
+        value() { throw new Error("Math.random() is not available in deterministic workflows"); },
+        writable: false,
+        configurable: false,
+      });
       delete globalThis.__workflowBridge;
       delete globalThis.__workflowArgsJson;
       const asFailure = (error) => ({
@@ -130,6 +158,11 @@ function installApi(context, argsJson) {
       const phaseApi = (title) => {
         if (typeof title !== "string") throw new TypeError("phase requires a string title");
         const error = callHost("phase", JSON.stringify({ title }));
+        if (typeof error === "string") throw new Error(error);
+      };
+      const logApi = (message) => {
+        if (typeof message !== "string") throw new TypeError("log requires a string message");
+        const error = callHost("log", JSON.stringify({ message }));
         if (typeof error === "string") throw new Error(error);
       };
       const agentApi = async (prompt, options = {}) => {
@@ -176,11 +209,38 @@ function installApi(context, argsJson) {
         await Promise.all(Array.from({ length: Math.min(concurrency, items.length) }, run));
         return results;
       };
+      const pipelineApi = async (items, ...stages) => {
+        if (!Array.isArray(items)) throw new TypeError("pipeline requires an array");
+        if (items.length > ${MAX_PIPELINE_ITEMS}) throw new RangeError("pipeline accepts at most ${MAX_PIPELINE_ITEMS} items");
+        if (!stages.length || !stages.every((stage) => typeof stage === "function")) {
+          throw new TypeError("pipeline requires one or more stage functions");
+        }
+        const results = new Array(items.length);
+        let cursor = 0;
+        const run = async () => {
+          while (cursor < items.length) {
+            const index = cursor++;
+            const original = items[index];
+            let value = original;
+            try {
+              for (const stage of stages) value = await stage(value, original, index);
+              results[index] = value;
+            } catch {
+              results[index] = null;
+            }
+          }
+        };
+        await Promise.all(Array.from({ length: Math.min(${MAX_PIPELINE_CONCURRENCY}, items.length) }, run));
+        return results;
+      };
       Object.defineProperties(globalThis, {
         args: { value: workflowArgs, writable: false, configurable: false },
+        Date: { value: WorkflowDate, writable: false, configurable: false },
         phase: { value: phaseApi, writable: false, configurable: false },
+        log: { value: logApi, writable: false, configurable: false },
         agent: { value: agentApi, writable: false, configurable: false },
         parallel: { value: parallelApi, writable: false, configurable: false },
+        pipeline: { value: pipelineApi, writable: false, configurable: false },
       });
       for (const name of ["require", "process", "global", "module"]) {
         Object.defineProperty(globalThis, name, {
@@ -214,6 +274,15 @@ async function execute(source, argsJson) {
   });
   await module.link(() => { throw new Error("Workflow imports are not allowed"); });
   await module.evaluate();
+  const hasMeta = Object.prototype.hasOwnProperty.call(module.namespace, "meta");
+  const meta = hasMeta ? module.namespace.meta : undefined;
+  if (hasMeta) {
+    let metaJson;
+    try { metaJson = JSON.stringify(meta); }
+    catch (error) { throw new TypeError(`Workflow meta must be JSON-serializable: ${errorMessage(error)}`); }
+    if (metaJson !== undefined && byteLength(metaJson) > 16 * KIB) throw new RangeError("Workflow meta exceeds the 16 KiB limit");
+    if (!send({ type: "meta", meta: metaJson === undefined ? null : JSON.parse(metaJson) })) throw new Error("Unable to send workflow meta");
+  }
   const defaultExport = module.namespace.default;
   if (typeof defaultExport !== "function") throw new TypeError("Workflow must export a default async function");
   const result = await Reflect.apply(defaultExport, undefined, [
@@ -221,12 +290,12 @@ async function execute(source, argsJson) {
     sandbox.phase,
     sandbox.agent,
     sandbox.parallel,
+    sandbox.pipeline,
+    sandbox.log,
   ]);
   if (pendingAgents.size > 0) {
     throw new Error(`Workflow returned before ${pendingAgents.size} agent call${pendingAgents.size === 1 ? "" : "s"} settled; await every agent() call`);
   }
-  const hasMeta = Object.prototype.hasOwnProperty.call(module.namespace, "meta");
-  const meta = hasMeta ? module.namespace.meta : undefined;
   let payload;
   try {
     payload = JSON.stringify({

@@ -100,7 +100,6 @@ export class PiRpcBackend implements Backend {
       });
     };
 
-    watchdog.arm();
     const framer = new JsonlFramer();
     const handle = (record: string) => {
       const event = parseJsonRecord(record);
@@ -217,7 +216,10 @@ export class PiRpcBackend implements Backend {
     const initialMessage = request.rawInitialMessage ? request.task : `Task: ${request.task}`;
     emit({ type: "user_message", text: initialMessage });
     void command("prompt", { message: initialMessage })
-      .then(() => emit({ type: "started" }))
+      .then(() => {
+        if (!settled) watchdog.arm();
+        emit({ type: "started" });
+      })
       .catch((error) => {
         if (!request.signal.aborted) finish({ type: "failed", error: error instanceof Error ? error.message : String(error) });
       });
@@ -225,8 +227,7 @@ export class PiRpcBackend implements Backend {
     const send = async (message: string, behavior: SendBehavior = "steer") => {
       if (closed) throw new Error("Pi RPC process is closed");
       const restarting = settled;
-      if (restarting) watchdog.arm();
-      else watchdog.touch();
+      if (!restarting) watchdog.touch();
       if (restarting) {
         settled = false;
         output = "";
@@ -236,6 +237,7 @@ export class PiRpcBackend implements Backend {
         behavior = "followUp";
       }
       await command(restarting ? "prompt" : behavior === "steer" ? "steer" : "follow_up", { message });
+      if (restarting && !settled) watchdog.arm();
       emit({ type: "queue_changed", messages: [{ text: message, behavior }] });
     };
 

@@ -12,6 +12,7 @@ async function fixture(
   const cwd = await mkdtemp(join(tmpdir(), "workflow-sandbox-"));
   const controller = new AbortController();
   const phases: string[] = [];
+  const logs: string[] = [];
   const options: WorkflowSandboxOptions = {
     source,
     args: { value: 7 },
@@ -22,10 +23,12 @@ async function fixture(
       output: `${prompt}:${String(agentOptions.tag ?? "")}`,
       jobId: "job-1",
     }),
+    onMeta: () => {},
     onPhase: (title) => phases.push(title),
+    onLog: (message) => logs.push(message),
     ...overrides,
   };
-  return { cwd, controller, phases, options };
+  return { cwd, controller, phases, logs, options };
 }
 
 async function cleanup(cwd: string): Promise<void> {
@@ -54,6 +57,64 @@ test("runs sequential agent calls and exposes args through globals and arguments
       },
     });
     assert.deepEqual(f.phases, ["first", "last"]);
+  } finally { await cleanup(f.cwd); }
+});
+
+test("pipelines items without a stage barrier and emits bounded progress logs", async () => {
+  const events: string[] = [];
+  const callIndices: number[] = [];
+  const f = await fixture(`
+    export default async () => {
+      log("pipeline started");
+      const values = await pipeline(
+        ["fast", "slow"],
+        async (item) => agent("stage-1:" + item),
+        async (previous, original, index) => {
+          log("stage-2:" + original + ":" + index);
+          return agent("stage-2:" + original + ":" + previous.output);
+        },
+      );
+      log("pipeline finished");
+      return values.map((value) => value.output);
+    }
+  `, {
+    onAgent: async (prompt, _options, _signal, callIndex) => {
+      callIndices.push(callIndex);
+      events.push(`start:${prompt}`);
+      if (prompt === "stage-1:slow") await new Promise((resolve) => setTimeout(resolve, 50));
+      events.push(`end:${prompt}`);
+      return { ok: true, output: prompt, jobId: `job-${events.length}` };
+    },
+  });
+  try {
+    const value = await runWorkflowSandbox(f.options);
+    assert.deepEqual(value.result, [
+      "stage-2:fast:stage-1:fast",
+      "stage-2:slow:stage-1:slow",
+    ]);
+    assert.ok(
+      events.indexOf("start:stage-2:fast:stage-1:fast") < events.indexOf("end:stage-1:slow"),
+      "a fast item advances to its next stage before slower items finish the prior stage",
+    );
+    assert.deepEqual(callIndices, [0, 1, 2, 3], "sandbox invocation ordinals are explicit and contiguous");
+    assert.deepEqual(f.logs, ["pipeline started", "stage-2:fast:0", "stage-2:slow:1", "pipeline finished"]);
+  } finally { await cleanup(f.cwd); }
+});
+
+test("pipeline drops an item to null when one of its stages throws", async () => {
+  const f = await fixture(`
+    export default async () => pipeline(
+      ["keep", "drop"],
+      (item) => item,
+      (value) => {
+        if (value === "drop") throw new Error("drop this item");
+        return value.toUpperCase();
+      },
+      () => "unreachable for dropped items",
+    );
+  `);
+  try {
+    assert.deepEqual((await runWorkflowSandbox(f.options)).result, ["unreachable for dropped items", null]);
   } finally { await cleanup(f.cwd); }
 });
 
@@ -165,6 +226,19 @@ test("enforces payload, call, phase, and parallel limits", async () => {
   try { await assert.rejects(runWorkflowSandbox(phases.options), /phase event limit exceeded \(128\)/i); }
   finally { await cleanup(phases.cwd); }
 
+  const logs = await fixture(`
+    export default async () => {
+      for (let index = 0; index < 257; index++) log("log-" + index);
+      return "unreachable";
+    }
+  `);
+  try { await assert.rejects(runWorkflowSandbox(logs.options), /log event limit exceeded \(256\)/i); }
+  finally { await cleanup(logs.cwd); }
+
+  const oversizedLog = await fixture(`export default async () => log("x".repeat(4096))`);
+  try { await assert.rejects(runWorkflowSandbox(oversizedLog.options), /log message exceeds the 4 KiB limit/i); }
+  finally { await cleanup(oversizedLog.cwd); }
+
   let calls = 0;
   const agents = await fixture(`
     export default async () => {
@@ -187,6 +261,45 @@ test("enforces payload, call, phase, and parallel limits", async () => {
     const parallel = await fixture(`export default async () => parallel([() => 1], ${concurrency})`);
     try { await assert.rejects(runWorkflowSandbox(parallel.options), /concurrency.*1.*4/i); }
     finally { await cleanup(parallel.cwd); }
+  }
+
+  const noStages = await fixture(`export default async () => pipeline([1])`);
+  try { await assert.rejects(runWorkflowSandbox(noStages.options), /one or more stage functions/i); }
+  finally { await cleanup(noStages.cwd); }
+
+  const tooManyItems = await fixture(`export default async () => pipeline(Array.from({ length: 4097 }, (_, index) => index), (item) => item)`);
+  try { await assert.rejects(runWorkflowSandbox(tooManyItems.options), /at most 4096 items/i); }
+  finally { await cleanup(tooManyItems.cwd); }
+});
+
+test("forbids nondeterministic time and random APIs used by replayable workflows", async () => {
+  const f = await fixture(`
+    export default async () => {
+      const failures = [];
+      for (const operation of [
+        () => Date.now(),
+        () => new Date(),
+        () => Math.random(),
+      ]) {
+        try { operation(); failures.push("allowed"); }
+        catch (error) { failures.push(error.message); }
+      }
+      return { failures, explicitDate: new Date(0).toISOString(), parsed: Date.parse("1970-01-01T00:00:00.000Z") };
+    }
+  `);
+  try {
+    const result = await runWorkflowSandbox(f.options);
+    assert.deepEqual(result.result, {
+      failures: [
+        "Date.now() is not available in deterministic workflows",
+        "new Date() is not available in deterministic workflows; pass an explicit value",
+        "Math.random() is not available in deterministic workflows",
+      ],
+      explicitDate: "1970-01-01T00:00:00.000Z",
+      parsed: 0,
+    });
+  } finally {
+    await cleanup(f.cwd);
   }
 });
 

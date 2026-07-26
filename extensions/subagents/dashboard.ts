@@ -1,5 +1,10 @@
 import { getMarkdownTheme, type ExtensionCommandContext, type Theme } from "@earendil-works/pi-coding-agent";
-import { Key, Markdown, type KeybindingsManager, matchesKey, truncateToWidth, type TUI, visibleWidth } from "@earendil-works/pi-tui";
+import { Key, Markdown, type KeybindingsManager, matchesKey, truncateToWidth, type TUI } from "@earendil-works/pi-tui";
+import {
+  alignDashboardRow,
+  createDashboardFrame,
+  dashboardMaxHeight,
+} from "../dashboard-style.ts";
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { formatEffort, sanitizeInline, sanitizeText, statusMeta } from "./render.ts";
 import { openSubagentTakeover } from "./takeover.ts";
@@ -75,46 +80,77 @@ class DashboardOverlay {
   render(width: number): string[] {
     width = Math.max(0, width);
     const jobs = this.manager.list();
-    const maxHeight = Math.max(0, Math.floor(this.tui.terminal.rows * 0.9));
-    if (!maxHeight || width < 4) return maxHeight ? [truncate(`Subagents ${jobs.length}`, width)] : [];
-    this.#selected = jobs.length ? Math.max(0, Math.min(this.#selected, jobs.length - 1)) : 0;
+    const maxHeight = dashboardMaxHeight(this.tui.terminal.rows);
+    if (!maxHeight || width < 4) {
+      return maxHeight ? [truncate(`Subagents ${jobs.length}`, width)] : [];
+    }
+
+    this.#selected = jobs.length
+      ? Math.max(0, Math.min(this.#selected, jobs.length - 1))
+      : 0;
     const chosen = jobs[this.#selected];
-    const borderColor = this.focused ? "borderAccent" : "borderMuted";
-    const glyphs = this.focused
-      ? { topLeft: "╔", topRight: "╗", bottomLeft: "╚", bottomRight: "╝", horizontal: "═", vertical: "║", separatorLeft: "╠", separatorRight: "╣" }
-      : { topLeft: "╭", topRight: "╮", bottomLeft: "╰", bottomRight: "╯", horizontal: "─", vertical: "│", separatorLeft: "├", separatorRight: "┤" };
-    const border = (text: string) => this.theme.fg(borderColor, text);
-    const innerWidth = width - 4;
-    const pad = (text: string) => text + " ".repeat(Math.max(0, innerWidth - visibleWidth(text)));
-    const row = (text: string) => border(`${glyphs.vertical} `) + pad(truncate(text, innerWidth)) + border(` ${glyphs.vertical}`);
-    const separator = () => border(glyphs.separatorLeft + glyphs.horizontal.repeat(width - 2) + glyphs.separatorRight);
-    const top = () => border(glyphs.topLeft + glyphs.horizontal.repeat(width - 2) + glyphs.topRight);
-    const bottom = () => border(glyphs.bottomLeft + glyphs.horizontal.repeat(width - 2) + glyphs.bottomRight);
-    if (maxHeight < 9) return this.renderCompact(maxHeight, top, bottom, row);
-    const lines = [border(glyphs.topLeft + glyphs.horizontal.repeat(width - 2) + glyphs.topRight)];
+    const frame = createDashboardFrame(this.theme, width, this.focused);
+    if (maxHeight < 9) {
+      return this.renderCompact(maxHeight, jobs.length, frame);
+    }
 
-    const focus = this.theme.bg("selectedBg", this.theme.bold(this.theme.fg(this.focused ? "accent" : "muted", " DASHBOARD ")));
-    const count = this.theme.fg("dim", `${jobs.length} job${jobs.length === 1 ? "" : "s"}`);
-    lines.push(row(this.theme.fg("accent", this.theme.bold("Native Subagents")) + " " + focus + " " + count));
-    lines.push(row(this.theme.fg("dim", "↑↓/jk select · Shift+↑↓/Pg scroll · s steer · f follow-up · x cancel")));
-    lines.push(separator());
+    const active = jobs.filter((job) => !isTerminal(job.status)).length;
+    const headerLeft = this.theme.fg(
+      "accent",
+      this.theme.bold("Native subagents"),
+    );
+    const headerRight = this.theme.fg(
+      "muted",
+      `${jobs.length} job${jobs.length === 1 ? "" : "s"}`,
+    );
+    const lines = [
+      frame.header(headerLeft, headerRight),
+      frame.top(`jobs · ${active} active / ${jobs.length}`),
+    ];
 
-    const contentRows = maxHeight - 8;
-    const listRows = jobs.length ? Math.min(jobs.length, Math.max(1, Math.floor(contentRows / 2))) : 1;
-    const detailRows = contentRows - listRows;
-    if (!jobs.length) lines.push(row(this.theme.fg("muted", "No jobs in this session.")));
-    else for (const { job, index } of this.listViewport(jobs, listRows)) lines.push(row(this.renderJob(job, index === this.#selected)));
+    const contentRows = Math.max(2, maxHeight - 5);
+    const listRows = jobs.length
+      ? Math.min(jobs.length, Math.max(1, Math.floor(contentRows / 2)))
+      : 1;
+    const detailRows = Math.max(1, contentRows - listRows);
+    if (!jobs.length) {
+      lines.push(frame.row(this.theme.fg("muted", "  No jobs in this session.")));
+    } else {
+      for (const { job, index } of this.listViewport(jobs, listRows)) {
+        lines.push(
+          frame.row(
+            this.renderJob(job, index === this.#selected, frame.innerWidth),
+          ),
+        );
+      }
+    }
 
-    lines.push(separator());
-    for (const detail of this.detailViewport(chosen, detailRows, innerWidth)) lines.push(row(detail));
+    const detailTitle = chosen
+      ? `detail · ${shortId(sanitizeText(chosen.id))} · ${chosen.status}`
+      : "detail";
+    lines.push(frame.divider(detailTitle));
+    for (const detail of this.detailViewport(
+      chosen,
+      detailRows,
+      Math.max(1, frame.innerWidth - 1),
+    )) {
+      lines.push(frame.row(` ${detail}`));
+    }
+    lines.push(frame.bottom());
 
-    lines.push(separator());
-    const actionHint = chosen && !isTerminal(chosen.status)
-      ? chosen.workflow ? " · x cancel" : " · s steer · f follow-up · x cancel"
-      : "";
-    lines.push(row(this.theme.fg("dim", `Enter takeover · Esc close${actionHint}`)));
-    lines.push(bottom());
-    return lines;
+    const actionHint =
+      chosen && !isTerminal(chosen.status)
+        ? chosen.workflow
+          ? " · x cancel"
+          : " · s steer · f follow-up · x cancel"
+        : "";
+    lines.push(
+      frame.hint(
+        `↑↓/jk select · Enter takeover${actionHint} · Shift+↑↓/Pg scroll`,
+        "· Esc close",
+      ),
+    );
+    return lines.slice(0, maxHeight);
   }
 
   invalidate(): void {}
@@ -161,21 +197,45 @@ class DashboardOverlay {
     }
   }
 
-  private renderJob(job: JobSnapshot, selected: boolean): string {
+  private renderJob(
+    job: JobSnapshot,
+    selected: boolean,
+    width: number,
+  ): string {
     const status = statusMeta(job.status, this.#now());
-    const marker = selected ? this.theme.fg("accent", "›") : " ";
-    const owner = job.workflow ? ` · wf:${sanitizeInline(job.workflow.label)}` : "";
-    const profile = job.profile ? ` · profile ${sanitizeInline(job.profile)}` : "";
-    const independent = job.independent ? " · independent" : "";
-    const label = `${status.glyph} ${job.status.padEnd(9)} ${shortId(sanitizeText(job.id))} ${sanitizeInline(job.name)} · ${job.access}${profile}${independent} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}${owner} · ${formatElapsed(job, this.#now())}`;
-    return marker + " " + this.theme.fg(status.color, label);
+    const marker = selected ? this.theme.fg("accent", "❯") : " ";
+    const name = selected
+      ? this.theme.fg("accent", sanitizeInline(job.name))
+      : this.theme.fg("text", sanitizeInline(job.name));
+    const left = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name} ${this.theme.fg("dim", shortId(sanitizeText(job.id)))}`;
+    const owner = job.workflow ? " · workflow" : "";
+    const right =
+      this.theme.fg(
+        "muted",
+        `${job.access} · ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}${owner} · ${formatElapsed(job, this.#now())}`,
+      ) + ` · ${this.theme.fg(status.color, job.status)} `;
+    return alignDashboardRow(left, right, width);
   }
 
-  private renderCompact(maxHeight: number, top: () => string, bottom: () => string, row: (text: string) => string): string[] {
-    if (maxHeight === 1) return [truncate("Subagents", visibleWidth(top()))];
-    if (maxHeight === 2) return [top(), bottom()];
-    if (maxHeight === 3) return [top(), row(this.theme.fg("accent", "Native Subagents")), bottom()];
-    return [top(), row(this.theme.fg("accent", "Native Subagents")), row(this.theme.fg("dim", "Esc close")), bottom()];
+  private renderCompact(
+    maxHeight: number,
+    count: number,
+    frame: ReturnType<typeof createDashboardFrame>,
+  ): string[] {
+    const header = frame.header(
+      this.theme.fg("accent", this.theme.bold("Native subagents")),
+      this.theme.fg("muted", `${count} job${count === 1 ? "" : "s"}`),
+    );
+    if (maxHeight === 1) return [truncate("Subagents", frame.innerWidth + 2)];
+    if (maxHeight === 2) return [header, frame.hint("Esc close")];
+    if (maxHeight === 3) return [header, frame.top("jobs"), frame.bottom()];
+    return [
+      header,
+      frame.top("jobs"),
+      frame.row(this.theme.fg("dim", "  Screen too short for dashboard detail.")),
+      frame.bottom(),
+      frame.hint("Esc close"),
+    ].slice(0, maxHeight);
   }
 
   private listViewport(jobs: JobSnapshot[], rows: number): Array<{ job: JobSnapshot; index: number }> {
@@ -246,7 +306,7 @@ export async function openSubagentsDashboard(ctx: ExtensionCommandContext, manag
   for (;;) {
     const action = await ctx.ui.custom<DashboardAction>((tui, theme, keybindings, done) => createDashboardOverlay(tui, theme, keybindings, manager, done), {
       overlay: true,
-      overlayOptions: { width: "90%", minWidth: 60, maxHeight: "90%", anchor: "center", margin: 1 },
+      overlayOptions: { width: "100%", minWidth: 60, maxHeight: "80%", anchor: "center" },
     });
     if (!action || action.type === "close") return;
     if (action.type === "cancel") {

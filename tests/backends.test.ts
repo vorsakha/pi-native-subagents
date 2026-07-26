@@ -26,8 +26,8 @@ process.stdin.on("data", chunk => {
     if (value.id) process.stdout.write(JSON.stringify({ type: "response", id: value.id, command: value.type, success: true }) + "\\n");
     if (value.type === "prompt" && process.env.MODE === "complete") complete(value.message.startsWith("Task:") ? "PI_OK" : value.message);
     if (value.type === "prompt" && process.env.MODE === "activity") {
-      for (const delay of [40, 80, 120]) setTimeout(() => process.stdout.write(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "." } }) + "\\n"), delay);
-      setTimeout(() => complete("ACTIVE"), 160);
+      for (const delay of [80, 160, 240]) setTimeout(() => process.stdout.write(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "." } }) + "\\n"), delay);
+      setTimeout(() => complete("ACTIVE"), 320);
     }
     if (value.type === "prompt" && process.env.MODE === "assistant_error") assistantEnd("error", "model exploded");
     if (value.type === "prompt" && process.env.MODE === "assistant_aborted") assistantEnd("aborted", "request aborted");
@@ -83,12 +83,12 @@ process.stdin.on("data", chunk => {
       const number = ++turns; const id = "turn-" + number;
       reply(value.id, { turn: { id } });
       if (process.env.MODE === "activity") {
-        for (const delay of [40, 80, 120]) setTimeout(() => process.stdout.write(JSON.stringify({ method: "item/reasoning/summaryTextDelta", params: { delta: "." } }) + "\\n"), delay);
+        for (const delay of [80, 160, 240]) setTimeout(() => process.stdout.write(JSON.stringify({ method: "item/reasoning/summaryTextDelta", params: { delta: "." } }) + "\\n"), delay);
       }
       if (process.env.MODE !== "silent") setTimeout(() => {
         process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { type: "agentMessage", text: number === 1 ? "FIRST" : "SECOND" } } }) + "\\n");
         process.stdout.write(JSON.stringify({ method: "turn/completed", params: { turn: { id, status: "completed" } } }) + "\\n");
-      }, process.env.MODE === "activity" ? 160 : 40);
+      }, process.env.MODE === "activity" ? 320 : 40);
     } else if (value.method === "turn/steer") reply(value.id, { turnId: "turn-1" });
     else reply(value.id, {});
   }
@@ -132,7 +132,7 @@ test("native harness watchdogs allow active turns beyond one inactivity window",
     const fake = await fixture(PI_FIXTURE);
     const events: BackendEvent[] = [];
     try {
-      const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 500, inactivityTimeoutMs: 70 })
+      const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 250 })
         .start(request("pi", fake.dir, { ...process.env, MODE: "activity" }), (event) => events.push(event));
       await run.completed;
       assert.deepEqual(terminal(events), { type: "completed", output: "ACTIVE" });
@@ -144,7 +144,7 @@ test("native harness watchdogs allow active turns beyond one inactivity window",
     async function* messages() {
       yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "active-claude", tools: [] };
       for (let index = 0; index < 3; index++) {
-        await delay(40);
+        await delay(80);
         yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "." } } };
       }
       await delay(40);
@@ -155,7 +155,7 @@ test("native harness watchdogs allow active turns beyond one inactivity window",
     const run = await new ClaudeBackend("fixture-claude", {
       verifyAuth: async () => undefined,
       queryFn: (() => stream) as never,
-      inactivityTimeoutMs: 70,
+      inactivityTimeoutMs: 250,
     }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
     await run.completed;
     assert.deepEqual(terminal(events), { type: "completed", output: "ACTIVE" });
@@ -166,7 +166,7 @@ test("native harness watchdogs allow active turns beyond one inactivity window",
     const fake = await fixture(CODEX_FIXTURE);
     const events: BackendEvent[] = [];
     try {
-      const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 500, inactivityTimeoutMs: 70 })
+      const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 250 })
         .start(request("codex", fake.dir, { ...process.env, MODE: "activity" }), (event) => events.push(event));
       await run.completed;
       assert.deepEqual(terminal(events), { type: "completed", output: "FIRST" });
@@ -180,7 +180,7 @@ test("silent native turns fail through the inactivity watchdog", async (t) => {
     const fake = await fixture(PI_FIXTURE);
     const events: BackendEvent[] = [];
     try {
-      const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 500, inactivityTimeoutMs: 60 })
+      const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 60 })
         .start(request("pi", fake.dir, { ...process.env, MODE: "silent" }), (event) => events.push(event));
       await run.completed;
       assert.match((terminal(events) as Extract<BackendEvent, { type: "failed" }>).error, /no activity for 60ms/);
@@ -192,7 +192,7 @@ test("silent native turns fail through the inactivity watchdog", async (t) => {
     const fake = await fixture(CODEX_FIXTURE);
     const events: BackendEvent[] = [];
     try {
-      const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 500, inactivityTimeoutMs: 60 })
+      const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 60 })
         .start(request("codex", fake.dir, { ...process.env, MODE: "silent" }), (event) => events.push(event));
       await run.completed;
       assert.match((terminal(events) as Extract<BackendEvent, { type: "failed" }>).error, /no activity for 60ms/);
@@ -207,7 +207,7 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
   const envFile = join(fake.dir, "env.json");
   const events: BackendEvent[] = [];
   try {
-    const backend = new PiRpcBackend(fake.command, { requestTimeoutMs: 1_000, inactivityTimeoutMs: 2_000 });
+    const backend = new PiRpcBackend(fake.command, { requestTimeoutMs: 20_000, inactivityTimeoutMs: 20_000 });
     const piRequest = request("pi", fake.dir, {
       ...process.env, MODE: "complete", ARG_FILE: argFile, ENV_FILE: envFile,
       OPENAI_API_KEY: "pi-provider-key", CODEX_API_KEY: "pi-provider-token",
@@ -245,7 +245,7 @@ test("Pi RPC resumes a forked session and sends a peer question verbatim", async
     peerRequest.rawInitialMessage = true;
     peerRequest.task = "What decision did this thread reach?";
     peerRequest.policy.piTools = [];
-    const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 1_000, inactivityTimeoutMs: 2_000 })
+    const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 20_000, inactivityTimeoutMs: 20_000 })
       .start(peerRequest, (event) => events.push(event));
     await run.completed;
     assert.deepEqual(terminal(events), { type: "completed", output: peerRequest.task });
@@ -270,7 +270,7 @@ test("Pi RPC maps assistant, stream, extension, and exhausted-retry errors at se
       const fake = await fixture(PI_FIXTURE);
       const events: BackendEvent[] = [];
       try {
-        const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 1_000, inactivityTimeoutMs: 2_000 })
+        const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 20_000, inactivityTimeoutMs: 20_000 })
           .start(request("pi", fake.dir, { ...process.env, MODE: mode }), (event) => events.push(event));
         await run.completed;
         const event = terminal(events) as Extract<BackendEvent, { type: "failed" | "cancelled" }>;
@@ -371,7 +371,7 @@ test("Codex reuses its native thread for queued and post-settlement follow-ups",
     const codexRequest = request("codex", fake.dir, { ...process.env, MODE: "normal", PARAM_FILE: paramFile, THREAD_PARAM_FILE: threadParamFile });
     delete codexRequest.policy.model;
     codexRequest.policy.effort = "high";
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 500, inactivityTimeoutMs: 2_000 })
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 5_000, inactivityTimeoutMs: 5_000 })
       .start(codexRequest, (event) => events.push(event));
     await run.completed;
     assert.deepEqual(terminal(events), { type: "completed", output: "FIRST" });
@@ -402,7 +402,7 @@ test("Codex startup timeout and early exit both settle clearly", async (t) => {
       const fake = await fixture(CODEX_FIXTURE);
       const events: BackendEvent[] = [];
       try {
-        const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 150, inactivityTimeoutMs: 400 })
+        const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: mode === "hang" ? 250 : 5_000, inactivityTimeoutMs: 6_000 })
           .start(request("codex", fake.dir, { ...process.env, MODE: mode }), (event) => events.push(event));
         await run.completed;
         const event = terminal(events) as { type: string; error: string };

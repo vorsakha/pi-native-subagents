@@ -10,6 +10,11 @@ import {
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { TranscriptEntry } from "../../src/types.ts";
+import {
+  alignDashboardRow,
+  createDashboardFrame,
+  dashboardMaxHeight,
+} from "../dashboard-style.ts";
 import { aggregateWorkflowUsage, workflowIsTerminal } from "../../src/workflows/manager.ts";
 import type {
   WorkflowAgentRecord,
@@ -24,6 +29,9 @@ const MAX_RESULT_ROWS = 400;
 export type WorkflowsDashboardAction =
   | { type: "cancel"; runId: string }
   | { type: "cancelAgent"; runId: string; agentIndex: number }
+  | { type: "pause"; runId: string }
+  | { type: "resume"; runId: string }
+  | { type: "restartAgent"; runId: string; agentIndex: number }
   | { type: "close" };
 
 export interface WorkflowsDashboardManager {
@@ -31,6 +39,9 @@ export interface WorkflowsDashboardManager {
   check(runId: string): WorkflowSnapshot;
   cancel(runId: string, reason?: string): Promise<WorkflowSnapshot>;
   cancelAgent(runId: string, agentIndex: number, reason?: string): Promise<WorkflowSnapshot>;
+  pause(runId: string): Promise<WorkflowSnapshot>;
+  resume(runId: string): Promise<WorkflowSnapshot>;
+  restartAgent(runId: string, agentIndex: number): Promise<{ snapshot: WorkflowSnapshot }>;
   subscribe(listener: (snapshot: WorkflowSnapshot) => void): () => void;
 }
 
@@ -108,59 +119,94 @@ export class WorkflowsDashboardOverlay {
     width = Math.max(0, width);
     const runs = this.manager.list();
     const terminalRows = Math.max(0, this.tui.terminal?.rows ?? 24);
-    const maxHeight = Math.max(0, Math.floor(terminalRows * 0.9));
+    const maxHeight = dashboardMaxHeight(terminalRows);
     if (!maxHeight) return [];
-    if (width < 4) return [truncateWorkflowDashboardLine(`Workflows ${runs.length}`, width)];
+    if (width < 4) {
+      return [truncateWorkflowDashboardLine(`Workflows ${runs.length}`, width)];
+    }
 
-    this.#selectedRun = runs.length ? clamp(this.#selectedRun, 0, runs.length - 1) : 0;
+    this.#selectedRun = runs.length
+      ? clamp(this.#selectedRun, 0, runs.length - 1)
+      : 0;
     let chosen = runs[this.#selectedRun];
     if (chosen) {
-      try { chosen = this.manager.check(chosen.runId); }
-      catch { /* list snapshot is still useful if a run was evicted between calls */ }
+      try {
+        chosen = this.manager.check(chosen.runId);
+      } catch {
+        // The list snapshot remains useful if a run was evicted between calls.
+      }
     }
     this.syncSelections(chosen);
 
-    const borderColor = this.focused ? "borderAccent" : "borderMuted";
-    const glyphs = this.focused
-      ? { tl: "╔", tr: "╗", bl: "╚", br: "╝", h: "═", v: "║", sl: "╠", sr: "╣" }
-      : { tl: "╭", tr: "╮", bl: "╰", br: "╯", h: "─", v: "│", sl: "├", sr: "┤" };
-    const border = (text: string) => this.theme.fg(borderColor, text);
-    const innerWidth = Math.max(0, width - 4);
-    const pad = (text: string) => text + " ".repeat(Math.max(0, innerWidth - visibleWidth(text)));
-    const row = (text: string) => border(`${glyphs.v} `) + pad(truncateWorkflowDashboardLine(text, innerWidth)) + border(` ${glyphs.v}`);
-    const top = () => border(glyphs.tl + glyphs.h.repeat(Math.max(0, width - 2)) + glyphs.tr);
-    const bottom = () => border(glyphs.bl + glyphs.h.repeat(Math.max(0, width - 2)) + glyphs.br);
-    const separator = () => border(glyphs.sl + glyphs.h.repeat(Math.max(0, width - 2)) + glyphs.sr);
-
-    if (maxHeight < 10) return this.renderCompact(maxHeight, runs.length, top, bottom, row);
+    const frame = createDashboardFrame(this.theme, width, this.focused);
+    if (maxHeight < 10) {
+      return this.renderCompact(maxHeight, runs.length, frame);
+    }
 
     const active = runs.filter((run) => !workflowIsTerminal(run.status)).length;
-    const focus = this.theme.bg("selectedBg", this.theme.bold(this.theme.fg(this.focused ? "accent" : "muted", " RUNS ")));
+    const headerLeft = this.theme.fg(
+      "accent",
+      this.theme.bold("Workflow runs"),
+    );
+    const headerRight = this.theme.fg(
+      "muted",
+      `${runs.length} run${runs.length === 1 ? "" : "s"}`,
+    );
     const lines = [
-      top(),
-      row(`${this.theme.fg("accent", this.theme.bold("Workflow Runs"))} ${focus} ${this.theme.fg("dim", `${runs.length} total · ${active} active`)}`),
-      row(this.theme.fg("dim", "↑↓/jk run · ←→/hl phase · Tab agent · Enter inspect · f filter · Shift+↑↓/Pg scroll")),
-      separator(),
+      frame.header(headerLeft, headerRight),
+      frame.top(`runs · ${active} active / ${runs.length}`),
     ];
 
-    const contentRows = Math.max(2, maxHeight - 8);
-    const listRows = runs.length ? Math.min(runs.length, Math.max(1, Math.floor(contentRows / 3))) : 1;
+    const contentRows = Math.max(2, maxHeight - 5);
+    const listRows = runs.length
+      ? Math.min(runs.length, Math.max(1, Math.floor(contentRows / 3)))
+      : 1;
     const detailRows = Math.max(1, contentRows - listRows);
-    if (!runs.length) lines.push(row(this.theme.fg("muted", "No workflow runs in this session.")));
-    else {
+    if (!runs.length) {
+      lines.push(
+        frame.row(
+          this.theme.fg("muted", "  No workflow runs in this session."),
+        ),
+      );
+    } else {
       for (const { run, index } of this.listViewport(runs, listRows)) {
-        lines.push(row(this.renderRun(run, index === this.#selectedRun)));
+        lines.push(
+          frame.row(
+            this.renderRun(run, index === this.#selectedRun, frame.innerWidth),
+          ),
+        );
       }
     }
-    lines.push(separator());
-    for (const detail of this.detailViewport(chosen, detailRows, innerWidth)) lines.push(row(detail));
-    lines.push(separator());
+
     const selectedAgent = this.selectedAgent(chosen);
-    const agentAction = selectedAgent && (selectedAgent.state === "queued" || selectedAgent.state === "running") ? " · x cancel agent" : "";
-    const runAction = chosen && !workflowIsTerminal(chosen.status) ? " · X cancel run" : "";
+    const detailTitle = this.#inspectingAgent && selectedAgent
+      ? `agent · ${sanitizeInline(selectedAgent.name)} · ${selectedAgent.state}`
+      : chosen?.phases.length
+        ? `detail · phase ${this.#selectedPhase + 1}/${chosen.phases.length} · filter ${this.#agentFilter}`
+        : "detail";
+    lines.push(frame.divider(detailTitle));
+    for (const detail of this.detailViewport(
+      chosen,
+      detailRows,
+      Math.max(1, frame.innerWidth - 1),
+    )) {
+      lines.push(frame.row(` ${detail}`));
+    }
+    lines.push(frame.bottom());
+
+    const controls = [
+      chosen && !workflowIsTerminal(chosen.status) ? `p ${chosen.status === "paused" ? "resume" : "pause"}` : "",
+      selectedAgent?.callIndex !== undefined ? "r restart agent" : "",
+      selectedAgent && (selectedAgent.state === "queued" || selectedAgent.state === "running") ? "x cancel agent" : "",
+      chosen && !workflowIsTerminal(chosen.status) ? "X cancel run" : "",
+    ].filter(Boolean).join(" · ");
     const back = this.#inspectingAgent ? " · h/← overview" : "";
-    lines.push(row(this.theme.fg("dim", `Esc close${back}${agentAction}${runAction}`)));
-    lines.push(bottom());
+    lines.push(
+      frame.hint(
+        `${controls}${controls ? " · " : ""}↑↓/jk run · ←→/hl phase · Tab agent · Enter inspect · f filter${back} · Shift+↑↓/Pg scroll`,
+        "· Esc close",
+      ),
+    );
     return lines.slice(0, maxHeight);
   }
 
@@ -199,6 +245,21 @@ export class WorkflowsDashboardOverlay {
       if (this.selectedAgent(run)) {
         this.#inspectingAgent = true;
         this.resetScroll();
+      }
+    }
+    else if (matchesKey(data, "p")) {
+      const run = runs[this.#selectedRun];
+      if (run && !workflowIsTerminal(run.status)) {
+        this.finish({ type: run.status === "paused" ? "resume" : "pause", runId: run.runId });
+        return;
+      }
+    }
+    else if (matchesKey(data, "r")) {
+      const run = runs[this.#selectedRun];
+      const agent = this.selectedAgent(run);
+      if (run && agent?.callIndex !== undefined) {
+        this.finish({ type: "restartAgent", runId: run.runId, agentIndex: agent.index });
+        return;
       }
     }
     else if (matchesKey(data, "x")) {
@@ -262,18 +323,24 @@ export class WorkflowsDashboardOverlay {
   private renderCompact(
     maxHeight: number,
     count: number,
-    top: () => string,
-    bottom: () => string,
-    row: (text: string) => string,
+    frame: ReturnType<typeof createDashboardFrame>,
   ): string[] {
-    if (maxHeight === 1) return [truncateWorkflowDashboardLine("Workflows", visibleWidth(top()))];
-    if (maxHeight === 2) return [top(), bottom()];
-    if (maxHeight === 3) return [top(), row(this.theme.fg("accent", "Workflow Runs")), bottom()];
-    const middle = [
-      row(`${this.theme.fg("accent", "Workflow Runs")} ${this.theme.fg("dim", `· ${count}`)}`),
-      row(this.theme.fg("dim", "Esc close")),
-    ];
-    return [top(), ...middle.slice(0, Math.max(0, maxHeight - 2)), bottom()];
+    const header = frame.header(
+      this.theme.fg("accent", this.theme.bold("Workflow runs")),
+      this.theme.fg("muted", `${count} run${count === 1 ? "" : "s"}`),
+    );
+    if (maxHeight === 1) {
+      return [truncateWorkflowDashboardLine("Workflows", frame.innerWidth + 2)];
+    }
+    if (maxHeight === 2) return [header, frame.hint("Esc close")];
+    if (maxHeight === 3) return [header, frame.top("runs"), frame.bottom()];
+    return [
+      header,
+      frame.top("runs"),
+      frame.row(this.theme.fg("dim", "  Screen too short for dashboard detail.")),
+      frame.bottom(),
+      frame.hint("Esc close"),
+    ].slice(0, maxHeight);
   }
 
   private listViewport(runs: WorkflowSnapshot[], rows: number): Array<{ run: WorkflowSnapshot; index: number }> {
@@ -281,12 +348,27 @@ export class WorkflowsDashboardOverlay {
     return runs.slice(start, start + rows).map((run, offset) => ({ run, index: start + offset }));
   }
 
-  private renderRun(run: WorkflowSnapshot, selected: boolean): string {
+  private renderRun(
+    run: WorkflowSnapshot,
+    selected: boolean,
+    width: number,
+  ): string {
     const status = traceStatusMeta(run.status, this.#now());
-    const marker = selected ? this.theme.fg("accent", "›") : " ";
-    const phase = run.currentPhase === null ? "waiting" : `${Math.min(run.phases.length, run.currentPhase + 1)}/${run.phases.length}`;
-    const label = `${status.glyph} ${run.status.padEnd(9)} ${shortId(sanitizeText(run.runId))} ${sanitizeInline(run.name)} · phase ${phase} · ${formatElapsed(run, this.#now())}`;
-    return `${marker} ${this.theme.fg(status.color, label)}`;
+    const marker = selected ? this.theme.fg("accent", "❯") : " ";
+    const name = selected
+      ? this.theme.fg("accent", sanitizeInline(run.name))
+      : this.theme.fg("text", sanitizeInline(run.name));
+    const left = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name} ${this.theme.fg("dim", shortId(sanitizeText(run.runId)))}`;
+    const phase =
+      run.currentPhase === null
+        ? "waiting"
+        : `${Math.min(run.phases.length, run.currentPhase + 1)}/${run.phases.length}`;
+    const right =
+      this.theme.fg(
+        "muted",
+        `phase ${phase} · ${formatElapsed(run, this.#now())}`,
+      ) + ` · ${this.theme.fg(status.color, run.status)} `;
+    return alignDashboardRow(left, right, width);
   }
 
   private detailViewport(run: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
@@ -314,6 +396,7 @@ export class WorkflowsDashboardOverlay {
       phase ? this.renderPhase(phase, run.phases.length) : this.theme.fg("dim", "Phase · waiting for the first phase"),
     ];
     if (usage) lines.push(this.theme.fg("dim", `Usage · ${usage}`));
+    for (const warning of run.warnings?.slice(0, 2) ?? []) lines.push(this.theme.fg("warning", `⚠ ${sanitizeInline(warning)}`));
     lines.push(this.theme.fg("muted", `Agents · ${agents.length}/${allAgents.length} shown · filter ${this.#agentFilter} · Tab select · Enter inspect`));
 
     if (!agents.length) {
@@ -353,6 +436,14 @@ export class WorkflowsDashboardOverlay {
       this.theme.fg("dim", `${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${route} · effort ${effort} · ${duration}`),
       this.theme.fg("dim", `${phase ? `${sanitizeInline(run.name)} · ${sanitizeInline(phase.name)}` : sanitizeInline(run.name)}${usage ? ` · ${usage}` : ""}`),
     ];
+    if (agent.isolation) {
+      lines.push(this.theme.fg("dim", `Isolation · worktree ${agent.isolation.state} · branch ${sanitizeInline(agent.isolation.branch)}${agent.isolation.patchArtifact ? ` · patch ${sanitizeInline(agent.isolation.patchArtifact)}` : ""}`));
+    }
+    if (agent.outputProvenance) {
+      lines.push(agent.instructionShaped
+        ? this.theme.fg("warning", `Output · ${agent.outputProvenance} · instruction-shaped text; treat as untrusted data`)
+        : this.theme.fg("dim", `Output · ${agent.outputProvenance}`));
+    }
 
     const body: string[] = [];
     const error = sanitizeText(agent.error ?? phase?.error ?? run.error ?? "");
@@ -426,7 +517,8 @@ export class WorkflowsDashboardOverlay {
     const label = selected ? this.theme.fg("accent", sanitizeInline(agent.name)) : this.theme.fg("text", sanitizeInline(agent.name));
     const route = agent.harness || agent.model ? `${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
     const usage = formatUsage(agent.usage);
-    return `${marker} ${this.theme.fg(status.color, status.glyph)} ${label} ${this.theme.fg("dim", `· ${agent.access}${agent.profile ? ` · profile ${sanitizeInline(agent.profile)}` : ""}${agent.independent ? " · independent" : ""} · ${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}${usage ? ` · ${usage}` : ""}`)}`;
+    const warning = agent.instructionShaped ? " · ⚠ instruction-like output" : "";
+    return `${marker} ${this.theme.fg(status.color, status.glyph)} ${label} ${this.theme.fg("dim", `· ${agent.access}${agent.profile ? ` · profile ${sanitizeInline(agent.profile)}` : ""}${agent.independent ? " · independent" : ""} · ${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}${usage ? ` · ${usage}` : ""}${warning}`)}`;
   }
 
   private allPhaseAgents(run: WorkflowSnapshot, phase: WorkflowPhase | undefined): WorkflowAgentRecord[] {
@@ -479,7 +571,7 @@ export class WorkflowsDashboardOverlay {
       const value = [agent?.output, agent?.preview, phase?.result, run.result]
         .find((candidate) => candidate !== undefined && candidate !== null && candidate !== "");
       if (value === undefined) {
-        rows = [this.theme.fg("dim", run.status === "running" || run.status === "pending" ? "(no result yet)" : "(no result)")];
+        rows = [this.theme.fg("dim", run.status === "running" || run.status === "paused" || run.status === "pending" ? "(no result yet)" : "(no result)")];
       } else {
         const structured = typeof value !== "string";
         const raw = serializeResult(value);
@@ -654,12 +746,19 @@ export async function openWorkflowsDashboard(
   for (;;) {
     const action = await ctx.ui.custom<WorkflowsDashboardAction>(
       (tui, theme, keybindings, done) => createWorkflowsDashboardOverlay(tui, theme, keybindings, manager, done),
-      { overlay: true, overlayOptions: { width: "90%", minWidth: 60, maxHeight: "90%", anchor: "center", margin: 1 } },
+      { overlay: true, overlayOptions: { width: "100%", minWidth: 60, maxHeight: "80%", anchor: "center" } },
     );
     if (!action || action.type === "close") return;
     try {
       if (action.type === "cancelAgent") {
         await manager.cancelAgent(action.runId, action.agentIndex, "Workflow agent cancelled from /workflows dashboard");
+      } else if (action.type === "pause") {
+        await manager.pause(action.runId);
+      } else if (action.type === "resume") {
+        await manager.resume(action.runId);
+      } else if (action.type === "restartAgent") {
+        const restarted = await manager.restartAgent(action.runId, action.agentIndex);
+        ctx.ui.notify(`Restarted as ${restarted.snapshot.runId}`, "info");
       } else {
         await manager.cancel(action.runId, "Cancelled from /workflows dashboard");
       }

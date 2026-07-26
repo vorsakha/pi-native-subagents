@@ -34,6 +34,7 @@ function workflow(overrides: Partial<WorkflowSnapshot> = {}): WorkflowSnapshot {
       { index: 0, name: "Review", status: "completed", timestamps: { createdAt, updatedAt: 2_000 }, agents: [0] },
       { index: 1, name: "Verification", status: "running", timestamps: { createdAt, updatedAt: 3_000 }, agents: [1] },
     ],
+    logs: [{ index: 0, message: "Verification is underway", at: 3_000 }],
     agents: [
       {
         index: 0, name: "reviewer", access: "readOnly", independent: true, phase: 0, state: "completed",
@@ -74,6 +75,7 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
   assert.ok(collapsed.at(-1)?.includes("/workflows"));
   assert.ok(collapsed.some((line) => line.includes("phase")));
   assert.ok(collapsed.some((line) => line.includes("agent")));
+  assert.ok(collapsed.some((line) => line.includes("Verification is underway")));
   assert.ok(collapsed.some((line) => line.includes("↑")));
 
   const callLines = renderWorkflowCall("Release readiness", "Review and verify", false, theme).render(100);
@@ -88,6 +90,10 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
   assert.ok(expanded.at(-1)?.includes("/workflows"));
   assert.ok(expanded.every((line) => !CONTROL_CHARS.test(line)));
   assert.ok(buildWorkflowCardLines(workflow(), theme, { expanded: true, now: 6_000 }).some((line) => line.includes("independent")), "cross-provider independence is visible in workflow cards");
+  const flagged = workflow();
+  flagged.agents[1]!.outputProvenance = "subagent";
+  flagged.agents[1]!.instructionShaped = true;
+  assert.ok(buildWorkflowCardLines(flagged, theme, { expanded: true, now: 6_000 }).some((line) => line.includes("instruction-like output")), "instruction-shaped child output is visibly flagged");
   const partial = workflow({
     agents: workflow().agents.map((agent, index) => ({
       ...agent,

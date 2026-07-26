@@ -42,6 +42,24 @@ function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: J
 }
 
 const MAX_RETAINED_JOBS = 100;
+const DEFAULT_STARTUP_TIMEOUT_MS = 45_000;
+const DEFAULT_OPERATION_TIMEOUT_MS = 10_000;
+
+class OperationDeadlineError extends Error {}
+
+async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new OperationDeadlineError(`${label} timed out after ${timeoutMs}ms`)), Math.max(0, timeoutMs));
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 export class JobManager {
   readonly #backends: Map<string, Backend>;
@@ -52,13 +70,23 @@ export class JobManager {
   readonly #listeners = new Set<(job: JobSnapshot, event: BackendEvent) => void>();
   readonly #launches = new Set<Promise<void>>();
   readonly #concurrency: number;
+  readonly #startupTimeoutMs: number;
+  readonly #operationTimeoutMs: number;
   #active = 0;
   #closed = false;
 
-  constructor(options: { backends: Backend[]; profiles?: Map<string, ProfileDefinition>; concurrency?: number }) {
+  constructor(options: {
+    backends: Backend[];
+    profiles?: Map<string, ProfileDefinition>;
+    concurrency?: number;
+    startupTimeoutMs?: number;
+    operationTimeoutMs?: number;
+  }) {
     this.#backends = new Map(options.backends.map((backend) => [backend.name, backend]));
     this.#profiles = options.profiles ?? new Map();
     this.#concurrency = Math.max(1, Math.min(4, options.concurrency ?? 4));
+    this.#startupTimeoutMs = Math.max(1, options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS);
+    this.#operationTimeoutMs = Math.max(1, options.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS);
   }
 
   spawn(request: SpawnRequest): JobSnapshot {
@@ -73,12 +101,21 @@ export class JobManager {
     const profile = profileName ? this.#profiles.get(profileName) : undefined;
     if (profileName && !profile) throw new Error(`Unknown subagent profile: ${profileName}`);
     const independenceTarget = independentOf ? this.#jobs.get(independentOf) : undefined;
-    if (independentOf && !independenceTarget) throw new Error(`Unknown independence target job: ${independentOf}`);
+    const replayProvider = request.independentOfProvider;
+    if (replayProvider !== undefined && replayProvider !== "claude" && replayProvider !== "codex") {
+      throw new Error("independentOfProvider must identify native Claude or Codex");
+    }
+    if (replayProvider !== undefined && !independentOf) throw new Error("independentOfProvider requires independentOf");
+    if (independentOf && !independenceTarget && !replayProvider) throw new Error(`Unknown independence target job: ${independentOf}`);
     const targetHarness = independenceTarget?.snapshot.harness;
     if (targetHarness === "pi") {
       throw new Error("independentOf requires a target job using the native Claude or Codex harness");
     }
-    const independentOfProvider = targetHarness === "claude" || targetHarness === "codex" ? targetHarness : undefined;
+    const retainedProvider = targetHarness === "claude" || targetHarness === "codex" ? targetHarness : undefined;
+    if (retainedProvider && replayProvider && retainedProvider !== replayProvider) {
+      throw new Error("independentOfProvider does not match the retained independence target");
+    }
+    const independentOfProvider = retainedProvider ?? replayProvider;
     const compiled = compilePolicy(request, profile, independentOfProvider);
     if (!this.#backends.has(compiled.policy.harness)) throw new Error(`Harness is unavailable: ${compiled.policy.harness}`);
     if (request.peer) {
@@ -231,12 +268,18 @@ export class JobManager {
     } else {
       job.cancelRequested ??= reason;
       job.startupController?.abort(new Error(job.cancelRequested));
-      const run = job.run ?? await new Promise<BackendRun | undefined>((resolve) => {
-        const waiters = job.runWaiters ??= new Set();
-        waiters.add(resolve);
-      });
-      if (run) await this.#cancelRun(job, run, job.cancelRequested);
-      else if (!isTerminal(job.snapshot.status)) this.#emit(job, { type: "cancelled", reason: job.cancelRequested });
+      const run = job.run ?? await this.#waitForRun(job, this.#operationTimeoutMs);
+      if (run) {
+        try {
+          await withDeadline(this.#cancelRun(job, run, job.cancelRequested), this.#operationTimeoutMs, "Harness cancellation");
+        } catch (error) {
+          if (!(error instanceof OperationDeadlineError)) throw error;
+          await withDeadline(run.forceClose?.() ?? run.close(), Math.min(1_000, this.#operationTimeoutMs), "Harness force-close").catch(() => undefined);
+          if (!isTerminal(job.snapshot.status)) this.#emit(job, { type: "cancelled", reason: `${job.cancelRequested} (harness cancellation deadline exceeded)` });
+        }
+      } else if (!isTerminal(job.snapshot.status)) {
+        this.#emit(job, { type: "cancelled", reason: `${job.cancelRequested} (harness startup cancellation deadline exceeded)` });
+      }
     }
     return clone(job.snapshot);
   }
@@ -276,6 +319,20 @@ export class JobManager {
     this.#listeners.clear();
   }
 
+  #waitForRun(job: InternalJob, timeoutMs: number): Promise<BackendRun | undefined> {
+    if (job.run) return Promise.resolve(job.run);
+    return new Promise<BackendRun | undefined>((resolve) => {
+      const waiters = job.runWaiters ??= new Set();
+      const ready = (run?: BackendRun) => {
+        clearTimeout(timer);
+        waiters.delete(ready);
+        resolve(run);
+      };
+      const timer = setTimeout(() => ready(undefined), Math.max(0, timeoutMs));
+      waiters.add(ready);
+    });
+  }
+
   #evictOldJobs(): void {
     if (this.#jobs.size < MAX_RETAINED_JOBS) return;
     const terminal = [...this.#jobs.values()]
@@ -292,7 +349,14 @@ export class JobManager {
 
   #pump(): void {
     while (!this.#closed && this.#active < this.#concurrency && this.#queue.length > 0) {
-      const id = this.#queue.shift();
+      // Interactive/direct work gets the next available slot instead of
+      // sitting behind a workflow's entire fan-out. Workflows still use every
+      // idle slot when no direct job is waiting.
+      const directIndex = this.#queue.findIndex((id) => {
+        const candidate = this.#jobs.get(id);
+        return candidate?.snapshot.status === "queued" && !candidate.snapshot.workflow;
+      });
+      const [id] = this.#queue.splice(directIndex >= 0 ? directIndex : 0, 1);
       const job = id ? this.#jobs.get(id) : undefined;
       if (!job || job.snapshot.status !== "queued") continue;
       this.#active++;
@@ -310,7 +374,7 @@ export class JobManager {
     try {
       const basePrompt = job.request.peer ? PEER_SYSTEM_PROMPT : GENERIC_SYSTEM_PROMPT;
       const systemPrompt = [basePrompt, job.profile?.systemPrompt].filter(Boolean).join("\n\n");
-      const startedRun = await backend.start({
+      const startup = backend.start({
         jobId: job.snapshot.id,
         name: job.snapshot.name,
         task: job.request.task,
@@ -322,6 +386,16 @@ export class JobManager {
         resumeSessionFile: job.request.peer?.sessionFile,
         rawInitialMessage: job.request.peer ? true : undefined,
       }, (event) => this.#handleBackendEvent(job, event));
+      let startedRun: BackendRun;
+      try {
+        startedRun = await withDeadline(startup, this.#startupTimeoutMs, "Harness startup");
+      } catch (error) {
+        if (error instanceof OperationDeadlineError) {
+          startupController.abort(error);
+          void startup.then((lateRun) => (lateRun.forceClose?.() ?? lateRun.close()).catch(() => undefined), () => undefined);
+        }
+        throw error;
+      }
       if (this.#closed || this.#jobs.get(job.snapshot.id) !== job) {
         await (startedRun.forceClose?.() ?? startedRun.close()).catch(() => undefined);
         return;
@@ -338,8 +412,10 @@ export class JobManager {
       if (!isTerminal(job.snapshot.status) && !job.cancelRequested) this.#emit(job, { type: "completed" });
     } catch (error) {
       if (!isTerminal(job.snapshot.status)) {
-        if (job.cancelRequested || startupController.signal.aborted) this.#emit(job, { type: "cancelled", reason: job.cancelRequested ?? "Harness startup aborted" });
-        else this.#emit(job, { type: "failed", error: error instanceof Error ? error.message : String(error) });
+        const startupTimedOut = startupController.signal.reason instanceof OperationDeadlineError;
+        if (job.cancelRequested || startupController.signal.aborted && !startupTimedOut) {
+          this.#emit(job, { type: "cancelled", reason: job.cancelRequested ?? "Harness startup aborted" });
+        } else this.#emit(job, { type: "failed", error: error instanceof Error ? error.message : String(error) });
       }
     } finally {
       job.startupController = undefined;

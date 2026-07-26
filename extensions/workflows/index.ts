@@ -5,6 +5,7 @@ import { Type } from "typebox";
 import type { JobManager } from "../../src/manager.ts";
 import { providerFamily } from "../../src/policy.ts";
 import { serializeWorkflowValue } from "../../src/workflows/artifacts.ts";
+import { loadSavedWorkflow, loadWorkflowScriptPath } from "../../src/workflows/saved.ts";
 import {
   WorkflowManager,
   workflowIsTerminal,
@@ -27,6 +28,7 @@ export interface RegisterWorkflowOptions {
   defaultHarness?: () => "pi" | "claude" | "codex";
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
+  savedWorkflowRoot?: string;
 }
 
 interface LiveWorkflowBlink {
@@ -55,6 +57,11 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
     result,
     agents: snapshot.agents.map((agent) => ({
       index: agent.index,
+      callIndex: agent.callIndex,
+      replayedFrom: agent.replayedFrom ? structuredClone(agent.replayedFrom) : undefined,
+      outputProvenance: agent.outputProvenance,
+      instructionShaped: agent.instructionShaped,
+      isolation: agent.isolation ? structuredClone(agent.isolation) : undefined,
       name: agent.name,
       access: agent.access,
       profile: agent.profile,
@@ -84,8 +91,7 @@ function resultText(snapshot: WorkflowSnapshot): string {
     try { result = JSON.stringify(serializeWorkflowValue(snapshot.result, { maxTotalBytes: MAX_RESULT_TEXT_BYTES - 512 }), null, 2); }
     catch { result = String(snapshot.result); }
   }
-  const artifact = `\nArtifacts: ${snapshot.artifactDir}`;
-  const body = `${heading}${error}${result ? `\n\nResult:\n${result}` : ""}${artifact}`;
+  const body = `${heading}${error}${result ? `\n\nResult:\n${result}` : ""}\nInspect private artifacts with /workflows.`;
   const buffer = Buffer.from(body);
   if (buffer.byteLength <= MAX_RESULT_TEXT_BYTES) return body;
   return `${buffer.subarray(0, MAX_RESULT_TEXT_BYTES - 64).toString("utf8")}\n[workflow result truncated — inspect /workflows]`;
@@ -104,6 +110,7 @@ function sessionId(ctx: ExtensionContext): string {
 
 export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOptions): WorkflowRegistration {
   const artifactRoot = options.artifactRoot ?? resolve(getAgentDir(), "workflows");
+  const savedWorkflowRoot = options.savedWorkflowRoot ?? resolve(getAgentDir(), "workflow-definitions");
   let manager: WorkflowManager | undefined;
   let unsubscribe: (() => void) | undefined;
   let sessionContext: ExtensionContext | undefined;
@@ -217,38 +224,76 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     name: "workflow",
     renderShell: "self",
     label: "Workflow",
-    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Scripts export a default async function and may call phase(title), agent(prompt,{name?,label?,access?,harness?,model?,effort?,independent?,independentOf?,profile?,phase?,schema?}), and parallel(tasks,{concurrency?}). agent(prompt) works without options. Runs are limited to 32 agent calls and four concurrent agents.",
+    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Scripts export a default async function and may call phase(title), log(message), agent(prompt,{name?,label?,access?,harness?,model?,effort?,independent?,independentOf?,profile?,phase?,schema?,isolation?}), parallel(tasks,{concurrency?}), and pipeline(items,...stages). isolation='worktree' runs a mutating agent in a clean Git worktree and preserves changed work with a patch. Runs are limited to 32 agent calls and four concurrent agents; resumeFromRunId replays an exact interrupted run's completed call prefix.",
     promptSnippet: "Run a sandboxed multi-agent workflow with phases and bounded parallelism",
     promptGuidelines: [
       "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls.",
       "agent(prompt) is generic and defaults to full access after project trust; set access=readOnly for inspection.",
       "Use independent=true to differ from the parent; use independentOf=<jobId> to differ from the agent that produced the work.",
       "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
-      "Scripts cannot access files, network, environment variables, subprocesses, imports, or credentials; only agent, parallel, phase, and JSON args are available.",
+      "Scripts cannot access files, network, environment variables, subprocesses, imports, or credentials; only agent, parallel, pipeline, phase, log, and JSON args are available.",
       "Use background=true for independent long work; completion is delivered automatically as a follow-up.",
       "Keep workflow results JSON-serializable and branch explicitly on each agent result's ok field.",
+      "Use pipeline for independent multi-stage item processing; use parallel only when the next step needs a barrier across all results.",
+      "Read-only workflow agents can run concurrently; mutating agents sharing the checkout are serialized unless each uses isolation='worktree'.",
+      "Use log for concise progress updates that are useful without opening an agent transcript.",
+      "Set resumeFromRunId only to replay an interrupted run with the exact same script, input, project, and routing context.",
+      "Use approval=plan for read-only planning or approval=onMutate to require a host confirmation before mutation.",
+      "Use workflowName for a saved user/project workflow or scriptPath for a trusted project-local script; provide exactly one script source.",
       "Use agent schema for validated JSON output when downstream phases need structure; schema cannot change access policy.",
     ],
     parameters: Type.Object({
-      name: Type.String({ minLength: 1, maxLength: 160 }),
+      name: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
       description: Type.Optional(Type.String({ maxLength: 1_000 })),
-      script: Type.String({ minLength: 1, maxLength: 512 * 1024 }),
-      args: Type.Optional(Type.String({ maxLength: 256 * 1024, description: "JSON passed to the script as args" })),
+      script: Type.Optional(Type.String({ minLength: 1, maxLength: 512 * 1024 })),
+      workflowName: Type.Optional(Type.String({ minLength: 1, maxLength: 80 })),
+      scriptPath: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
+      args: Type.Optional(Type.String({ maxLength: 256 * 1024, description: "Legacy JSON string passed to the script as args" })),
+      input: Type.Optional(Type.Unknown({ description: "Structured JSON value exposed to the script as args; do not combine with legacy args" })),
+      resumeFromRunId: Type.Optional(Type.String({ pattern: "^wf_[a-f0-9]+$", description: "Terminal run whose matching completed call prefix should be replayed" })),
+      approval: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("plan"), Type.Literal("onMutate")])),
+      budget: Type.Optional(Type.Object({
+        maxAgents: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })),
+        maxConcurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
+        maxTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000_000 })),
+        maxCost: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 10_000 })),
+        maxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
+      })),
       background: Type.Optional(Type.Boolean()),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
       const workflows = getManager();
+      if (params.args !== undefined && params.input !== undefined) {
+        throw new Error("Workflow accepts either structured input or legacy JSON args, not both");
+      }
+      const sources = [params.script !== undefined, params.workflowName !== undefined, params.scriptPath !== undefined].filter(Boolean).length;
+      if (sources !== 1) throw new Error("Workflow requires exactly one of script, workflowName, or scriptPath");
+      let script = params.script;
+      let sourceName: string | undefined;
+      if (params.workflowName !== undefined) {
+        const saved = await loadSavedWorkflow({ cwd: ctx.cwd, trusted: ctx.isProjectTrusted(), globalRoot: savedWorkflowRoot, name: params.workflowName });
+        script = saved.script;
+        sourceName = saved.definition.name;
+      } else if (params.scriptPath !== undefined) {
+        const loaded = await loadWorkflowScriptPath({ cwd: ctx.cwd, trusted: ctx.isProjectTrusted(), scriptPath: params.scriptPath });
+        script = loaded.script;
+        sourceName = params.scriptPath.split(/[\\/]/).at(-1)?.replace(/\.(?:m?js)$/i, "");
+      }
+      if (script === undefined) throw new Error("Workflow script could not be resolved");
       const request: StartWorkflowRequest = {
         sessionId: sessionId(ctx),
-        name: params.name,
+        name: params.name ?? sourceName ?? "workflow",
         description: params.description,
-        script: params.script,
-        args: parseArgs(params.args),
+        script,
+        args: params.input !== undefined ? params.input : parseArgs(params.args),
         background: params.background ?? false,
         cwd: ctx.cwd,
         trusted: ctx.isProjectTrusted(),
         parentProvider: providerFamily(ctx.model?.provider),
         defaultHarness: options.defaultHarness?.() ?? "pi",
+        resumeFromRunId: params.resumeFromRunId,
+        approval: params.approval,
+        budget: params.budget,
       };
       const started = await workflows.start(request);
       const runGeneration = generation;
@@ -312,7 +357,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   });
 
   pi.registerCommand("workflows", {
-    description: "Inspect and cancel persisted workflow runs.",
+    description: "Inspect, pause, resume, restart, or cancel workflow runs.",
     handler: async (_args, ctx) => {
       if (!ctx.isProjectTrusted()) {
         ctx.ui.notify("Workflow history is unavailable for untrusted projects.", "error");
@@ -330,7 +375,19 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       clearBlinks();
       sessionContext = ctx;
       unsubscribe?.();
-      manager = new WorkflowManager({ jobs, artifactRoot, sessionId: ctx.sessionManager.getSessionId() });
+      manager = new WorkflowManager({
+        jobs,
+        artifactRoot,
+        sessionId: ctx.sessionManager.getSessionId(),
+        approveMutation: async ({ workflow, agent, prompt, signal }) => {
+          if (!ctx.hasUI || typeof ctx.ui.confirm !== "function") return false;
+          return ctx.ui.confirm(
+            `Allow workflow mutation?`,
+            `${workflow} · ${agent}\n\n${prompt}`,
+            { timeout: 60_000, signal },
+          );
+        },
+      });
       unsubscribe = manager.subscribe((snapshot) => {
         updateStatus(snapshot);
         refreshBlinks();

@@ -80,6 +80,7 @@ export interface RegistrationOptions {
   legacyRoot?: string | false;
   backends?: Backend[];
   workflowArtifactRoot?: string;
+  savedWorkflowRoot?: string;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   globalProfilesDir?: string;
@@ -259,6 +260,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   };
   const workflows = registerWorkflows(pi, {
     artifactRoot: options.workflowArtifactRoot,
+    savedWorkflowRoot: options.savedWorkflowRoot,
     defaultHarness: () => activeHarness,
     setInterval: options.setInterval,
     clearInterval: options.clearInterval,

@@ -93,19 +93,31 @@ Workflow scripts compose task-driven agents directly:
 ```js
 export default async function () {
   phase("Investigate");
-  const findings = await parallel([
-    () => agent("Inspect the architecture", { name: "architecture", access: "readOnly" }),
-    () => agent("Identify implementation risks", { name: "risks", independent: true, access: "readOnly" }),
-  ], { concurrency: 2 });
+  log("Inspecting architecture and implementation risks");
+  const findings = await pipeline(
+    ["architecture", "risks"],
+    (lens) => agent(`Inspect the ${lens}`, { name: `inspect:${lens}`, access: "readOnly" }),
+    (inspection, lens) => agent(`Verify the ${lens} findings:\n${inspection.output}`, {
+      name: `verify:${lens}`,
+      access: "readOnly",
+      independentOf: inspection.jobId,
+    }),
+  );
 
   phase("Implement");
   return agent(JSON.stringify(findings), { name: "implementation", access: "full" });
 }
 ```
 
-`agent(prompt, options?)` resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. Options support `name`/`label`, `access`, `harness`, exact harness-local `model`, `effort`, `independent`, `independentOf`, `profile`, `phase`, and bounded JSON `schema`. A sequential workflow can pass an implementation result's `jobId` as the reviewer's `independentOf`. `parallel()` accepts task functions with concurrency 1–4; the shared manager remains the authoritative global scheduler.
+`agent(prompt, options?)` resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. Options support `name`/`label`, `access`, `harness`, exact harness-local `model`, `effort`, `independent`, `independentOf`, `profile`, `phase`, and bounded JSON `schema`. A sequential workflow can pass an implementation result's `jobId` as the reviewer's `independentOf`. `pipeline(items, ...stages)` advances each item through its stages without waiting for unrelated items; failed stage functions drop only that item to `null`. `parallel()` remains the explicit barrier and accepts task functions with concurrency 1–4. Read-only agents can use all four shared slots; mutating workflow agents targeting the same checkout are serialized unless they request `isolation: "worktree"`. Worktree isolation requires a clean Git source checkout, creates a private per-agent branch/worktree, automatically removes unchanged work, and preserves changed work with branch plus patch metadata for explicit integration. `log(message)` emits bounded progress retained in artifacts and workflow cards. Exported `meta` name/description is published before the default workflow function settles. The shared manager remains the authoritative global scheduler and gives queued direct work the next available slot ahead of workflow fan-out.
 
-Workflow scripts, checkpoints, results, bounded transcripts, and reports are private under `~/.pi/agent/workflows/`, never the project. V1 does not resume interrupted execution; stale running checkpoints become `aborted`.
+The workflow tool accepts structured JSON through `input`. Its legacy `args` field remains available for callers that already pass a JSON-encoded string; callers must not provide both. Provide exactly one source: inline `script`, a saved `workflowName`, or a trusted project-local `scriptPath`. Saved definitions load from user `~/.pi/agent/workflow-definitions` and project `.pi/workflows`, with trusted-project precedence. `resumeFromRunId` starts a new auditable run, replays the source run's contiguous prefix of successfully completed calls, and reruns the first incomplete call plus its suffix. Replay is accepted only when the script, input, project cwd, approval, budget, and default routing context match exactly. Replayed calls retain their original result and route but add no usage to the new run.
+
+Workflow approval is host-enforced: `auto` uses trusted-project policy, `plan` rejects mutating agents, and `onMutate` requires one Pi UI confirmation before the run's first mutation and fails closed without an interactive host. Optional budgets bound agent calls, per-workflow concurrency, combined input/output tokens, turns, and cost. Token/turn/cost overruns abort the workflow and cancel active members; generous allowances are surfaced as advisory warnings.
+
+Each run keeps a private, append-only `journal.jsonl` with call ordinals, canonical prompt/options fingerprints, lifecycle transitions, results, routes, and usage. Journal appends are flushed before a call returns to the sandbox; a partial crash tail is ignored during recovery. `Date.now()`, zero-argument `new Date()`, and `Math.random()` are unavailable in workflow scripts so replay does not silently depend on local time or randomness. `/workflows` uses `p` to pause/resume at the next agent-dispatch boundary and `r` to restart the selected agent by replaying its prefix into a new run. Already-running provider turns finish while paused. Child-model and replay output provenance is retained, and instruction-shaped output is visibly flagged as untrusted data.
+
+Workflow scripts, journals, checkpoints, results, bounded transcripts, and reports are private under `~/.pi/agent/workflows/`, never the project. Restored running checkpoints become `aborted` and may then be resumed through their journal.
 
 ## Installation and development
 

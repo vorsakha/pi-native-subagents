@@ -57,7 +57,7 @@ export class CodexAppServerBackend implements Backend {
     const input = (text: string) => [{ type: "text", text }];
     const startTurn = async (text: string): Promise<void> => {
       turnOutput = "";
-      watchdog.touch();
+      watchdog.arm();
       emit({ type: "user_message", text });
       const turnResult = asObject(await peer.request("turn/start", {
         threadId,
@@ -126,7 +126,6 @@ export class CodexAppServerBackend implements Backend {
       },
     });
 
-    watchdog.arm();
     let startupAbortTeardown: Promise<void> | undefined;
     const abortStartup = () => {
       closing = true;

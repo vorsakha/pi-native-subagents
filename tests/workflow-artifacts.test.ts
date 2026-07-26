@@ -67,7 +67,7 @@ test("creates private workflow artifacts and redacts environment/auth values", a
   assert.match(created.runId, /^wf_[a-f0-9]+$/);
   assert.equal(created.artifactDir, join(root, created.runId));
   assert.deepEqual((await readdir(created.artifactDir)).sort(), [
-    "args.json", "result.json", "script.js", "transcripts.json", "workflow.json",
+    "args.json", "journal.jsonl", "result.json", "script.js", "transcripts.json", "workflow.json",
   ]);
   const persisted = await readFile(join(created.artifactDir, "args.json"), "utf8");
   assert.match(persisted, /safe/);
@@ -141,10 +141,12 @@ test("loads session summaries, ignores corrupt files, and durably aborts stale r
   assert.equal(summaries[0]?.agents[0]?.transcript?.at(-1)?.kind, "assistant");
 });
 
-test("no-resume loading aborts future checkpoints plus queued agents and pending phases", async () => {
+test("no-resume loading aborts paused future checkpoints plus queued agents and pending phases", async () => {
   const { root } = await fixture();
   const future = 99_999_999;
   const input = snapshot("future-session", future);
+  input.status = "paused";
+  input.timestamps.pausedAt = future;
   input.phases[0]!.status = "pending";
   input.agents[0]!.state = "queued";
   const created = await createWorkflowArtifacts(root, {

@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
   chmod,
   lstat,
@@ -11,12 +12,16 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type { TranscriptEntry } from "../types.ts";
-import type { WorkflowSnapshot } from "./types.ts";
+import type { WorkflowJournalRecord, WorkflowSnapshot } from "./types.ts";
 
 const RUN_ID_PATTERN = /^wf_[a-f0-9]+$/;
 const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 const TRANSCRIPT_ENTRY_BYTES = 4 * 1_024;
 const TRANSCRIPT_AGENT_BYTES = 32 * 1_024;
+const JOURNAL_RECORD_BYTES = 1 * 1_024 * 1_024;
+const JOURNAL_FILE_BYTES = 72 * 1_024 * 1_024;
+const MAX_JOURNAL_RECORDS = 256;
+const journalWrites = new Map<string, Promise<void>>();
 
 export interface WorkflowSerializationLimits {
   maxDepth: number;
@@ -269,6 +274,11 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
     transcriptArtifact: "transcripts.json",
     reportArtifact: snapshot.reportArtifact,
     result: serializeWorkflowValue(snapshot.result, { maxNodes: 4_000, maxStringBytes: 16 * 1024, maxTotalBytes: 64 * 1024 }),
+    logs: snapshot.logs?.slice(-128).map((entry) => ({
+      index: entry.index,
+      message: truncateUtf8(entry.message, 4 * 1024),
+      at: entry.at,
+    })),
     phases: snapshot.phases.slice(0, 64).map((phase) => ({
       ...phase,
       name: truncateUtf8(phase.name, 1_000),
@@ -323,6 +333,85 @@ async function requireRunDirectory(root: string, runId: string): Promise<string>
   return directory;
 }
 
+function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<WorkflowJournalRecord>;
+  if (record.version !== 1 || !Number.isSafeInteger(record.sequence) || record.sequence! < 0 || record.sequence! >= MAX_JOURNAL_RECORDS
+      || !Number.isSafeInteger(record.callIndex) || record.callIndex! < 0 || record.callIndex! >= 32
+      || typeof record.fingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(record.fingerprint)
+      || !["started", "completed", "failed"].includes(record.state ?? "")
+      || typeof record.at !== "number" || !Number.isFinite(record.at)) return false;
+  if (record.agentIndex !== undefined && (!Number.isSafeInteger(record.agentIndex) || record.agentIndex! < 0 || record.agentIndex! >= 32)) return false;
+  if (record.replayedFrom !== undefined && (typeof record.replayedFrom.runId !== "string"
+      || !RUN_ID_PATTERN.test(record.replayedFrom.runId) || !Number.isSafeInteger(record.replayedFrom.callIndex)
+      || record.replayedFrom.callIndex < 0 || record.replayedFrom.callIndex >= 32)) return false;
+  if (record.route !== undefined && (record.route === null || typeof record.route !== "object"
+      || record.route.harness !== undefined && !["pi", "claude", "codex"].includes(record.route.harness)
+      || record.route.jobId !== undefined && (typeof record.route.jobId !== "string" || !record.route.jobId || record.route.jobId.length > 200)
+      || record.route.model !== undefined && (typeof record.route.model !== "string" || record.route.model.length > 256))) return false;
+  if (record.state === "started") return record.result === undefined && record.route === undefined && record.replayedFrom === undefined;
+  if (!record.result || typeof record.result !== "object" || typeof record.result.ok !== "boolean"
+      || typeof record.result.output !== "string" || record.result.output.length > JOURNAL_RECORD_BYTES
+      || record.result.jobId !== undefined && (typeof record.result.jobId !== "string" || !record.result.jobId || record.result.jobId.length > 200)
+      || record.result.error !== undefined && typeof record.result.error !== "string") return false;
+  return record.state === "completed" ? record.result.ok : !record.result.ok;
+}
+
+async function appendJournalLine(path: string, record: WorkflowJournalRecord): Promise<void> {
+  const contents = `${JSON.stringify(record)}\n`;
+  if (Buffer.byteLength(contents) > JOURNAL_RECORD_BYTES) throw new Error("Workflow journal record exceeds the 1 MiB limit");
+  const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0);
+  const handle = await open(path, flags, 0o600);
+  try {
+    const info = await handle.stat();
+    if (!info.isFile()) throw new Error("Workflow journal is not a regular file");
+    if (info.size + Buffer.byteLength(contents) > JOURNAL_FILE_BYTES) throw new Error("Workflow journal exceeds the 72 MiB limit");
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+    await handle.chmod(0o600);
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function appendWorkflowJournal(root: string, runId: string, record: WorkflowJournalRecord): Promise<void> {
+  if (!isWorkflowJournalRecord(record)) throw new Error("Invalid workflow journal record");
+  const directory = await requireRunDirectory(root, runId);
+  const path = join(directory, "journal.jsonl");
+  const previous = journalWrites.get(path) ?? Promise.resolve();
+  const write = previous.catch(() => undefined).then(() => appendJournalLine(path, record));
+  journalWrites.set(path, write);
+  try { await write; }
+  finally { if (journalWrites.get(path) === write) journalWrites.delete(path); }
+}
+
+/** Load the durable prefix only. A partial tail from a crash is ignored; a
+ * malformed or out-of-sequence complete line stops replay before corruption. */
+export async function loadWorkflowJournal(root: string, runId: string): Promise<WorkflowJournalRecord[]> {
+  const directory = await requireRunDirectory(root, runId);
+  const path = join(directory, "journal.jsonl");
+  let info;
+  try { info = await lstat(path); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Workflow journal is not a regular file: ${runId}`);
+  if (info.size > JOURNAL_FILE_BYTES) throw new Error("Workflow journal exceeds the 72 MiB limit");
+  const contents = await readFile(path, "utf8");
+  const complete = contents.endsWith("\n") ? contents : contents.slice(0, contents.lastIndexOf("\n") + 1);
+  const records: WorkflowJournalRecord[] = [];
+  for (const line of complete.split("\n")) {
+    if (!line) continue;
+    if (records.length >= MAX_JOURNAL_RECORDS || Buffer.byteLength(line) > JOURNAL_RECORD_BYTES) break;
+    let parsed: unknown;
+    try { parsed = JSON.parse(line); } catch { break; }
+    if (!isWorkflowJournalRecord(parsed) || parsed.sequence !== records.length) break;
+    records.push(parsed);
+  }
+  return records;
+}
+
 export async function createWorkflowArtifacts(
   root: string,
   input: CreateWorkflowArtifactsInput,
@@ -348,6 +437,7 @@ export async function createWorkflowArtifacts(
   try {
     await atomicWrite(join(artifactDir, "script.js"), input.script);
     await atomicWriteJson(join(artifactDir, "args.json"), input.args, input.limits);
+    await atomicWrite(join(artifactDir, "journal.jsonl"), "");
     await atomicWriteJson(join(artifactDir, "transcripts.json"), transcriptArtifact(workflow), { maxTotalBytes: 2 * 1024 * 1024 });
     await atomicWriteJson(join(artifactDir, "workflow.json"), workflow, input.limits);
     await atomicWriteJson(join(artifactDir, "result.json"), workflow.result ?? null, input.limits);
@@ -406,6 +496,11 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
     "## Phases",
     ...snapshot.phases.map((phase) => `- ${phase.name}: ${phase.status} (${phase.agents.length} agents)`),
     "",
+    ...(snapshot.logs?.length ? [
+      "## Progress",
+      ...snapshot.logs.slice(-32).map((entry) => `- ${truncateUtf8(entry.message, 4 * 1024)}`),
+      "",
+    ] : []),
     "## Agents",
     ...snapshot.agents.map((agent) => `### ${agent.name}\n\n- Access: ${agent.access}\n- Profile: ${agent.profile ?? "none"}\n- Independent: ${agent.independent ? "yes" : "no"}\n- Status: ${agent.state}\n- Route: ${agent.harness ?? "?"}/${agent.model ?? "?"}\n- Effort: ${agent.effort ?? "adaptive"}\n\n${truncateUtf8(String(agent.output ?? agent.preview ?? agent.error ?? "(no output)"), 8 * 1024)}\n`),
     "## Result",
@@ -447,6 +542,10 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
     && typeof candidate.timestamps === "object"
     && typeof candidate.timestamps.createdAt === "number"
     && typeof candidate.timestamps.updatedAt === "number"
+    && (candidate.approval === undefined || candidate.approval === "auto" || candidate.approval === "plan" || candidate.approval === "onMutate")
+    && (candidate.budget === undefined || !!candidate.budget && typeof candidate.budget === "object" && !Array.isArray(candidate.budget)
+      && Object.keys(candidate.budget).every((key) => ["maxAgents", "maxConcurrency", "maxTokens", "maxCost", "maxTurns"].includes(key))
+      && Object.values(candidate.budget).every((item) => item === undefined || typeof item === "number" && Number.isFinite(item) && item > 0))
     && Array.isArray(candidate.phases)
     && Array.isArray(candidate.agents)
     && candidate.agents.every((agent) => !!agent && typeof agent === "object"
@@ -456,7 +555,7 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
 }
 
 function abortStaleWorkflow(snapshot: WorkflowSnapshot, now: number, staleAfterMs: number): WorkflowSnapshot {
-  if (snapshot.status !== "running") return snapshot;
+  if (snapshot.status !== "running" && snapshot.status !== "paused") return snapshot;
   // staleAfterMs=0 is the explicit no-resume mode: every restored running
   // checkpoint is from a previous manager, even with equal/future timestamps.
   if (staleAfterMs > 0 && now - snapshot.timestamps.updatedAt <= staleAfterMs) return snapshot;
@@ -465,7 +564,7 @@ function abortStaleWorkflow(snapshot: WorkflowSnapshot, now: number, staleAfterM
     ...snapshot,
     status: "aborted",
     error,
-    timestamps: { ...snapshot.timestamps, updatedAt: now, endedAt: now },
+    timestamps: { ...snapshot.timestamps, updatedAt: now, pausedAt: undefined, endedAt: now },
     phases: snapshot.phases.map((phase) => phase.status === "running" || phase.status === "pending" ? {
       ...phase,
       status: "aborted",

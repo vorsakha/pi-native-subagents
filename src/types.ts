@@ -134,6 +134,8 @@ export interface SpawnRequest {
   independent?: boolean;
   /** Route on a native provider different from this existing session-scoped job. */
   independentOf?: string;
+  /** Internal durable-replay hint used only when independentOf names a prior-session job no longer retained by JobManager. */
+  independentOfProvider?: ProviderFamily;
   profile?: string;
   /** Internal configured fallback; not exposed as a model-facing tool field. */
   defaultHarness?: HarnessName;

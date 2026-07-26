@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { KeybindingsManager } from "@earendil-works/pi-tui";
+import { type KeybindingsManager, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
   createWorkflowsDashboardOverlay,
@@ -14,7 +14,8 @@ const theme = {
 } as unknown as Theme;
 
 function workflow(id: string, status: WorkflowSnapshot["status"] = "running"): WorkflowSnapshot {
-  const settledAgentState = status === "pending" ? "queued" as const : status;
+  const settledAgentState = status === "pending" ? "queued" as const : status === "paused" ? "running" as const : status;
+  const terminal = status === "completed" || status === "failed" || status === "aborted";
   return {
     runId: id,
     sessionId: "session",
@@ -22,18 +23,18 @@ function workflow(id: string, status: WorkflowSnapshot["status"] = "running"): W
     description: "Review and verify Unicode output 你好世界",
     background: true,
     status,
-    timestamps: { createdAt: 1_000, updatedAt: 3_000, startedAt: 2_000, ...(status === "running" ? {} : { endedAt: 4_000 }) },
+    timestamps: { createdAt: 1_000, updatedAt: 3_000, startedAt: 2_000, ...(status === "paused" ? { pausedAt: 3_000 } : {}), ...(terminal ? { endedAt: 4_000 } : {}) },
     currentPhase: 0,
     phases: [{ index: 0, name: "Verification", status, timestamps: { createdAt: 1_000, updatedAt: 3_000 }, agents: [0, 1] }],
     agents: [
       {
-        index: 0, name: "review", access: "readOnly", independent: false, phase: 0, state: status === "running" ? "completed" : settledAgentState,
+        index: 0, callIndex: 0, name: "review", access: "readOnly", independent: false, phase: 0, state: status === "running" || status === "paused" ? "completed" : settledAgentState,
         timestamps: { createdAt: 1_000, updatedAt: 3_000, startedAt: 2_000 }, harness: "claude", model: "claude-fixture-model", effort: "high",
         jobId: "review-job-0001", prompt: "Review the implementation", tools: [{ id: "read-1", name: "read", summary: "src/index.ts", status: "completed" }],
         output: "review result", preview: "review result", usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.01, turns: 1 },
       },
       {
-        index: 1, name: "tests", access: "full", independent: false, phase: 0, state: status === "running" ? "running" : settledAgentState,
+        index: 1, callIndex: 1, name: "tests", access: "full", independent: false, phase: 0, state: status === "running" || status === "paused" ? "running" : settledAgentState,
         timestamps: { createdAt: 1_000, updatedAt: 3_000, startedAt: 2_000 }, harness: "codex", model: "codex-fixture-model", effort: "medium",
         jobId: "tests-job-0002", prompt: "\u001b[31mRun the affected tests\u001b[0m", liveThinking: "\u001b]0;bad\u0007checking failures", tools: [{ id: "bash-1", name: "bash", summary: "npm test", status: "running" }],
         output: Array.from({ length: 60 }, (_, index) => `test result ${index}`).join("\n"), preview: "test result 59",
@@ -70,6 +71,17 @@ function harness(
       if (agent) agent.state = "cancelled";
       return run;
     },
+    pause: async (runId: string) => {
+      const run = runs.find((candidate) => candidate.runId === runId)!;
+      run.status = "paused";
+      return run;
+    },
+    resume: async (runId: string) => {
+      const run = runs.find((candidate) => candidate.runId === runId)!;
+      run.status = "running";
+      return run;
+    },
+    restartAgent: async (runId: string) => ({ snapshot: runs.find((candidate) => candidate.runId === runId)! }),
     subscribe: (next: (snapshot: WorkflowSnapshot) => void) => {
       listener = next;
       return () => { unsubscribed++; };
@@ -205,7 +217,17 @@ test("dashboard navigation, cancellation, and scrolling share one interaction co
   const { overlay } = harness([first, second], 30, (action) => actions.push(action));
   t.after(() => overlay.dispose());
 
-  overlay.render(52);
+  overlay.focused = true;
+  const chrome = overlay.render(52);
+  assert.ok(chrome[0]?.includes("Workflow runs"));
+  assert.ok(chrome[0]?.includes("2 runs"));
+  assert.ok(chrome[1]?.startsWith("╭─ runs · 2 active / 2 "));
+  assert.ok(chrome.some((line) => line.startsWith("├─ detail · phase 1/1 · filter all ")));
+  assert.equal(chrome.at(-2), `╰${"─".repeat(50)}╯`);
+  assert.ok(chrome.at(-1)?.includes("Esc close"));
+  assert.ok(!chrome.some((line) => /[╔╗╚╝═║]/.test(line)), "focused state keeps the calm single-line frame");
+  assert.ok(chrome.length <= 24, "dashboard respects the 80% terminal-height cap");
+  assert.ok(chrome.every((line) => visibleWidth(line) <= 52));
   overlay.handleInput("\t");
   assert.ok(overlay.render(52).some((line) => line.includes("tests")));
   overlay.handleInput("\r");
@@ -238,4 +260,28 @@ test("dashboard navigation, cancellation, and scrolling share one interaction co
   assert.ok(!activeOnly.some((line) => line.includes("reviewer")), "status filter hides completed agents");
   filtered.handleInput("x");
   assert.deepEqual(agentActions, [{ type: "cancelAgent", runId: "agent-action", agentIndex: 1 }]);
+
+  const pauseActions: unknown[] = [];
+  const pausable = harness([workflow("pausable")], 30, (action) => pauseActions.push(action)).overlay;
+  t.after(() => pausable.dispose());
+  pausable.render(72);
+  assert.ok(pausable.render(72).at(-1)?.includes("p pause"));
+  pausable.handleInput("p");
+  assert.deepEqual(pauseActions, [{ type: "pause", runId: "pausable" }]);
+
+  const resumeActions: unknown[] = [];
+  const resumable = harness([workflow("resumable", "paused")], 30, (action) => resumeActions.push(action)).overlay;
+  t.after(() => resumable.dispose());
+  resumable.render(72);
+  assert.ok(resumable.render(72).some((line) => line.includes("Ⅱ")));
+  assert.ok(resumable.render(72).at(-1)?.includes("p resume"));
+  resumable.handleInput("p");
+  assert.deepEqual(resumeActions, [{ type: "resume", runId: "resumable" }]);
+
+  const restartActions: unknown[] = [];
+  const restartable = harness([workflow("restartable", "completed")], 30, (action) => restartActions.push(action)).overlay;
+  t.after(() => restartable.dispose());
+  restartable.render(72);
+  restartable.handleInput("r");
+  assert.deepEqual(restartActions, [{ type: "restartAgent", runId: "restartable", agentIndex: 0 }]);
 });

@@ -13,10 +13,10 @@ Build a standalone Pi extension providing first-class generic subagent lifecycle
 - Default to the Pi harness so provider and model choice come from the user's Pi configuration; keep native Claude and Codex as equal explicit routes.
 - Preserve subscription authentication for native Claude and Codex and never inherit environment state that could silently switch billing modes; Pi children inherit Pi's provider environment.
 - Provide background spawn/wait/check/send/cancel/list, retained-session follow-up, foreground `subagent`, and one-shot delivery for unconsumed background results.
-- Provide sandboxed workflows with phases, sequential/bounded-parallel generic agents, schemas, foreground/background execution, private durable artifacts, delivery, and `/workflows` inspection.
+- Provide sandboxed workflows with phases, bounded progress logs, sequential/bounded-parallel/pipelined generic agents, schemas, structured inputs, append-only call journals, deterministic prefix replay, pause/resume and selected-agent restart, saved definitions, host approvals, budgets, foreground/background execution, private durable artifacts, delivery, and `/workflows` inspection/control.
 - Disable nested child delegation. Children must not receive subagent or workflow capabilities.
 - Default-deny untrusted execution and constrain child working directories to the trusted project.
-- Preserve four concurrent jobs, bounded output/shutdown, cancellation, process-tree cleanup, and workflow source/args/result limits.
+- Preserve four concurrent jobs, direct-job queue priority, bounded startup/output/shutdown/cancellation, process-tree cleanup, and workflow source/args/result limits. Serialize mutating workflow agents that share one checkout unless they use clean-source worktree isolation with explicit preservation metadata.
 - Keep full transcripts and workflow runtime artifacts private and out of Git.
 
 ## Engineering constraints

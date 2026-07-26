@@ -1,3 +1,4 @@
+import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { TSchema } from "typebox";
 import { Check } from "typebox/value";
@@ -6,17 +7,26 @@ import { isTerminal } from "../manager.ts";
 import { normalizeModel } from "../policy.ts";
 import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProviderFamily, Usage } from "../types.ts";
 import {
+  appendWorkflowJournal,
   checkpointWorkflow,
   createWorkflowArtifacts,
+  loadWorkflowJournal,
   loadWorkflowSummaries,
   writeWorkflowReport,
   writeWorkflowResult,
 } from "./artifacts.ts";
-import { runWorkflowSandbox, type WorkflowAgentResult } from "./sandbox.ts";
+import { replayableJournalPrefix, workflowCallFingerprint, workflowDefinitionFingerprint } from "./journal.ts";
+import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
+import { finishWorkflowWorktree, prepareWorkflowWorktree, type WorkflowWorktreeHandle } from "./worktree.ts";
 import type {
   WorkflowAgentRecord,
   WorkflowAgentState,
+  WorkflowJournalRecord,
+  WorkflowJournalResult,
+  WorkflowApprovalMode,
+  WorkflowBudgetPolicy,
   WorkflowPhase,
+  WorkflowReplayCall,
   WorkflowSnapshot,
   WorkflowStatus,
   WorkflowUsage,
@@ -27,6 +37,7 @@ const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
 const ACCESS = new Set<AccessMode>(["readOnly", "full"]);
 const CHECKPOINT_DELAY_MS = 150;
 const MAX_RETAINED_RUNS = 64;
+const MAX_WORKFLOW_LOGS = 128;
 export const MAX_WORKFLOW_PHASES = 64;
 
 export interface StartWorkflowRequest {
@@ -40,11 +51,24 @@ export interface StartWorkflowRequest {
   trusted: boolean;
   parentProvider?: ProviderFamily;
   defaultHarness?: HarnessName;
+  /** Replay the completed call prefix from this terminal run. The definition and execution context must match exactly. */
+  resumeFromRunId?: string;
+  /** Internal dashboard control: force replay invalidation at this call ordinal. */
+  restartFromCallIndex?: number;
+  approval?: WorkflowApprovalMode;
+  budget?: WorkflowBudgetPolicy;
 }
 
 export interface StartedWorkflow {
   snapshot: WorkflowSnapshot;
   completion: Promise<WorkflowSnapshot>;
+}
+
+interface ReplayRuntime {
+  sourceRunId: string;
+  calls: WorkflowReplayCall[];
+  active: boolean;
+  priorJobProviders: Map<string, ProviderFamily>;
 }
 
 interface RunEntry {
@@ -53,6 +77,16 @@ interface RunEntry {
   completion: Promise<WorkflowSnapshot>;
   checkpointTimer?: NodeJS.Timeout;
   persistChain: Promise<void>;
+  journalChain: Promise<void>;
+  journalSequence: number;
+  nextCallIndex: number;
+  replay?: ReplayRuntime;
+  request?: StartWorkflowRequest;
+  pauseWaiters: Set<() => void>;
+  mutationApproved: boolean;
+  approvalPromise?: Promise<boolean>;
+  activeDispatches: number;
+  dispatchWaiters: Set<() => void>;
 }
 
 function workflowUsage(usage?: Partial<Usage>): WorkflowUsage {
@@ -79,6 +113,12 @@ function label(value: unknown, fallback: string): string {
   return (text || fallback).slice(0, 160);
 }
 
+function looksInstructionShaped(value: unknown): boolean {
+  if (typeof value !== "string" || !value) return false;
+  const sample = value.slice(0, 32 * 1024);
+  return /(?:ignore|disregard|override).{0,80}(?:previous|prior|system|developer|instructions?)|(?:system|developer)\s+(?:message|instructions?)\s*:|you\s+must\s+(?:now\s+)?(?:ignore|disregard|override)/is.test(sample);
+}
+
 function agentState(job: JobSnapshot): WorkflowAgentState {
   switch (job.status) {
     case "completed": return "completed";
@@ -93,21 +133,35 @@ function terminalWorkflow(status: WorkflowStatus): boolean {
   return status === "completed" || status === "failed" || status === "aborted";
 }
 
+function abortError(reason: unknown): Error {
+  const error = reason instanceof Error ? reason : new Error(String(reason ?? "Workflow aborted"));
+  error.name = "AbortError";
+  return error;
+}
+
 export class WorkflowManager {
   readonly #jobs: JobManager;
   readonly #artifactRoot: string;
   readonly #sessionId: string;
   readonly #runs = new Map<string, RunEntry>();
   readonly #jobOwners = new Map<string, { runId: string; agentIndex: number }>();
+  readonly #mutationTails = new Map<string, Promise<void>>();
   readonly #listeners = new Set<(snapshot: WorkflowSnapshot) => void>();
   readonly #unsubscribeJobs: () => void;
+  readonly #approveMutation?: (request: { runId: string; workflow: string; agent: string; prompt: string; signal: AbortSignal }) => Promise<boolean>;
   #initializing?: Promise<void>;
   #closed = false;
 
-  constructor(options: { jobs: JobManager; artifactRoot: string; sessionId: string }) {
+  constructor(options: {
+    jobs: JobManager;
+    artifactRoot: string;
+    sessionId: string;
+    approveMutation?: (request: { runId: string; workflow: string; agent: string; prompt: string; signal: AbortSignal }) => Promise<boolean>;
+  }) {
     this.#jobs = options.jobs;
     this.#artifactRoot = resolve(options.artifactRoot);
     this.#sessionId = options.sessionId;
+    this.#approveMutation = options.approveMutation;
     this.#unsubscribeJobs = this.#jobs.subscribe((job, event) => this.#updateAgentFromJob(job, event));
   }
 
@@ -123,6 +177,13 @@ export class WorkflowManager {
           controller,
           completion,
           persistChain: Promise.resolve(),
+          journalChain: Promise.resolve(),
+          journalSequence: 0,
+          nextCallIndex: 0,
+          pauseWaiters: new Set(),
+          mutationApproved: false,
+          activeDispatches: 0,
+          dispatchWaiters: new Set(),
         });
       }
     })();
@@ -153,6 +214,46 @@ export class WorkflowManager {
     await this.initialize();
     if (this.#closed) throw new Error("Workflow manager is closed");
     if (!request.script.trim()) throw new Error("Workflow script must not be empty");
+    const argsJson = serializeWorkflowArgs(request.args ?? null);
+    const approval = request.approval ?? "auto";
+    if (!["auto", "plan", "onMutate"].includes(approval)) throw new Error(`Unknown workflow approval mode: ${approval}`);
+    const budget = normalizeWorkflowBudget(request.budget);
+    const definitionFingerprint = workflowDefinitionFingerprint({
+      script: request.script,
+      argsJson,
+      cwd: resolve(request.cwd),
+      parentProvider: request.parentProvider,
+      defaultHarness: request.defaultHarness,
+      approval,
+      budget,
+    });
+    let replay: ReplayRuntime | undefined;
+    if (request.resumeFromRunId) {
+      const source = this.#runs.get(request.resumeFromRunId);
+      if (!source) throw new Error(`Unknown workflow replay source: ${request.resumeFromRunId}`);
+      if (!terminalWorkflow(source.snapshot.status)) throw new Error("Cannot resume from an active workflow");
+      if (!source.snapshot.definitionFingerprint) throw new Error("Workflow predates durable replay and cannot be resumed");
+      if (source.snapshot.definitionFingerprint !== definitionFingerprint) {
+        throw new Error("Workflow definition or execution context does not match the replay source");
+      }
+      const restartAt = request.restartFromCallIndex;
+      if (restartAt !== undefined && (!Number.isSafeInteger(restartAt) || restartAt < 0 || restartAt >= 32)) {
+        throw new Error("restartFromCallIndex must be an agent call ordinal from 0 to 31");
+      }
+      const prefix = replayableJournalPrefix(await loadWorkflowJournal(this.#artifactRoot, source.snapshot.runId));
+      const calls = restartAt === undefined ? prefix : prefix.filter((call) => call.callIndex < restartAt);
+      replay = {
+        sourceRunId: source.snapshot.runId,
+        calls,
+        active: true,
+        priorJobProviders: new Map(calls.flatMap((call) => {
+          const jobId = call.result.jobId ?? call.route?.jobId;
+          const harness = call.route?.harness;
+          return jobId && (harness === "claude" || harness === "codex") ? [[jobId, harness] as const] : [];
+        })),
+      };
+    }
+    const warnings = workflowBudgetWarnings(budget);
     const now = Date.now();
     const base: Omit<WorkflowSnapshot, "runId" | "artifactDir"> = {
       sessionId: request.sessionId,
@@ -164,6 +265,17 @@ export class WorkflowManager {
       currentPhase: null,
       phases: [],
       agents: [],
+      logs: [],
+      definitionFingerprint,
+      journalArtifact: "journal.jsonl",
+      approval,
+      budget,
+      warnings: warnings.length ? warnings : undefined,
+      replay: replay ? {
+        sourceRunId: replay.sourceRunId,
+        matchedCalls: 0,
+        invalidatedAt: request.restartFromCallIndex,
+      } : undefined,
     };
     const snapshot = await createWorkflowArtifacts(this.#artifactRoot, {
       script: request.script,
@@ -177,6 +289,15 @@ export class WorkflowManager {
       controller,
       completion: Promise.resolve(snapshot),
       persistChain: Promise.resolve(),
+      journalChain: Promise.resolve(),
+      journalSequence: 0,
+      nextCallIndex: 0,
+      replay,
+      request: clone(request),
+      pauseWaiters: new Set(),
+      mutationApproved: approval === "auto",
+      activeDispatches: 0,
+      dispatchWaiters: new Set(),
     };
     this.#runs.set(snapshot.runId, entry);
     entry.completion = this.#execute(entry, request);
@@ -190,7 +311,48 @@ export class WorkflowManager {
     if (terminalWorkflow(entry.snapshot.status)) return clone(entry.snapshot);
     entry.snapshot.error = boundedText(reason);
     entry.controller.abort(new Error(reason));
+    this.#releasePause(entry);
     return entry.completion;
+  }
+
+  async pause(runId: string): Promise<WorkflowSnapshot> {
+    const entry = this.#runs.get(runId);
+    if (!entry) throw new Error(`Unknown workflow: ${runId}`);
+    if (terminalWorkflow(entry.snapshot.status)) throw new Error("Cannot pause a terminal workflow");
+    if (entry.snapshot.status === "paused") return this.check(runId);
+    entry.snapshot.status = "paused";
+    entry.snapshot.timestamps.pausedAt = Date.now();
+    this.#touch(entry);
+    await this.#flushCheckpoint(entry);
+    return this.check(runId);
+  }
+
+  async resume(runId: string): Promise<WorkflowSnapshot> {
+    const entry = this.#runs.get(runId);
+    if (!entry) throw new Error(`Unknown workflow: ${runId}`);
+    if (terminalWorkflow(entry.snapshot.status)) throw new Error("Cannot resume a terminal workflow in place; start a journal replay instead");
+    if (entry.snapshot.status !== "paused") return this.check(runId);
+    entry.snapshot.status = "running";
+    entry.snapshot.timestamps.pausedAt = undefined;
+    this.#releasePause(entry);
+    this.#touch(entry);
+    await this.#flushCheckpoint(entry);
+    return this.check(runId);
+  }
+
+  async restartAgent(runId: string, agentIndex: number): Promise<StartedWorkflow> {
+    const entry = this.#runs.get(runId);
+    if (!entry) throw new Error(`Unknown workflow: ${runId}`);
+    const agent = entry.snapshot.agents.find((candidate) => candidate.index === agentIndex);
+    if (!agent) throw new Error(`Unknown workflow agent: ${agentIndex}`);
+    if (agent.callIndex === undefined) throw new Error("Workflow agent predates durable replay and cannot be restarted");
+    if (!entry.request) throw new Error("Workflow definition is unavailable in this session; rerun the workflow tool with resumeFromRunId");
+    if (!terminalWorkflow(entry.snapshot.status)) await this.cancel(runId, `Restarting workflow from agent ${agent.name}`);
+    return this.start({
+      ...clone(entry.request),
+      resumeFromRunId: runId,
+      restartFromCallIndex: agent.callIndex,
+    });
   }
 
   async cancelAgent(runId: string, agentIndex: number, reason = "Workflow agent cancelled by user"): Promise<WorkflowSnapshot> {
@@ -212,6 +374,7 @@ export class WorkflowManager {
     for (const entry of active) {
       entry.snapshot.error = "Session shutdown";
       entry.controller.abort(new Error("Session shutdown"));
+      this.#releasePause(entry);
     }
     let timer: NodeJS.Timeout | undefined;
     await Promise.race([
@@ -234,14 +397,12 @@ export class WorkflowManager {
         args: request.args ?? null,
         cwd: request.cwd,
         signal: entry.controller.signal,
+        onMeta: (meta) => this.#applyMeta(entry, meta),
         onPhase: (title) => this.#activatePhase(entry, title),
-        onAgent: (prompt, options, signal) => this.#runAgent(entry, request, prompt, options, signal),
+        onLog: (message) => this.#recordLog(entry, message),
+        onAgent: (prompt, options, signal, callIndex) => this.#runAgent(entry, request, prompt, options, signal, callIndex),
       });
-      const meta = sandbox.meta && typeof sandbox.meta === "object" && !Array.isArray(sandbox.meta)
-        ? sandbox.meta as Record<string, unknown>
-        : undefined;
-      if (meta?.name !== undefined) entry.snapshot.name = label(meta.name, entry.snapshot.name);
-      if (meta?.description !== undefined) entry.snapshot.description = label(meta.description, entry.snapshot.description);
+      this.#applyMeta(entry, sandbox.meta);
       entry.snapshot.result = sandbox.result;
       entry.snapshot.status = "completed";
       this.#finishPhases(entry, "completed");
@@ -253,10 +414,13 @@ export class WorkflowManager {
       await this.#cancelMemberJobs(entry, entry.snapshot.error);
       this.#finishPhases(entry, entry.snapshot.status);
     } finally {
+      this.#releasePause(entry);
       const now = Date.now();
       entry.snapshot.timestamps.updatedAt = now;
+      entry.snapshot.timestamps.pausedAt = undefined;
       entry.snapshot.timestamps.endedAt = now;
       try {
+        await entry.journalChain;
         entry.snapshot.reportArtifact = "report.md";
         await writeWorkflowReport(this.#artifactRoot, entry.snapshot);
         await this.#flushCheckpoint(entry);
@@ -280,8 +444,101 @@ export class WorkflowManager {
     prompt: string,
     options: Record<string, unknown>,
     signal: AbortSignal,
+    callIndex: number,
+  ): Promise<WorkflowAgentResult> {
+    if (callIndex !== entry.nextCallIndex || callIndex < 0 || callIndex >= 32) {
+      throw new Error(`Workflow agent call ordinal is invalid or out of sequence: ${callIndex}`);
+    }
+    entry.nextCallIndex++;
+    const fingerprint = workflowCallFingerprint(prompt, options);
+    await this.#appendJournal(entry, {
+      callIndex,
+      fingerprint,
+      state: "started",
+      at: Date.now(),
+    });
+    await this.#waitUntilResumed(entry, signal);
+
+    const expected = entry.replay?.active && callIndex < (entry.snapshot.budget?.maxAgents ?? 32)
+      ? entry.replay.calls[callIndex]
+      : undefined;
+    if (entry.replay?.active && expected?.fingerprint === fingerprint) {
+      const record = this.#recordReplayedAgent(entry, prompt, options, callIndex, fingerprint, expected);
+      entry.snapshot.replay!.matchedCalls++;
+      await this.#appendJournal(entry, {
+        callIndex,
+        fingerprint,
+        state: "completed",
+        at: Date.now(),
+        agentIndex: record.index,
+        result: clone(expected.result),
+        route: expected.route ? { ...expected.route } : undefined,
+        replayedFrom: { runId: entry.replay.sourceRunId, callIndex: expected.callIndex },
+      });
+      this.#touch(entry);
+      return clone(expected.result);
+    }
+    if (entry.replay?.active) {
+      entry.replay.active = false;
+      entry.snapshot.replay!.invalidatedAt = callIndex;
+      this.#touch(entry);
+    }
+
+    let result: WorkflowAgentResult;
+    try {
+      const execute = () => this.#runFreshAgent(entry, request, prompt, options, signal, callIndex, fingerprint);
+      const isolated = () => options.access === "readOnly" || options.isolation === "worktree"
+        ? execute()
+        : this.#withMutationLock(request.cwd, signal, execute);
+      result = await this.#withDispatchSlot(entry, signal, isolated);
+    } catch (error) {
+      const failed = { ok: false, output: "", error: boundedText(error) } satisfies WorkflowJournalResult;
+      await this.#appendJournal(entry, {
+        callIndex,
+        fingerprint,
+        state: "failed",
+        at: Date.now(),
+        result: failed,
+      });
+      throw error;
+    }
+    const record = entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
+    const budgetError = this.#budgetViolation(entry);
+    if (budgetError) {
+      result = { ...result, ok: false, error: budgetError };
+      if (record) {
+        record.state = "failed";
+        record.error = budgetError;
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt ??= record.timestamps.updatedAt;
+      }
+      entry.snapshot.error = budgetError;
+    }
+    await this.#appendJournal(entry, {
+      callIndex,
+      fingerprint,
+      state: result.ok ? "completed" : "failed",
+      at: Date.now(),
+      agentIndex: record?.index,
+      result: clone(result) as WorkflowJournalResult,
+      route: record ? { jobId: record.jobId, harness: record.harness as HarnessName | undefined, model: record.model } : undefined,
+    });
+    if (budgetError) entry.controller.abort(new Error(budgetError));
+    return result;
+  }
+
+  async #runFreshAgent(
+    entry: RunEntry,
+    request: StartWorkflowRequest,
+    prompt: string,
+    options: Record<string, unknown>,
+    signal: AbortSignal,
+    callIndex: number,
+    fingerprint: string,
   ): Promise<WorkflowAgentResult> {
     if (!prompt.trim()) return { ok: false, output: "", error: "agent() requires a non-empty prompt" };
+    const preflightError = this.#budgetPreflight(entry);
+    if (preflightError) return { ok: false, output: "", error: preflightError };
     if (["role", "agent", "tier", "modelTier", "modelProfile", "backend"].some((key) => Object.hasOwn(options, key))) {
       return { ok: false, output: "", error: "Workflow agent() API schema mismatch: use the current task-driven schema." };
     }
@@ -295,9 +552,20 @@ export class WorkflowManager {
     if (effort && !EFFORTS.has(effort)) return { ok: false, output: "", error: `Unknown effort: ${effort}` };
     const access = options.access === undefined ? undefined : String(options.access) as AccessMode;
     if (access && !ACCESS.has(access)) return { ok: false, output: "", error: `Unknown access: ${access}` };
+    if (callIndex >= (entry.snapshot.budget?.maxAgents ?? 32)) {
+      return { ok: false, output: "", error: `Workflow agent budget exceeded (${entry.snapshot.budget?.maxAgents} calls)` };
+    }
     if (options.independent !== undefined && typeof options.independent !== "boolean") return { ok: false, output: "", error: "independent must be boolean" };
     if (options.independentOf !== undefined && (typeof options.independentOf !== "string" || !options.independentOf.trim() || options.independentOf.trim().length > 200)) return { ok: false, output: "", error: "independentOf must be a job ID containing 1–200 characters" };
     if (options.profile !== undefined && (typeof options.profile !== "string" || !options.profile.trim())) return { ok: false, output: "", error: "profile must be a non-empty string" };
+    if (options.isolation !== undefined && options.isolation !== "worktree") return { ok: false, output: "", error: "isolation must be worktree when provided" };
+    if ((access ?? "full") === "full") {
+      const approved = await this.#authorizeMutation(entry, label(options.name ?? options.label, `agent-${callIndex + 1}`), prompt, signal);
+      if (!approved) return { ok: false, output: "", error: entry.snapshot.approval === "plan"
+        ? "Workflow approval mode plan forbids mutating agents"
+        : "Workflow mutation was not approved by the host" };
+    }
+    await this.#waitUntilResumed(entry, signal);
 
     const phase = typeof options.phase === "string"
       ? this.#ensurePhase(entry, options.phase)
@@ -308,6 +576,8 @@ export class WorkflowManager {
     const now = Date.now();
     const record: WorkflowAgentRecord = {
       index,
+      callIndex,
+      callFingerprint: fingerprint,
       name,
       access: access ?? "full",
       profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
@@ -338,12 +608,55 @@ export class WorkflowManager {
       ? `${prompt}\n\nReturn ONLY valid JSON matching this JSON Schema (no markdown fences):\n${JSON.stringify(schema)}`
       : prompt;
 
+    let worktree: WorkflowWorktreeHandle | undefined;
+    const finishIsolation = async () => {
+      if (!worktree) return;
+      const handle = worktree;
+      worktree = undefined;
+      try {
+        record.isolation = await this.#withMutationLock(request.cwd, new AbortController().signal, () => finishWorkflowWorktree(handle, entry.snapshot.artifactDir));
+      } catch (error) {
+        record.isolation = {
+          type: "worktree",
+          state: "orphaned",
+          branch: handle.branch,
+          changed: true,
+          error: boundedText(error, 2_000),
+        };
+        this.#touch(entry);
+        throw error;
+      }
+      this.#touch(entry);
+    };
+    let agentCwd = request.cwd;
+    if (options.isolation === "worktree") {
+      try {
+        worktree = await this.#withMutationLock(request.cwd, signal, () => prepareWorkflowWorktree({
+          cwd: request.cwd,
+          artifactDir: entry.snapshot.artifactDir,
+          runId: entry.snapshot.runId,
+          agentIndex: index,
+        }));
+        agentCwd = worktree.path;
+      } catch (error) {
+        record.state = "failed";
+        record.error = boundedText(error);
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt = record.timestamps.updatedAt;
+        this.#touch(entry);
+        return { ok: false, output: "", error: record.error };
+      }
+    }
+
+    const replayIndependenceProvider = record.independentOf
+      ? entry.replay?.priorJobProviders.get(record.independentOf)
+      : undefined;
     let job: JobSnapshot;
     try {
       job = this.#jobs.spawn({
         name,
         task,
-        cwd: request.cwd,
+        cwd: agentCwd,
         trusted: request.trusted,
         harness,
         model,
@@ -351,6 +664,7 @@ export class WorkflowManager {
         access,
         independent: options.independent === true,
         independentOf: record.independentOf,
+        independentOfProvider: replayIndependenceProvider,
         profile: record.profile,
         defaultHarness: request.defaultHarness,
         parentProvider: request.parentProvider,
@@ -362,6 +676,7 @@ export class WorkflowManager {
         },
       });
     } catch (error) {
+      await finishIsolation().catch(() => undefined);
       record.state = "failed";
       record.error = boundedText(error);
       record.timestamps.updatedAt = Date.now();
@@ -417,6 +732,191 @@ export class WorkflowManager {
       return { ok: false, output: final.output, jobId: final.id, error: boundedText(error), usage: clone(final.usage) };
     } finally {
       signal.removeEventListener("abort", abort);
+      try { await finishIsolation(); }
+      catch (error) {
+        record.state = "failed";
+        record.error = boundedText(error);
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt ??= record.timestamps.updatedAt;
+        this.#touch(entry);
+        throw error;
+      }
+    }
+  }
+
+  #recordReplayedAgent(
+    entry: RunEntry,
+    prompt: string,
+    options: Record<string, unknown>,
+    callIndex: number,
+    fingerprint: string,
+    replay: WorkflowReplayCall,
+  ): WorkflowAgentRecord {
+    const phase = typeof options.phase === "string"
+      ? this.#ensurePhase(entry, options.phase)
+      : entry.snapshot.currentPhase ?? this.#ensurePhase(entry, "Agents");
+    this.#markPhaseRunning(entry, phase);
+    const index = entry.snapshot.agents.length;
+    const now = Date.now();
+    const access = options.access === "readOnly" ? "readOnly" : "full";
+    const independentOf = typeof options.independentOf === "string" ? options.independentOf.trim() : undefined;
+    const replayEffort = typeof options.effort === "string" && EFFORTS.has(options.effort as EffortLevel)
+      ? options.effort as EffortLevel
+      : undefined;
+    const record: WorkflowAgentRecord = {
+      index,
+      callIndex,
+      callFingerprint: fingerprint,
+      replayedFrom: { runId: entry.replay!.sourceRunId, callIndex: replay.callIndex },
+      outputProvenance: "replay",
+      instructionShaped: looksInstructionShaped(replay.result.output),
+      name: label(options.name ?? options.label, `agent-${index + 1}`),
+      access,
+      profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
+      independent: options.independent === true || independentOf !== undefined,
+      independentOf,
+      phase,
+      jobId: replay.result.jobId ?? replay.route?.jobId,
+      state: "completed",
+      timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now },
+      harness: replay.route?.harness,
+      model: replay.route?.model,
+      effort: replayEffort,
+      prompt: boundedText(prompt, 2 * 1024),
+      tools: [],
+      output: replay.result.output,
+      structured: replay.result.structured === undefined ? undefined : clone(replay.result.structured),
+      usage: workflowUsage(),
+    };
+    entry.snapshot.agents.push(record);
+    entry.snapshot.phases[phase]?.agents.push(index);
+    this.#touch(entry);
+    return record;
+  }
+
+  async #authorizeMutation(entry: RunEntry, agent: string, prompt: string, signal: AbortSignal): Promise<boolean> {
+    if (entry.snapshot.approval === "plan") return false;
+    if (entry.mutationApproved || entry.snapshot.approval === "auto") return true;
+    entry.approvalPromise ??= this.#approveMutation?.({
+      runId: entry.snapshot.runId,
+      workflow: entry.snapshot.name,
+      agent,
+      prompt: boundedText(prompt, 1_000).replace(/[\u0000-\u001f\u007f-\u009f]/g, " "),
+      signal,
+    }) ?? Promise.resolve(false);
+    const approved = await entry.approvalPromise.catch(() => false);
+    entry.approvalPromise = undefined;
+    if (signal.aborted) throw abortError(signal.reason);
+    entry.mutationApproved = approved;
+    return approved;
+  }
+
+  async #withDispatchSlot<T>(entry: RunEntry, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+    const limit = entry.snapshot.budget?.maxConcurrency ?? 4;
+    while (entry.activeDispatches >= limit) {
+      if (signal.aborted) throw abortError(signal.reason);
+      await new Promise<void>((resolveSlot, rejectSlot) => {
+        const ready = () => { cleanup(); resolveSlot(); };
+        const abort = () => { cleanup(); rejectSlot(abortError(signal.reason)); };
+        const cleanup = () => {
+          entry.dispatchWaiters.delete(ready);
+          signal.removeEventListener("abort", abort);
+        };
+        entry.dispatchWaiters.add(ready);
+        signal.addEventListener("abort", abort, { once: true });
+      });
+    }
+    entry.activeDispatches++;
+    try { return await operation(); }
+    finally {
+      entry.activeDispatches--;
+      const ready = entry.dispatchWaiters.values().next().value as (() => void) | undefined;
+      if (ready) {
+        entry.dispatchWaiters.delete(ready);
+        ready();
+      }
+    }
+  }
+
+  #budgetPreflight(entry: RunEntry): string | undefined {
+    const budget = entry.snapshot.budget;
+    if (!budget) return undefined;
+    const usage = aggregateWorkflowUsage(entry.snapshot);
+    const tokens = usage.input + usage.output;
+    if (budget.maxTokens !== undefined && tokens >= budget.maxTokens) return `Workflow token budget exhausted (${tokens}/${budget.maxTokens})`;
+    if (budget.maxCost !== undefined && usage.cost >= budget.maxCost) return `Workflow cost budget exhausted ($${usage.cost.toFixed(4)}/$${budget.maxCost})`;
+    if (budget.maxTurns !== undefined && usage.turns >= budget.maxTurns) return `Workflow turn budget exhausted (${usage.turns}/${budget.maxTurns})`;
+    return undefined;
+  }
+
+  #budgetViolation(entry: RunEntry): string | undefined {
+    const budget = entry.snapshot.budget;
+    if (!budget) return undefined;
+    const usage = aggregateWorkflowUsage(entry.snapshot);
+    const tokens = usage.input + usage.output;
+    if (budget.maxTokens !== undefined && tokens > budget.maxTokens) return `Workflow token budget exceeded (${tokens}/${budget.maxTokens})`;
+    if (budget.maxCost !== undefined && usage.cost > budget.maxCost) return `Workflow cost budget exceeded ($${usage.cost.toFixed(4)}/$${budget.maxCost})`;
+    if (budget.maxTurns !== undefined && usage.turns > budget.maxTurns) return `Workflow turn budget exceeded (${usage.turns}/${budget.maxTurns})`;
+    return undefined;
+  }
+
+  async #withMutationLock<T>(cwd: string, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+    const key = await realpath(resolve(cwd)).catch(() => resolve(cwd));
+    const previous = this.#mutationTails.get(key) ?? Promise.resolve();
+    const queued = previous.catch(() => undefined).then(async () => {
+      if (signal.aborted) throw abortError(signal.reason);
+      return operation();
+    });
+    const tail = queued.then(() => undefined, () => undefined);
+    this.#mutationTails.set(key, tail);
+    void tail.then(() => { if (this.#mutationTails.get(key) === tail) this.#mutationTails.delete(key); });
+    return queued;
+  }
+
+  async #waitUntilResumed(entry: RunEntry, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) throw abortError(signal.reason);
+    if (entry.snapshot.status !== "paused") return;
+    await new Promise<void>((resolveWait, rejectWait) => {
+      const resume = () => {
+        cleanup();
+        resolveWait();
+      };
+      const abort = () => {
+        cleanup();
+        rejectWait(abortError(signal.reason));
+      };
+      const cleanup = () => {
+        entry.pauseWaiters.delete(resume);
+        signal.removeEventListener("abort", abort);
+      };
+      entry.pauseWaiters.add(resume);
+      signal.addEventListener("abort", abort, { once: true });
+      if (entry.snapshot.status !== "paused") resume();
+    });
+  }
+
+  #releasePause(entry: RunEntry): void {
+    const waiters = [...entry.pauseWaiters];
+    entry.pauseWaiters.clear();
+    for (const resume of waiters) resume();
+  }
+
+  async #appendJournal(
+    entry: RunEntry,
+    value: Omit<WorkflowJournalRecord, "version" | "sequence">,
+  ): Promise<void> {
+    const record: WorkflowJournalRecord = {
+      version: 1,
+      sequence: entry.journalSequence++,
+      ...value,
+    };
+    const write = entry.journalChain.then(() => appendWorkflowJournal(this.#artifactRoot, entry.snapshot.runId, record));
+    entry.journalChain = write.catch(() => undefined);
+    try { await write; }
+    catch (error) {
+      entry.snapshot.error ??= `Workflow journal persistence failed: ${boundedText(error)}`;
+      entry.controller.abort(error instanceof Error ? error : new Error(String(error)));
+      throw error;
     }
   }
 
@@ -487,8 +987,20 @@ export class WorkflowManager {
       agent.tools = job.tools.slice(-8).map((tool) => ({ ...tool }));
       agent.truncated = job.truncated;
     }
-    if (isTerminal(job.status)) agent.output = job.output;
+    if (isTerminal(job.status)) {
+      agent.output = job.output;
+      agent.outputProvenance = "subagent";
+      agent.instructionShaped = looksInstructionShaped(job.output);
+    }
     this.#touch(entry);
+    if (event.type === "usage") {
+      const violation = this.#budgetViolation(entry);
+      if (violation && !entry.controller.signal.aborted) {
+        entry.snapshot.error = violation;
+        entry.controller.abort(new Error(violation));
+        void this.#cancelMemberJobs(entry, violation);
+      }
+    }
   }
 
   #ensurePhase(entry: RunEntry, rawTitle: string): number {
@@ -518,6 +1030,28 @@ export class WorkflowManager {
     phase.timestamps.startedAt ??= now;
     phase.timestamps.updatedAt = now;
     entry.snapshot.currentPhase ??= index;
+    this.#touch(entry);
+  }
+
+  #applyMeta(entry: RunEntry, value: unknown): void {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return;
+    const meta = value as Record<string, unknown>;
+    const name = meta.name === undefined ? entry.snapshot.name : label(meta.name, entry.snapshot.name);
+    const description = meta.description === undefined ? entry.snapshot.description : label(meta.description, entry.snapshot.description);
+    if (name === entry.snapshot.name && description === entry.snapshot.description) return;
+    entry.snapshot.name = name;
+    entry.snapshot.description = description;
+    this.#touch(entry);
+  }
+
+  #recordLog(entry: RunEntry, message: string): void {
+    const logs = entry.snapshot.logs ??= [];
+    logs.push({
+      index: logs.length ? logs.at(-1)!.index + 1 : 0,
+      message: boundedText(message, 4 * 1024),
+      at: Date.now(),
+    });
+    if (logs.length > MAX_WORKFLOW_LOGS) logs.splice(0, logs.length - MAX_WORKFLOW_LOGS);
     this.#touch(entry);
   }
 
@@ -552,8 +1086,11 @@ export class WorkflowManager {
   async #cancelMemberJobs(entry: RunEntry, reason: string): Promise<void> {
     const jobs = entry.snapshot.agents
       .map((agent) => agent.jobId)
-      .filter((id): id is string => id !== undefined)
-      .map((id) => this.#jobs.check(id))
+      .filter((id): id is string => id !== undefined && this.#jobOwners.get(id)?.runId === entry.snapshot.runId)
+      .flatMap((id) => {
+        try { return [this.#jobs.check(id)]; }
+        catch { return []; }
+      })
       .filter((job) => !isTerminal(job.status));
     await Promise.allSettled(jobs.map((job) => this.#jobs.cancel(job.id, reason)));
   }
@@ -606,6 +1143,38 @@ export function aggregateWorkflowUsage(snapshot: WorkflowSnapshot): WorkflowUsag
     cost: total.cost + agent.usage.cost,
     turns: total.turns + agent.usage.turns,
   }), workflowUsage());
+}
+
+function normalizeWorkflowBudget(value: WorkflowBudgetPolicy | undefined): WorkflowBudgetPolicy | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Workflow budget must be an object");
+  const integer = (name: keyof WorkflowBudgetPolicy, maximum: number) => {
+    const item = value[name];
+    if (item === undefined) return undefined;
+    if (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1 || item > maximum) throw new Error(`Workflow budget ${name} must be an integer from 1 to ${maximum}`);
+    return item;
+  };
+  const maxCost = value.maxCost;
+  if (maxCost !== undefined && (typeof maxCost !== "number" || !Number.isFinite(maxCost) || maxCost <= 0 || maxCost > 10_000)) {
+    throw new Error("Workflow budget maxCost must be a positive number no greater than 10000");
+  }
+  return {
+    maxAgents: integer("maxAgents", 32),
+    maxConcurrency: integer("maxConcurrency", 4),
+    maxTokens: integer("maxTokens", 100_000_000),
+    maxCost,
+    maxTurns: integer("maxTurns", 10_000),
+  };
+}
+
+function workflowBudgetWarnings(budget: WorkflowBudgetPolicy | undefined): string[] {
+  if (!budget) return [];
+  const warnings: string[] = [];
+  if ((budget.maxAgents ?? 0) > 16) warnings.push(`Large workflow allowance: ${budget.maxAgents} agents`);
+  if ((budget.maxConcurrency ?? 0) === 4) warnings.push("Maximum workflow concurrency requested");
+  if ((budget.maxTokens ?? 0) > 500_000) warnings.push(`Large token allowance: ${budget.maxTokens} tokens`);
+  if ((budget.maxCost ?? 0) > 20) warnings.push(`Large cost allowance: $${budget.maxCost}`);
+  return warnings;
 }
 
 function workflowSchema(value: unknown): TSchema | undefined {

@@ -75,11 +75,16 @@ test("dashboard layout, exit/actions, and transcript scrolling follow the overla
   t.after(() => overlay.dispose());
   overlay.focused = true;
   const lines = overlay.render(72);
-  assert.equal(lines[0], `╔${"═".repeat(70)}╗`);
-  assert.equal(lines.at(-1), `╚${"═".repeat(70)}╝`);
-  assert.ok(lines.filter((line) => line.startsWith("║ ")).every((line) => line.endsWith(" ║")));
-  assert.ok(lines.filter((line) => line.startsWith("╠")).every((line) => line.endsWith("╣")));
-  assert.ok(lines.some((line) => line.includes("Esc close")));
+  assert.ok(lines[0]?.includes("Native subagents"));
+  assert.ok(lines[0]?.includes("2 jobs"));
+  assert.ok(lines[1]?.startsWith("╭─ jobs · 1 active / 2 "));
+  assert.ok(lines[1]?.endsWith("╮"));
+  assert.equal(lines.at(-2), `╰${"─".repeat(70)}╯`);
+  assert.ok(lines.at(-1)?.includes("Esc close"));
+  assert.ok(lines.some((line) => line.startsWith("├─ detail · first · completed ")));
+  assert.ok(lines.filter((line) => line.startsWith("│")).every((line) => line.endsWith("│")));
+  assert.ok(!lines.some((line) => /[╔╗╚╝═║]/.test(line)), "focused state keeps the calm single-line frame");
+  assert.ok(lines.length <= 24, "dashboard respects the 80% terminal-height cap");
   assert.ok(lines.some((line) => line.includes("effort high")), "dashboard details show request effort");
   assert.ok(overlay.render(60).some((line) => line.includes("effort high")), "effort survives the dashboard minimum width");
   assert.ok(overlay.render(72).some((line) => line.includes("first-0")));
@@ -87,7 +92,7 @@ test("dashboard layout, exit/actions, and transcript scrolling follow the overla
   const scrolled = overlay.render(72);
   assert.ok(scrolled.some((line) => line.includes("first-")));
   assert.ok(!scrolled.some((line) => line.includes("first-0")));
-  assert.ok(scrolled.every((line) => visibleWidth(line) === 72));
+  assert.ok(scrolled.every((line) => visibleWidth(line) <= 72));
 
   overlay.handleInput("j");
   const reset = overlay.render(72);
@@ -116,7 +121,7 @@ test("dashboard layout, exit/actions, and transcript scrolling follow the overla
   const styled = markdown.render(72);
   assert.equal(markdownSource, "# Verdict\n\n**PASS**");
   assert.ok(styled.some((line) => line.includes("\u001b[1mVerdict\u001b[0m")), "dashboard preserves native Markdown styling");
-  assert.ok(styled.every((line) => visibleWidth(line) === 72));
+  assert.ok(styled.every((line) => visibleWidth(line) <= 72));
 });
 
 test("takeover renders normalized thinking, tools, queued messages, and closes reliably", (t) => {

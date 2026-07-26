@@ -130,7 +130,9 @@ function agentLine(agent: WorkflowAgentRecord, theme: Theme, now: number): strin
     : "";
   const profile = agent.profile ? ` · profile ${sanitizeInline(agent.profile)}` : "";
   const independent = agent.independent ? " · independent" : "";
-  return `  ${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", `${agent.access}${profile}${independent} · ${agent.state}${route} · effort ${agent.effort ?? "adaptive"}`)}`;
+  const warning = agent.instructionShaped ? " · ⚠ instruction-like output" : "";
+  const isolation = agent.isolation ? ` · worktree ${agent.isolation.state}` : "";
+  return `  ${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", `${agent.access}${profile}${independent} · ${agent.state}${route} · effort ${agent.effort ?? "adaptive"}${isolation}${warning}`)}`;
 }
 
 function clampContent(theme: Theme, lines: string[], budget: number): string[] {
@@ -155,6 +157,7 @@ export function buildWorkflowCardLines(
 
   const description = sanitizeInline(snapshot.description);
   if (options.expanded && description) lines.push(theme.fg("dim", description));
+  for (const warning of snapshot.warnings?.slice(0, options.expanded ? 3 : 1) ?? []) lines.push(theme.fg("warning", `⚠ ${sanitizeInline(warning)}`));
   lines.push(phaseSummary(snapshot, theme, options.now));
 
   if (options.expanded) {
@@ -174,8 +177,17 @@ export function buildWorkflowCardLines(
     lines.push(theme.fg("muted", `  +${snapshot.agents.length - agents.length} earlier agents`));
   }
 
+  const logs = snapshot.logs?.slice(options.expanded ? -3 : -1) ?? [];
+  for (const entry of logs) {
+    lines.push(theme.fg("muted", `Log · ${sanitizeInline(entry.message)}`));
+  }
+
   const usage = formatUsage(aggregateWorkflowUsage(snapshot));
   if (usage) lines.push(theme.fg("dim", `Usage · ${usage}`));
+  if (options.expanded && snapshot.budget) {
+    const limits = Object.entries(snapshot.budget).filter(([, value]) => value !== undefined).map(([key, value]) => `${key} ${value}`).join(" · ");
+    if (limits) lines.push(theme.fg("dim", `Budget · ${limits}`));
+  }
 
   if (snapshot.error) {
     const errorLines = sanitizeText(snapshot.error).split("\n").map(sanitizeInline).filter(Boolean);
@@ -188,7 +200,7 @@ export function buildWorkflowCardLines(
     if (options.expanded) lines.push(theme.fg("dim", options.isPartial ? "Latest result" : "Result preview"));
     for (const line of renderedPreview) lines.push(theme.fg("toolOutput", line));
   } else {
-    lines.push(theme.fg("dim", options.isPartial || snapshot.status === "running" || snapshot.status === "pending"
+    lines.push(theme.fg("dim", options.isPartial || snapshot.status === "running" || snapshot.status === "paused" || snapshot.status === "pending"
       ? "(no result yet)"
       : "(no result)"));
   }

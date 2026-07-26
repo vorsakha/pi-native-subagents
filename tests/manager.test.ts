@@ -66,6 +66,26 @@ test("manager enforces concurrency cap four and pumps queued work", async () => 
   await manager.shutdown();
 });
 
+test("direct jobs take the next free slot ahead of queued workflow fan-out", async () => {
+  const { backend, manager } = setup(1);
+  const blocker = manager.spawn(request(0));
+  await tick();
+  const workflow = { runId: "wf_fair", agentIndex: 0, label: "worker" };
+  const firstWorkflow = manager.spawn({ ...request(1), workflow });
+  const secondWorkflow = manager.spawn({ ...request(2), workflow: { ...workflow, agentIndex: 1 } });
+  const interactive = manager.spawn(request(3));
+  backend.complete(blocker.id);
+  await tick(); await tick();
+  assert.equal(backend.starts[1], interactive.id, "interactive work is not trapped behind the workflow queue");
+  backend.complete(interactive.id);
+  await tick(); await tick();
+  backend.complete(firstWorkflow.id);
+  await tick(); await tick();
+  backend.complete(secondWorkflow.id);
+  await manager.wait(secondWorkflow.id);
+  await manager.shutdown();
+});
+
 test("completed native sessions live until session shutdown or oldest-terminal capacity eviction", async () => {
   const { backend, manager } = setup(4);
   const jobs = Array.from({ length: 100 }, (_, index) => manager.spawn(request(index)));
@@ -155,9 +175,19 @@ test("independentOf routes against the producer job rather than the parent provi
     () => manager.spawn({ ...request(4), independentOf: "missing-job" }),
     /Unknown independence target job/,
   );
+  const replayReviewer = manager.spawn({
+    ...request(5), harness: undefined, independentOf: "prior-session-job", independentOfProvider: "claude",
+  });
+  assert.equal(replayReviewer.harness, "codex", "durable replay can preserve routing after the producer leaves JobManager");
+  assert.equal(replayReviewer.independentOf, "prior-session-job");
+  assert.throws(
+    () => manager.spawn({ ...request(6), independentOfProvider: "claude" }),
+    /requires independentOf/,
+  );
   await tick();
   claude.complete(producer.id);
   codex.complete(reviewer.id);
+  codex.complete(replayReviewer.id);
   await manager.shutdown();
 });
 
@@ -220,6 +250,45 @@ test("cancellation aborts a pending backend start before returning", async () =>
   assert.equal(final.status, "cancelled");
   assert.equal(startupAborted, true);
   await manager.shutdown();
+});
+
+test("manager bounds harness startup and direct cancellation waits", async (t) => {
+  await t.test("startup", async () => {
+    const backend: Backend = {
+      name: "codex",
+      async start() { return new Promise<BackendRun>(() => {}); },
+    };
+    const manager = new JobManager({ backends: [backend], startupTimeoutMs: 20, operationTimeoutMs: 20 });
+    const job = manager.spawn(request(1));
+    const final = await manager.wait(job.id);
+    assert.equal(final.status, "failed");
+    assert.match(final.error ?? "", /Harness startup timed out after 20ms/);
+    await manager.shutdown(20);
+  });
+
+  await t.test("cancellation", async () => {
+    let forceCloses = 0;
+    const backend: Backend = {
+      name: "codex",
+      async start() {
+        return {
+          completed: new Promise<void>(() => {}),
+          async send() {},
+          async cancel() { await new Promise<void>(() => {}); },
+          async close() {},
+          async forceClose() { forceCloses++; },
+        };
+      },
+    };
+    const manager = new JobManager({ backends: [backend], startupTimeoutMs: 100, operationTimeoutMs: 20 });
+    const job = manager.spawn(request(1));
+    await tick();
+    const final = await manager.cancel(job.id, "bounded cancel");
+    assert.equal(final.status, "cancelled");
+    assert.match(final.error ?? "", /deadline exceeded/);
+    assert.equal(forceCloses, 1);
+    await manager.shutdown(20);
+  });
 });
 
 test("shutdown aborts delayed startup with no late run or resource resurrection", async () => {
