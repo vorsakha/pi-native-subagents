@@ -132,6 +132,8 @@ export interface SpawnRequest {
   effort?: EffortLevel;
   access?: AccessMode;
   independent?: boolean;
+  /** Route on a native provider different from this existing session-scoped job. */
+  independentOf?: string;
   profile?: string;
   /** Internal configured fallback; not exposed as a model-facing tool field. */
   defaultHarness?: HarnessName;
@@ -155,6 +157,8 @@ export interface JobSnapshot {
   access: AccessMode;
   profile?: string;
   independent: boolean;
+  /** Existing job whose native provider this job was routed against. */
+  independentOf?: string;
   harness: HarnessName;
   model: string;
   /** Explicit request-scoped provider effort; omitted means provider-adaptive. */

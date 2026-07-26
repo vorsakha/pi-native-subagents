@@ -32,6 +32,7 @@ export interface WorkflowAgentRecord {
   access: AccessMode;
   profile?: string;
   independent: boolean;
+  independentOf?: string;
   phase: number;
   jobId?: string;
   state: WorkflowAgentState;

@@ -29,13 +29,13 @@ The fork is registered as a Pi-backed managed job. Its returned `jobId` works wi
 `subagent_spawn` and foreground `subagent` accept:
 
 - required `task`;
-- optional `name`, `cwd`, `harness`, exact harness-local `model`, `effort`, `access`, `independent`, and `profile`.
+- optional `name`, `cwd`, `harness`, exact harness-local `model`, `effort`, `access`, `independent`, `independentOf`, and `profile`.
 
 `access` is `readOnly` or `full` and defaults to `full` only after Pi's project-trust gate succeeds. The configured harness defaults to Pi, which delegates through the user's existing Pi provider and model configuration. Native Codex and Claude execution remain equal explicit choices through `harness`. `model` never selects or changes a harness; it is forwarded only to the chosen harness. Omitting it uses that harness's configured default. Claude and Codex also omit effort by default so provider behavior remains adaptive; callers may set `low`, `medium`, `high`, `xhigh`, or `max`.
 
 The extension contains no concrete model names or model recommendation table. The separately installed, easy-to-edit `subagents` skill owns current cost/capability guidance and supplies exact models when useful. Runtime code remains responsible for trust, access, provider diversity, subscription authentication, sandboxing, and lifecycle constraints.
 
-`independent: true` forces a different native provider from the parent: OpenAI/GPT/Codex parent → Claude, Claude parent → Codex. Explicit Pi or same-provider routes are rejected. For an unknown parent provider, Claude is the native fallback.
+`independent: true` forces a different native provider from the parent: OpenAI/GPT/Codex parent → Claude, Claude parent → Codex. `independentOf: <jobId>` instead forces a different provider from the referenced session-scoped producer job, so delegated implementation and review cannot silently land on the same provider. The target must be an existing native Claude or Codex job; unknown, evicted, or Pi-backed targets fail closed. Explicit Pi or same-provider routes are rejected. For an unknown parent provider, `independent: true` falls back to Claude.
 
 ## Optional profiles
 
@@ -103,7 +103,7 @@ export default async function () {
 }
 ```
 
-`agent(prompt, options?)` resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. Options support `name`/`label`, `access`, `harness`, exact harness-local `model`, `effort`, `independent`, `profile`, `phase`, and bounded JSON `schema`. `parallel()` accepts task functions with concurrency 1–4; the shared manager remains the authoritative global scheduler.
+`agent(prompt, options?)` resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. Options support `name`/`label`, `access`, `harness`, exact harness-local `model`, `effort`, `independent`, `independentOf`, `profile`, `phase`, and bounded JSON `schema`. A sequential workflow can pass an implementation result's `jobId` as the reviewer's `independentOf`. `parallel()` accepts task functions with concurrency 1–4; the shared manager remains the authoritative global scheduler.
 
 Workflow scripts, checkpoints, results, bounded transcripts, and reports are private under `~/.pi/agent/workflows/`, never the project. V1 does not resume interrupted execution; stale running checkpoints become `aborted`.
 

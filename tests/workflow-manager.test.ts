@@ -27,12 +27,16 @@ interface FakeRun {
 }
 
 class ControlledBackend implements Backend {
-  readonly name = "codex" as const;
+  readonly name: "codex" | "claude";
   readonly requests: BackendRequest[] = [];
   readonly cancels: Array<{ jobId: string; reason?: string }> = [];
   readonly runs = new Map<string, FakeRun>();
   active = 0;
   maxActive = 0;
+
+  constructor(name: "codex" | "claude" = "codex") {
+    this.name = name;
+  }
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     this.requests.push(request);
@@ -121,9 +125,10 @@ async function fixture(concurrency = 4) {
   const cwd = join(parent, "cwd");
   await import("node:fs/promises").then(({ mkdir }) => mkdir(cwd));
   const artifactRoot = join(parent, "artifacts");
-  const backend = new ControlledBackend();
+  const backend = new ControlledBackend("codex");
+  const claude = new ControlledBackend("claude");
   const jobs = new JobManager({
-    backends: [backend],
+    backends: [backend, claude],
     profiles: new Map([[reviewer.name, reviewer]]),
     concurrency,
   });
@@ -133,6 +138,7 @@ async function fixture(concurrency = 4) {
     cwd,
     artifactRoot,
     backend,
+    claude,
     jobs,
     workflows,
     request(script: string, overrides: Partial<Parameters<WorkflowManager["start"]>[0]> = {}) {
@@ -323,6 +329,23 @@ test("workflow agent options preserve generic read-only/profile policy in the ba
     assert.equal(adversaryRequest.policy.harness, "codex", "independent Claude-parent workflow agent routes to Codex");
     f.backend.completeTask(adversaryRequest.task, "independent review");
     assert.equal((await crossProvider.completion).status, "completed");
+
+    const producerAware = await f.workflows.start(f.request(`
+      export default async () => {
+        const implementation = await agent("delegated implementation", { name: "implementation", harness: "codex" });
+        if (!implementation.ok) return implementation;
+        return agent("review delegated implementation", { name: "producer-adversary", access: "readOnly", independentOf: implementation.jobId });
+      };
+    `, { parentProvider: "codex" }));
+    await waitFor(() => f.backend.requests.length === 4, "workflow producer");
+    f.backend.completeTask("delegated implementation", "implemented");
+    await waitFor(() => f.claude.requests.length === 1, "producer-aware workflow adversary");
+    const producerAdversary = f.claude.requests[0]!;
+    assert.equal(producerAdversary.policy.harness, "claude", "independentOf routes opposite the Codex producer, not the Codex parent");
+    f.claude.completeTask("review delegated implementation", "reviewed");
+    const producerAwareFinal = await producerAware.completion;
+    assert.equal(producerAwareFinal.status, "completed");
+    assert.equal(producerAwareFinal.agents[1]?.independentOf, producerAwareFinal.agents[0]?.jobId);
   } finally {
     await f.cleanup();
   }

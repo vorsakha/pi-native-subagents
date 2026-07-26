@@ -21,9 +21,13 @@ export interface CompiledJob {
   independent: boolean;
 }
 
-export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition): CompiledJob {
+export function compilePolicy(
+  request: SpawnRequest,
+  profile?: ProfileDefinition,
+  independentOfProvider?: ProviderFamily,
+): CompiledJob {
   if (!request.trusted) throw new Error("Subagents are disabled for untrusted projects");
-  const independent = request.independent === true || profile?.independent === true;
+  const independent = request.independent === true || profile?.independent === true || independentOfProvider !== undefined;
   let selected: HarnessName = request.harness ?? profile?.harness ?? request.defaultHarness ?? "pi";
   if (profile?.lockedHarness) {
     if (request.harness && request.harness !== profile.lockedHarness) {
@@ -33,12 +37,13 @@ export function compilePolicy(request: SpawnRequest, profile?: ProfileDefinition
   }
   if (independent) {
     if (request.harness === "pi" || profile?.lockedHarness === "pi") throw new Error("independent agents require a native Claude or Codex harness");
-    const parent = request.parentProvider;
+    const target = independentOfProvider ?? request.parentProvider;
+    const targetLabel = independentOfProvider ? "referenced job" : "parent";
     const explicitRoute = request.harness !== undefined || profile?.lockedHarness !== undefined;
-    if (explicitRoute && parent !== "other" && selected === parent) {
-      throw new Error(`independent agent must use a provider different from the parent ${parent} model`);
+    if (explicitRoute && target !== "other" && selected === target) {
+      throw new Error(`independent agent must use a provider different from the ${targetLabel} ${target} model`);
     }
-    if (!explicitRoute) selected = parent === "claude" ? "codex" : "claude";
+    if (!explicitRoute) selected = target === "claude" ? "codex" : "claude";
   }
 
   const model = normalizeModel(request.model);

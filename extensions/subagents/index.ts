@@ -412,6 +412,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     effort: Type.Optional(StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" })),
     access: Type.Optional(StringEnum(ACCESS, { description: "Access policy; defaults to full after project trust is established" })),
     independent: Type.Optional(Type.Boolean({ description: "Require a native provider different from the parent" })),
+    independentOf: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Route on a native provider different from this existing job ID" })),
     profile: Type.Optional(Type.String({ minLength: 1, maxLength: 160, description: "Human-authored profile name; omit unless the human explicitly requested one" })),
   });
 
@@ -424,7 +425,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     promptGuidelines: [
       "Give each isolated agent a complete task with all relevant paths, requirements, constraints, and expected verification.",
       "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
-      "Use access=readOnly for inspection and independent=true for a cross-provider second opinion.",
+      "Use access=readOnly for inspection; use independent=true to differ from the parent, or independentOf=<jobId> to differ from the job that produced the work.",
     ],
     parameters: spawnParameters,
     async execute(_id, params, _signal, _onUpdate, ctx) {
@@ -433,7 +434,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       return result(snapshot, `Spawned ${snapshot.id} (${snapshot.name}, ${snapshot.access}, ${snapshot.harness}/${snapshot.model}, effort ${formatEffort(snapshot.effort)})`);
     },
     renderCall(args, theme) {
-      const route = args.independent ? "independent" : args.harness
+      const route = args.independentOf ? `independent-of:${shortId(args.independentOf)}` : args.independent ? "independent" : args.harness
         ? `${args.harness}${args.model ? `/${args.model}` : ""}`
         : args.model ?? "";
       const detail = [args.access ?? "full", args.profile ? `profile:${args.profile}` : "", route, args.effort ? `effort:${args.effort}` : "", truncatePreview(args.task)].filter(Boolean).join(" · ");
@@ -599,7 +600,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       "Use subagent_spawn for independent work that can run in parallel; use subagent_wait before consuming its result.",
       "Use subagent for a single foreground delegation.",
       "Subagents have isolated context; include all required paths, requirements, constraints, and verification evidence in task.",
-      "Use access=readOnly for inspection and independent=true for a cross-provider second opinion.",
+      "Use access=readOnly for inspection; use independent=true to differ from the parent, or independentOf=<jobId> to differ from the job that produced the work.",
       "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
     ],
     parameters: spawnParameters,
@@ -628,7 +629,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
     },
     renderCall(args, theme) {
-      const harness = args.independent ? "independent" : args.harness ?? activeHarness;
+      const harness = args.independentOf ? `independent-of:${shortId(args.independentOf)}` : args.independent ? "independent" : args.harness ?? activeHarness;
       const route = args.model ? `${harness}/${args.model}` : harness;
       const effort = args.effort ? ` · effort:${args.effort}` : "";
       const profile = args.profile ? ` · profile:${args.profile}` : "";
@@ -739,7 +740,7 @@ function sendTitle(behavior: SendBehavior): "Steer" | "Follow up" {
 
 function spawn(
   manager: JobManager,
-  params: { task: string; name?: string; cwd?: string; harness?: HarnessName; model?: string; effort?: EffortLevel; access?: AccessMode; independent?: boolean; profile?: string },
+  params: { task: string; name?: string; cwd?: string; harness?: HarnessName; model?: string; effort?: EffortLevel; access?: AccessMode; independent?: boolean; independentOf?: string; profile?: string },
   parentCwd: string,
   trusted: boolean,
   defaultHarness?: HarnessName,
@@ -756,6 +757,7 @@ function spawn(
     effort: params.effort,
     access: params.access,
     independent: params.independent,
+    independentOf: params.independentOf,
     profile: params.profile,
     defaultHarness,
     parentProvider,

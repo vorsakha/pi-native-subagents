@@ -32,6 +32,6 @@ The `/workflows` dashboard supports run/phase/agent navigation, status filtering
 
 Workflow JavaScript is control-plane code with no filesystem, network, subprocess, import, environment, or credential access. It can announce phases, request generic agents, and return JSON. Every request is validated by `WorkflowManager` and dispatched through the shared `JobManager`, preserving trust, profile ceilings, routing, subscription-auth sanitation, access sandboxes, the four-job cap, cancellation, and cleanup.
 
-`agent(prompt, options?)` accepts `name`/`label`, `access`, `harness`, exact harness-local `model`, `effort`, `independent`, explicit `profile`, `phase`, and bounded `schema`. Profiles are human-selected overlays. Provider independence is an enforceable route constraint, not prompt wording.
+`agent(prompt, options?)` accepts `name`/`label`, `access`, `harness`, exact harness-local `model`, `effort`, `independent`, `independentOf`, explicit `profile`, `phase`, and bounded `schema`. Profiles are human-selected overlays. Provider independence is an enforceable route constraint, not prompt wording: `independent` differs from the parent, while `independentOf` resolves an existing producer job and differs from that job's native provider.
 
 Workflow artifacts are private operational state under the Pi agent directory. Terminal runs write compact summary/result/transcript/report artifacts. Background runs deliver one bounded follow-up; session shutdown aborts without delivery.

@@ -66,9 +66,20 @@ export class JobManager {
     if (!request.task.trim()) throw new Error("Task must not be empty");
     const profileName = request.profile?.trim();
     if (request.profile !== undefined && !profileName) throw new Error("Profile must be a non-empty string");
+    const independentOf = request.independentOf?.trim();
+    if (request.independentOf !== undefined && (!independentOf || independentOf.length > 200)) {
+      throw new Error("independentOf must be a job ID containing 1–200 characters");
+    }
     const profile = profileName ? this.#profiles.get(profileName) : undefined;
     if (profileName && !profile) throw new Error(`Unknown subagent profile: ${profileName}`);
-    const compiled = compilePolicy(request, profile);
+    const independenceTarget = independentOf ? this.#jobs.get(independentOf) : undefined;
+    if (independentOf && !independenceTarget) throw new Error(`Unknown independence target job: ${independentOf}`);
+    const targetHarness = independenceTarget?.snapshot.harness;
+    if (targetHarness === "pi") {
+      throw new Error("independentOf requires a target job using the native Claude or Codex harness");
+    }
+    const independentOfProvider = targetHarness === "claude" || targetHarness === "codex" ? targetHarness : undefined;
+    const compiled = compilePolicy(request, profile, independentOfProvider);
     if (!this.#backends.has(compiled.policy.harness)) throw new Error(`Harness is unavailable: ${compiled.policy.harness}`);
     if (request.peer) {
       if (compiled.policy.harness !== "pi") throw new Error("Session peers require the pi harness");
@@ -87,6 +98,7 @@ export class JobManager {
       access: policy.access,
       profile: profile?.name,
       independent,
+      independentOf,
       harness: policy.harness,
       model: policy.model ?? "default",
       effort: policy.effort,

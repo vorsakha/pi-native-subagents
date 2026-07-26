@@ -4,7 +4,7 @@ import { JobManager } from "../src/manager.ts";
 import type { Backend, BackendEvent, BackendRequest, BackendRun, JobSnapshot, ProfileDefinition } from "../src/types.ts";
 
 class FakeBackend implements Backend {
-  readonly name = "codex" as const;
+  readonly name: "codex" | "claude";
   active = 0;
   maxActive = 0;
   starts: string[] = [];
@@ -13,6 +13,10 @@ class FakeBackend implements Backend {
   closes: string[] = [];
   sends: Array<{ id: string; message: string; behavior: string }> = [];
   readonly runs = new Map<string, { emit: (event: BackendEvent) => void; resolve: () => void }>();
+
+  constructor(name: "codex" | "claude" = "codex") {
+    this.name = name;
+  }
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     this.active++;
@@ -129,6 +133,31 @@ test("manager forwards caller models and labels omitted models as native default
   assert.equal(backend.policies[1]?.model, undefined);
   backend.complete(selected.id);
   backend.complete(nativeDefault.id);
+  await manager.shutdown();
+});
+
+test("independentOf routes against the producer job rather than the parent provider", async () => {
+  const codex = new FakeBackend("codex");
+  const claude = new FakeBackend("claude");
+  const manager = new JobManager({ backends: [codex, claude] });
+  const producer = manager.spawn({ ...request(1), harness: "claude" });
+  const reviewer = manager.spawn({
+    ...request(2), harness: undefined, parentProvider: "codex", independentOf: producer.id, access: "readOnly",
+  });
+  assert.equal(reviewer.harness, "codex", "reviewer differs from the Claude producer even though the parent is Codex");
+  assert.equal(reviewer.independent, true);
+  assert.equal(reviewer.independentOf, producer.id);
+  assert.throws(
+    () => manager.spawn({ ...request(3), harness: "claude", independentOf: producer.id }),
+    /different from the referenced job claude/,
+  );
+  assert.throws(
+    () => manager.spawn({ ...request(4), independentOf: "missing-job" }),
+    /Unknown independence target job/,
+  );
+  await tick();
+  claude.complete(producer.id);
+  codex.complete(reviewer.id);
   await manager.shutdown();
 });
 

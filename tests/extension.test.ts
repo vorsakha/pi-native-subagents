@@ -196,6 +196,12 @@ test("extension exposes generic direct tools, caller models, independence, and o
   const explicitRequest = backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "explicit Claude model");
   assert.equal(explicitRequest?.policy.model, "caller-model");
   assert.equal(explicitRequest?.policy.effort, "max");
+  const producerAdversary = await pi.tools.get("subagent_spawn").execute("producer-adversary", {
+    name: "producer-adversary", task: "review the delegated implementation", independentOf: explicitClaude.details.job.id, access: "readOnly",
+  }, undefined, undefined, ctx);
+  assert.equal(producerAdversary.details.job.harness, "codex", "independentOf routes opposite the producer instead of the unknown parent fallback");
+  assert.equal(producerAdversary.details.job.independentOf, explicitClaude.details.job.id);
+  await pi.tools.get("subagent_wait").execute("wait-producer-adversary", { jobId: producerAdversary.details.job.id }, undefined, undefined, ctx);
   await assert.rejects(
     pi.tools.get("subagent_spawn").execute("blank-model", { task: "invalid", model: "   " }, undefined, undefined, ctx),
     /1–256/,

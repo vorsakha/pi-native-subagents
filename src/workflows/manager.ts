@@ -296,6 +296,7 @@ export class WorkflowManager {
     const access = options.access === undefined ? undefined : String(options.access) as AccessMode;
     if (access && !ACCESS.has(access)) return { ok: false, output: "", error: `Unknown access: ${access}` };
     if (options.independent !== undefined && typeof options.independent !== "boolean") return { ok: false, output: "", error: "independent must be boolean" };
+    if (options.independentOf !== undefined && (typeof options.independentOf !== "string" || !options.independentOf.trim() || options.independentOf.trim().length > 200)) return { ok: false, output: "", error: "independentOf must be a job ID containing 1–200 characters" };
     if (options.profile !== undefined && (typeof options.profile !== "string" || !options.profile.trim())) return { ok: false, output: "", error: "profile must be a non-empty string" };
 
     const phase = typeof options.phase === "string"
@@ -310,7 +311,8 @@ export class WorkflowManager {
       name,
       access: access ?? "full",
       profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
-      independent: options.independent === true,
+      independent: options.independent === true || options.independentOf !== undefined,
+      independentOf: typeof options.independentOf === "string" ? options.independentOf.trim() : undefined,
       phase,
       state: "queued",
       timestamps: { createdAt: now, updatedAt: now },
@@ -348,6 +350,7 @@ export class WorkflowManager {
         effort,
         access,
         independent: options.independent === true,
+        independentOf: record.independentOf,
         profile: record.profile,
         defaultHarness: request.defaultHarness,
         parentProvider: request.parentProvider,
@@ -372,6 +375,7 @@ export class WorkflowManager {
     record.access = job.access;
     record.profile = job.profile;
     record.independent = job.independent;
+    record.independentOf = job.independentOf;
     record.harness = job.harness;
     record.model = job.model;
     record.timestamps.updatedAt = Date.now();
@@ -427,6 +431,7 @@ export class WorkflowManager {
       access: job.access,
       profile: job.profile,
       independent: job.independent,
+      independentOf: job.independentOf,
       state: agentState(job),
       harness: job.harness,
       model: job.model,
@@ -465,6 +470,7 @@ export class WorkflowManager {
     agent.access = job.access;
     agent.profile = job.profile;
     agent.independent = job.independent;
+    agent.independentOf = job.independentOf;
     agent.harness = job.harness;
     agent.model = job.model;
     agent.effort = job.effort;
