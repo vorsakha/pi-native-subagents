@@ -203,6 +203,12 @@ test("capabilityAvailability denies by policy, disablement, unavailability, and 
   assert.equal(access(declaredDelegation, "full").available, false, "adapter-declared delegation is denied even when its name avoids the deny patterns");
   const declaredInteractive = normalizeCapability("codex", { kind: "tool", name: "dialog", effect: "interactive" });
   assert.equal(access(declaredInteractive, "full").available, false, "adapter-declared interactivity is denied in full access too");
+  const describedDelegation = normalizeCapability("claude", {
+    kind: "command", name: "batch", description: "Execute work in parallel across isolated worktree agents",
+  });
+  assert.equal(access(describedDelegation, "full").available, false, "described nested orchestration is denied even when the command name is generic");
+  const adminCommand = normalizeCapability("claude", { kind: "command", name: "config", description: "Set a setting by key" });
+  assert.equal(access(adminCommand, "full").available, false, "harness administration commands are denied");
 
   const readTool = normalizeCapability("claude", { kind: "tool", name: "Read" });
   assert.equal(access(readTool, "readOnly").available, true);

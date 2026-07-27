@@ -133,6 +133,9 @@ export function capabilityId(harness: HarnessName, kind: CapabilityKind, name: s
 export function capabilityDenial(kind: CapabilityKind, name: string): { effect: CapabilityEffect; reason: string } | undefined {
   if (kind === "agent") return { effect: "delegation", reason: "nested agent orchestration is denied" };
   const subject = name.trim();
+  if (kind === "command" && /^(?:config|permissions?|plugins?|marketplace|mcp|login|logout|install|uninstall)$/i.test(subject)) {
+    return { effect: "external-write", reason: "harness administration is denied" };
+  }
   for (const rule of DENIAL_RULES) {
     if (rule.test.test(subject)) return { effect: rule.effect, reason: rule.reason };
   }
@@ -161,11 +164,14 @@ export function classifyEffect(kind: CapabilityKind, name: string, declared?: Ca
 export function normalizeCapability(harness: HarnessName, input: DiscoveredCapability): HarnessCapability {
   const name = input.name.trim().slice(0, 160) || "unnamed";
   const nameDenial = capabilityDenial(input.kind, name);
-  const effect = classifyEffect(input.kind, name, input.effect);
+  const descriptionDenial = input.description && /(?:spawn|launch|delegate|orchestrat|parallel)[^.!]{0,100}(?:sub[- ]?agents?|agents?|workflows?)/i.test(input.description)
+    ? { effect: "delegation" as const, reason: "nested delegation described by this capability is denied" }
+    : undefined;
+  const effect = descriptionDenial?.effect ?? classifyEffect(input.kind, name, input.effect);
   const effectDenial = effect === "delegation"
     ? "nested delegation is denied"
     : effect === "interactive" ? "unattended children must not prompt the user" : undefined;
-  const deniedReason = nameDenial?.reason ?? effectDenial;
+  const deniedReason = nameDenial?.reason ?? descriptionDenial?.reason ?? effectDenial;
   return {
     id: capabilityId(harness, input.kind, name),
     harness,
