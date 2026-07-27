@@ -175,10 +175,14 @@ function assertRuntimeRenderers(): void {
     assert.equal(typeof toolDef.renderResult, "function", `${name} missing renderResult`);
     assert.equal(toolDef.renderShell, "self", `${name} should use the inline trace shell`);
     const callLines = toolDef.renderCall(args[name], ansiTheme).render(48);
-    assert.ok(callLines[0].includes("\u001b["), `${name} did not apply the theme`);
-    assert.ok(callLines[0].includes("⌁"), `${name} call is missing the trace group prefix`);
-    assert.equal(callLines.join("\n").includes("\u001b]"), false, `${name} leaked an OSC sequence`);
-    assert.ok(callLines.every((line: string) => visibleWidth(line) <= 48), `${name} call exceeded width`);
+    if (name === "subagent_wait") {
+      assert.deepEqual(callLines, [], "successful wait mechanics stay out of the transcript");
+    } else {
+      assert.ok(callLines[0].includes("\u001b["), `${name} did not apply the theme`);
+      assert.ok(callLines[0].includes("⌁"), `${name} call is missing the trace group prefix`);
+      assert.equal(callLines.join("\n").includes("\u001b]"), false, `${name} leaked an OSC sequence`);
+      assert.ok(callLines.every((line: string) => visibleWidth(line) <= 48), `${name} call exceeded width`);
+    }
     const details = name === "subagent_list"
       ? { jobs: [job()] }
       : name === "session_peer_list"
@@ -186,10 +190,24 @@ function assertRuntimeRenderers(): void {
         : { job: job({ status: "completed", endedAt: 3_000, output: "first\nlast" }) };
     const resultLines = toolDef.renderResult({ details }, { expanded: false, isPartial: false }, ansiTheme, { args: args[name] }).render(48);
     assert.ok(resultLines.length <= MAX_COLLAPSED_LINES, `${name} result exceeded budget`);
-    assert.ok(resultLines[0]?.includes("│"), `${name} result is missing the trace continuation rail`);
-    if (["subagent_check", "subagent_wait", "subagent_send", "subagent_cancel"].includes(name)) {
+    if (name === "subagent_wait") {
+      assert.deepEqual(resultLines, [], "completed waits are represented by the original live job card");
+    } else {
+      assert.ok(resultLines[0]?.includes("│"), `${name} result is missing the trace continuation rail`);
+    }
+    if (["subagent_check", "subagent_send", "subagent_cancel"].includes(name)) {
       assert.equal(resultLines.length, 1, `${name} should render a compact receipt instead of duplicating the spawn card`);
     }
     assert.ok(resultLines.every((line: string) => visibleWidth(line) <= 48), `${name} result exceeded width`);
   }
+
+  const wait = pi.tools.get("subagent_wait");
+  const timedOut = wait.renderResult(
+    { details: { job: job({ status: "running" }) } },
+    { expanded: false, isPartial: false },
+    theme,
+    { args: { timeoutMs: 30_000 }, state: {}, invalidate() {} },
+  ).render(80).join("\n");
+  assert.match(timedOut, /^⌁\s+/);
+  assert.match(timedOut, /running after 30s wait timeout ·/);
 }

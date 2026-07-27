@@ -12,6 +12,7 @@ import { claimExtensionInstall } from "../../src/install-guard.ts";
 import { providerFamily } from "../../src/policy.ts";
 import { openSubagentsDashboard } from "./dashboard.ts";
 import {
+  emptyComponent,
   formatEffort,
   linesComponent,
   renderJobCard,
@@ -237,9 +238,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const action = typeof options.receipt === "function" ? options.receipt(current.job) : options.receipt;
       return renderJobReceipt(current.job, theme, { action, now });
     }
+    const parentIsWaiting = active && (waitInterest.get(resultKey(current.job.id, current.job.generation)) ?? 0) > 0;
     return renderJobCard(current.job, theme, {
       ...options,
       now,
+      statusLabel: parentIsWaiting ? "waiting" : undefined,
       isPartial: options.isPartial || active,
       expandHint: expandHint(),
     });
@@ -298,6 +301,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     const key = resultKey(id, generation);
     waitInterest.set(key, (waitInterest.get(key) ?? 0) + 1);
     deferredResults.delete(key);
+    refreshCardBlinks();
     return generation;
   };
   const endResultConsumption = (id: string, generation: number, consumed: boolean) => {
@@ -305,6 +309,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     const count = (waitInterest.get(key) ?? 1) - 1;
     if (count <= 0) waitInterest.delete(key);
     else waitInterest.set(key, count);
+    refreshCardBlinks();
     if (consumed) {
       consumedResults.add(key);
       if (consumedResults.size > 200) consumedResults.delete(consumedResults.values().next().value!);
@@ -497,19 +502,23 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         endResultConsumption(params.jobId, generation, consumed);
       }
     },
-    renderCall(args, theme) {
-      const target = jobCallTarget(args.jobId);
-      const timeout = args.timeoutMs ? `timeout ${Math.round(args.timeoutMs / 1000)}s` : "";
-      return renderToolCallLine(theme, "Wait", target.accent, [target.detail, timeout].filter(Boolean).join(" · "));
+    renderCall() {
+      // Waiting is orchestration, not a second user-facing event. The original job card
+      // switches to `waiting` while this tool is active and carries the final outcome.
+      return emptyComponent();
     },
-    renderResult(res, { expanded, isPartial }, theme, context) {
+    renderResult(res, { isPartial }, theme, context) {
       const job = jobOf(res);
       if (!job) return renderFailure(theme, "subagent not found");
-      return renderLiveJob(job, theme, {
-        expanded,
-        isPartial,
-        receipt: (current) => isTerminal(current.status) ? current.status : "waiting",
-      }, context);
+      if (isPartial || job.status === "completed") return emptyComponent();
+      const current = liveJob(job, context).job;
+      if (current.status === "completed") return emptyComponent();
+      const timeoutMs = (context.args as { timeoutMs?: number } | undefined)?.timeoutMs ?? 600_000;
+      const timeout = timeoutMs < 1_000 ? "<1s" : `${Math.round(timeoutMs / 1000)}s`;
+      const action = isTerminal(current.status)
+        ? current.status
+        : `${current.status} after ${timeout} wait timeout`;
+      return renderJobReceipt(current, theme, { action, now: Date.now(), standalone: true });
     },
   });
 

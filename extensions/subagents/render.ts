@@ -34,6 +34,11 @@ export function linesComponent(lines: string[]): Component {
   return new Lines(lines.length ? lines : [""]);
 }
 
+/** Render no transcript rows. Used for lifecycle mechanics already reflected by a live parent card. */
+export function emptyComponent(): Component {
+  return new Lines([]);
+}
+
 const TRACE_GROUP = "⌁";
 const TRACE_RAIL = "│";
 const TRACE_INDENT = "     ";
@@ -178,6 +183,8 @@ export interface JobCardOptions {
   now: number;
   /** Extra line rendered above the job header, e.g. a send/cancel confirmation. */
   lead?: string;
+  /** Display-only lifecycle label. The underlying job status still controls color and terminal behavior. */
+  statusLabel?: string;
   /** Whether this render is a streaming update rather than the settled tool result. */
   isPartial?: boolean;
   /** Configured expand-key hint text (e.g. from Pi's `keyHint("app.tools.expand", ...)`), supplied by the live renderer. */
@@ -195,7 +202,8 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
   const profile = job.profile ? ` · profile ${sanitizeInline(job.profile)}` : "";
   const independent = job.independent ? " · independent" : "";
   const peerMarker = job.peer ? " · peer" : "";
-  const header = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(job.name)))} ${theme.fg("dim", `${shortId(sanitizeText(job.id))} · ${job.status} · ${formatElapsed(job, now)}`)}`;
+  const statusLabel = sanitizeInline(options.statusLabel ?? job.status);
+  const header = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(job.name)))} ${theme.fg("dim", `${shortId(sanitizeText(job.id))} · ${statusLabel} · ${formatElapsed(job, now)}`)}`;
   const policy = theme.fg("dim", `${job.access}${profile}${independent}${peerMarker} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}`);
   lines.push(header, policy);
 
@@ -268,10 +276,11 @@ export function renderJobCard(job: JobSnapshot, theme: Theme, options: JobCardOp
 }
 
 /** Compact acknowledgement for operations already identified by their call row. */
-export function renderJobReceipt(job: JobSnapshot, theme: Theme, options: { action: string; now: number }): Component {
+export function renderJobReceipt(job: JobSnapshot, theme: Theme, options: { action: string; now: number; standalone?: boolean }): Component {
   const status = statusMeta(job.status, options.now);
   const elapsed = formatElapsed(job, options.now);
-  return linesComponent([traceResultLine(theme, status.glyph, `${options.action} · ${elapsed}`, status.color)]);
+  const line = `${theme.fg(status.color, status.glyph)} ${theme.fg("muted", sanitizeInline(`${options.action} · ${elapsed}`))}`;
+  return linesComponent(traceResultLines(theme, [line], options.standalone));
 }
 
 function jobRow(job: JobSnapshot, theme: Theme, now: number): string {

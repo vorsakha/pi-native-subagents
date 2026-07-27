@@ -167,12 +167,11 @@ test("extension exposes generic direct tools, caller models, independence, and o
 
   const consumed = await pi.tools.get("subagent_spawn").execute("spawn", { name: "reader", task: "consumed", access: "readOnly", effort: "high" }, undefined, undefined, ctx);
   assert.equal(consumed.details.job.effort, "high");
-  const waitCall = pi.tools.get("subagent_wait").renderCall({ jobId: consumed.details.job.id, timeoutMs: 600_000 }, theme).render(100).join("\n");
-  assert.match(waitCall, /⌁\s+· wait reader .*timeout 600s/, "wait call resolves the human-readable agent name once");
+  const waitCall = pi.tools.get("subagent_wait").renderCall({ jobId: consumed.details.job.id, timeoutMs: 600_000 }, theme).render(100);
+  assert.deepEqual(waitCall, [], "wait orchestration does not create a second transcript block");
   const waited = await pi.tools.get("subagent_wait").execute("wait", { jobId: consumed.details.job.id }, undefined, undefined, ctx);
-  const waitReceipt = pi.tools.get("subagent_wait").renderResult(waited, { expanded: false, isPartial: false }, theme, { args: {} }).render(100).join("\n");
-  assert.match(waitReceipt, /^│\s+✓ completed ·/);
-  assert.equal(waitReceipt.includes("reader"), false, "wait result does not repeat its call target");
+  const waitReceipt = pi.tools.get("subagent_wait").renderResult(waited, { expanded: false, isPartial: false }, theme, { args: {} }).render(100);
+  assert.deepEqual(waitReceipt, [], "successful completion stays on the original live job card");
   pi.handlers.get("agent_settled")?.();
   assert.equal(pi.messages.length, 1, "wait consumes deferred delivery without duplication");
   const historicalContext = { args: {}, state: {}, invalidate() {} };
@@ -264,6 +263,12 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.equal(blinkDelay, 500, "thread card status blinks at a restrained 500 ms cadence");
   blinkTimers.values().next().value?.();
   assert.equal(invalidations, 1, "blink timer invalidates the existing thread row");
+  const timedWait = blinkPi.tools.get("subagent_wait").execute("wait-blink", { jobId: active.details.job.id, timeoutMs: 10 }, undefined, undefined, blinkCtx);
+  const waitingCard = blinkPi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
+  assert.ok(waitingCard.render(80).some((line: string) => line.includes("waiting")), "the original job card owns the parent wait lifecycle");
+  const timedOut = await timedWait;
+  const timeoutNotice = blinkPi.tools.get("subagent_wait").renderResult(timedOut, { expanded: false, isPartial: false }, theme, { args: { timeoutMs: 10 }, state: {}, invalidate() {} }).render(100).join("\n");
+  assert.match(timeoutNotice, /running after <1s wait timeout/, "non-terminal wait timeouts remain visible as exceptional outcomes");
   await blinkPi.tools.get("subagent_cancel").execute("cancel-blink", { jobId: active.details.job.id }, undefined, undefined, blinkCtx);
   assert.equal(blinkTimers.size, 0, "manager settlement prunes the blink without requiring a rerender");
   const settledCard = blinkPi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
