@@ -38,6 +38,11 @@ function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: J
       : snapshot.queuedMessages.map((message) => ({ ...message })),
     workflow: snapshot.workflow ? { ...snapshot.workflow } : undefined,
     peer: snapshot.peer ? { ...snapshot.peer } : undefined,
+    requires: snapshot.requires ? [...snapshot.requires] : undefined,
+    capabilities: snapshot.capabilities
+      ? { ...snapshot.capabilities, matched: [...snapshot.capabilities.matched], warnings: snapshot.capabilities.warnings ? [...snapshot.capabilities.warnings] : undefined }
+      : undefined,
+    warnings: previous && previous.source.warnings === snapshot.warnings ? previous.value.warnings : snapshot.warnings ? [...snapshot.warnings] : undefined,
   };
 }
 
@@ -118,6 +123,10 @@ export class JobManager {
     const independentOfProvider = retainedProvider ?? replayProvider;
     const compiled = compilePolicy(request, profile, independentOfProvider);
     if (!this.#backends.has(compiled.policy.harness)) throw new Error(`Harness is unavailable: ${compiled.policy.harness}`);
+    // A recorded route is only evidence for the harness it was validated against.
+    if (request.capabilityRoute && request.capabilityRoute.harness !== compiled.policy.harness) {
+      throw new Error(`Capability route was validated for ${request.capabilityRoute.harness} but this job routes to ${compiled.policy.harness}`);
+    }
     if (request.peer) {
       if (compiled.policy.harness !== "pi") throw new Error("Session peers require the pi harness");
       if (compiled.independent) throw new Error("Session peers cannot be independent");
@@ -156,6 +165,8 @@ export class JobManager {
       peer: request.peer
         ? { sourceSessionId: request.peer.sourceSessionId, sourceCwd: request.peer.sourceCwd, sourceName: request.peer.sourceName }
         : undefined,
+      requires: policy.requires ? [...policy.requires] : undefined,
+      capabilities: request.capabilityRoute ? { ...request.capabilityRoute } : undefined,
     };
     this.#jobs.set(id, { snapshot, profile, request, policy });
     this.#queue.push(id);
@@ -373,7 +384,10 @@ export class JobManager {
     this.#emit(job, { type: "started" });
     try {
       const basePrompt = job.request.peer ? PEER_SYSTEM_PROMPT : GENERIC_SYSTEM_PROMPT;
-      const systemPrompt = [basePrompt, job.profile?.systemPrompt].filter(Boolean).join("\n\n");
+      const capabilityPrompt = job.request.capabilityRoute?.matched.length
+        ? `The parent live-verified these required native capabilities for this task: ${job.request.capabilityRoute.matched.join(", ")}. Use the relevant skill or tool when the task calls for it; do not substitute an unverified capability.`
+        : undefined;
+      const systemPrompt = [basePrompt, capabilityPrompt, job.profile?.systemPrompt].filter(Boolean).join("\n\n");
       const startup = backend.start({
         jobId: job.snapshot.id,
         name: job.snapshot.name,

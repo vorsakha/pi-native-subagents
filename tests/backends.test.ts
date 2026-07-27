@@ -112,7 +112,7 @@ function request(harness: HarnessName, cwd: string, env: NodeJS.ProcessEnv): Bac
     jobId: `job-${harness}`, name: "worker", task: "fixture task", systemPrompt: "fixture system", cwd, env,
     signal: new AbortController().signal,
     policy: {
-      harness, access: "readOnly", model: "fixture-model", thinking: "low",
+      harness, access: "readOnly", customization: "isolated", model: "fixture-model", thinking: "low",
       piTools: [], claudeTools: [], approvalPolicy: "never",
       codexSandbox: { type: "readOnly", networkAccess: false },
     },
@@ -358,7 +358,7 @@ test("Claude fails closed if a read-only CLI init exposes mutating tools", async
   await run.completed;
   const event = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
   assert.equal(event.type, "failed");
-  assert.match(event.error, /read-only initialization exposed mutating tools: Write/);
+  assert.match(event.error, /read-only initialization exposed (?:mutating|forbidden) tools: Write/);
   await run.close();
 });
 

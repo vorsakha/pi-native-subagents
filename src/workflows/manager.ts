@@ -2,10 +2,12 @@ import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import type { TSchema } from "typebox";
 import { Check } from "typebox/value";
+import { isRequestedHarness, routeCapabilities, type RequestedHarness } from "../capability-routing.ts";
+import type { CapabilityRouter } from "../capability-service.ts";
 import type { JobManager } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
 import { normalizeModel } from "../policy.ts";
-import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProviderFamily, Usage } from "../types.ts";
+import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, Usage } from "../types.ts";
 import {
   appendWorkflowJournal,
   checkpointWorkflow,
@@ -32,7 +34,6 @@ import type {
   WorkflowUsage,
 } from "./types.ts";
 
-const HARNESSES = new Set<HarnessName>(["pi", "claude", "codex"]);
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
 const ACCESS = new Set<AccessMode>(["readOnly", "full"]);
 const CHECKPOINT_DELAY_MS = 150;
@@ -149,6 +150,8 @@ export class WorkflowManager {
   readonly #listeners = new Set<(snapshot: WorkflowSnapshot) => void>();
   readonly #unsubscribeJobs: () => void;
   readonly #approveMutation?: (request: { runId: string; workflow: string; agent: string; prompt: string; signal: AbortSignal }) => Promise<boolean>;
+  readonly #router?: CapabilityRouter;
+  readonly #resolveProfile?: (name: string) => ProfileDefinition | undefined;
   #initializing?: Promise<void>;
   #closed = false;
 
@@ -157,11 +160,16 @@ export class WorkflowManager {
     artifactRoot: string;
     sessionId: string;
     approveMutation?: (request: { runId: string; workflow: string; agent: string; prompt: string; signal: AbortSignal }) => Promise<boolean>;
+    /** Live capability routing for `requires`/`harness: "auto"`; absent means requirements fail closed. */
+    router?: CapabilityRouter;
+    resolveProfile?: (name: string) => ProfileDefinition | undefined;
   }) {
     this.#jobs = options.jobs;
     this.#artifactRoot = resolve(options.artifactRoot);
     this.#sessionId = options.sessionId;
     this.#approveMutation = options.approveMutation;
+    this.#router = options.router;
+    this.#resolveProfile = options.resolveProfile;
     this.#unsubscribeJobs = this.#jobs.subscribe((job, event) => this.#updateAgentFromJob(job, event));
   }
 
@@ -542,8 +550,8 @@ export class WorkflowManager {
     if (["role", "agent", "tier", "modelTier", "modelProfile", "backend"].some((key) => Object.hasOwn(options, key))) {
       return { ok: false, output: "", error: "Workflow agent() API schema mismatch: use the current task-driven schema." };
     }
-    const harness = options.harness === undefined ? undefined : String(options.harness) as HarnessName;
-    if (harness && !HARNESSES.has(harness)) return { ok: false, output: "", error: `Unknown harness: ${harness}` };
+    const harness = options.harness === undefined ? undefined : String(options.harness) as RequestedHarness;
+    if (harness && !isRequestedHarness(harness)) return { ok: false, output: "", error: `Unknown harness: ${harness}` };
     let model: string | undefined;
     try { model = normalizeModel(options.model); }
     catch (error) { return { ok: false, output: "", error: boundedText(error) }; }
@@ -653,12 +661,37 @@ export class WorkflowManager {
       : undefined;
     let job: JobSnapshot;
     try {
+      const routing = await routeCapabilities(this.#router, {
+        request: {
+          name,
+          task,
+          cwd: agentCwd,
+          trusted: request.trusted,
+          harness,
+          requires: options.requires as string[] | undefined,
+          model,
+          effort,
+          access,
+          independent: options.independent === true,
+          independentOf: record.independentOf,
+          independentOfProvider: replayIndependenceProvider,
+          profile: record.profile,
+          defaultHarness: request.defaultHarness,
+          parentProvider: request.parentProvider,
+        },
+        profile: record.profile ? this.#resolveProfile?.(record.profile) : undefined,
+        independentOfProvider: replayIndependenceProvider,
+        preference: request.defaultHarness ? [request.defaultHarness] : undefined,
+        signal,
+      });
       job = this.#jobs.spawn({
         name,
         task,
         cwd: agentCwd,
         trusted: request.trusted,
-        harness,
+        harness: routing.harness ?? (harness === "auto" ? undefined : harness),
+        requires: routing.requires,
+        capabilityRoute: routing.capabilityRoute,
         model,
         effort,
         access,

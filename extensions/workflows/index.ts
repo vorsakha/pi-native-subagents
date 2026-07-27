@@ -1,6 +1,8 @@
 import { resolve } from "node:path";
 import { getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { CapabilityRouter } from "../../src/capability-service.ts";
+import type { ProfileDefinition } from "../../src/types.ts";
 import { Type } from "typebox";
 import type { JobManager } from "../../src/manager.ts";
 import { providerFamily } from "../../src/policy.ts";
@@ -29,6 +31,8 @@ export interface RegisterWorkflowOptions {
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   savedWorkflowRoot?: string;
+  router?: CapabilityRouter;
+  resolveProfile?: (name: string) => ProfileDefinition | undefined;
 }
 
 interface LiveWorkflowBlink {
@@ -379,6 +383,8 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         jobs,
         artifactRoot,
         sessionId: ctx.sessionManager.getSessionId(),
+        router: options.router,
+        resolveProfile: options.resolveProfile,
         approveMutation: async ({ workflow, agent, prompt, signal }) => {
           if (!ctx.hasUI || typeof ctx.ui.confirm !== "function") return false;
           return ctx.ui.confirm(

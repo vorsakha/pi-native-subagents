@@ -2,6 +2,7 @@ import type { BackendEvent, JobSnapshot, Usage } from "./types.ts";
 
 export const MAX_OUTPUT_BYTES = 50 * 1024;
 export const MAX_TOOL_TRACES = 200;
+export const MAX_JOB_WARNINGS = 8;
 export const MAX_TRANSCRIPT_ENTRIES = 160;
 export const MAX_TRANSCRIPT_BYTES = 256 * 1024;
 const MAX_TRANSCRIPT_ENTRY_BYTES = 16 * 1024;
@@ -102,6 +103,13 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
         }
       }
       pushTranscript(next, { kind: "tool", toolId: event.id, name: event.name ?? "tool", text: event.output, error: event.error, at: event.at ?? now });
+      break;
+    }
+    case "degraded": {
+      // Optional native integrations report themselves without failing the job;
+      // the notice stays bounded and de-duplicated so a flapping source cannot spam the card.
+      const warning = `${event.source}: ${event.detail}`.replace(/\s+/g, " ").trim().slice(0, 300);
+      if (!job.warnings?.includes(warning)) next.warnings = [...(job.warnings ?? []), warning].slice(-MAX_JOB_WARNINGS);
       break;
     }
     case "usage":

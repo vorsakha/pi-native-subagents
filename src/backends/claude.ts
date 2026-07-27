@@ -1,13 +1,55 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { query, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Options, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { createActivityWatchdog } from "../activity-watchdog.ts";
+import type { CapabilityHealth, CapabilitySourceStatus, DiscoveredCapability } from "../capabilities.ts";
 import { sanitizeSubscriptionEnv } from "../env.ts";
 import { boundedAppend } from "../reducer.ts";
-import type { Backend, BackendEvent, BackendRequest, BackendRun, SendBehavior } from "../types.ts";
+import type { Backend, BackendEvent, BackendPolicy, BackendRequest, BackendRun, DiscoveryRequest, DiscoveryResult, SendBehavior } from "../types.ts";
 
 const READ_ONLY_DENY = ["Bash", "Edit", "Write", "NotebookEdit", "Agent"];
+/** Orchestration and interactivity are denied in every access mode. */
+const ALWAYS_DENY = [
+  "Agent", "Workflow", "Task", "TaskCreate", "TaskGet", "TaskList", "TaskOutput", "TaskStop", "TaskUpdate",
+  "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
+];
+/** Read-only children never reach external MCP surfaces or user-invocable commands. */
+const READ_ONLY_NATIVE_DENY = ["mcp__*", "SlashCommand", "KillShell"];
 const execFileAsync = promisify(execFile);
+
+/** Tool policy for one launch, shared by real runs and the read-only startup assertion. */
+export function claudeToolPolicy(policy: Pick<BackendPolicy, "customization" | "access" | "claudeTools">): {
+  tools: Options["tools"];
+  allowedTools?: string[];
+  disallowedTools: string[];
+} {
+  const native = policy.customization === "native";
+  const readOnly = policy.access === "readOnly";
+  const disallowedTools = [
+    ...new Set([
+      ...(readOnly ? [...READ_ONLY_DENY, ...READ_ONLY_NATIVE_DENY] : []),
+      ...ALWAYS_DENY,
+    ]),
+  ];
+  if (!native) return { tools: policy.claudeTools, allowedTools: policy.claudeTools, disallowedTools };
+  if (readOnly) {
+    // Native context and skills load, but the executable surface stays the
+    // fixed read allowlist plus instruction-only Skill loading.
+    const tools = [...policy.claudeTools, "Skill"];
+    return { tools, allowedTools: tools, disallowedTools };
+  }
+  return { tools: { type: "preset", preset: "claude_code" }, disallowedTools };
+}
+
+function claudeSettings(policy: Pick<BackendPolicy, "customization" | "access">): Record<string, unknown> {
+  return {
+    // Provider-native orchestration surfaces stay off regardless of user settings.
+    disableWorkflows: true,
+    disableAgentView: true,
+    // Hooks can mutate outside the model tool policy, so read-only children never run them.
+    ...(policy.access === "readOnly" || policy.customization !== "native" ? { disableAllHooks: true } : {}),
+  };
+}
 
 type ClaudeQuery = typeof query;
 type ClaudeAuthVerifier = (command: string, cwd: string, env: NodeJS.ProcessEnv, signal: AbortSignal) => Promise<void>;
@@ -29,6 +71,151 @@ export class ClaudeBackend implements Backend {
     this.#inactivityTimeoutMs = options.inactivityTimeoutMs ?? 15 * 60_000;
     this.#query = options.queryFn ?? query;
     this.#verifyAuth = options.verifyAuth ?? verifyClaudeSubscription;
+  }
+
+  /**
+   * Zero-model-turn discovery: initialize a fresh SDK session, read the
+   * initialization inventory plus the live command/agent/MCP introspection
+   * methods, and close before any user message exists.
+   */
+  async discover(request: DiscoveryRequest): Promise<DiscoveryResult> {
+    request.signal.throwIfAborted();
+    const env = sanitizeSubscriptionEnv(request.env, "claude");
+    const controller = new AbortController();
+    const abort = () => controller.abort(request.signal.reason ?? new Error("Claude capability discovery aborted"));
+    request.signal.addEventListener("abort", abort, { once: true });
+    const input = new AsyncInput();
+    const policy = { customization: request.customization, access: request.access, claudeTools: [] as string[] };
+    const toolPolicy = claudeToolPolicy({ ...policy, claudeTools: [] });
+    const stream = this.#query({
+      prompt: input,
+      options: {
+        abortController: controller,
+        cwd: request.cwd,
+        env: { ...env, CLAUDE_AGENT_SDK_CLIENT_APP: "pi-native-subagents/0.1.0" },
+        pathToClaudeCodeExecutable: this.#command,
+        systemPrompt: { type: "preset", preset: "claude_code" },
+        disallowedTools: toolPolicy.disallowedTools,
+        permissionMode: "dontAsk",
+        settingSources: request.customization === "native" ? ["user", "project", "local"] : [],
+        ...(request.customization === "native" ? { skills: "all" as const } : {}),
+        settings: claudeSettings(policy),
+        extraArgs: { "safe-mode": null },
+        persistSession: false,
+        maxTurns: 1,
+      },
+    });
+    const capabilities: DiscoveredCapability[] = [];
+    const sources: CapabilitySourceStatus[] = [];
+    const warnings: string[] = [];
+    try {
+      // initializationResult resolves after the CLI handshake even when the
+      // input stream has never yielded a user message. This is the zero-turn
+      // discovery primitive; iterating the assistant stream would wait for a
+      // prompt and incorrectly time out.
+      const target = stream as unknown as {
+        initializationResult(): Promise<{ commands?: unknown[]; agents?: unknown[] }>;
+        reloadSkills?: () => Promise<{ skills?: unknown[] }>;
+        reloadPlugins?: () => Promise<{ plugins?: unknown[] }>;
+      };
+      const init = await target.initializationResult();
+      // The SDK control response does not expose the final tool list. Report
+      // the exact read-only allowlist and a conservative known subset of the
+      // full Claude Code preset; dynamic skills/plugins/MCP are read live below.
+      const nativeTools = [
+        "Read", "Glob", "Grep", "WebSearch", "WebFetch", "Skill",
+        ...(request.access === "full"
+          ? ["Write", "Edit", "Bash", "NotebookEdit", "TodoWrite", "ListMcpResources", "ReadMcpResource"]
+          : []),
+      ];
+      for (const tool of nativeTools) capabilities.push({ kind: "tool", name: tool, origin: "native" });
+      for (const command of init.commands ?? []) {
+        const record = command as { name?: unknown; description?: unknown };
+        if (typeof record.name !== "string") continue;
+        capabilities.push({ kind: "command", name: record.name, description: typeof record.description === "string" ? record.description : undefined, origin: "native" });
+      }
+      for (const agent of init.agents ?? []) {
+        const record = agent as { name?: unknown; description?: unknown };
+        if (typeof record.name !== "string") continue;
+        capabilities.push({ kind: "agent", name: record.name, description: typeof record.description === "string" ? record.description : undefined, origin: "native" });
+      }
+      sources.push({ source: "claude-init", health: "healthy" });
+
+      if (typeof target.reloadSkills === "function") {
+        try {
+          const result = await target.reloadSkills();
+          for (const skill of result.skills ?? []) {
+            const record = skill as { name?: unknown; description?: unknown };
+            if (typeof record.name !== "string") continue;
+            capabilities.push({ kind: "skill", name: record.name, description: typeof record.description === "string" ? record.description : undefined, origin: "native" });
+          }
+          sources.push({ source: "claude-skills", health: "healthy" });
+        } catch (error) {
+          sources.push({ source: "claude-skills", health: "unknown", detail: error instanceof Error ? error.message : String(error) });
+        }
+      }
+      if (typeof target.reloadPlugins === "function") {
+        try {
+          const result = await target.reloadPlugins();
+          for (const plugin of result.plugins ?? []) {
+            const record = plugin as { name?: unknown; source?: unknown };
+            if (typeof record.name !== "string") continue;
+            capabilities.push({ kind: "plugin", name: record.name, origin: typeof record.source === "string" ? `plugin:${record.source}` : "plugin" });
+          }
+          sources.push({ source: "claude-plugins", health: "healthy" });
+        } catch (error) {
+          sources.push({ source: "claude-plugins", health: "unknown", detail: error instanceof Error ? error.message : String(error) });
+        }
+      }
+
+      const mcp = await introspect(stream, "mcpServerStatus");
+      if (mcp.ok) {
+        let degraded = 0;
+        for (const server of mcp.value as Array<Record<string, unknown>>) {
+          if (typeof server?.name !== "string") continue;
+          const status = String(server.status ?? "pending");
+          const health: CapabilityHealth = status === "connected"
+            ? "healthy"
+            : status === "failed" || status === "needs-auth" ? "unavailable" : "unknown";
+          if (health !== "healthy") degraded++;
+          capabilities.push({
+            kind: "mcp",
+            name: server.name,
+            origin: typeof server.scope === "string" ? `mcp:${server.scope}` : "mcp",
+            health,
+            enabled: status !== "disabled",
+            detail: typeof server.error === "string" ? server.error : status,
+          });
+          for (const tool of Array.isArray(server.tools) ? server.tools : []) {
+            const record = tool as { name?: unknown; description?: unknown; annotations?: { readOnly?: unknown } };
+            if (typeof record?.name !== "string") continue;
+            capabilities.push({
+              kind: "tool",
+              name: `mcp__${server.name}__${record.name}`,
+              description: typeof record.description === "string" ? record.description : undefined,
+              origin: `mcp:${server.name}`,
+              health,
+              effect: record.annotations?.readOnly === true ? "external-read" : "external-write",
+            });
+          }
+        }
+        sources.push({
+          source: "claude-mcp",
+          health: degraded ? "degraded" : "healthy",
+          detail: degraded ? `${degraded} MCP server(s) are not connected` : undefined,
+        });
+        if (degraded) warnings.push(`Claude reports ${degraded} MCP server(s) that are not connected`);
+      } else {
+        sources.push({ source: "claude-mcp", health: "unknown", detail: mcp.detail });
+        warnings.push(`Claude MCP status unavailable: ${mcp.detail}`);
+      }
+    } finally {
+      request.signal.removeEventListener("abort", abort);
+      input.close();
+      controller.abort();
+      try { stream.close(); } catch { /* discovery teardown is best effort */ }
+    }
+    return { capabilities, sources, warnings };
   }
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
@@ -62,6 +249,9 @@ export class ClaudeBackend implements Backend {
       emit(event);
       resolveCompleted();
     };
+    const native = request.policy.customization === "native";
+    const readOnly = request.policy.access === "readOnly";
+    const toolPolicy = claudeToolPolicy(request.policy);
     const stream = this.#query({
       prompt: input,
       options: {
@@ -73,12 +263,21 @@ export class ClaudeBackend implements Backend {
         ...(request.policy.effort ? { effort: request.policy.effort } : {}),
         thinking: request.policy.thinking === "off" ? { type: "disabled" } : { type: "adaptive" },
         systemPrompt: { type: "preset", preset: "claude_code", append: request.systemPrompt },
-        tools: request.policy.claudeTools,
-        allowedTools: request.policy.claudeTools,
-        disallowedTools: request.policy.access === "readOnly" ? READ_ONLY_DENY : [],
+        tools: toolPolicy.tools,
+        ...(toolPolicy.allowedTools ? { allowedTools: toolPolicy.allowedTools } : {}),
+        disallowedTools: toolPolicy.disallowedTools,
+        canUseTool: async (toolName) => ({
+          behavior: "deny" as const,
+          message: `Unattended subagent denied interactive approval for ${toolName}`,
+        }),
         permissionMode: request.policy.access === "full" ? "bypassPermissions" : "dontAsk",
         allowDangerouslySkipPermissions: request.policy.access === "full",
-        settingSources: [],
+        // Native parity loads the user's own context, skills, plugins, and MCP.
+        settingSources: native ? ["user", "project", "local"] : [],
+        ...(native ? { skills: "all" as const } : {}),
+        // Read-only children discover MCP but never reach a configured server.
+        ...(native && !readOnly ? {} : { strictMcpConfig: true }),
+        settings: claudeSettings(request.policy),
         extraArgs: { "safe-mode": null },
         persistSession: true,
         includePartialMessages: true,
@@ -160,6 +359,22 @@ export class ClaudeBackend implements Backend {
   }
 }
 
+/** Feature-detected introspection: a missing method degrades to unknown, never to a false inventory. */
+async function introspect(
+  stream: unknown,
+  method: "mcpServerStatus",
+): Promise<{ ok: true; value: unknown[] } | { ok: false; detail: string }> {
+  const target = stream as Record<string, unknown>;
+  const fn = target[method];
+  if (typeof fn !== "function") return { ok: false, detail: `installed CLI does not expose ${method}()` };
+  try {
+    const value = await (fn as () => Promise<unknown>).call(stream);
+    return Array.isArray(value) ? { ok: true, value } : { ok: false, detail: `${method}() returned an unexpected payload` };
+  } catch (error) {
+    return { ok: false, detail: error instanceof Error ? error.message : String(error) };
+  }
+}
+
 class AsyncInput implements AsyncIterable<SDKUserMessage> {
   readonly #queued: SDKUserMessage[] = [];
   readonly #waiters: Array<(result: IteratorResult<SDKUserMessage>) => void> = [];
@@ -209,9 +424,9 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
       controller.abort();
       return { success: false, output: "", error: "Claude subscription OAuth required" };
     }
-    const mutatingTools = message.tools.filter((tool) => READ_ONLY_DENY.includes(tool));
-    if (readOnly && mutatingTools.length > 0) {
-      const error = `Claude read-only initialization exposed mutating tools: ${mutatingTools.join(", ")}`;
+    const forbidden = forbiddenInitTools(message.tools, readOnly);
+    if (forbidden.length > 0) {
+      const error = `Claude ${readOnly ? "read-only " : ""}initialization exposed forbidden tools: ${forbidden.join(", ")}`;
       controller.abort();
       return { success: false, output: "", error };
     }
@@ -262,6 +477,19 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
       ? { success: true, output: message.result, error: "" }
       : { success: false, output: "", error: message.errors.join("\n") || message.subtype };
   }
+}
+
+/**
+ * Fail-closed startup assertion. Nested orchestration is never acceptable, and a
+ * read-only session must not expose mutating or external MCP surfaces even if a
+ * newer CLI changes its defaults.
+ */
+export function forbiddenInitTools(tools: string[], readOnly: boolean): string[] {
+  return tools.filter((tool) => {
+    if (ALWAYS_DENY.includes(tool)) return true;
+    if (!readOnly) return false;
+    return READ_ONLY_DENY.includes(tool) || tool.startsWith("mcp__");
+  });
 }
 
 async function verifyClaudeSubscription(command: string, cwd: string, env: NodeJS.ProcessEnv, signal: AbortSignal): Promise<void> {

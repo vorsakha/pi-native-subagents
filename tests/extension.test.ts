@@ -117,7 +117,7 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_BACKEND: "codex" }), "pi", "obsolete backend env is ignored");
   assert.deepEqual([...pi.tools.keys()].sort(), [
     "session_peer_fork", "session_peer_list",
-    "subagent", "subagent_cancel", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
+    "subagent", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
   ]);
   assert.deepEqual([...pi.commands.keys()].sort(), ["subagents", "subagents-config", "workflows"]);
   const spawnProperties = pi.tools.get("subagent_spawn").parameters.properties;

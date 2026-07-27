@@ -1,13 +1,41 @@
 import { createActivityWatchdog } from "../activity-watchdog.ts";
+import type { DiscoveredCapability, CapabilitySourceStatus } from "../capabilities.ts";
 import { sanitizeSubscriptionEnv } from "../env.ts";
 import { JsonlFramer, parseJsonRecord } from "../framing.ts";
 import { spawnManaged } from "../process-tree.ts";
 import { boundedAppend } from "../reducer.ts";
-import type { Backend, BackendEvent, BackendRequest, BackendRun, SendBehavior } from "../types.ts";
+import type { Backend, BackendEvent, BackendPolicy, BackendRequest, BackendRun, DiscoveryRequest, DiscoveryResult, SendBehavior } from "../types.ts";
+
+/** Marks a Pi child so this package registers nothing inside it. */
+export const PI_CHILD_MARKER = "PI_NATIVE_SUBAGENTS_CHILD";
+
+/** Parent-session inventory injected by the extension; discovery never imports Pi's runtime. */
+export interface PiParentInventory {
+  tools?: Array<{ name: string; description?: string; source?: string }>;
+  commands?: Array<{ name: string; description?: string; source?: string }>;
+}
 
 interface PiBackendOptions {
   requestTimeoutMs?: number;
   inactivityTimeoutMs?: number;
+  /** Live parent tool/command inventory, e.g. `pi.getAllTools()` and `pi.getCommands()`. */
+  parentInventory?: () => PiParentInventory;
+}
+
+/**
+ * Native customization parity: a full-access child loads the user's skills,
+ * prompt templates, and extensions, while a read-only child keeps extensions off
+ * so its sandbox stays deny-by-construction. Isolated children keep the original
+ * fully stripped launch.
+ */
+export function piResourceArgs(policy: Pick<BackendPolicy, "customization" | "access">): string[] {
+  if (policy.customization !== "native") return ["--no-skills", "--no-prompt-templates", "--no-extensions"];
+  return policy.access === "readOnly" ? ["--no-extensions"] : [];
+}
+
+/** Pi children inherit the parent provider environment plus a recursion marker. */
+export function piChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...sanitizeSubscriptionEnv(env, "pi"), [PI_CHILD_MARKER]: "1" };
 }
 
 interface PendingCommand {
@@ -22,17 +50,133 @@ export class PiRpcBackend implements Backend {
   readonly #command: string;
   readonly #requestTimeoutMs: number;
   readonly #inactivityTimeoutMs: number;
+  readonly #parentInventory?: () => PiParentInventory;
 
   constructor(command = "pi", options: PiBackendOptions = {}) {
     this.#command = command;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.#inactivityTimeoutMs = options.inactivityTimeoutMs ?? 15 * 60_000;
+    this.#parentInventory = options.parentInventory;
+  }
+
+  /**
+   * Zero-model-turn inventory: the parent's live tool/command list plus the
+   * child's own `get_commands` reply, which reflects the resources a real child
+   * launch would load under the same policy.
+   */
+  async discover(request: DiscoveryRequest): Promise<DiscoveryResult> {
+    const capabilities: DiscoveredCapability[] = [];
+    const sources: CapabilitySourceStatus[] = [];
+    const warnings: string[] = [];
+
+    if (this.#parentInventory) {
+      try {
+        const inventory = this.#parentInventory();
+        for (const tool of inventory.tools ?? []) {
+          const nativeBuiltin = tool.source === "builtin" || tool.source === "sdk";
+          capabilities.push({
+            kind: "tool",
+            name: tool.name,
+            description: tool.description,
+            origin: tool.source ?? "parent",
+            // Read-only Pi children keep extensions disabled because extension
+            // hooks are outside the core tool sandbox. Report extension tools
+            // honestly as unavailable instead of routing to a surface that will
+            // not be loaded.
+            effect: request.access === "readOnly" && !nativeBuiltin ? "unknown" : undefined,
+          });
+        }
+        for (const command of inventory.commands ?? []) {
+          capabilities.push({
+            kind: command.source === "skill" ? "skill" : "command",
+            name: command.name,
+            description: command.description,
+            origin: command.source ?? "parent",
+          });
+        }
+        sources.push({ source: "pi-parent", health: "healthy" });
+      } catch (error) {
+        sources.push({ source: "pi-parent", health: "unknown", detail: message(error) });
+        warnings.push(`Pi parent inventory unavailable: ${message(error)}`);
+      }
+    } else {
+      sources.push({ source: "pi-parent", health: "unknown", detail: "no live parent tool inventory was provided" });
+      warnings.push("Pi parent tool inventory is unavailable; the catalog may omit extension tools");
+    }
+
+    try {
+      const commands = await this.#childCommands(request);
+      for (const command of commands) {
+        capabilities.push({
+          kind: command.source === "skill" ? "skill" : "command",
+          name: command.name,
+          description: command.description,
+          origin: command.source ? `child:${command.source}` : "child",
+        });
+      }
+      sources.push({ source: "pi-child", health: "healthy" });
+    } catch (error) {
+      sources.push({ source: "pi-child", health: "unknown", detail: message(error) });
+      warnings.push(`Pi child command inventory unavailable: ${message(error)}`);
+    }
+    return { capabilities, sources, warnings };
+  }
+
+  async #childCommands(request: DiscoveryRequest): Promise<Array<{ name: string; description?: string; source?: string }>> {
+    request.signal.throwIfAborted();
+    const args = [
+      "--mode", "rpc", "--approve",
+      ...piResourceArgs({ customization: request.customization, access: request.access }),
+      "--name", "subagent-capability-probe",
+      "--no-tools",
+    ];
+    const managed = spawnManaged(this.#command, args, { cwd: request.cwd, env: piChildEnv(request.env) });
+    const framer = new JsonlFramer();
+    try {
+      return await new Promise<Array<{ name: string; description?: string; source?: string }>>((resolveCommands, reject) => {
+        const id = "capability-probe";
+        const settle = (fn: () => void) => { cleanup(); fn(); };
+        const onAbort = () => settle(() => reject(request.signal.reason ?? new Error("Pi capability discovery aborted")));
+        const cleanup = () => {
+          request.signal.removeEventListener("abort", onAbort);
+          clearTimeout(timer);
+        };
+        const timer = setTimeout(() => settle(() => reject(new Error("Pi get_commands timed out"))), this.#requestTimeoutMs);
+        const handle = (record: string) => {
+          const event = parseJsonRecord(record);
+          if (!event || event.type !== "response" || event.id !== id) return;
+          if (event.success === false) return settle(() => reject(new Error(String(event.error ?? "Pi rejected get_commands"))));
+          const data = asObject(event.data);
+          const list = Array.isArray(data.commands) ? data.commands : [];
+          settle(() => resolveCommands(list.map((item) => {
+            const command = asObject(item);
+            return {
+              name: String(command.name ?? ""),
+              description: typeof command.description === "string" ? command.description : undefined,
+              source: typeof command.source === "string" ? command.source : undefined,
+            };
+          }).filter((command) => command.name)));
+        };
+        managed.child.stdout.on("data", (chunk: Buffer) => {
+          try { for (const record of framer.push(chunk)) handle(record); }
+          catch (error) { settle(() => reject(error instanceof Error ? error : new Error(String(error)))); }
+        });
+        managed.child.on("error", (error) => settle(() => reject(error)));
+        managed.child.on("close", (code, signal) => settle(() => reject(new Error(`Pi capability probe exited (${code ?? signal ?? "signal"})`))));
+        request.signal.addEventListener("abort", onAbort, { once: true });
+        try { managed.child.stdin.write(`${JSON.stringify({ id, type: "get_commands" })}\n`); }
+        catch (error) { settle(() => reject(error instanceof Error ? error : new Error(String(error)))); }
+      });
+    } finally {
+      await managed.terminate(0).catch(() => undefined);
+    }
   }
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     request.signal.throwIfAborted();
     const args = [
-      "--mode", "rpc", "--approve", "--no-skills", "--no-prompt-templates", "--no-extensions",
+      "--mode", "rpc", "--approve",
+      ...piResourceArgs(request.policy),
       "--name", `subagent-${request.name}-${request.jobId.slice(0, 8)}`,
     ];
     if (request.resumeSessionFile) args.push("--session", request.resumeSessionFile);
@@ -45,7 +189,7 @@ export class PiRpcBackend implements Backend {
     else args.push("--no-tools");
 
     request.signal.throwIfAborted();
-    const managed = spawnManaged(this.#command, args, { cwd: request.cwd, env: sanitizeSubscriptionEnv(request.env, "pi") });
+    const managed = spawnManaged(this.#command, args, { cwd: request.cwd, env: piChildEnv(request.env) });
     const pending = new Map<string, PendingCommand>();
     let commandSequence = 0;
     let output = "";
@@ -161,6 +305,11 @@ export class PiRpcBackend implements Backend {
           ...steering.map((text) => ({ text: String(text), behavior: "steer" as const })),
           ...followUp.map((text) => ({ text: String(text), behavior: "followUp" as const })),
         ] });
+      } else if (event.type === "extension_ui_request" && typeof event.id === "string") {
+        // Native extensions may ask the host user questions. Generic children
+        // are unattended, so decline immediately instead of parking the RPC
+        // process until the inactivity watchdog fires.
+        write({ type: "extension_ui_response", id: event.id, cancelled: true });
       } else if (event.type === "extension_error") {
         terminalProblem = { type: "failed", error: `Pi extension error: ${errorText(event.error, String(event.extensionPath ?? "unknown extension"))}` };
         retryableAssistantProblem = false;
@@ -314,6 +463,9 @@ function resultPreview(value: unknown): string {
 function summarize(args: Record<string, unknown>): string {
   const value = args.path ?? args.command ?? args.query ?? args.url ?? "";
   return String(value).replace(/\s+/g, " ").slice(0, 160);
+}
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 function errorText(value: unknown, fallback: string): string {
   if (typeof value === "string" && value.trim()) return value;

@@ -7,6 +7,21 @@ import { CONFIG_DIR_NAME, getAgentDir, keyHint, SessionManager } from "@earendil
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ClaudeBackend, CodexAppServerBackend, PiRpcBackend } from "../../src/backends/index.ts";
+import { PI_CHILD_MARKER } from "../../src/backends/pi-rpc.ts";
+import {
+  CAPABILITY_EFFECTS,
+  CAPABILITY_KINDS,
+  DEFAULT_SEARCH_LIMIT,
+  formatCapabilityLine,
+  formatCatalogSummary,
+  MAX_REQUIREMENTS,
+  MAX_REQUIREMENT_LENGTH,
+  MAX_SEARCH_LIMIT,
+  type CapabilityEffect,
+  type CapabilityKind,
+} from "../../src/capabilities.ts";
+import { routeCapabilities, type RequestedHarness } from "../../src/capability-routing.ts";
+import { CapabilityService, type CapabilityRouter } from "../../src/capability-service.ts";
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { claimExtensionInstall } from "../../src/install-guard.ts";
 import { providerFamily } from "../../src/policy.ts";
@@ -15,6 +30,8 @@ import {
   emptyComponent,
   formatEffort,
   linesComponent,
+  MAX_COLLAPSED_LINES,
+  MAX_EXPANDED_LINES,
   renderJobCard,
   renderJobListCard,
   renderPeerListCard,
@@ -34,7 +51,7 @@ import {
   type PeerSessionSummary,
   type SessionPeerSource,
 } from "../../src/session-peers.ts";
-import type { AccessMode, Backend, HarnessName, EffortLevel, JobSnapshot, ProviderFamily, SendBehavior } from "../../src/types.ts";
+import type { AccessMode, Backend, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SendBehavior } from "../../src/types.ts";
 import { registerWorkflows } from "../workflows/index.ts";
 
 /** Production session-peer source backed by Pi's real SessionManager. Never mutates the source session. */
@@ -73,8 +90,10 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const STATE_ENTRY = "native-subagents-harness";
 const SUBAGENT_RESULT_MESSAGE = "native-subagent-result";
 const HARNESSES = ["codex", "claude", "pi"] as const;
+const REQUESTED_HARNESSES = ["codex", "claude", "pi", "auto"] as const;
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const ACCESS = ["readOnly", "full"] as const;
+const MAX_CAPABILITY_LINES = 40;
 
 export interface RegistrationOptions {
   registry?: object;
@@ -87,6 +106,8 @@ export interface RegistrationOptions {
   globalProfilesDir?: string;
   /** Injectable for tests; production uses the real Pi SessionManager. */
   sessionPeerSource?: SessionPeerSource;
+  /** Injectable for tests; production reads the real process environment. */
+  env?: NodeJS.ProcessEnv;
 }
 
 interface LiveCardBlink {
@@ -109,6 +130,10 @@ export default function nativeSubagents(pi: ExtensionAPI): void {
 }
 
 export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationOptions = {}): void {
+  // A Pi child launched by this package must never register the delegation
+  // surface again: nested orchestration is denied by construction, not by prompt.
+  if ((options.env ?? process.env)[PI_CHILD_MARKER] === "1") return;
+  const env = options.env ?? process.env;
   const legacyRoot = options.legacyRoot === false
     ? undefined
     : options.legacyRoot ?? resolve(homedir(), ".pi/agent/extensions/subagents");
@@ -116,7 +141,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const globalProfilesDir = options.globalProfilesDir ?? resolve(getAgentDir(), "subagents");
   const sessionPeers = options.sessionPeerSource ?? createRealSessionPeerSource();
   let profileCatalog: ProfileCatalog = loadProfiles(globalProfilesDir);
-  const configuredHarness = configuredHarnessFromEnv(process.env);
+  const configuredHarness = configuredHarnessFromEnv(env);
   let activeHarness = configuredHarness;
   let manager: JobManager | undefined;
   let unsubscribeManager: (() => void) | undefined;
@@ -131,12 +156,32 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const consumedResults = new Set<string>();
   const resultKey = (id: string, generation: number) => `${id}:${generation}`;
 
+  // The Pi adapter reports the parent's live tool/command inventory so Pi
+  // capability discovery reflects what a child would actually load.
+  const backends = options.backends ?? [
+    new PiRpcBackend("pi", { parentInventory: () => ({ tools: parentTools(pi), commands: parentCommands(pi) }) }),
+    new ClaudeBackend(),
+    new CodexAppServerBackend(),
+  ];
+  const capabilities = new CapabilityService({ backends, env });
   const createManager = () => new JobManager({
     profiles: profileCatalog.profiles,
     concurrency: 4,
-    backends: options.backends ?? [new PiRpcBackend(), new ClaudeBackend(), new CodexAppServerBackend()],
+    backends,
   });
   const getManager = () => manager ??= createManager();
+  const spawnJob = (
+    params: SpawnToolParams,
+    ctx: { cwd: string; isProjectTrusted(): boolean; model?: { provider?: string } },
+    signal?: AbortSignal,
+  ) => spawn(getManager(), capabilities, params, {
+    parentCwd: ctx.cwd,
+    trusted: ctx.isProjectTrusted(),
+    defaultHarness: activeHarness,
+    parentProvider: providerFamily(ctx.model?.provider),
+    profile: params.profile ? profileCatalog.profiles.get(params.profile.trim()) : undefined,
+    signal,
+  });
   const jobCallTarget = (jobId: string): { accent: string; detail: string } => {
     try {
       const job = manager?.check(jobId);
@@ -265,6 +310,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     artifactRoot: options.workflowArtifactRoot,
     savedWorkflowRoot: options.savedWorkflowRoot,
     defaultHarness: () => activeHarness,
+    router: capabilities,
+    resolveProfile: (name) => profileCatalog.profiles.get(name),
     setInterval: options.setInterval,
     clearInterval: options.clearInterval,
   });
@@ -328,6 +375,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       ctx.isProjectTrusted() ? resolve(ctx.cwd, CONFIG_DIR_NAME, "subagents") : undefined,
     );
     manager = createManager();
+    // A new session may open a different project or follow a configuration change.
+    capabilities.invalidate();
     sessionContext = ctx;
     deferredResults.clear();
     cardSnapshots.clear();
@@ -374,6 +423,26 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     }
   });
 
+  /** Text inventory shared by `/subagents capabilities` and `subagent_capabilities`. */
+  const capabilityReport = async (
+    request: { cwd: string; access: AccessMode; refresh?: boolean; query?: string; harness?: HarnessName; kind?: CapabilityKind; effect?: CapabilityEffect; includeUnavailable?: boolean; limit?: number; signal?: AbortSignal },
+  ): Promise<string> => {
+    const found = await capabilities.search(request);
+    const now = Date.now();
+    const lines = [
+      ...found.catalogs.map((catalog) => formatCatalogSummary(catalog, now)),
+      "",
+      found.matches.length
+        ? `${found.matches.length} of ${found.total} capability match${found.total === 1 ? "" : "es"} under ${request.access} access:`
+        : `No capability matches ${request.query ? `for "${request.query}" ` : ""}under ${request.access} access.`,
+      ...found.matches.map((match) => formatCapabilityLine(match, now)),
+    ];
+    for (const catalog of found.catalogs) {
+      for (const warning of catalog.warnings) lines.push(`warning (${catalog.harness}): ${warning}`);
+    }
+    return lines.slice(0, MAX_CAPABILITY_LINES).join("\n").trim();
+  };
+
   const configure = async (args: string, ctx: ExtensionCommandContext) => {
     const value = args.trim().toLowerCase();
     const selected = normalizeHarness(value);
@@ -390,14 +459,25 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         .map((profile) => `${profile.name} (${profile.origin}) — ${profile.filePath}`);
       const warnings = profileCatalog.warnings.map((warning) => `Warning (${warning.origin}) ${warning.filePath}: ${warning.message}`);
       ctx.ui.notify([...resolved, ...warnings].join("\n") || "No subagent profiles configured.", warnings.length ? "warning" : "info");
+    } else if (value === "capabilities" || value.startsWith("capabilities ")) {
+      if (!ctx.isProjectTrusted()) {
+        ctx.ui.notify("Subagent capability discovery is disabled for untrusted projects.", "warning");
+        return;
+      }
+      const refresh = value.slice("capabilities".length).trim() === "refresh";
+      try {
+        ctx.ui.notify(await capabilityReport({ cwd: ctx.cwd, access: "full", refresh, includeUnavailable: true }), "info");
+      } catch (error) {
+        ctx.ui.notify(`Capability discovery failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
     } else {
-      ctx.ui.notify("Usage: /subagents [status|profiles|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <harness>", "warning");
+      ctx.ui.notify("Usage: /subagents [status|profiles|capabilities [refresh]|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <harness>", "warning");
     }
   };
 
   pi.registerCommand("subagents", {
-    description: "Open the subagent dashboard; inspect optional profiles with /subagents profiles.",
-    getArgumentCompletions: (prefix) => ["status", "profiles", ...HARNESSES, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    description: "Open the subagent dashboard; inspect profiles with /subagents profiles and native capabilities with /subagents capabilities.",
+    getArgumentCompletions: (prefix) => ["status", "profiles", "capabilities", "capabilities refresh", ...HARNESSES, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (args.trim()) await configure(args, ctx);
       else await openSubagentsDashboard(ctx, getManager());
@@ -414,13 +494,69 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     task: Type.String({ minLength: 1, maxLength: 100_000 }),
     name: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
     cwd: Type.Optional(Type.String()),
-    harness: Type.Optional(StringEnum(HARNESSES)),
+    harness: Type.Optional(StringEnum(REQUESTED_HARNESSES, { description: "Explicit harness, or auto to pick the harness that actually provides requires" })),
+    requires: Type.Optional(Type.Array(
+      Type.String({ minLength: 1, maxLength: MAX_REQUIREMENT_LENGTH }),
+      { maxItems: MAX_REQUIREMENTS, description: "Capability IDs from subagent_capabilities the child must really have; verified live before dispatch" },
+    )),
     model: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Harness-local model ID; omit to use the harness default" })),
     effort: Type.Optional(StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" })),
     access: Type.Optional(StringEnum(ACCESS, { description: "Access policy; defaults to full after project trust is established" })),
     independent: Type.Optional(Type.Boolean({ description: "Require a native provider different from the parent" })),
     independentOf: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Route on a native provider different from this existing job ID" })),
     profile: Type.Optional(Type.String({ minLength: 1, maxLength: 160, description: "Human-authored profile name; omit unless the human explicitly requested one" })),
+  });
+
+  pi.registerTool({
+    name: "subagent_capabilities",
+    renderShell: "self",
+    label: "Subagent Capabilities",
+    description: "List the native tools, skills, commands, plugins, MCP servers, and hooks a subagent would really have on each harness, with the access ceiling already applied. Use the returned capability IDs as subagent requires.",
+    promptSnippet: "Discover what native capabilities each subagent harness actually provides",
+    promptGuidelines: [
+      "Call this before requiring a capability; requires must use IDs reported here, never guessed names.",
+      "Discovery is live and model-free; use refresh only after the human changed their harness configuration.",
+    ],
+    parameters: Type.Object({
+      query: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Case-insensitive filter over capability ID, name, description, and origin" })),
+      harness: Type.Optional(StringEnum(HARNESSES, { description: "Limit discovery to one harness; omit to compare every configured harness" })),
+      kind: Type.Optional(StringEnum(CAPABILITY_KINDS)),
+      effect: Type.Optional(StringEnum(CAPABILITY_EFFECTS)),
+      access: Type.Optional(StringEnum(ACCESS, { description: "Access ceiling to evaluate; defaults to full" })),
+      includeUnavailable: Type.Optional(Type.Boolean({ description: "Include denied or blocked capabilities with the reason they are unusable" })),
+      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_SEARCH_LIMIT, description: `Maximum capabilities to return (default ${DEFAULT_SEARCH_LIMIT})` })),
+      refresh: Type.Optional(Type.Boolean({ description: "Bypass the bounded discovery cache" })),
+    }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
+      if (!ctx.isProjectTrusted()) throw new Error("Subagent capability discovery is disabled for untrusted projects");
+      const access = (params.access ?? "full") as AccessMode;
+      const text = await capabilityReport({
+        cwd: ctx.cwd,
+        access,
+        query: params.query,
+        harness: params.harness as HarnessName | undefined,
+        kind: params.kind as CapabilityKind | undefined,
+        effect: params.effect as CapabilityEffect | undefined,
+        includeUnavailable: params.includeUnavailable,
+        limit: params.limit,
+        refresh: params.refresh,
+        signal,
+      });
+      return { content: [{ type: "text" as const, text }], details: { access } };
+    },
+    renderCall(args, theme) {
+      const input = args ?? {};
+      const detail = [input.harness ?? "all harnesses", input.kind ?? "", input.effect ?? "", input.access ?? "full", input.refresh ? "refresh" : ""].filter(Boolean).join(" · ");
+      return renderToolCallLine(theme, "Inspect", input.query ? `capabilities: ${input.query}` : "capabilities", detail);
+    },
+    renderResult(res, { expanded }, theme) {
+      const text = (res.content?.[0] as { text?: string } | undefined)?.text ?? "";
+      const lines = text.split("\n").filter(Boolean);
+      const budget = expanded ? MAX_EXPANDED_LINES - 1 : MAX_COLLAPSED_LINES - 1;
+      const shown = lines.slice(0, budget).map((line) => traceResultLine(theme, "·", line));
+      if (lines.length > budget) shown.push(traceResultLine(theme, "…", `${lines.length - budget} more line${lines.length - budget === 1 ? "" : "s"} hidden`, "dim"));
+      return linesComponent(shown.length ? shown : [traceResultLine(theme, "○", "No capabilities reported.", "muted")]);
+    },
   });
 
   pi.registerTool({
@@ -433,12 +569,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       "Give each isolated agent a complete task with all relevant paths, requirements, constraints, and expected verification.",
       "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
       "Use access=readOnly for inspection; use independent=true to differ from the parent, or independentOf=<jobId> to differ from the job that produced the work.",
+      "Use requires only for capabilities confirmed by subagent_capabilities; pair it with harness=auto to let the capable harness be chosen.",
     ],
     parameters: spawnParameters,
-    async execute(_id, params, _signal, _onUpdate, ctx) {
+    async execute(_id, params, signal, _onUpdate, ctx) {
       rejectSchemaMismatch(params);
-      const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), activeHarness, providerFamily(ctx.model?.provider));
-      return result(snapshot, `Spawned ${snapshot.id} (${snapshot.name}, ${snapshot.access}, ${snapshot.harness}/${snapshot.model}, effort ${formatEffort(snapshot.effort)})`);
+      const snapshot = await spawnJob(params, ctx, signal);
+      return result(snapshot, `Spawned ${snapshot.id} (${snapshot.name}, ${snapshot.access}, ${snapshot.harness}/${snapshot.model}, effort ${formatEffort(snapshot.effort)}${capabilityText(snapshot)})`);
     },
     renderCall(args, theme) {
       const route = args.independentOf ? `independent-of:${shortId(args.independentOf)}` : args.independent ? "independent" : args.harness
@@ -612,12 +749,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       "Use subagent for a single foreground delegation.",
       "Subagents have isolated context; include all required paths, requirements, constraints, and verification evidence in task.",
       "Use access=readOnly for inspection; use independent=true to differ from the parent, or independentOf=<jobId> to differ from the job that produced the work.",
+      "Use requires only for capabilities confirmed by subagent_capabilities; pair it with harness=auto to let the capable harness be chosen.",
       "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
     ],
     parameters: spawnParameters,
     async execute(_id, params, signal, onUpdate, ctx) {
       rejectSchemaMismatch(params);
-      const snapshot = spawn(getManager(), params, ctx.cwd, ctx.isProjectTrusted(), activeHarness, providerFamily(ctx.model?.provider));
+      const snapshot = await spawnJob(params, ctx, signal);
       const generation = beginResultConsumption(snapshot.id);
       let consumed = false;
       const timer = setInterval(() => {
@@ -739,6 +877,27 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   });
 }
 
+/** Live parent inventories, tolerant of hosts that do not implement them. */
+function parentTools(pi: ExtensionAPI): Array<{ name: string; description?: string; source?: string }> {
+  try {
+    return (pi.getAllTools?.() ?? []).map((tool) => ({
+      name: tool.name,
+      description: typeof tool.description === "string" ? tool.description : undefined,
+      source: tool.sourceInfo?.source,
+    }));
+  } catch { return []; }
+}
+
+function parentCommands(pi: ExtensionAPI): Array<{ name: string; description?: string; source?: string }> {
+  try {
+    return (pi.getCommands?.() ?? []).map((command) => ({
+      name: command.name,
+      description: command.description,
+      source: command.source,
+    }));
+  } catch { return []; }
+}
+
 function rejectSchemaMismatch(params: object): void {
   if (["role", "agent", "modelProfile", "modelTier", "tier", "backend"].some((key) => Object.hasOwn(params, key))) {
     throw new Error("Subagent API schema mismatch: reload Pi to use the current task-driven schema.");
@@ -749,30 +908,79 @@ function sendTitle(behavior: SendBehavior): "Steer" | "Follow up" {
   return behavior === "followUp" ? "Follow up" : "Steer";
 }
 
-function spawn(
+export interface SpawnToolParams {
+  task: string;
+  name?: string;
+  cwd?: string;
+  harness?: RequestedHarness;
+  requires?: string[];
+  model?: string;
+  effort?: EffortLevel;
+  access?: AccessMode;
+  independent?: boolean;
+  independentOf?: string;
+  profile?: string;
+}
+
+/**
+ * Compile the caller's request, resolve and live-revalidate any capability
+ * requirements, then dispatch. Requests without `requires`/`harness: "auto"`
+ * take the original synchronous routing path unchanged.
+ */
+async function spawn(
   manager: JobManager,
-  params: { task: string; name?: string; cwd?: string; harness?: HarnessName; model?: string; effort?: EffortLevel; access?: AccessMode; independent?: boolean; independentOf?: string; profile?: string },
-  parentCwd: string,
-  trusted: boolean,
-  defaultHarness?: HarnessName,
-  parentProvider?: ProviderFamily,
-): JobSnapshot {
-  const cwd = secureCwd(parentCwd, params.cwd);
-  return manager.spawn({
+  router: CapabilityRouter | undefined,
+  params: SpawnToolParams,
+  context: {
+    parentCwd: string;
+    trusted: boolean;
+    defaultHarness?: HarnessName;
+    parentProvider?: ProviderFamily;
+    profile?: ProfileDefinition;
+    signal?: AbortSignal;
+  },
+): Promise<JobSnapshot> {
+  if (!context.trusted) throw new Error("Subagents are disabled for untrusted projects");
+  const cwd = secureCwd(context.parentCwd, params.cwd);
+  const request = {
     name: params.name,
     task: params.task,
     cwd,
-    trusted,
-    harness: params.harness,
+    trusted: context.trusted,
     model: params.model,
     effort: params.effort,
     access: params.access,
     independent: params.independent,
     independentOf: params.independentOf,
     profile: params.profile,
-    defaultHarness,
-    parentProvider,
+    defaultHarness: context.defaultHarness,
+    parentProvider: context.parentProvider,
+  };
+  const routing = await routeCapabilities(router, {
+    request: { ...request, harness: params.harness, requires: params.requires },
+    profile: context.profile,
+    independentOfProvider: independenceProvider(manager, params.independentOf),
+    preference: context.defaultHarness ? [context.defaultHarness] : undefined,
+    signal: context.signal,
   });
+  return manager.spawn({
+    ...request,
+    harness: routing.harness ?? (params.harness === "auto" ? undefined : params.harness),
+    requires: routing.requires,
+    capabilityRoute: routing.capabilityRoute,
+  });
+}
+
+/** Provider of an existing independence target, when it is still retained. */
+function independenceProvider(manager: JobManager, independentOf?: string): ProviderFamily | undefined {
+  if (!independentOf) return undefined;
+  try {
+    const harness = manager.check(independentOf).harness;
+    return harness === "claude" || harness === "codex" ? harness : undefined;
+  } catch {
+    // Unknown or evicted targets keep failing closed inside JobManager.spawn().
+    return undefined;
+  }
 }
 
 function secureCwd(parentCwd: string, requested?: string): string {
@@ -809,6 +1017,12 @@ function updateStatus(ctx: { ui: { setStatus(key: string, text: string | undefin
 function statusLine(job: JobSnapshot): string {
   const profile = job.profile ? `; profile ${job.profile}` : "";
   return `${job.id} ${job.status} ${job.name} [${job.access}; ${job.harness}/${job.model}; effort ${formatEffort(job.effort)}${profile}]`;
+}
+/** Route provenance for tool text: what was required, and which live inventory satisfied it. */
+function capabilityText(job: JobSnapshot): string {
+  if (!job.capabilities) return "";
+  const route = job.capabilities;
+  return `, capabilities ${route.matched.join(", ") || "none"}${route.auto ? " (auto-routed)" : ""} @ ${route.revision.slice(7, 15)}`;
 }
 function terminalText(job: JobSnapshot): string {
   if (job.status === "completed") return job.output || "(completed with no text output)";

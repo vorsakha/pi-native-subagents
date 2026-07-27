@@ -41,6 +41,7 @@ function policy(name, access = "readOnly") {
   const common = {
     harness: name,
     access,
+    customization: "native",
     thinking: accessMode ? "medium" : "low",
     effort: accessMode ? "medium" : "low",
     piTools: [],
@@ -108,7 +109,7 @@ async function execute(name, cwd, task, systemPrompt, access) {
   const startupController = new AbortController();
   const run = await harnessAdapter(name).start({
     jobId: `smoke-${name}-${access}`, name: `smoke-${access}`, task, systemPrompt, cwd,
-    policy: policy(name, access), env: name === "pi" ? sanitizeSubscriptionEnv(process.env, "codex") : process.env,
+    policy: policy(name, access), env: process.env,
     signal: startupController.signal,
   }, (event) => {
     if (["completed", "failed", "cancelled"].includes(event.type)) terminal.push(event);

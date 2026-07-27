@@ -1,4 +1,5 @@
-import type { HarnessName, BackendPolicy, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
+import { normalizeRequirements } from "./capabilities.ts";
+import type { AccessMode, HarnessName, BackendPolicy, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
 
 export function normalizeModel(value: unknown): string | undefined {
   if (value === undefined) return undefined;
@@ -21,13 +22,16 @@ export interface CompiledJob {
   independent: boolean;
 }
 
-export function compilePolicy(
+export function isIndependent(request: SpawnRequest, profile?: ProfileDefinition, independentOfProvider?: ProviderFamily): boolean {
+  return request.independent === true || profile?.independent === true || independentOfProvider !== undefined;
+}
+
+/** Harness a request resolves to before dispatch. Shared with pre-dispatch capability routing. */
+export function selectHarness(
   request: SpawnRequest,
   profile?: ProfileDefinition,
   independentOfProvider?: ProviderFamily,
-): CompiledJob {
-  if (!request.trusted) throw new Error("Subagents are disabled for untrusted projects");
-  const independent = request.independent === true || profile?.independent === true || independentOfProvider !== undefined;
+): HarnessName {
   let selected: HarnessName = request.harness ?? profile?.harness ?? request.defaultHarness ?? "pi";
   if (profile?.lockedHarness) {
     if (request.harness && request.harness !== profile.lockedHarness) {
@@ -35,7 +39,7 @@ export function compilePolicy(
     }
     selected = profile.lockedHarness;
   }
-  if (independent) {
+  if (isIndependent(request, profile, independentOfProvider)) {
     if (request.harness === "pi" || profile?.lockedHarness === "pi") throw new Error("independent agents require a native Claude or Codex harness");
     const target = independentOfProvider ?? request.parentProvider;
     const targetLabel = independentOfProvider ? "referenced job" : "parent";
@@ -45,20 +49,49 @@ export function compilePolicy(
     }
     if (!explicitRoute) selected = target === "claude" ? "codex" : "claude";
   }
+  return selected;
+}
+
+/** Effective access ceiling. A profile's readOnly access cannot be elevated per call. */
+export function selectAccess(request: SpawnRequest, profile?: ProfileDefinition): AccessMode {
+  return profile?.access === "readOnly" ? "readOnly" : request.access ?? profile?.access ?? "full";
+}
+
+export function compilePolicy(
+  request: SpawnRequest,
+  profile?: ProfileDefinition,
+  independentOfProvider?: ProviderFamily,
+): CompiledJob {
+  if (!request.trusted) throw new Error("Subagents are disabled for untrusted projects");
+  const independent = isIndependent(request, profile, independentOfProvider);
+  const selected = selectHarness(request, profile, independentOfProvider);
 
   const model = normalizeModel(request.model);
-  const access = profile?.access === "readOnly" ? "readOnly" : request.access ?? profile?.access ?? "full";
+  const access = selectAccess(request, profile);
   const readOnly = access === "readOnly";
+  const requires = normalizeRequirements(request.requires);
+  const requiredPiTools = selected === "pi"
+    ? (request.capabilityRoute?.matched ?? [])
+      .filter((id) => id.startsWith("pi:tool:"))
+      .map((id) => id.slice("pi:tool:".length))
+    : [];
   return {
     profile,
     independent,
     policy: {
       harness: selected,
       access,
+      // Native customization is the default; only explicitly isolated launches
+      // (tool-less session peers) opt out.
+      customization: request.customization ?? "native",
+      requires: request.capabilityRoute?.matched ?? requires,
       model,
       thinking: "medium",
       effort: request.effort ?? profile?.effort,
-      piTools: readOnly ? ["read", "grep", "find", "ls"] : ["read", "write", "edit", "bash", "grep", "find", "ls"],
+      piTools: [...new Set([
+        ...(readOnly ? ["read", "grep", "find", "ls"] : ["read", "write", "edit", "bash", "grep", "find", "ls"]),
+        ...requiredPiTools,
+      ])],
       claudeTools: readOnly
         ? ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
         : ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch"],

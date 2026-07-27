@@ -154,7 +154,7 @@ function assertRuntimeRenderers(): void {
 
   const expected = [
     "session_peer_fork", "session_peer_list",
-    "subagent", "subagent_cancel", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait",
+    "subagent", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait",
   ];
   assert.deepEqual([...pi.tools.keys()].filter((name) => name !== "workflow").sort(), expected);
   assert.ok(pi.tools.has("workflow"));

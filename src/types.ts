@@ -1,3 +1,9 @@
+import type {
+  CapabilityHealth,
+  CapabilitySourceStatus,
+  DiscoveredCapability,
+} from "./capabilities.ts";
+
 export type HarnessName = "pi" | "claude" | "codex";
 export type ProviderFamily = "claude" | "codex" | "other";
 export type AccessMode = "readOnly" | "full";
@@ -27,11 +33,24 @@ export type BackendEvent =
   | { type: "usage"; usage: Partial<Usage>; at?: number }
   | { type: "completed"; output?: string; at?: number }
   | { type: "failed"; error: string; at?: number }
-  | { type: "cancelled"; reason?: string; at?: number };
+  | { type: "cancelled"; reason?: string; at?: number }
+  /** An optional native integration failed; the job continues without it. */
+  | { type: "degraded"; source: string; detail: string; at?: number };
+
+/**
+ * `native` loads the harness's installed context, skills, plugins, and MCP
+ * inside the access ceiling. `isolated` keeps the historical stripped launch and
+ * is used for tool-less session peers.
+ */
+export type CustomizationMode = "native" | "isolated";
 
 export interface BackendPolicy {
   harness: HarnessName;
   access: AccessMode;
+  /** Native customization parity mode; defaults to `native`. */
+  customization: CustomizationMode;
+  /** Capability IDs the caller required; adapters must not silently drop them. */
+  requires?: string[];
   /** Optional harness-local model ID. Omitted to use the harness's native default. */
   model?: string;
   thinking: ThinkingLevel;
@@ -81,9 +100,31 @@ export interface BackendRun {
   forceClose?(): Promise<void>;
 }
 
+/** Model-free capability discovery request. Discovery never sends a user message. */
+export interface DiscoveryRequest {
+  cwd: string;
+  access: AccessMode;
+  customization: CustomizationMode;
+  env: NodeJS.ProcessEnv;
+  signal: AbortSignal;
+  /** Bypass native caches (Codex `forceReload`, fresh SDK/RPC initialization). */
+  refresh: boolean;
+}
+
+export interface DiscoveryResult {
+  capabilities: DiscoveredCapability[];
+  sources: CapabilitySourceStatus[];
+  warnings?: string[];
+  nativeVersion?: string;
+  /** Overall discovery health; omitted means derived from `sources`. */
+  health?: CapabilityHealth;
+}
+
 export interface Backend {
   readonly name: HarnessName;
   start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun>;
+  /** Optional zero-model-turn native inventory. Absent adapters report an unknown catalog. */
+  discover?(request: DiscoveryRequest): Promise<DiscoveryResult>;
 }
 
 export type ProfileOrigin = "global" | "project";
@@ -121,12 +162,30 @@ export interface PeerSessionReference {
   sourceName?: string;
 }
 
+/** Capability provenance recorded on a job after live pre-dispatch revalidation. */
+export interface JobCapabilityRoute {
+  harness: HarnessName;
+  /** Capability IDs that satisfied the request's requirements. */
+  matched: string[];
+  revision: string;
+  discoveredAt: number;
+  /** Set when the route was chosen by `harness: "auto"` rather than an explicit route. */
+  auto?: boolean;
+  warnings?: string[];
+}
+
 export interface SpawnRequest {
   name?: string;
   task: string;
   cwd: string;
   trusted: boolean;
   harness?: HarnessName;
+  /** Capability IDs the child must actually have; revalidated live before dispatch. */
+  requires?: string[];
+  /** Internal override; only tool-less session peers opt out of native customization. */
+  customization?: CustomizationMode;
+  /** Route provenance captured when requirements were resolved before spawning. */
+  capabilityRoute?: JobCapabilityRoute;
   /** Harness-local model ID selected by the caller or routing skill. */
   model?: string;
   effort?: EffortLevel;
@@ -186,4 +245,10 @@ export interface JobSnapshot {
   workflow?: WorkflowJobReference;
   /** Present when this job is a read-only session peer forked from a saved Pi session. */
   peer?: PeerSessionReference;
+  /** Capability IDs required by the caller. */
+  requires?: string[];
+  /** Effective capability route recorded at pre-dispatch revalidation. */
+  capabilities?: JobCapabilityRoute;
+  /** Bounded degraded-integration notices reported by the harness. */
+  warnings?: string[];
 }
