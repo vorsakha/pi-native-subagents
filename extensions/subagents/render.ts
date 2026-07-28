@@ -110,14 +110,10 @@ export function formatUsage(usage: Usage): string {
 
 export type TraceStatusColor = "accent" | "success" | "warning" | "error" | "muted" | "dim";
 
-const ACTIVE_BLINK_MS = 500;
-
 /** Shared width-stable status vocabulary for subagents and workflows. */
 export function traceStatusMeta(status: string, now?: number): { glyph: string; color: TraceStatusColor } {
   switch (status) {
-    case "running": return now === undefined || Math.floor(now / ACTIVE_BLINK_MS) % 2 === 0
-      ? { glyph: "●", color: "accent" }
-      : { glyph: " ", color: "dim" };
+    case "running": return { glyph: "●", color: "accent" };
     case "paused": return { glyph: "Ⅱ", color: "warning" };
     case "completed": return { glyph: "✓", color: "success" };
     case "failed": return { glyph: "×", color: "error" };

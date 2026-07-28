@@ -70,8 +70,8 @@ test("renderer sanitizes output, enforces line budgets, and registers runtime re
   assert.deepEqual(statusMeta("running"), { glyph: "●", color: "accent" });
   assert.deepEqual(statusMeta("running", 0), { glyph: "●", color: "accent" });
   assert.deepEqual(statusMeta("running", 499), { glyph: "●", color: "accent" });
-  assert.deepEqual(statusMeta("running", 500), { glyph: " ", color: "dim" });
-  assert.deepEqual(statusMeta("running", 999), { glyph: " ", color: "dim" });
+  assert.deepEqual(statusMeta("running", 500), { glyph: "●", color: "accent" });
+  assert.deepEqual(statusMeta("running", 999), { glyph: "●", color: "accent" });
   assert.deepEqual(statusMeta("running", 1_000), { glyph: "●", color: "accent" });
   assert.deepEqual(statusMeta("completed", 800), { glyph: "✓", color: "success" });
   const hugeOutput = Array.from({ length: 5_000 }, (_, i) => `${ESC}[3${i % 8}mline ${i} `).join("\n");

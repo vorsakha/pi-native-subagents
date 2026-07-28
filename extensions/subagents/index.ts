@@ -149,9 +149,6 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const deferredResults = new Map<string, JobSnapshot>();
   const cardSnapshots = new Map<string, JobSnapshot>();
   const liveCardBlinks = new Set<LiveCardBlink>();
-  const scheduleBlink = options.setInterval ?? setInterval;
-  const cancelBlink = options.clearInterval ?? clearInterval;
-  let liveCardTicker: ReturnType<typeof setInterval> | undefined;
   const waitInterest = new Map<string, number>();
   const consumedResults = new Set<string>();
   const resultKey = (id: string, generation: number) => `${id}:${generation}`;
@@ -196,10 +193,6 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     blink.invalidate = undefined;
     blink.shouldContinue = undefined;
     liveCardBlinks.delete(blink);
-    if (!liveCardBlinks.size && liveCardTicker) {
-      cancelBlink(liveCardTicker);
-      liveCardTicker = undefined;
-    }
   };
   const clearCardBlinks = () => {
     for (const blink of liveCardBlinks) {
@@ -207,8 +200,6 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       blink.shouldContinue = undefined;
     }
     liveCardBlinks.clear();
-    if (liveCardTicker) cancelBlink(liveCardTicker);
-    liveCardTicker = undefined;
   };
   const syncCardBlink = (context: LiveCardRenderContext | undefined, active: boolean, shouldContinue: () => boolean) => {
     if (!context?.state) return;
@@ -217,18 +208,6 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     blink.invalidate = context.invalidate;
     blink.shouldContinue = shouldContinue;
     liveCardBlinks.add(blink);
-    if (liveCardTicker) return;
-    liveCardTicker = scheduleBlink(() => {
-      for (const current of [...liveCardBlinks]) {
-        if (!current.shouldContinue?.()) {
-          stopCardBlink(current);
-          continue;
-        }
-        try { current.invalidate?.(); }
-        catch { stopCardBlink(current); }
-      }
-    }, 500);
-    liveCardTicker.unref?.();
   };
   const refreshCardBlinks = () => {
     for (const blink of [...liveCardBlinks]) {

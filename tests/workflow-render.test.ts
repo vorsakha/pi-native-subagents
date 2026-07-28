@@ -83,7 +83,7 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
   const cardLines = renderWorkflowCard(workflow(), theme, { expanded: false, now: 6_000 }).render(100);
   assert.ok(cardLines.every((line) => line.startsWith("│")), "workflow result rows use the trace continuation rail");
   assert.ok(buildWorkflowCardLines(workflow(), theme, { expanded: false, now: 6_000 }).some((line) => line.includes("●")));
-  assert.ok(buildWorkflowCardLines(workflow(), theme, { expanded: false, now: 6_500 }).every((line) => !line.includes("●")), "active workflow state uses a two-frame blink");
+  assert.ok(buildWorkflowCardLines(workflow(), theme, { expanded: false, now: 6_500 }).some((line) => line.includes("●")), "active workflow state uses a static indicator");
 
   const expanded = buildWorkflowCardLines(huge, theme, { expanded: true, now: 6_000 });
   assert.ok(expanded.length <= MAX_EXPANDED_LINES);

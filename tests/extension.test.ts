@@ -259,10 +259,9 @@ test("extension exposes generic direct tools, caller models, independence, and o
   const renderContext = { args: {}, state: {}, invalidate: () => { invalidations++; } };
   const activeCard = blinkPi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
   assert.ok(activeCard.render(80).some((line: string) => line.includes("running")), "background thread card follows the live job");
-  assert.equal(blinkTimers.size, 1, "active thread cards share one bounded blink timer");
-  assert.equal(blinkDelay, 500, "thread card status blinks at a restrained 500 ms cadence");
-  blinkTimers.values().next().value?.();
-  assert.equal(invalidations, 1, "blink timer invalidates the existing thread row");
+  assert.equal(blinkTimers.size, 0, "active thread cards do not schedule periodic rerenders");
+  assert.equal(blinkDelay, 0);
+  assert.equal(invalidations, 0);
   const timedWait = blinkPi.tools.get("subagent_wait").execute("wait-blink", { jobId: active.details.job.id, timeoutMs: 10 }, undefined, undefined, blinkCtx);
   const waitingCard = blinkPi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
   assert.ok(waitingCard.render(80).some((line: string) => line.includes("waiting")), "the original job card owns the parent wait lifecycle");
@@ -270,7 +269,7 @@ test("extension exposes generic direct tools, caller models, independence, and o
   const timeoutNotice = blinkPi.tools.get("subagent_wait").renderResult(timedOut, { expanded: false, isPartial: false }, theme, { args: { timeoutMs: 10 }, state: {}, invalidate() {} }).render(100).join("\n");
   assert.match(timeoutNotice, /running after <1s wait timeout/, "non-terminal wait timeouts remain visible as exceptional outcomes");
   await blinkPi.tools.get("subagent_cancel").execute("cancel-blink", { jobId: active.details.job.id }, undefined, undefined, blinkCtx);
-  assert.equal(blinkTimers.size, 0, "manager settlement prunes the blink without requiring a rerender");
+  assert.equal(blinkTimers.size, 0, "manager settlement does not leave a periodic render timer");
   const settledCard = blinkPi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
   assert.ok(settledCard.render(80).some((line: string) => line.includes("cancelled")), "thread card settles from remembered manager state");
   await blinkPi.handlers.get("session_shutdown")?.();

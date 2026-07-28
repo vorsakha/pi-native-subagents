@@ -120,10 +120,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   let sessionContext: ExtensionContext | undefined;
   let generation = 0;
   let shuttingDown = false;
-  const scheduleBlink = options.setInterval ?? setInterval;
-  const cancelBlink = options.clearInterval ?? clearInterval;
   const liveBlinks = new Set<LiveWorkflowBlink>();
-  let liveBlinkTicker: ReturnType<typeof setInterval> | undefined;
 
   const getManager = () => {
     if (!manager) throw new Error("Workflow manager is not available before session_start");
@@ -133,10 +130,6 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     blink.invalidate = undefined;
     blink.runId = undefined;
     liveBlinks.delete(blink);
-    if (!liveBlinks.size && liveBlinkTicker) {
-      cancelBlink(liveBlinkTicker);
-      liveBlinkTicker = undefined;
-    }
   };
   const clearBlinks = () => {
     for (const blink of liveBlinks) {
@@ -144,8 +137,6 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       blink.runId = undefined;
     }
     liveBlinks.clear();
-    if (liveBlinkTicker) cancelBlink(liveBlinkTicker);
-    liveBlinkTicker = undefined;
   };
   const workflowIsActive = (runId: string): boolean => {
     if (!manager) return false;
@@ -159,18 +150,6 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     blink.runId = runId;
     blink.invalidate = context.invalidate;
     liveBlinks.add(blink);
-    if (liveBlinkTicker) return;
-    liveBlinkTicker = scheduleBlink(() => {
-      for (const current of [...liveBlinks]) {
-        if (!current.runId || !workflowIsActive(current.runId)) {
-          stopBlink(current);
-          continue;
-        }
-        try { current.invalidate?.(); }
-        catch { stopBlink(current); }
-      }
-    }, 500);
-    liveBlinkTicker.unref?.();
   };
   const refreshBlinks = () => {
     for (const blink of [...liveBlinks]) {

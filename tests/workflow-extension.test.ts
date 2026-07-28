@@ -180,7 +180,7 @@ test("background workflows return immediately and deliver one follow-up result f
   await failed.pi.handlers.get("session_shutdown")?.();
 });
 
-test("background workflow cards follow live state with one bounded blink timer", async () => {
+test("background workflow cards follow live state without periodic rerenders", async () => {
   const backend = new HoldingBackend();
   const timers = new Map<object, () => void>();
   let blinkDelay = 0;
@@ -208,16 +208,16 @@ test("background workflow cards follow live state with one bounded blink timer",
   const renderContext = { args: {}, state: {}, invalidate: () => { invalidations++; } };
   const activeCard = pi.tools.get("workflow").renderResult(result, { expanded: false, isPartial: false }, theme, renderContext);
   assert.ok(activeCard.render(100).some((line: string) => line.includes("running")));
-  assert.equal(timers.size, 1);
-  assert.equal(blinkDelay, 500);
-  timers.values().next().value?.();
-  assert.equal(invalidations, 1);
+  assert.equal(timers.size, 0);
+  assert.equal(blinkDelay, 0);
+  assert.equal(invalidations, 0);
 
   backend.complete("review complete");
   for (let index = 0; index < 500 && pi.messages.length === 0; index++) {
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.equal(timers.size, 0, "terminal workflow state prunes the shared blink timer");
+  assert.equal(timers.size, 0, "terminal workflow state leaves no periodic render timer");
+  assert.ok(invalidations > 0, "workflow events still invalidate the existing card");
   const settledCard = pi.tools.get("workflow").renderResult(result, { expanded: false, isPartial: false }, theme, renderContext);
   assert.ok(settledCard.render(100).some((line: string) => line.includes("completed")));
   await pi.handlers.get("session_shutdown")?.();
