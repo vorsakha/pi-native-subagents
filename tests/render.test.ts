@@ -104,13 +104,18 @@ test("renderer sanitizes output, enforces line budgets, and registers runtime re
     usage: usage({ input: 1200, output: 50, turns: 2 }),
   }), theme, { expanded: false, now: 5_000 });
   const resultIndex = outcomeLines.findIndex((line) => line.includes("Result"));
-  const activityIndex = outcomeLines.findIndex((line) => line.includes("Activity"));
   const usageIndex = outcomeLines.findIndex((line) => line.includes("Usage"));
-  assert.ok(resultIndex > 0 && resultIndex < activityIndex && activityIndex < usageIndex, "collapsed card prioritizes outcome before activity and usage");
+  assert.ok(resultIndex > 0 && resultIndex < usageIndex, "collapsed card prioritizes outcome before usage");
   assert.ok(outcomeLines.some((line) => line.includes("effort high")), "explicit effort is visible in the main thread card");
   assert.ok(renderJobCard(job({ effort: "high" }), theme, { expanded: false, now: 5_000 }).render(48).some((line) => line.includes("effort high")), "explicit effort survives bounded-width rendering");
-  assert.ok(outcomeLines.some((line) => line.includes("tool-latest")));
-  assert.ok(outcomeLines.every((line) => !line.includes("tool-old")), "collapsed card keeps only latest activity");
+  assert.ok(outcomeLines.every((line) => !line.includes("tool-")), "collapsed card hides tool calls");
+
+  const liveLines = buildJobCardLines(job({
+    output: "Inspecting the renderer behavior",
+    tools: [tool("latest", "running")],
+  }), theme, { expanded: false, isPartial: true, now: 5_000 });
+  assert.ok(liveLines.some((line) => line.includes("Latest") && line.includes("Inspecting the renderer behavior")), "latest activity uses assistant text");
+  assert.ok(liveLines.every((line) => !line.includes("tool-latest")), "latest activity never substitutes a tool call");
   const receipt = renderJobReceipt(job({ status: "completed", endedAt: 5_000 }), theme, { action: "completed", now: 5_000 }).render(48);
   assert.equal(receipt.length, 1);
   assert.match(receipt[0]!, /^│\s+✓ completed · 3s$/);

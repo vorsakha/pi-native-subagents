@@ -9,7 +9,6 @@ import type { JobSnapshot, JobStatus, SendBehavior, ToolTrace, Usage } from "../
 export const MAX_COLLAPSED_LINES = 10;
 export const MAX_EXPANDED_LINES = 36;
 
-const MAX_TOOLS_COLLAPSED = 1;
 const MAX_TOOLS_EXPANDED = 8;
 const MAX_TAIL_COLLAPSED = 3;
 const MAX_TAIL_EXPANDED = 16;
@@ -236,17 +235,14 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
     }
   }
 
-  const maxTools = expanded ? MAX_TOOLS_EXPANDED : MAX_TOOLS_COLLAPSED;
-  if (job.tools.length) {
-    const shown = job.tools.slice(-maxTools);
-    if (expanded) {
-      lines.push(theme.fg("muted", "Activity"));
-      for (const tool of shown) lines.push(toolLine(theme, tool, "  "));
-      const omitted = job.tools.length - shown.length;
-      if (omitted > 0) lines.push(theme.fg("muted", `  +${omitted} earlier tool call${omitted === 1 ? "" : "s"}`));
-    } else {
-      lines.push(sectionLine(theme, "Activity", toolLine(theme, shown[0]!), "muted"));
-    }
+  // Keep collapsed live activity human-readable: tool calls are implementation detail.
+  // They remain available in the expanded card and the /subagents dashboard.
+  if (expanded && job.tools.length) {
+    const shown = job.tools.slice(-MAX_TOOLS_EXPANDED);
+    lines.push(theme.fg("muted", "Activity"));
+    for (const tool of shown) lines.push(toolLine(theme, tool, "  "));
+    const omitted = job.tools.length - shown.length;
+    if (omitted > 0) lines.push(theme.fg("muted", `  +${omitted} earlier tool call${omitted === 1 ? "" : "s"}`));
   } else if (!job.output && job.status === "queued") {
     lines.push(sectionLine(theme, "Activity", "waiting for an agent slot", "dim"));
   } else if (!job.output && job.status === "running") {
