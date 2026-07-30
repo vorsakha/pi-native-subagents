@@ -145,6 +145,7 @@ export class JobManager {
       profile: profile?.name,
       independent,
       independentOf,
+      humanVisible: request.humanVisible,
       harness: policy.harness,
       model: policy.model ?? "default",
       effort: policy.effort,

@@ -84,6 +84,32 @@ test("compilePolicy's read-only/full base piTools sets never contain a delegatio
   }
 });
 
+test("full human Pi jobs inherit permitted parent tools while read-only and non-human jobs do not", () => {
+  const inventory = ["mcp", "browser", "subagent_spawn", "workflow", "ask_user"];
+  const fullHuman = compilePolicy(request({
+    harness: "pi",
+    access: "full",
+    humanVisible: true,
+    humanPiTools: inventory,
+  })).policy.piTools;
+  assert.ok(fullHuman.includes("mcp"));
+  assert.ok(fullHuman.includes("browser"));
+  assert.ok(!fullHuman.includes("subagent_spawn"));
+  assert.ok(!fullHuman.includes("workflow"));
+  assert.ok(!fullHuman.includes("ask_user"));
+
+  const readOnlyHuman = compilePolicy(request({
+    harness: "pi",
+    access: "readOnly",
+    humanVisible: true,
+    humanPiTools: inventory,
+  })).policy.piTools;
+  assert.deepEqual(readOnlyHuman, ["read", "grep", "find", "ls"]);
+
+  const ordinary = compilePolicy(request({ harness: "pi", access: "full", humanPiTools: inventory })).policy.piTools;
+  assert.ok(!ordinary.includes("mcp"), "only the human command widens the Pi tool surface automatically");
+});
+
 test("compilePolicy activates required pi:tool: capabilities on top of the base allowlist, deduplicated, only for the pi harness", () => {
   const routedToPi = compilePolicy(request({
     harness: "pi",

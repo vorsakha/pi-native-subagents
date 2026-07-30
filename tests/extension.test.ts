@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { configuredHarnessFromEnv, registerNativeSubagents } from "../extensions/subagents/index.ts";
+import { configuredHarnessFromEnv, parseHumanSubagentCommand, permittedHumanPiToolNames, registerNativeSubagents } from "../extensions/subagents/index.ts";
 import type { Backend, BackendEvent, HarnessName, BackendRequest, BackendRun } from "../src/types.ts";
 
 class HoldingBackend implements Backend {
@@ -44,7 +44,9 @@ function fakePi() {
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
   const messageRenderers = new Map<string, any>();
+  const entryRenderers = new Map<string, any>();
   const messages: unknown[] = [];
+  const entries: Array<{ customType: string; data: unknown }> = [];
   return {
     api: {
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
@@ -57,14 +59,26 @@ function fakePi() {
         commands.set(name, command);
       },
       registerMessageRenderer(name: string, renderer: any) { messageRenderers.set(name, renderer); },
+      registerEntryRenderer(name: string, renderer: any) { entryRenderers.set(name, renderer); },
+      getAllTools() {
+        return [
+          { name: "mcp", description: "MCP gateway", sourceInfo: { source: "npm:pi-mcp-adapter" } },
+          { name: "browser", description: "Browser automation", sourceInfo: { source: "npm:pi-agent-browser" } },
+          { name: "subagent_spawn", description: "Spawn a nested subagent", sourceInfo: { source: "extension" } },
+          { name: "workflow", description: "Run a nested workflow", sourceInfo: { source: "extension" } },
+          { name: "ask_user", description: "Prompt the user", sourceInfo: { source: "extension" } },
+        ];
+      },
       sendMessage(message: unknown) { messages.push(message); },
-      appendEntry() {},
+      appendEntry(customType: string, data: unknown) { entries.push({ customType, data }); },
     } as any,
     handlers,
     tools,
     commands,
     messageRenderers,
+    entryRenderers,
     messages,
+    entries,
   };
 }
 
@@ -119,7 +133,24 @@ test("extension exposes generic direct tools, caller models, independence, and o
     "session_peer_fork", "session_peer_list",
     "subagent", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
   ]);
-  assert.deepEqual([...pi.commands.keys()].sort(), ["subagents", "subagents-config", "workflows"]);
+  assert.deepEqual([...pi.commands.keys()].sort(), ["subagent", "subagents", "subagents-config", "workflows"]);
+  assert.deepEqual(parseHumanSubagentCommand('--harness claude --model opus --name "auth review" --effort high --access readOnly "Review the auth flow"'), {
+    harness: "claude",
+    model: "opus",
+    name: "auth review",
+    effort: "high",
+    access: "readOnly",
+    task: "Review the auth flow",
+  });
+  assert.throws(() => parseHumanSubagentCommand("--harness nope investigate"), /Unknown harness/);
+  assert.throws(() => parseHumanSubagentCommand("--model opus"), /A task is required/);
+  assert.deepEqual(permittedHumanPiToolNames([
+    { name: "mcp", description: "MCP gateway", source: "extension" },
+    { name: "browser", description: "Browser automation", source: "extension" },
+    { name: "subagent_spawn", description: "nested delegation", source: "extension" },
+    { name: "workflow", source: "extension" },
+    { name: "ask_user", source: "extension" },
+  ]), ["mcp", "browser"]);
   const spawnProperties = pi.tools.get("subagent_spawn").parameters.properties;
   assert.ok(spawnProperties.harness);
   assert.ok(spawnProperties.model);
@@ -127,6 +158,7 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.equal(spawnProperties.modelTier, undefined, "tier compatibility is intentionally absent");
   assert.ok(pi.messageRenderers.has("native-workflow-result"));
   assert.ok(pi.messageRenderers.has("native-subagent-result"));
+  assert.ok(pi.entryRenderers.has("native-human-subagent"));
   assert.throws(() => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }), /loaded more than once/);
 
   const ctx = context([{ type: "custom", customType: "native-subagents-harness", data: { harness: "pi" } }]);
@@ -161,9 +193,44 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.equal(background.details.job.harness, "pi", "background spawn uses the configured harness");
   assert.equal(background.details.job.model, "default", "omitted models use the native harness default");
   assert.equal(background.details.job.access, "full", "trusted generic agents default to full access");
+  const ordinaryBackgroundRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "background");
+  assert.ok(!ordinaryBackgroundRequest?.policy.piTools.includes("mcp"), "model-triggered spawns keep the explicit capability contract");
   await new Promise((resolve) => setImmediate(resolve));
   pi.handlers.get("agent_settled")?.();
   assert.equal((pi.messages[0] as any)?.customType, "native-subagent-result", "unconsumed background result is delivered once");
+
+  const entriesBeforeHumanCommand = pi.entries.length;
+  const messagesBeforeHumanCommand = pi.messages.length;
+  await pi.commands.get("subagent").handler('--harness claude --model caller-model --name "human review" "human task"', ctx);
+  assert.equal(pi.messages.length, messagesBeforeHumanCommand, "human-triggered jobs do not notify the orchestrator");
+  assert.equal(pi.entries.length, entriesBeforeHumanCommand + 2, "human jobs render a start card and a terminal result card");
+  const humanStart = pi.entries[entriesBeforeHumanCommand];
+  const humanResult = pi.entries[entriesBeforeHumanCommand + 1];
+  assert.equal(humanStart.customType, "native-human-subagent");
+  assert.equal((humanStart.data as any).job.status, "queued");
+  assert.equal((humanStart.data as any).job.humanVisible, true);
+  assert.equal((humanResult.data as any).job.status, "completed");
+  assert.equal((humanResult.data as any).job.output, "claude-ok");
+  const humanRequest = backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "human task");
+  assert.equal(humanRequest?.policy.model, "caller-model");
+  const humanCard = pi.entryRenderers.get("native-human-subagent")(humanResult, { expanded: true }, theme).render(120).join("\n");
+  assert.match(humanCard, /claude\/caller-model/);
+  assert.match(humanCard, /claude-ok/);
+
+  const entriesBeforeDefaultHumanCommand = pi.entries.length;
+  await pi.commands.get("subagent").handler("default human task", ctx);
+  assert.equal(pi.entries.length, entriesBeforeDefaultHumanCommand + 2);
+  const defaultHumanRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "default human task");
+  assert.equal(defaultHumanRequest?.policy.model, undefined, "an omitted human model uses the native default");
+  assert.ok(defaultHumanRequest?.policy.piTools.includes("mcp"), "full human Pi jobs inherit permitted MCP/extension gateways");
+  assert.ok(defaultHumanRequest?.policy.piTools.includes("browser"));
+  assert.ok(!defaultHumanRequest?.policy.piTools.includes("subagent_spawn"));
+  assert.ok(!defaultHumanRequest?.policy.piTools.includes("workflow"));
+  assert.ok(!defaultHumanRequest?.policy.piTools.includes("ask_user"));
+
+  await pi.commands.get("subagent").handler("--access readOnly read-only human task", ctx);
+  const readOnlyHumanRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "read-only human task");
+  assert.deepEqual(readOnlyHumanRequest?.policy.piTools, ["read", "grep", "find", "ls"]);
 
   const consumed = await pi.tools.get("subagent_spawn").execute("spawn", { name: "reader", task: "consumed", access: "readOnly", effort: "high" }, undefined, undefined, ctx);
   assert.equal(consumed.details.job.effort, "high");

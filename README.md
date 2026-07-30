@@ -96,8 +96,21 @@ Workflow JavaScript runs in a separate permission-restricted Node process with 1
 /subagents claude
 /subagents pi
 /subagents-config codex
+/subagent [--harness pi|claude|codex] [--model ID] [--name NAME] <task>
 /workflows
 ```
+
+`/subagent` is a human-only background spawn command. It does not inject a
+message into the orchestrator's context. The job appears as a TUI-only start
+card and terminal result card in the current thread, while `/subagents` remains
+the live dashboard for inspection, cancellation, steering, and follow-ups.
+Omitting `--harness` and `--model` uses the configured default harness and its
+native model default. A full-access human Pi job automatically receives every
+loaded parent Pi tool permitted by the hard safety ceiling, including configured
+MCP and extension gateways; nested delegation, administration, and interactive
+prompt surfaces remain denied. Read-only jobs keep the fixed core read tool set.
+Additional policy flags include `--effort`, `--access`, `--cwd`, `--profile`,
+`--independent`, and `--independent-of`.
 
 The default Pi harness applies to both direct tools and workflow `agent()` calls and can be changed with `/subagents-config` or `PI_NATIVE_SUBAGENTS_HARNESS`. Exact model selection stays request-scoped; `/subagents status` reports that models are caller-selected or native-default. Successfully completed ordinary jobs retain their native session for the parent Pi session, bounded by the 100-job capacity; follow-up sends reopen the same job/session. At capacity, the oldest terminal jobs and their native sessions are evicted before new spawns. Failed, cancelled, evicted, and workflow-owned sessions are not reusable.
 

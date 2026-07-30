@@ -1,4 +1,4 @@
-import { normalizeRequirements } from "./capabilities.ts";
+import { capabilityDenial, normalizeRequirements } from "./capabilities.ts";
 import type { AccessMode, HarnessName, BackendPolicy, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
 
 export function normalizeModel(value: unknown): string | undefined {
@@ -75,6 +75,9 @@ export function compilePolicy(
       .filter((id) => id.startsWith("pi:tool:"))
       .map((id) => id.slice("pi:tool:".length))
     : [];
+  const humanPiTools = selected === "pi" && !readOnly && request.humanVisible
+    ? normalizeHumanPiTools(request.humanPiTools)
+    : [];
   return {
     profile,
     independent,
@@ -91,6 +94,7 @@ export function compilePolicy(
       piTools: [...new Set([
         ...(readOnly ? ["read", "grep", "find", "ls"] : ["read", "write", "edit", "bash", "grep", "find", "ls"]),
         ...requiredPiTools,
+        ...humanPiTools,
       ])],
       claudeTools: readOnly
         ? ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]
@@ -101,4 +105,13 @@ export function compilePolicy(
         : { type: "dangerFullAccess" },
     },
   };
+}
+
+/** Defense-in-depth for the trusted extension-provided human tool inventory. */
+function normalizeHumanPiTools(value: string[] | undefined): string[] {
+  if (!value) return [];
+  return value
+    .filter((tool): tool is string => typeof tool === "string")
+    .map((tool) => tool.trim())
+    .filter((tool) => tool.length > 0 && tool.length <= 160 && !capabilityDenial("tool", tool));
 }

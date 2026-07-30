@@ -199,6 +199,10 @@ export interface SpawnRequest {
   /** Internal configured fallback; not exposed as a model-facing tool field. */
   defaultHarness?: HarnessName;
   parentProvider?: ProviderFamily;
+  /** Internal TUI-only delivery marker for human-triggered background commands. */
+  humanVisible?: boolean;
+  /** Permitted parent Pi tools inherited only by full-access human-triggered Pi jobs. */
+  humanPiTools?: string[];
   /** Internal ownership metadata supplied by the workflow runtime, never by a harness adapter. */
   workflow?: WorkflowJobReference;
   /** Internal session-peer fork data (source provenance plus the already-forked session file to resume). Pi-only; never set by a harness adapter. */
@@ -220,6 +224,8 @@ export interface JobSnapshot {
   independent: boolean;
   /** Existing job whose native provider this job was routed against. */
   independentOf?: string;
+  /** True when the job was started by the human-facing /subagent command. */
+  humanVisible?: boolean;
   harness: HarnessName;
   model: string;
   /** Explicit request-scoped provider effort; omitted means provider-adaptive. */

@@ -11,12 +11,14 @@ import { PI_CHILD_MARKER } from "../../src/backends/pi-rpc.ts";
 import {
   CAPABILITY_EFFECTS,
   CAPABILITY_KINDS,
+  capabilityAvailability,
   DEFAULT_SEARCH_LIMIT,
   formatCapabilityLine,
   formatCatalogSummary,
   MAX_REQUIREMENTS,
   MAX_REQUIREMENT_LENGTH,
   MAX_SEARCH_LIMIT,
+  normalizeCapability,
   type CapabilityEffect,
   type CapabilityKind,
 } from "../../src/capabilities.ts";
@@ -94,6 +96,12 @@ const REQUESTED_HARNESSES = ["codex", "claude", "pi", "auto"] as const;
 const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const ACCESS = ["readOnly", "full"] as const;
 const MAX_CAPABILITY_LINES = 40;
+const HUMAN_SUBAGENT_ENTRY = "native-human-subagent";
+const HUMAN_SUBAGENT_USAGE = "/subagent [--harness pi|claude|codex] [--model ID] [--name NAME] [--effort LEVEL] [--access readOnly|full] [--cwd PATH] [--profile NAME] [--independent] <task>";
+
+interface HumanSubagentEntryData {
+  job: JobSnapshot;
+}
 
 export interface RegistrationOptions {
   registry?: object;
@@ -151,6 +159,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const liveCardBlinks = new Set<LiveCardBlink>();
   const waitInterest = new Map<string, number>();
   const consumedResults = new Set<string>();
+  const humanEntryReady = new Set<string>();
+  const humanResultsPublished = new Set<string>();
+  const pendingHumanResults = new Map<string, JobSnapshot>();
   const resultKey = (id: string, generation: number) => `${id}:${generation}`;
 
   // The Pi adapter reports the parent's live tool/command inventory so Pi
@@ -171,12 +182,15 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     params: SpawnToolParams,
     ctx: { cwd: string; isProjectTrusted(): boolean; model?: { provider?: string } },
     signal?: AbortSignal,
+    humanVisible = false,
   ) => spawn(getManager(), capabilities, params, {
     parentCwd: ctx.cwd,
     trusted: ctx.isProjectTrusted(),
     defaultHarness: activeHarness,
     parentProvider: providerFamily(ctx.model?.provider),
     profile: params.profile ? profileCatalog.profiles.get(params.profile.trim()) : undefined,
+    humanVisible,
+    humanPiTools: humanVisible ? permittedHumanPiToolNames(parentTools(pi)) : undefined,
     signal,
   });
   const jobCallTarget = (jobId: string): { accent: string; detail: string } => {
@@ -301,6 +315,38 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint(), standalone: true });
   });
 
+  // Human-triggered jobs use durable TUI-only entries instead of custom messages,
+  // so the orchestrator never receives a prompt or context update.
+  pi.registerEntryRenderer<HumanSubagentEntryData>(HUMAN_SUBAGENT_ENTRY, (entry, { expanded }, theme) => {
+    const job = entry.data?.job;
+    if (!job) return renderToolCallLine(theme, "Inspect", "human subagent entry unavailable");
+    return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint(), standalone: true });
+  });
+
+  const appendHumanEntry = (job: JobSnapshot) => {
+    pi.appendEntry<HumanSubagentEntryData>(HUMAN_SUBAGENT_ENTRY, { job: compactJob(job) });
+  };
+  const publishHumanResult = (job: JobSnapshot) => {
+    const key = resultKey(job.id, job.generation);
+    if (humanResultsPublished.has(key)) return;
+    if (!humanEntryReady.has(key) && job.generation === 0) {
+      pendingHumanResults.set(key, job);
+      return;
+    }
+    humanResultsPublished.add(key);
+    appendHumanEntry(job);
+  };
+  const markHumanEntryReady = (job: JobSnapshot) => {
+    const key = resultKey(job.id, job.generation);
+    humanEntryReady.add(key);
+    const pending = pendingHumanResults.get(key);
+    if (pending) {
+      pendingHumanResults.delete(key);
+      humanResultsPublished.add(key);
+      appendHumanEntry(pending);
+    }
+  };
+
   const deliverResult = (job: JobSnapshot) => {
     const compact = compactJob(job);
     pi.sendMessage({
@@ -317,6 +363,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     }
   };
   const deferResult = (job: JobSnapshot) => {
+    if (job.humanVisible) {
+      publishHumanResult(job);
+      return;
+    }
     const key = resultKey(job.id, job.generation);
     if (job.workflow || consumedResults.has(key) || (waitInterest.get(key) ?? 0) > 0) return;
     deferredResults.set(key, job);
@@ -361,6 +411,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     cardSnapshots.clear();
     waitInterest.clear();
     consumedResults.clear();
+    humanEntryReady.clear();
+    humanResultsPublished.clear();
+    pendingHumanResults.clear();
     activeHarness = configuredHarness;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom") continue;
@@ -374,7 +427,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       refreshCardBlinks();
       updateStatus(ctx, sessionManager, activeHarness);
       if (event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown")) {
-        deferResult(job);
+        if (job.humanVisible) publishHumanResult(job);
+        else deferResult(job);
       }
     });
     updateStatus(ctx, sessionManager, activeHarness);
@@ -392,6 +446,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     cardSnapshots.clear();
     waitInterest.clear();
     consumedResults.clear();
+    humanEntryReady.clear();
+    humanResultsPublished.clear();
+    pendingHumanResults.clear();
     try {
       await workflows.sessionShutdown();
       await manager?.shutdown();
@@ -460,6 +517,25 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     handler: async (args, ctx) => {
       if (args.trim()) await configure(args, ctx);
       else await openSubagentsDashboard(ctx, getManager());
+    },
+  });
+
+  pi.registerCommand("subagent", {
+    description: "Spawn a background subagent for the human without notifying the orchestrator.",
+    getArgumentCompletions: (prefix) => ["--harness", "--model", "--name", "--effort", "--access", "--cwd", "--profile", "--independent", "--independent-of"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    handler: async (args, ctx) => {
+      if (!args.trim() || args.trim() === "--help" || args.trim() === "-h") {
+        ctx.ui.notify(`Usage: ${HUMAN_SUBAGENT_USAGE}`, "info");
+        return;
+      }
+      try {
+        const params = parseHumanSubagentCommand(args);
+        const initial = await spawnJob(params, ctx, undefined, true);
+        appendHumanEntry(initial);
+        markHumanEntryReady(initial);
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
     },
   });
 
@@ -856,6 +932,23 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   });
 }
 
+/**
+ * Full-access human Pi jobs inherit every loaded parent tool that remains below
+ * the package's hard orchestration/interactivity ceiling. Read-only jobs ignore
+ * this list later in policy compilation.
+ */
+export function permittedHumanPiToolNames(
+  tools: Array<{ name: string; description?: string; source?: string }>,
+): string[] {
+  const permitted = tools.filter((tool) => capabilityAvailability(normalizeCapability("pi", {
+    kind: "tool",
+    name: tool.name,
+    description: tool.description,
+    origin: tool.source,
+  }), "full").available);
+  return [...new Set(permitted.map((tool) => tool.name.trim()).filter(Boolean))];
+}
+
 /** Live parent inventories, tolerant of hosts that do not implement them. */
 function parentTools(pi: ExtensionAPI): Array<{ name: string; description?: string; source?: string }> {
   try {
@@ -887,6 +980,139 @@ function sendTitle(behavior: SendBehavior): "Steer" | "Follow up" {
   return behavior === "followUp" ? "Follow up" : "Steer";
 }
 
+export function parseHumanSubagentCommand(input: string): SpawnToolParams {
+  const tokens = tokenizeCommandArgs(input);
+  const params: SpawnToolParams = { task: "" };
+  const task: string[] = [];
+  let parseFlags = true;
+
+  const takeValue = (flag: string, inlineValue: string | undefined, index: number): { value: string; nextIndex: number } => {
+    const value = inlineValue ?? tokens[index + 1];
+    if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value. Usage: ${HUMAN_SUBAGENT_USAGE}`);
+    return { value, nextIndex: inlineValue === undefined ? index + 1 : index };
+  };
+
+  for (let index = 0; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (parseFlags && token === "--") {
+      parseFlags = false;
+      continue;
+    }
+    if (!parseFlags || !token.startsWith("--")) {
+      task.push(token);
+      continue;
+    }
+
+    const equals = token.indexOf("=");
+    const flag = equals >= 0 ? token.slice(0, equals) : token;
+    const inlineValue = equals >= 0 ? token.slice(equals + 1) : undefined;
+    switch (flag) {
+      case "--harness": {
+        const taken = takeValue(flag, inlineValue, index);
+        const harness = normalizeHarness(taken.value);
+        if (!harness) throw new Error(`Unknown harness '${taken.value}'. Choose pi, claude, or codex.`);
+        params.harness = harness;
+        index = taken.nextIndex;
+        break;
+      }
+      case "--model": {
+        const taken = takeValue(flag, inlineValue, index);
+        params.model = taken.value;
+        index = taken.nextIndex;
+        break;
+      }
+      case "--name": {
+        const taken = takeValue(flag, inlineValue, index);
+        params.name = taken.value;
+        index = taken.nextIndex;
+        break;
+      }
+      case "--effort": {
+        const taken = takeValue(flag, inlineValue, index);
+        if (!(EFFORTS as readonly string[]).includes(taken.value)) throw new Error(`Unknown effort '${taken.value}'. Choose ${EFFORTS.join(", ")}.`);
+        params.effort = taken.value as EffortLevel;
+        index = taken.nextIndex;
+        break;
+      }
+      case "--access": {
+        const taken = takeValue(flag, inlineValue, index);
+        if (!(ACCESS as readonly string[]).includes(taken.value)) throw new Error(`Unknown access '${taken.value}'. Choose ${ACCESS.join(" or ")}.`);
+        params.access = taken.value as AccessMode;
+        index = taken.nextIndex;
+        break;
+      }
+      case "--cwd": {
+        const taken = takeValue(flag, inlineValue, index);
+        params.cwd = taken.value;
+        index = taken.nextIndex;
+        break;
+      }
+      case "--profile": {
+        const taken = takeValue(flag, inlineValue, index);
+        params.profile = taken.value;
+        index = taken.nextIndex;
+        break;
+      }
+      case "--independent":
+        if (inlineValue !== undefined) throw new Error(`${flag} does not take a value.`);
+        params.independent = true;
+        break;
+      case "--independent-of": {
+        const taken = takeValue(flag, inlineValue, index);
+        params.independentOf = taken.value;
+        index = taken.nextIndex;
+        break;
+      }
+      default:
+        throw new Error(`Unknown option '${flag}'. Usage: ${HUMAN_SUBAGENT_USAGE}`);
+    }
+  }
+
+  params.task = task.join(" ").trim();
+  if (!params.task) throw new Error(`A task is required. Usage: ${HUMAN_SUBAGENT_USAGE}`);
+  return params;
+}
+
+function tokenizeCommandArgs(input: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: "'" | '"' | undefined;
+  let escaped = false;
+  let started = false;
+
+  for (const character of input.trim()) {
+    if (escaped) {
+      current += character;
+      escaped = false;
+      started = true;
+    } else if (character === "\\") {
+      escaped = true;
+      started = true;
+    } else if (quote) {
+      if (character === quote) quote = undefined;
+      else current += character;
+      started = true;
+    } else if (character === "'" || character === '"') {
+      quote = character;
+      started = true;
+    } else if (/\s/.test(character)) {
+      if (started) {
+        tokens.push(current);
+        current = "";
+        started = false;
+      }
+    } else {
+      current += character;
+      started = true;
+    }
+  }
+
+  if (escaped) current += "\\";
+  if (quote) throw new Error("Unclosed quote in /subagent command.");
+  if (started) tokens.push(current);
+  return tokens;
+}
+
 export interface SpawnToolParams {
   task: string;
   name?: string;
@@ -916,6 +1142,8 @@ async function spawn(
     defaultHarness?: HarnessName;
     parentProvider?: ProviderFamily;
     profile?: ProfileDefinition;
+    humanVisible?: boolean;
+    humanPiTools?: string[];
     signal?: AbortSignal;
   },
 ): Promise<JobSnapshot> {
@@ -934,6 +1162,8 @@ async function spawn(
     profile: params.profile,
     defaultHarness: context.defaultHarness,
     parentProvider: context.parentProvider,
+    humanVisible: context.humanVisible,
+    humanPiTools: context.humanPiTools,
   };
   const routing = await routeCapabilities(router, {
     request: { ...request, harness: params.harness, requires: params.requires },

@@ -43,6 +43,7 @@ function fakePi() {
       registerTool(tool: any) { tools.set(tool.name, tool); },
       registerCommand(name: string, command: any) { commands.set(name, command); },
       registerMessageRenderer() {},
+      registerEntryRenderer() {},
       sendMessage() {},
       appendEntry() {},
     } as any,
