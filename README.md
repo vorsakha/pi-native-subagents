@@ -101,9 +101,10 @@ Workflow JavaScript runs in a separate permission-restricted Node process with 1
 ```
 
 `/subagent` is a human-only background spawn command. It does not inject a
-message into the orchestrator's context. The job appears as a TUI-only start
-card and terminal result card in the current thread, while `/subagents` remains
-the live dashboard for inspection, cancellation, steering, and follow-ups.
+message into the orchestrator's context. The job appears as one TUI-only card
+that settles in place from queued/running state to its terminal result, while
+`/subagents` remains the live dashboard for inspection, cancellation, steering,
+and follow-ups.
 Omitting `--harness` and `--model` uses the configured default harness and its
 native model default. A full-access human Pi job automatically receives every
 loaded parent Pi tool permitted by the hard safety ceiling, including configured

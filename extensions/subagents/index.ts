@@ -101,6 +101,8 @@ const HUMAN_SUBAGENT_USAGE = "/subagent [--harness pi|claude|codex] [--model ID]
 
 interface HumanSubagentEntryData {
   job: JobSnapshot;
+  /** Anchors are visible cards; updates are durable state deltas rendered through their anchor. */
+  kind?: "anchor" | "update";
 }
 
 export interface RegistrationOptions {
@@ -162,6 +164,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const humanEntryReady = new Set<string>();
   const humanResultsPublished = new Set<string>();
   const pendingHumanResults = new Map<string, JobSnapshot>();
+  const hiddenLegacyHumanEntries = new Set<string>();
   const resultKey = (id: string, generation: number) => `${id}:${generation}`;
 
   // The Pi adapter reports the parent's live tool/command inventory so Pi
@@ -316,15 +319,24 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   });
 
   // Human-triggered jobs use durable TUI-only entries instead of custom messages,
-  // so the orchestrator never receives a prompt or context update.
+  // so the orchestrator never receives a prompt or context update. The first entry
+  // is the one visible card. Later entries persist state but render through that
+  // anchor, preventing completion from creating a duplicate card.
   pi.registerEntryRenderer<HumanSubagentEntryData>(HUMAN_SUBAGENT_ENTRY, (entry, { expanded }, theme) => {
     const job = entry.data?.job;
     if (!job) return renderToolCallLine(theme, "Inspect", "human subagent entry unavailable");
-    return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint(), standalone: true });
+    if (entry.data?.kind === "update" || hiddenLegacyHumanEntries.has(entry.id)) return emptyComponent();
+    return {
+      render(width: number) {
+        const current = liveJob(job).job;
+        return renderJobCard(current, theme, { expanded, now: Date.now(), expandHint: expandHint(), standalone: true }).render(width);
+      },
+      invalidate() {},
+    };
   });
 
-  const appendHumanEntry = (job: JobSnapshot) => {
-    pi.appendEntry<HumanSubagentEntryData>(HUMAN_SUBAGENT_ENTRY, { job: compactJob(job) });
+  const appendHumanEntry = (job: JobSnapshot, kind: "anchor" | "update") => {
+    pi.appendEntry<HumanSubagentEntryData>(HUMAN_SUBAGENT_ENTRY, { job: compactJob(job), kind });
   };
   const publishHumanResult = (job: JobSnapshot) => {
     const key = resultKey(job.id, job.generation);
@@ -334,16 +346,21 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       return;
     }
     humanResultsPublished.add(key);
-    appendHumanEntry(job);
+    rememberCardSnapshot(job);
+    const kind = humanEntryReady.has(key) ? "update" : "anchor";
+    if (kind === "anchor") humanEntryReady.add(key);
+    appendHumanEntry(job, kind);
   };
-  const markHumanEntryReady = (job: JobSnapshot) => {
+  const appendHumanAnchor = (job: JobSnapshot) => {
     const key = resultKey(job.id, job.generation);
     humanEntryReady.add(key);
+    appendHumanEntry(job, "anchor");
     const pending = pendingHumanResults.get(key);
     if (pending) {
       pendingHumanResults.delete(key);
       humanResultsPublished.add(key);
-      appendHumanEntry(pending);
+      rememberCardSnapshot(pending);
+      appendHumanEntry(pending, "update");
     }
   };
 
@@ -414,12 +431,19 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     humanEntryReady.clear();
     humanResultsPublished.clear();
     pendingHumanResults.clear();
+    hiddenLegacyHumanEntries.clear();
     activeHarness = configuredHarness;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom") continue;
-      const data = entry.data as { harness?: unknown } | undefined;
+      const data = entry.data as { harness?: unknown; job?: JobSnapshot; kind?: "anchor" | "update" } | undefined;
       const restored = entry.customType === STATE_ENTRY ? normalizeHarness(data?.harness) : undefined;
       if (restored) activeHarness = restored;
+      if (entry.customType !== HUMAN_SUBAGENT_ENTRY || !data?.job) continue;
+      const key = resultKey(data.job.id, data.job.generation);
+      rememberCardSnapshot(data.job);
+      if (data.kind === "update" || humanEntryReady.has(key)) hiddenLegacyHumanEntries.add(entry.id);
+      else humanEntryReady.add(key);
+      if (isTerminal(data.job.status)) humanResultsPublished.add(key);
     }
     const sessionManager = manager;
     unsubscribeManager = sessionManager.subscribe((job, event) => {
@@ -449,6 +473,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     humanEntryReady.clear();
     humanResultsPublished.clear();
     pendingHumanResults.clear();
+    hiddenLegacyHumanEntries.clear();
     try {
       await workflows.sessionShutdown();
       await manager?.shutdown();
@@ -531,8 +556,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       try {
         const params = parseHumanSubagentCommand(args);
         const initial = await spawnJob(params, ctx, undefined, true);
-        appendHumanEntry(initial);
-        markHumanEntryReady(initial);
+        appendHumanAnchor(initial);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }

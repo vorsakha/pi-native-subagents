@@ -46,7 +46,7 @@ function fakePi() {
   const messageRenderers = new Map<string, any>();
   const entryRenderers = new Map<string, any>();
   const messages: unknown[] = [];
-  const entries: Array<{ customType: string; data: unknown }> = [];
+  const entries: Array<{ id: string; customType: string; data: unknown }> = [];
   return {
     api: {
       on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
@@ -70,7 +70,7 @@ function fakePi() {
         ];
       },
       sendMessage(message: unknown) { messages.push(message); },
-      appendEntry(customType: string, data: unknown) { entries.push({ customType, data }); },
+      appendEntry(customType: string, data: unknown) { entries.push({ id: `entry-${entries.length}`, customType, data }); },
     } as any,
     handlers,
     tools,
@@ -203,19 +203,26 @@ test("extension exposes generic direct tools, caller models, independence, and o
   const messagesBeforeHumanCommand = pi.messages.length;
   await pi.commands.get("subagent").handler('--harness claude --model caller-model --name "human review" "human task"', ctx);
   assert.equal(pi.messages.length, messagesBeforeHumanCommand, "human-triggered jobs do not notify the orchestrator");
-  assert.equal(pi.entries.length, entriesBeforeHumanCommand + 2, "human jobs render a start card and a terminal result card");
+  assert.equal(pi.entries.length, entriesBeforeHumanCommand + 2, "human jobs persist one card anchor and one hidden terminal update");
   const humanStart = pi.entries[entriesBeforeHumanCommand];
   const humanResult = pi.entries[entriesBeforeHumanCommand + 1];
   assert.equal(humanStart.customType, "native-human-subagent");
+  assert.equal((humanStart.data as any).kind, "anchor");
   assert.equal((humanStart.data as any).job.status, "queued");
   assert.equal((humanStart.data as any).job.humanVisible, true);
+  assert.equal((humanResult.data as any).kind, "update");
   assert.equal((humanResult.data as any).job.status, "completed");
   assert.equal((humanResult.data as any).job.output, "claude-ok");
   const humanRequest = backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "human task");
   assert.equal(humanRequest?.policy.model, "caller-model");
-  const humanCard = pi.entryRenderers.get("native-human-subagent")(humanResult, { expanded: true }, theme).render(120).join("\n");
+  const humanCard = pi.entryRenderers.get("native-human-subagent")(humanStart, { expanded: true }, theme).render(120).join("\n");
   assert.match(humanCard, /claude\/caller-model/);
-  assert.match(humanCard, /claude-ok/);
+  assert.match(humanCard, /claude-ok/, "the original card settles with the terminal output");
+  assert.deepEqual(
+    pi.entryRenderers.get("native-human-subagent")(humanResult, { expanded: true }, theme).render(120),
+    [],
+    "the durable terminal update does not create a second visible card",
+  );
 
   const entriesBeforeDefaultHumanCommand = pi.entries.length;
   await pi.commands.get("subagent").handler("default human task", ctx);
@@ -339,5 +346,21 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.equal(blinkTimers.size, 0, "manager settlement does not leave a periodic render timer");
   const settledCard = blinkPi.tools.get("subagent_spawn").renderResult(active, { expanded: false, isPartial: false }, theme, renderContext);
   assert.ok(settledCard.render(80).some((line: string) => line.includes("cancelled")), "thread card settles from remembered manager state");
+
+  const humanEntryCount = blinkPi.entries.length;
+  await blinkPi.commands.get("subagent").handler('--name "human live card" "wait for cancellation"', blinkCtx);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(blinkPi.entries.length, humanEntryCount + 1, "an active human job has only its visible anchor entry");
+  const humanAnchor = blinkPi.entries[humanEntryCount];
+  const humanLiveCard = blinkPi.entryRenderers.get("native-human-subagent")(humanAnchor, { expanded: false }, theme);
+  assert.match(humanLiveCard.render(100).join("\n"), /running/);
+  const humanJobs = (await blinkPi.tools.get("subagent_list").execute()).details.jobs;
+  const humanJob = humanJobs.find((job: any) => job.humanVisible && job.name === "human live card");
+  await blinkPi.tools.get("subagent_cancel").execute("cancel-human", { jobId: humanJob.id }, undefined, undefined, blinkCtx);
+  assert.equal(blinkPi.entries.length, humanEntryCount + 2, "settlement adds only a hidden durable update");
+  assert.match(humanLiveCard.render(100).join("\n"), /cancelled/, "the existing component settles in place");
+  const humanUpdate = blinkPi.entries[humanEntryCount + 1];
+  assert.deepEqual(blinkPi.entryRenderers.get("native-human-subagent")(humanUpdate, { expanded: false }, theme).render(100), []);
+
   await blinkPi.handlers.get("session_shutdown")?.();
 });
