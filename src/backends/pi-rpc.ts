@@ -1,13 +1,19 @@
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createActivityWatchdog } from "../activity-watchdog.ts";
 import type { DiscoveredCapability, CapabilitySourceStatus } from "../capabilities.ts";
 import { sanitizeSubscriptionEnv } from "../env.ts";
 import { JsonlFramer, parseJsonRecord } from "../framing.ts";
 import { spawnManaged } from "../process-tree.ts";
 import { boundedAppend } from "../reducer.ts";
+import { PI_PARENT_THREAD_FILE } from "../parent-thread-context.ts";
 import type { Backend, BackendEvent, BackendPolicy, BackendRequest, BackendRun, DiscoveryRequest, DiscoveryResult, SendBehavior } from "../types.ts";
 
 /** Marks a Pi child so this package registers nothing inside it. */
 export const PI_CHILD_MARKER = "PI_NATIVE_SUBAGENTS_CHILD";
+const CHILD_EXTENSION_PATH = fileURLToPath(new URL("../../extensions/parent-thread/index.ts", import.meta.url));
 
 /** Parent-session inventory injected by the extension; discovery never imports Pi's runtime. */
 export interface PiParentInventory {
@@ -179,6 +185,26 @@ export class PiRpcBackend implements Backend {
       ...piResourceArgs(request.policy),
       "--name", `subagent-${request.name}-${request.jobId.slice(0, 8)}`,
     ];
+    let parentThreadDir: string | undefined;
+    let parentThreadCleaned = false;
+    const cleanupParentThread = async () => {
+      if (parentThreadCleaned || !parentThreadDir) return;
+      parentThreadCleaned = true;
+      await rm(parentThreadDir, { recursive: true, force: true });
+    };
+    let childEnv = piChildEnv(request.env);
+    try {
+      if (request.parentThread) {
+        parentThreadDir = await mkdtemp(join(tmpdir(), "pi-parent-thread-"));
+        const snapshotPath = join(parentThreadDir, "snapshot.json");
+        await writeFile(snapshotPath, JSON.stringify(request.parentThread), { encoding: "utf8", mode: 0o600 });
+        childEnv = { ...childEnv, [PI_PARENT_THREAD_FILE]: snapshotPath };
+        args.push("--extension", CHILD_EXTENSION_PATH);
+      }
+    } catch (error) {
+      await cleanupParentThread();
+      throw error;
+    }
     if (request.resumeSessionFile) args.push("--session", request.resumeSessionFile);
     if (request.policy.model) args.push("--model", request.policy.model);
     args.push(
@@ -188,8 +214,14 @@ export class PiRpcBackend implements Backend {
     if (request.policy.piTools.length > 0) args.push("--tools", request.policy.piTools.join(","));
     else args.push("--no-tools");
 
-    request.signal.throwIfAborted();
-    const managed = spawnManaged(this.#command, args, { cwd: request.cwd, env: piChildEnv(request.env) });
+    let managed;
+    try {
+      request.signal.throwIfAborted();
+      managed = spawnManaged(this.#command, args, { cwd: request.cwd, env: childEnv });
+    } catch (error) {
+      await cleanupParentThread();
+      throw error;
+    }
     const pending = new Map<string, PendingCommand>();
     let commandSequence = 0;
     let output = "";
@@ -349,6 +381,7 @@ export class PiRpcBackend implements Backend {
     });
     managed.child.on("close", (code, signal) => {
       closed = true;
+      void cleanupParentThread();
       const detail = `Pi RPC exited (${code ?? signal ?? "signal"})${stderr.trim() ? `: ${stderr.trim()}` : ""}`;
       rejectPending(new Error(detail));
       if (!settled && !tearingDown) finish({ type: "failed", error: detail });
@@ -400,6 +433,7 @@ export class PiRpcBackend implements Backend {
         closed = true;
         rejectPending(new Error(reason));
         await managed.terminate();
+        await cleanupParentThread();
         finish({ type: "cancelled", reason });
       },
       async close() {
@@ -409,6 +443,7 @@ export class PiRpcBackend implements Backend {
         watchdog.clear();
         rejectPending(new Error("Pi RPC run closed"));
         await managed.terminate();
+        await cleanupParentThread();
       },
       async forceClose() {
         closed = true;
@@ -416,6 +451,7 @@ export class PiRpcBackend implements Backend {
         watchdog.clear();
         rejectPending(new Error("Pi RPC run force-closed"));
         await managed.terminate(0);
+        await cleanupParentThread();
         finish({ type: "cancelled", reason: "Pi RPC force-closed after shutdown deadline" });
       },
     };

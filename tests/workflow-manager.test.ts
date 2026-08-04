@@ -72,7 +72,7 @@ class ControlledBackend implements Backend {
   }
 
   requestForTask(task: string): BackendRequest | undefined {
-    return this.requests.find((request) => request.task === task);
+    return [...this.requests].reverse().find((request) => request.task === task);
   }
 
   activeRuns(): FakeRun[] {
@@ -281,6 +281,29 @@ test("runs sequential and parallel agents through one JobManager and its global 
   } finally {
     await f.cleanup();
   }
+});
+
+test("journals failed agent routes with status and bounded error details", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("route failure", { name: "reviewer", access: "readOnly" });`,
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "failed route agent");
+    f.backend.failTask("route failure", "provider exploded");
+    const final = await started.completion;
+    assert.equal(final.agents[0]?.state, "failed");
+
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const failed = journal.find((record) => record.state === "failed");
+    assert.deepEqual(failed?.route, {
+      jobId: final.agents[0]?.jobId,
+      harness: "codex",
+      model: "default",
+      status: "failed",
+      error: "provider exploded",
+    });
+  } finally { await f.cleanup(); }
 });
 
 test("serializes mutating workflow agents that share one checkout", async () => {
@@ -554,7 +577,11 @@ test("records phases, results, and final workflow artifacts", async () => {
     }
   `;
   try {
-    const started = await f.workflows.start(f.request(script, { args: { subject: "change" }, parentProvider: "claude" }));
+    const started = await f.workflows.start(f.request(script, {
+      args: { subject: "change" },
+      parentProvider: "claude",
+      budget: { maxAgents: 2, maxConcurrency: 1, maxTokens: 1_000, maxTurns: 4, maxCost: 1 },
+    }));
     await waitFor(() => f.backend.requests.length === 1, "phase agent");
     const live = f.workflows.check(started.snapshot.runId);
     assert.equal(live.name, "release review", "static module metadata is visible before workflow execution settles");
@@ -593,6 +620,7 @@ test("records phases, results, and final workflow artifacts", async () => {
     const report = await readFile(join(final.artifactDir, "report.md"), "utf8");
     assert.match(report, /# release review[\s\S]*## Progress[\s\S]*Inspecting change[\s\S]*Preparing final summary[\s\S]*looks good/);
     assert.match(report, /- Independent: yes/);
+    assert.match(report, /- Budget: agents 1\/2 \(1 remaining\)/);
   } finally {
     await f.cleanup();
   }
@@ -676,6 +704,17 @@ test("restarts a selected agent by replaying its prefix and invalidating its suf
     assert.equal(final.agents[0]?.outputProvenance, "replay");
     assert.equal(final.agents[1]?.replayedFrom, undefined);
     assert.equal((final.result as { output: string }).output, "new second");
+    assert.equal(final.replacementOf?.sourceRunId, sourceFinal.runId);
+    assert.equal(final.replacementOf?.sourceAgentIndex, sourceFinal.agents[1]!.index);
+    assert.equal(final.replacementOf?.sourceJobId, sourceFinal.agents[1]!.jobId);
+    assert.equal(final.replacementOf?.sourceState, sourceFinal.agents[1]!.state);
+    assert.equal(final.replacementOf?.sourceHarness, sourceFinal.agents[1]!.harness);
+    assert.equal(final.replacementOf?.sourceModel, sourceFinal.agents[1]!.model);
+    assert.match(final.replacementOf?.reason ?? "", /inadequate|manual/i);
+    const sourceWithLink = f.workflows.check(sourceFinal.runId);
+    assert.equal(sourceWithLink.agents[1]?.replacedBy?.replacementRunId, final.runId);
+    const replacementJournal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    assert.equal(replacementJournal.find((record) => record.replacementOf)?.replacementOf?.sourceRunId, sourceFinal.runId);
 
     const cancelledRestart = await f.workflows.restartAgent(sourceFinal.runId, sourceFinal.agents[1]!.index);
     await waitFor(() => f.backend.activeRuns().length === 1, "cancelled replay suffix");
@@ -878,6 +917,40 @@ test("replays the completed journal prefix and reruns the first incomplete call"
       [0, "started"], [0, "completed"], [1, "started"], [1, "completed"],
     ]);
     assert.deepEqual(journal[1]?.replayedFrom, { runId: source.runId, callIndex: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("replay permits a monotonic budget increase and preserves the completed prefix", async () => {
+  const f = await fixture();
+  const script = `
+    export default async () => {
+      const first = await agent("budget:first", { access: "readOnly" });
+      return agent("budget:second:" + first.output, { access: "readOnly" });
+    }
+  `;
+  try {
+    const source = await f.workflows.start(f.request(script, { budget: { maxTokens: 5 } }));
+    await waitFor(() => f.backend.requests.length === 1, "budget prefix agent");
+    f.backend.completeTask("budget:first", "one", { input: 2, output: 1, turns: 1 });
+    await waitFor(() => f.backend.requests.length === 2, "budget exhausted suffix agent");
+    f.backend.completeTask("budget:second:one", "old suffix", { input: 10, output: 1, turns: 1 });
+    const sourceFinal = await source.completion;
+    assert.equal(sourceFinal.status, "aborted");
+
+    const resumed = await f.workflows.start(f.request(script, {
+      budget: { maxTokens: 100 },
+      resumeFromRunId: sourceFinal.runId,
+    }));
+    await waitFor(() => f.backend.requests.length === 3, "replayed budget suffix agent");
+    assert.equal(f.backend.requests.filter((request) => request.task === "budget:first").length, 1, "completed prefix is not rerun");
+    f.backend.completeTask("budget:second:one", "new suffix", { input: 10, output: 1, turns: 1 });
+    const final = await resumed.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.replay?.matchedCalls, 1);
+    assert.equal(final.agents[0]?.outputProvenance, "replay");
+    assert.equal((final.result as { output: string }).output, "new suffix");
   } finally {
     await f.cleanup();
   }

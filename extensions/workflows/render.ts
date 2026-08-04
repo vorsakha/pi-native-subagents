@@ -1,6 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { aggregateWorkflowUsage } from "../../src/workflows/manager.ts";
+import { formatWorkflowBudget } from "../../src/workflows/budget.ts";
 import type {
   WorkflowAgentRecord,
   WorkflowSnapshot,
@@ -182,12 +183,11 @@ export function buildWorkflowCardLines(
     lines.push(theme.fg("muted", `Log · ${sanitizeInline(entry.message)}`));
   }
 
-  const usage = formatUsage(aggregateWorkflowUsage(snapshot));
+  const usageSnapshot = aggregateWorkflowUsage(snapshot);
+  const usage = formatUsage(usageSnapshot);
   if (usage) lines.push(theme.fg("dim", `Usage · ${usage}`));
-  if (options.expanded && snapshot.budget) {
-    const limits = Object.entries(snapshot.budget).filter(([, value]) => value !== undefined).map(([key, value]) => `${key} ${value}`).join(" · ");
-    if (limits) lines.push(theme.fg("dim", `Budget · ${limits}`));
-  }
+  const budgetLine = formatWorkflowBudget(snapshot, usageSnapshot);
+  if (budgetLine) lines.push(theme.fg("dim", `Budget · ${budgetLine}`));
 
   if (snapshot.error) {
     const errorLines = sanitizeText(snapshot.error).split("\n").map(sanitizeInline).filter(Boolean);

@@ -175,11 +175,13 @@ test("search() aggregates catalogs and defers filtering to searchCapabilities", 
   assert.equal(result.catalogs.length, 2, "search still returns every discovered catalog for summary reporting");
 });
 
-test("resolveRoute rejects an unavailable explicit harness and an auto route with no requirements", async () => {
+test("resolveRoute rejects unavailable explicit harnesses while allowing auth/health-based auto selection", async () => {
   const codex = new FakeBackend("codex", []);
   const service = new CapabilityService({ backends: [codex], fingerprint: () => "stable" });
   await assert.rejects(service.resolveRoute({ ...request(), harness: "claude", requires: [] }), /Harness is unavailable: claude/);
-  await assert.rejects(service.resolveRoute({ ...request(), harness: "auto", requires: [] }), /requires at least one capability/);
+  const auto = await service.resolveRoute({ ...request(), harness: "auto", requires: [] });
+  assert.equal(auto.harness, "codex", "auto selection can use a healthy catalog even without a capability requirement");
+  assert.equal(auto.auto, true);
   await assert.rejects(service.resolveRoute({ ...request(), requires: ["codex:tool:read"] }), /explicit harness or harness auto/);
 });
 
@@ -255,6 +257,57 @@ test("route() compares candidates from the browse cache, then live-revalidates o
   assert.equal(codex.calls, 2, "the winning candidate is browsed once and then revalidated live");
   assert.equal(codex.refreshFlags.at(-1), true);
   assert.equal(routed.route.auto, true, "auto provenance survives the live revalidation pass");
+});
+
+test("route() failover refreshes the candidate set when the preferred auto route becomes unhealthy", async () => {
+  let calls = 0;
+  const flaky = new FakeBackend("codex", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
+  const fallback = new FakeBackend("claude", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
+  const original = flaky.discover.bind(flaky);
+  flaky.discover = async (req) => {
+    calls++;
+    if (calls === 1) return original(req);
+    throw new Error("authentication_failed");
+  };
+  const service = new CapabilityService({ backends: [flaky, fallback], fingerprint: () => "stable" });
+  const routed = await service.route({ ...request(), harness: "auto", requires: ["tool:lint"], preference: ["codex", "claude"] });
+  assert.equal(routed.harness, "claude");
+  assert.equal(calls, 2, "the unhealthy preferred provider is refreshed once and then skipped");
+  assert.equal(flaky.calls, 1, "the unhealthy preferred provider is not retried after live failure");
+  assert.equal(fallback.calls, 2, "the fallback provider is browsed and live revalidated");
+});
+
+test("route() keeps explicit auth failures fail-closed", async () => {
+  let discoveries = 0;
+  const claude = new FakeBackend("claude", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
+  const codex = new FakeBackend("codex", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
+  codex.discover = async (request) => {
+    discoveries++;
+    if (discoveries > 1) throw new Error("authentication_failed");
+    return { capabilities: [{ kind: "tool", name: "Lint", effect: "inspect" }], sources: [{ source: "codex-fixture", health: "healthy" }] };
+  };
+  const service = new CapabilityService({ backends: [codex, claude], fingerprint: () => "stable" });
+  await assert.rejects(
+    service.route({ ...request(), harness: "codex", requires: ["tool:lint"] }),
+    /Selected harness cannot satisfy the required capabilities/,
+  );
+  assert.equal(claude.calls, 0, "an explicit provider failure never falls over to another provider");
+});
+
+test("route() failover also covers auto routing without explicit requirements", async () => {
+  let flakyDiscoveries = 0;
+  const flaky = new FakeBackend("codex", []);
+  const fallback = new FakeBackend("claude", []);
+  flaky.discover = async (request) => {
+    flakyDiscoveries++;
+    if (flakyDiscoveries > 1) throw new Error("authentication_failed");
+    return { capabilities: [], sources: [{ source: "codex-fixture", health: "healthy" }] };
+  };
+  const service = new CapabilityService({ backends: [flaky, fallback], fingerprint: () => "stable" });
+  const routed = await service.route({ ...request(), harness: "auto", preference: ["codex", "claude"] });
+  assert.equal(routed.harness, "claude");
+  assert.equal(flakyDiscoveries, 2, "auth failure is not retried after the initial live route check");
+  assert.equal(fallback.calls, 2, "the fallback route is browsed and live revalidated");
 });
 
 test("route() live-revalidation catches a capability that disappeared between browse and dispatch", async () => {

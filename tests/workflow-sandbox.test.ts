@@ -154,6 +154,25 @@ test("aborts a running workflow and aborts in-flight agent work", async () => {
   } finally { await cleanup(stuck.cwd); }
 });
 
+test("terminates the child when a host progress callback fails", async () => {
+  const f = await fixture(`
+    export const meta = { name: "callback-failure" };
+    export default async () => new Promise(() => {});
+  `, {
+    onMeta: () => { throw new Error("meta callback failed"); },
+  });
+  try {
+    await assert.rejects(runWorkflowSandbox(f.options), /meta callback failed/);
+  } finally { await cleanup(f.cwd); }
+});
+
+test("explains that workflow helpers are globals when the callback context is misused", async () => {
+  const f = await fixture(`export default async ({ phase }) => phase("wrong shape")`, { args: null });
+  try {
+    await assert.rejects(runWorkflowSandbox(f.options), /Workflow helpers are globals.*phase\(\)/i);
+  } finally { await cleanup(f.cwd); }
+});
+
 test("has no overall deadline and runs until explicitly aborted", async () => {
   const f = await fixture(`export default async () => new Promise(() => {})`);
   try {
@@ -262,6 +281,11 @@ test("enforces payload, call, phase, and parallel limits", async () => {
     try { await assert.rejects(runWorkflowSandbox(parallel.options), /concurrency.*1.*4/i); }
     finally { await cleanup(parallel.cwd); }
   }
+
+  const startedTasks = await fixture(`export default async () => parallel([Promise.resolve("already started")])`);
+  try {
+    await assert.rejects(runWorkflowSandbox(startedTasks.options), /parallel\(\) requires deferred functions.*\(\) => agent/i);
+  } finally { await cleanup(startedTasks.cwd); }
 
   const noStages = await fixture(`export default async () => pipeline([1])`);
   try { await assert.rejects(runWorkflowSandbox(noStages.options), /one or more stage functions/i); }

@@ -4,6 +4,12 @@ import { sanitizeSubscriptionEnv } from "../env.ts";
 import { asObject, JsonRpcPeer } from "../jsonrpc.ts";
 import { spawnManaged } from "../process-tree.ts";
 import { boundedAppend } from "../reducer.ts";
+import {
+  PARENT_THREAD_INPUT_SCHEMA,
+  PARENT_THREAD_TOOL_DESCRIPTION,
+  PARENT_THREAD_TOOL_NAME,
+  renderParentThreadContext,
+} from "../parent-thread-context.ts";
 import type { Backend, BackendEvent, BackendPolicy, BackendRequest, BackendRun, DiscoveryRequest, DiscoveryResult, SendBehavior } from "../types.ts";
 
 const CLIENT_INFO = { name: "pi-native-subagents", title: "Pi Native Subagents", version: "0.1.0" };
@@ -255,7 +261,14 @@ export class CodexAppServerBackend implements Backend {
     peer = new JsonRpcPeer({
       process: managed,
       onActivity: () => watchdog.touch(),
-      onRequest: (_id, method) => {
+      onRequest: (_id, method, params) => {
+        if (method === "item/tool/call" && request.parentThread) {
+          if (params.tool !== PARENT_THREAD_TOOL_NAME) throw new Error(`Unsupported dynamic tool: ${String(params.tool ?? "unknown")}`);
+          return {
+            success: true,
+            contentItems: [{ type: "inputText", text: renderParentThreadContext(request.parentThread, params.arguments) }],
+          };
+        }
         if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") return { decision: "decline" };
         if (method === "item/permissions/requestApproval") return { permissions: { network: false, fileSystem: { read: [], write: [] } }, scope: "turn" };
         // Unattended children never answer elicitation, login, or approval
@@ -335,11 +348,22 @@ export class CodexAppServerBackend implements Backend {
       ephemeral: false,
       ...(config ? { config } : {}),
       developerInstructions: `${request.systemPrompt}\n\n${request.policy.access === "readOnly" ? "Hard policy: remain read-only; do not mutate files, Git state, or external systems." : "This is a trusted workspace. Work autonomously without asking for per-command approval."}`,
+      ...(request.parentThread ? {
+        dynamicTools: [{
+          type: "function",
+          name: PARENT_THREAD_TOOL_NAME,
+          description: PARENT_THREAD_TOOL_DESCRIPTION,
+          inputSchema: PARENT_THREAD_INPUT_SCHEMA,
+        }],
+      } : {}),
     }, this.#requestTimeoutMs));
 
     const initialization = (async () => {
       try {
-        await peer.request("initialize", { clientInfo: CLIENT_INFO }, this.#requestTimeoutMs);
+        await peer.request("initialize", {
+          clientInfo: CLIENT_INFO,
+          ...(request.parentThread ? { capabilities: { experimentalApi: true } } : {}),
+        }, this.#requestTimeoutMs);
         peer.notify("initialized");
         const accountResult = asObject(await peer.request("account/read", { refreshToken: false }, this.#requestTimeoutMs));
         const account = asObject(accountResult.account);

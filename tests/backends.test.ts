@@ -12,7 +12,11 @@ import type { BackendEvent, HarnessName, BackendRequest } from "../src/types.ts"
 const PI_FIXTURE = `#!/usr/bin/env node
 import fs from "node:fs";
 if (process.env.ARG_FILE) fs.writeFileSync(process.env.ARG_FILE, JSON.stringify(process.argv.slice(2)));
-if (process.env.ENV_FILE) fs.writeFileSync(process.env.ENV_FILE, JSON.stringify({ openai: process.env.OPENAI_API_KEY, codex: process.env.CODEX_API_KEY }));
+if (process.env.ENV_FILE) fs.writeFileSync(process.env.ENV_FILE, JSON.stringify({
+  openai: process.env.OPENAI_API_KEY,
+  codex: process.env.CODEX_API_KEY,
+  ...(process.env.PI_NATIVE_SUBAGENTS_PARENT_THREAD_FILE ? { parentThread: JSON.parse(fs.readFileSync(process.env.PI_NATIVE_SUBAGENTS_PARENT_THREAD_FILE, "utf8")) } : {}),
+}));
 let buffer = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", chunk => {
@@ -72,7 +76,15 @@ process.stdin.on("data", chunk => {
     const line = buffer.slice(0, at); buffer = buffer.slice(at + 1);
     const value = JSON.parse(line);
     if (!value.id || process.env.MODE === "hang") continue;
-    if (value.method === "initialize") reply(value.id, {});
+    if (value.id === "server-tool-1" && !value.method) {
+      if (process.env.TOOL_RESULT_FILE) fs.writeFileSync(process.env.TOOL_RESULT_FILE, JSON.stringify(value.result));
+      process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { type: "agentMessage", text: "CONTEXT_OK" } } }) + "\\n");
+      process.stdout.write(JSON.stringify({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } }) + "\\n");
+    }
+    else if (value.method === "initialize") {
+      if (process.env.INIT_PARAM_FILE) fs.writeFileSync(process.env.INIT_PARAM_FILE, JSON.stringify(value.params));
+      reply(value.id, {});
+    }
     else if (value.method === "account/read") reply(value.id, { account: { type: "chatgpt" } });
     else if (value.method === "thread/start") {
       if (process.env.THREAD_PARAM_FILE) fs.writeFileSync(process.env.THREAD_PARAM_FILE, JSON.stringify(value.params));
@@ -82,10 +94,13 @@ process.stdin.on("data", chunk => {
       if (process.env.PARAM_FILE) fs.appendFileSync(process.env.PARAM_FILE, JSON.stringify(value.params) + "\\n");
       const number = ++turns; const id = "turn-" + number;
       reply(value.id, { turn: { id } });
+      if (process.env.MODE === "dynamic-tool") {
+        process.stdout.write(JSON.stringify({ id: "server-tool-1", method: "item/tool/call", params: { threadId: "thread-1", turnId: id, callId: "call-1", tool: "parent_thread_context", arguments: { query: "decision" } } }) + "\\n");
+      }
       if (process.env.MODE === "activity") {
         for (const delay of [80, 160, 240]) setTimeout(() => process.stdout.write(JSON.stringify({ method: "item/reasoning/summaryTextDelta", params: { delta: "." } }) + "\\n"), delay);
       }
-      if (process.env.MODE !== "silent") setTimeout(() => {
+      if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool") setTimeout(() => {
         process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { type: "agentMessage", text: number === 1 ? "FIRST" : "SECOND" } } }) + "\\n");
         process.stdout.write(JSON.stringify({ method: "turn/completed", params: { turn: { id, status: "completed" } } }) + "\\n");
       }, process.env.MODE === "activity" ? 320 : 40);
@@ -235,6 +250,33 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
 
+test("Pi RPC loads only the targeted parent-thread extension alongside the read-only tool set", async () => {
+  const fake = await fixture(PI_FIXTURE);
+  const argFile = join(fake.dir, "parent-args.json");
+  const envFile = join(fake.dir, "parent-env.json");
+  const events: BackendEvent[] = [];
+  try {
+    const piRequest = request("pi", fake.dir, { ...process.env, MODE: "complete", ARG_FILE: argFile, ENV_FILE: envFile });
+    piRequest.policy.piTools = ["read", "parent_thread_context"];
+    piRequest.parentThread = {
+      capturedAt: 1_000,
+      totalMessages: 1,
+      truncated: false,
+      messages: [{ role: "assistant", text: "Use a pull-based tool." }],
+    };
+    const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 20_000, inactivityTimeoutMs: 20_000 })
+      .start(piRequest, (event) => events.push(event));
+    await run.completed;
+    const args = JSON.parse(await readFile(argFile, "utf8")) as string[];
+    assert.equal(args.includes("--no-extensions"), true, "normal extension discovery remains disabled in read-only mode");
+    assert.equal(args.includes("--extension"), true, "the narrow child extension is loaded explicitly");
+    assert.equal(args[args.indexOf("--tools") + 1], "read,parent_thread_context");
+    const childEnv = JSON.parse(await readFile(envFile, "utf8"));
+    assert.equal(childEnv.parentThread.messages[0].text, "Use a pull-based tool.");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
 test("Pi RPC resumes a forked session and sends a peer question verbatim", async () => {
   const fake = await fixture(PI_FIXTURE);
   const argFile = join(fake.dir, "peer-args.json");
@@ -282,6 +324,26 @@ test("Pi RPC maps assistant, stream, extension, and exhausted-retry errors at se
   }
 });
 
+test("Claude capability discovery performs auth preflight before opening an SDK session", async () => {
+  let queried = false;
+  const backend = new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => { throw new Error("authentication_failed"); },
+    queryFn: (() => { queried = true; throw new Error("query must not run after auth failure"); }) as never,
+  });
+  await assert.rejects(
+    backend.discover({
+      cwd: process.cwd(),
+      access: "readOnly",
+      customization: "native",
+      env: process.env,
+      signal: new AbortController().signal,
+      refresh: true,
+    }),
+    /authentication_failed/,
+  );
+  assert.equal(queried, false, "auth failure is reported before SDK capability discovery");
+});
+
 test("Claude emits live events and reopens a completed subscription session", async () => {
   const huge = "x".repeat(MAX_OUTPUT_BYTES);
   let capturedOptions: Record<string, unknown> | undefined;
@@ -289,7 +351,7 @@ test("Claude emits live events and reopens a completed subscription session", as
   let releaseSecond!: () => void;
   const secondTurn = new Promise<void>((resolve) => { releaseSecond = resolve; });
   async function* messages() {
-    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: ["mcp__parent_thread__parent_thread_context"] };
     yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking: "live thought" } } };
     yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "live" } } };
     yield { type: "assistant", message: { content: [{ type: "thinking", thinking: "final thought" }, { type: "text", text: "message" }] } };
@@ -314,6 +376,12 @@ test("Claude emits live events and reopens a completed subscription session", as
     AWS_ACCESS_KEY_ID: "must-not-leak",
   });
   delete claudeRequest.policy.model;
+  claudeRequest.parentThread = {
+    capturedAt: 1_000,
+    totalMessages: 1,
+    truncated: false,
+    messages: [{ role: "user", text: "parent context" }],
+  };
   const run = await backend.start(claudeRequest, (event) => events.push(event));
   await run.completed;
   await run.send("second turn", "followUp");
@@ -326,6 +394,8 @@ test("Claude emits live events and reopens a completed subscription session", as
   assert.equal(capturedOptions?.includePartialMessages, true);
   assert.equal(capturedOptions?.model, undefined, "Claude uses its native default when no model is requested");
   assert.equal(capturedOptions?.effort, undefined, "Claude effort is provider-adaptive unless explicitly requested");
+  assert.ok((capturedOptions?.allowedTools as string[]).includes("mcp__parent_thread__parent_thread_context"));
+  assert.ok((capturedOptions?.mcpServers as Record<string, unknown>).parent_thread, "Claude receives the in-process parent-thread MCP server");
   const childEnv = capturedOptions?.env as NodeJS.ProcessEnv;
   for (const env of [verifiedEnv, childEnv]) {
     assert.equal(env?.ANTHROPIC_BASE_URL, undefined);
@@ -392,6 +462,41 @@ test("Codex reuses its native thread for queued and post-settlement follow-ups",
       assert.equal(params.cwd, fake.dir);
       assert.equal(params.effort, "high", "explicit Codex effort is forwarded");
     }
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex exposes parent_thread_context as a client-hosted dynamic tool", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const threadParamFile = join(fake.dir, "thread-params.json");
+  const initParamFile = join(fake.dir, "init-params.json");
+  const toolResultFile = join(fake.dir, "tool-result.json");
+  const events: BackendEvent[] = [];
+  try {
+    const codexRequest = request("codex", fake.dir, {
+      ...process.env,
+      MODE: "dynamic-tool",
+      THREAD_PARAM_FILE: threadParamFile,
+      INIT_PARAM_FILE: initParamFile,
+      TOOL_RESULT_FILE: toolResultFile,
+    });
+    codexRequest.parentThread = {
+      capturedAt: 1_000,
+      totalMessages: 1,
+      truncated: false,
+      messages: [{ role: "assistant", text: "The decision was pull-based access." }],
+    };
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 5_000, inactivityTimeoutMs: 5_000 })
+      .start(codexRequest, (event) => events.push(event));
+    await run.completed;
+    assert.deepEqual(terminal(events), { type: "completed", output: "CONTEXT_OK" });
+    const initParams = JSON.parse(await readFile(initParamFile, "utf8"));
+    assert.equal(initParams.capabilities.experimentalApi, true);
+    const threadParams = JSON.parse(await readFile(threadParamFile, "utf8"));
+    assert.equal(threadParams.dynamicTools[0].name, "parent_thread_context");
+    const toolResult = JSON.parse(await readFile(toolResultFile, "utf8"));
+    assert.equal(toolResult.success, true);
+    assert.match(toolResult.contentItems[0].text, /pull-based access/);
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });

@@ -30,7 +30,8 @@ export function isRequestedHarness(value: unknown): value is RequestedHarness {
 /**
  * Resolve and live-revalidate a capability route before dispatch. Requests
  * without `requires` and without `harness: "auto"` keep their existing routing
- * untouched, so ordinary delegation never pays for discovery.
+ * untouched, so ordinary delegation never pays for discovery. `harness: "auto"`
+ * may omit `requires` when the caller wants health/auth-based provider selection.
  */
 export async function routeCapabilities(
   router: CapabilityRouter | undefined,
@@ -40,8 +41,7 @@ export async function routeCapabilities(
   const auto = request.harness === "auto";
   const requires = normalizeRequirements(request.requires);
   if (!auto && !requires) return {};
-  if (!requires) throw new Error("harness auto requires at least one capability in requires; choose an explicit harness otherwise");
-  if (!router) throw new Error("Capability requirements are unavailable in this session");
+  if (!router) throw new Error("Capability requirements are unavailable in this session (capability routing is unavailable)");
 
   const explicit = auto
     ? undefined
@@ -52,7 +52,9 @@ export async function routeCapabilities(
   // arbitrarily excluding a capable harness during catalog selection.
   const independent = request.independent === true || input.independentOfProvider !== undefined || input.profile?.independent === true;
   let candidates: HarnessName[] | undefined = auto && independent
-    ? independenceTarget === "claude" ? ["codex"] : ["claude"]
+    ? independenceTarget === "claude" ? ["codex"]
+      : independenceTarget === "codex" ? ["claude"]
+      : ["claude", "codex"]
     : undefined;
   if (auto && input.profile?.lockedHarness) {
     candidates = candidates

@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
 import type { TranscriptEntry } from "../types.ts";
+import { formatWorkflowBudget } from "./budget.ts";
 import type { WorkflowJournalRecord, WorkflowSnapshot } from "./types.ts";
 
 const RUN_ID_PATTERN = /^wf_[a-f0-9]+$/;
@@ -348,8 +349,20 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
   if (record.route !== undefined && (record.route === null || typeof record.route !== "object"
       || record.route.harness !== undefined && !["pi", "claude", "codex"].includes(record.route.harness)
       || record.route.jobId !== undefined && (typeof record.route.jobId !== "string" || !record.route.jobId || record.route.jobId.length > 200)
-      || record.route.model !== undefined && (typeof record.route.model !== "string" || record.route.model.length > 256))) return false;
-  if (record.state === "started") return record.result === undefined && record.route === undefined && record.replayedFrom === undefined;
+      || record.route.model !== undefined && (typeof record.route.model !== "string" || record.route.model.length > 256)
+      || record.route.status !== undefined && !["queued", "running", "completed", "failed", "cancelled", "aborted"].includes(record.route.status)
+      || record.route.error !== undefined && (typeof record.route.error !== "string" || record.route.error.length > 2_000))) return false;
+  if (record.replacementOf !== undefined && (record.replacementOf === null || typeof record.replacementOf !== "object"
+      || typeof record.replacementOf.sourceRunId !== "string" || !RUN_ID_PATTERN.test(record.replacementOf.sourceRunId)
+      || !Number.isSafeInteger(record.replacementOf.sourceAgentIndex) || record.replacementOf.sourceAgentIndex < 0 || record.replacementOf.sourceAgentIndex >= 32
+      || record.replacementOf.sourceCallIndex !== undefined && (!Number.isSafeInteger(record.replacementOf.sourceCallIndex) || record.replacementOf.sourceCallIndex < 0 || record.replacementOf.sourceCallIndex >= 32)
+      || record.replacementOf.sourceJobId !== undefined && (typeof record.replacementOf.sourceJobId !== "string" || !record.replacementOf.sourceJobId || record.replacementOf.sourceJobId.length > 200)
+      || record.replacementOf.sourceHarness !== undefined && !["pi", "claude", "codex"].includes(record.replacementOf.sourceHarness)
+      || record.replacementOf.sourceModel !== undefined && (typeof record.replacementOf.sourceModel !== "string" || !record.replacementOf.sourceModel || record.replacementOf.sourceModel.length > 256)
+      || !["queued", "running", "completed", "failed", "cancelled", "aborted"].includes(record.replacementOf.sourceState)
+      || record.replacementOf.sourceError !== undefined && (typeof record.replacementOf.sourceError !== "string" || record.replacementOf.sourceError.length > 2_000)
+      || typeof record.replacementOf.reason !== "string" || !record.replacementOf.reason || record.replacementOf.reason.length > 200)) return false;
+  if (record.state === "started") return record.result === undefined && record.route === undefined && record.replayedFrom === undefined && record.replacementOf === undefined;
   if (!record.result || typeof record.result !== "object" || typeof record.result.ok !== "boolean"
       || typeof record.result.output !== "string" || record.result.output.length > JOURNAL_RECORD_BYTES
       || record.result.jobId !== undefined && (typeof record.result.jobId !== "string" || !record.result.jobId || record.result.jobId.length > 200)
@@ -483,6 +496,7 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
     cost: total.cost + agent.usage.cost,
     turns: total.turns + agent.usage.turns,
   }), { input: 0, output: 0, cost: 0, turns: 0 });
+  const budget = formatWorkflowBudget(snapshot, usage);
   const lines = [
     `# ${snapshot.name}`,
     "",
@@ -492,6 +506,7 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
     `- Status: **${snapshot.status}**`,
     `- Agents: ${snapshot.agents.length}`,
     `- Usage: ${usage.input} input / ${usage.output} output tokens · ${usage.turns} turns · $${usage.cost.toFixed(4)}`,
+    ...(budget ? [`- Budget: ${budget}`] : []),
     "",
     "## Phases",
     ...snapshot.phases.map((phase) => `- ${phase.name}: ${phase.status} (${phase.agents.length} agents)`),
@@ -528,6 +543,25 @@ function normalizeTranscript(value: unknown): TranscriptEntry[] | undefined {
   return boundedTranscript(entries);
 }
 
+function validReplacementReference(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const reference = value as Record<string, unknown>;
+  return typeof reference.sourceRunId === "string"
+    && RUN_ID_PATTERN.test(reference.sourceRunId)
+    && Number.isSafeInteger(reference.sourceAgentIndex)
+    && (reference.sourceAgentIndex as number) >= 0
+    && (reference.sourceAgentIndex as number) < 32
+    && (reference.sourceCallIndex === undefined || Number.isSafeInteger(reference.sourceCallIndex) && (reference.sourceCallIndex as number) >= 0 && (reference.sourceCallIndex as number) < 32)
+    && (reference.sourceJobId === undefined || typeof reference.sourceJobId === "string" && reference.sourceJobId.length > 0 && reference.sourceJobId.length <= 200)
+    && (reference.sourceHarness === undefined || reference.sourceHarness === "pi" || reference.sourceHarness === "claude" || reference.sourceHarness === "codex")
+    && (reference.sourceModel === undefined || typeof reference.sourceModel === "string" && reference.sourceModel.length > 0 && reference.sourceModel.length <= 256)
+    && ["queued", "running", "completed", "failed", "cancelled", "aborted"].includes(String(reference.sourceState))
+    && (reference.sourceError === undefined || typeof reference.sourceError === "string" && reference.sourceError.length <= 2_000)
+    && typeof reference.reason === "string"
+    && reference.reason.length > 0
+    && reference.reason.length <= 200;
+}
+
 function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<WorkflowSnapshot>;
@@ -543,6 +577,7 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
     && typeof candidate.timestamps.createdAt === "number"
     && typeof candidate.timestamps.updatedAt === "number"
     && (candidate.approval === undefined || candidate.approval === "auto" || candidate.approval === "plan" || candidate.approval === "onMutate")
+    && (candidate.replacementOf === undefined || validReplacementReference(candidate.replacementOf))
     && (candidate.budget === undefined || !!candidate.budget && typeof candidate.budget === "object" && !Array.isArray(candidate.budget)
       && Object.keys(candidate.budget).every((key) => ["maxAgents", "maxConcurrency", "maxTokens", "maxCost", "maxTurns"].includes(key))
       && Object.values(candidate.budget).every((item) => item === undefined || typeof item === "number" && Number.isFinite(item) && item > 0))

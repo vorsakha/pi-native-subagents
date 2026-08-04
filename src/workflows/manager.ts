@@ -25,10 +25,12 @@ import type {
   WorkflowAgentState,
   WorkflowJournalRecord,
   WorkflowJournalResult,
+  WorkflowJournalRoute,
   WorkflowApprovalMode,
   WorkflowBudgetPolicy,
   WorkflowPhase,
   WorkflowReplayCall,
+  WorkflowReplacementReference,
   WorkflowSnapshot,
   WorkflowStatus,
   WorkflowUsage,
@@ -56,6 +58,8 @@ export interface StartWorkflowRequest {
   resumeFromRunId?: string;
   /** Internal dashboard control: force replay invalidation at this call ordinal. */
   restartFromCallIndex?: number;
+  /** Internal replacement provenance set by restartAgent(). */
+  replacementOf?: WorkflowReplacementReference;
   approval?: WorkflowApprovalMode;
   budget?: WorkflowBudgetPolicy;
 }
@@ -120,6 +124,17 @@ function looksInstructionShaped(value: unknown): boolean {
   return /(?:ignore|disregard|override).{0,80}(?:previous|prior|system|developer|instructions?)|(?:system|developer)\s+(?:message|instructions?)\s*:|you\s+must\s+(?:now\s+)?(?:ignore|disregard|override)/is.test(sample);
 }
 
+function journalRoute(agent?: WorkflowAgentRecord): WorkflowJournalRoute | undefined {
+  if (!agent) return undefined;
+  return {
+    jobId: agent.jobId,
+    harness: agent.harness as HarnessName | undefined,
+    model: agent.model,
+    status: agent.state,
+    error: agent.error ? boundedText(agent.error, 2_000) : undefined,
+  };
+}
+
 function agentState(job: JobSnapshot): WorkflowAgentState {
   switch (job.status) {
     case "completed": return "completed";
@@ -132,6 +147,23 @@ function agentState(job: JobSnapshot): WorkflowAgentState {
 
 function terminalWorkflow(status: WorkflowStatus): boolean {
   return status === "completed" || status === "failed" || status === "aborted";
+}
+
+function replacementReason(agent: WorkflowAgentRecord): string {
+  if (agent.state === "failed") return agent.error ? "failed" : "failed without a recorded reason";
+  if (agent.state === "cancelled") return "cancelled";
+  if (agent.state === "aborted") return "aborted or stalled";
+  if (agent.state === "completed") return "manual replacement / inadequate result";
+  return "manual replacement";
+}
+
+function budgetsAllowReplay(source: WorkflowBudgetPolicy | undefined, next: WorkflowBudgetPolicy | undefined): boolean {
+  for (const key of ["maxAgents", "maxConcurrency", "maxTokens", "maxCost", "maxTurns"] as const) {
+    const previous = source?.[key] ?? Number.POSITIVE_INFINITY;
+    const current = next?.[key] ?? Number.POSITIVE_INFINITY;
+    if (current < previous) return false;
+  }
+  return true;
 }
 
 function abortError(reason: unknown): Error {
@@ -226,13 +258,17 @@ export class WorkflowManager {
     const approval = request.approval ?? "auto";
     if (!["auto", "plan", "onMutate"].includes(approval)) throw new Error(`Unknown workflow approval mode: ${approval}`);
     const budget = normalizeWorkflowBudget(request.budget);
-    const definitionFingerprint = workflowDefinitionFingerprint({
+    const fingerprintInput = {
       script: request.script,
       argsJson,
       cwd: resolve(request.cwd),
       parentProvider: request.parentProvider,
       defaultHarness: request.defaultHarness,
       approval,
+    };
+    const replayBaseFingerprint = workflowDefinitionFingerprint(fingerprintInput);
+    const definitionFingerprint = workflowDefinitionFingerprint({
+      ...fingerprintInput,
       budget,
     });
     let replay: ReplayRuntime | undefined;
@@ -241,8 +277,11 @@ export class WorkflowManager {
       if (!source) throw new Error(`Unknown workflow replay source: ${request.resumeFromRunId}`);
       if (!terminalWorkflow(source.snapshot.status)) throw new Error("Cannot resume from an active workflow");
       if (!source.snapshot.definitionFingerprint) throw new Error("Workflow predates durable replay and cannot be resumed");
-      if (source.snapshot.definitionFingerprint !== definitionFingerprint) {
-        throw new Error("Workflow definition or execution context does not match the replay source");
+      const sameDefinition = source.snapshot.replayBaseFingerprint
+        ? source.snapshot.replayBaseFingerprint === replayBaseFingerprint && budgetsAllowReplay(source.snapshot.budget, budget)
+        : source.snapshot.definitionFingerprint === definitionFingerprint;
+      if (!sameDefinition) {
+        throw new Error("Workflow definition or execution context does not match the replay source (including budget)");
       }
       const restartAt = request.restartFromCallIndex;
       if (restartAt !== undefined && (!Number.isSafeInteger(restartAt) || restartAt < 0 || restartAt >= 32)) {
@@ -275,6 +314,8 @@ export class WorkflowManager {
       agents: [],
       logs: [],
       definitionFingerprint,
+      replayBaseFingerprint,
+      replacementOf: request.replacementOf ? clone(request.replacementOf) : undefined,
       journalArtifact: "journal.jsonl",
       approval,
       budget,
@@ -356,11 +397,28 @@ export class WorkflowManager {
     if (agent.callIndex === undefined) throw new Error("Workflow agent predates durable replay and cannot be restarted");
     if (!entry.request) throw new Error("Workflow definition is unavailable in this session; rerun the workflow tool with resumeFromRunId");
     if (!terminalWorkflow(entry.snapshot.status)) await this.cancel(runId, `Restarting workflow from agent ${agent.name}`);
-    return this.start({
+    const reason = replacementReason(agent);
+    const replacementOf: WorkflowReplacementReference = {
+      sourceRunId: runId,
+      sourceAgentIndex: agent.index,
+      sourceCallIndex: agent.callIndex,
+      sourceJobId: agent.jobId,
+      sourceHarness: agent.harness as HarnessName | undefined,
+      sourceModel: agent.model,
+      sourceState: agent.state,
+      sourceError: agent.error ? boundedText(agent.error, 2_000) : undefined,
+      reason,
+    };
+    const started = await this.start({
       ...clone(entry.request),
       resumeFromRunId: runId,
       restartFromCallIndex: agent.callIndex,
+      replacementOf,
     });
+    agent.replacedBy = { replacementRunId: started.snapshot.runId, reason, at: Date.now() };
+    this.#touch(entry);
+    await this.#flushCheckpoint(entry);
+    return started;
   }
 
   async cancelAgent(runId: string, agentIndex: number, reason = "Workflow agent cancelled by user"): Promise<WorkflowSnapshot> {
@@ -501,12 +559,16 @@ export class WorkflowManager {
       result = await this.#withDispatchSlot(entry, signal, isolated);
     } catch (error) {
       const failed = { ok: false, output: "", error: boundedText(error) } satisfies WorkflowJournalResult;
+      const record = entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
       await this.#appendJournal(entry, {
         callIndex,
         fingerprint,
         state: "failed",
         at: Date.now(),
+        agentIndex: record?.index,
         result: failed,
+        route: journalRoute(record),
+        replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
       });
       throw error;
     }
@@ -529,7 +591,8 @@ export class WorkflowManager {
       at: Date.now(),
       agentIndex: record?.index,
       result: clone(result) as WorkflowJournalResult,
-      route: record ? { jobId: record.jobId, harness: record.harness as HarnessName | undefined, model: record.model } : undefined,
+      route: journalRoute(record),
+      replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
     });
     if (budgetError) entry.controller.abort(new Error(budgetError));
     return result;
@@ -594,6 +657,8 @@ export class WorkflowManager {
       phase,
       state: "queued",
       timestamps: { createdAt: now, updatedAt: now },
+      harness: harness && harness !== "auto" ? harness : undefined,
+      model,
       prompt: boundedText(prompt, 2 * 1024),
       effort,
       tools: [],

@@ -3,6 +3,7 @@ import type {
   CapabilitySourceStatus,
   DiscoveredCapability,
 } from "./capabilities.ts";
+import type { ParentThreadSnapshot } from "./parent-thread-context.ts";
 
 export type HarnessName = "pi" | "claude" | "codex";
 export type ProviderFamily = "claude" | "codex" | "other";
@@ -76,6 +77,8 @@ export interface BackendRequest {
   resumeSessionFile?: string;
   /** When true, the initial message is sent verbatim instead of prefixed with the generic "Task:" wrapper. */
   rawInitialMessage?: boolean;
+  /** Read-only spawn-time snapshot available only to human /subagent jobs through parent_thread_context. */
+  parentThread?: ParentThreadSnapshot;
 }
 
 export type SendBehavior = "steer" | "followUp";
@@ -203,6 +206,8 @@ export interface SpawnRequest {
   humanVisible?: boolean;
   /** Permitted parent Pi tools inherited only by full-access human-triggered Pi jobs. */
   humanPiTools?: string[];
+  /** Internal read-only spawn-time snapshot attached only by the human /subagent command. */
+  parentThread?: ParentThreadSnapshot;
   /** Internal ownership metadata supplied by the workflow runtime, never by a harness adapter. */
   workflow?: WorkflowJobReference;
   /** Internal session-peer fork data (source provenance plus the already-forked session file to resume). Pi-only; never set by a harness adapter. */

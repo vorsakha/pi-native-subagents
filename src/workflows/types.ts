@@ -33,12 +33,31 @@ export interface WorkflowReplayReference {
   callIndex: number;
 }
 
+export interface WorkflowReplacementLink {
+  replacementRunId: string;
+  reason: string;
+  at: number;
+}
+
+export interface WorkflowReplacementReference {
+  sourceRunId: string;
+  sourceAgentIndex: number;
+  sourceCallIndex?: number;
+  sourceJobId?: string;
+  sourceHarness?: HarnessName;
+  sourceModel?: string;
+  sourceState: WorkflowAgentState;
+  sourceError?: string;
+  reason: string;
+}
+
 export interface WorkflowAgentRecord {
   index: number;
   /** Script-level agent() ordinal used by the durable replay journal. */
   callIndex?: number;
   callFingerprint?: string;
   replayedFrom?: WorkflowReplayReference;
+  replacedBy?: WorkflowReplacementLink;
   outputProvenance?: "subagent" | "replay";
   instructionShaped?: boolean;
   isolation?: WorkflowWorktreeResult;
@@ -99,6 +118,9 @@ export interface WorkflowJournalRoute {
   jobId?: string;
   harness?: HarnessName;
   model?: string;
+  /** Actual child lifecycle state and bounded failure detail for durable review. */
+  status?: WorkflowAgentState;
+  error?: string;
 }
 
 export interface WorkflowJournalRecord {
@@ -112,6 +134,7 @@ export interface WorkflowJournalRecord {
   result?: WorkflowJournalResult;
   route?: WorkflowJournalRoute;
   replayedFrom?: WorkflowReplayReference;
+  replacementOf?: WorkflowReplacementReference;
 }
 
 export interface WorkflowReplayCall {
@@ -150,9 +173,13 @@ export interface WorkflowSnapshot {
   agents: WorkflowAgentRecord[];
   /** Bounded narrator-style progress emitted by workflow log(). */
   logs?: WorkflowLogRecord[];
-  /** Hash of script, arguments, project cwd, and default routing context. */
+  /** Hash of script, arguments, project cwd, routing context, and budget. */
   definitionFingerprint?: string;
+  /** Same identity hash without budget, allowing monotonic budget increases on replay. */
+  replayBaseFingerprint?: string;
   replay?: WorkflowReplayState;
+  /** Present when this run replaces a failed, stalled, cancelled, or manually restarted agent. */
+  replacementOf?: WorkflowReplacementReference;
   journalArtifact?: string;
   approval?: WorkflowApprovalMode;
   budget?: WorkflowBudgetPolicy;

@@ -54,13 +54,13 @@ test("a request with neither requires nor harness:auto passes through untouched 
   assert.equal(router.calls.length, 0);
 });
 
-test("harness:auto without requires is rejected before the router is consulted", async () => {
-  const router = new RecordingRouter(fakeResult("codex", []));
-  await assert.rejects(
-    routeCapabilities(router, { request: baseRequest({ harness: "auto" }) }),
-    /harness auto requires at least one capability in requires/,
-  );
-  assert.equal(router.calls.length, 0);
+test("harness:auto without requires delegates health/auth-based selection to the router", async () => {
+  const router = new RecordingRouter(fakeResult("codex", [], true));
+  const routing = await routeCapabilities(router, { request: baseRequest({ harness: "auto" }) });
+  assert.equal(router.calls.length, 1);
+  assert.equal(router.calls[0]!.harness, "auto");
+  assert.deepEqual(router.calls[0]!.requires, undefined);
+  assert.equal(routing.harness, "codex");
 });
 
 test("requires without a router configured fails closed", async () => {

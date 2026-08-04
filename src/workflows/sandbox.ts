@@ -165,13 +165,20 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
       settled = true;
       clear();
       abortAgents();
-      const boundedDrain = Promise.race([
-        Promise.allSettled([...agentTasks]).then(() => undefined),
-        new Promise<void>((resolveDrain) => {
-          const timer = setTimeout(resolveDrain, AGENT_DRAIN_GRACE_MS);
-          timer.unref();
-        }),
-      ]);
+      const boundedDrain = new Promise<void>((resolveDrain) => {
+        let finished = false;
+        const finish = () => {
+          if (finished) return;
+          finished = true;
+          clearTimeout(timer);
+          resolveDrain();
+        };
+        // Keep this timer referenced until either every agent task settles or
+        // the bounded drain expires. An unref() here lets Node exit while the
+        // parent workflow promise is still waiting to reject.
+        const timer = setTimeout(finish, AGENT_DRAIN_GRACE_MS);
+        void Promise.allSettled([...agentTasks]).then(finish, finish);
+      });
       void Promise.allSettled([terminate(child), boundedDrain]).then(() => reject(error), () => reject(error));
     };
     const succeed = (value: WorkflowSandboxResult) => {

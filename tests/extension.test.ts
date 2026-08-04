@@ -1,9 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { registerParentThreadChildTool } from "../extensions/parent-thread/index.ts";
 import { configuredHarnessFromEnv, parseHumanSubagentCommand, permittedHumanPiToolNames, registerNativeSubagents } from "../extensions/subagents/index.ts";
+import { PI_CHILD_MARKER } from "../src/backends/pi-rpc.ts";
+import { PI_PARENT_THREAD_FILE } from "../src/parent-thread-context.ts";
 import type { Backend, BackendEvent, HarnessName, BackendRequest, BackendRun } from "../src/types.ts";
 
 class HoldingBackend implements Backend {
@@ -95,7 +98,7 @@ function context(branch: unknown[] = [], provider?: string, trusted = true) {
     mode: "rpc",
     isProjectTrusted: () => trusted,
     isIdle: () => false,
-    sessionManager: { getBranch: () => branch, getSessionId: () => "extension-session" },
+    sessionManager: { getBranch: () => branch, buildContextEntries: () => branch, getSessionId: () => "extension-session" },
     ui: {
       notifications,
       setStatus() {},
@@ -103,6 +106,24 @@ function context(branch: unknown[] = [], provider?: string, trusted = true) {
     },
   } as any;
 }
+
+test("a Pi child with a parent snapshot registers only parent_thread_context", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "parent-thread-child-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const snapshotPath = join(root, "snapshot.json");
+  await writeFile(snapshotPath, JSON.stringify({
+    capturedAt: 1_000,
+    totalMessages: 1,
+    truncated: false,
+    messages: [{ role: "user", text: "Analyze this decision" }],
+  }));
+  const child = fakePi();
+  registerParentThreadChildTool(child.api, { [PI_CHILD_MARKER]: "1", [PI_PARENT_THREAD_FILE]: snapshotPath });
+  assert.deepEqual([...child.tools.keys()], ["parent_thread_context"]);
+  assert.deepEqual([...child.commands.keys()], []);
+  const result = await child.tools.get("parent_thread_context").execute("context", {}, undefined, undefined, context());
+  assert.match(result.content[0].text, /Analyze this decision/);
+});
 
 test("extension exposes generic direct tools, caller models, independence, and one-shot delivery", async () => {
   const pi = fakePi();
@@ -151,17 +172,34 @@ test("extension exposes generic direct tools, caller models, independence, and o
     { name: "workflow", source: "extension" },
     { name: "ask_user", source: "extension" },
   ]), ["mcp", "browser"]);
-  const spawnProperties = pi.tools.get("subagent_spawn").parameters.properties;
+  const spawnTool = pi.tools.get("subagent_spawn");
+  const spawnProperties = spawnTool.parameters.properties;
   assert.ok(spawnProperties.harness);
   assert.ok(spawnProperties.model);
   assert.equal(spawnProperties.backend, undefined, "backend compatibility is intentionally absent");
   assert.equal(spawnProperties.modelTier, undefined, "tier compatibility is intentionally absent");
+  assert.ok(spawnTool.promptGuidelines?.some((line: string) => /different native provider/i.test(line)));
+  assert.ok(spawnTool.promptGuidelines?.some((line: string) => /subagent_capabilities/i.test(line)));
+  const foregroundTool = pi.tools.get("subagent");
+  assert.ok(foregroundTool.promptGuidelines?.some((line: string) => /different native provider/i.test(line)));
+  const capabilitiesTool = pi.tools.get("subagent_capabilities");
+  assert.ok(capabilitiesTool.promptGuidelines?.some((line: string) => /access ceiling/i.test(line)));
+  const workflowTool = pi.tools.get("workflow");
+  assert.ok(workflowTool.promptGuidelines?.some((line: string) => /deferred functions/i.test(line)));
+  assert.ok(workflowTool.promptGuidelines?.some((line: string) => /default async function/i.test(line)));
+  const budgetProperties = workflowTool.parameters.properties.budget.properties;
+  assert.match(String(budgetProperties.maxTurns.description), /aggregate native-provider turns/i);
+  assert.match(String(budgetProperties.maxConcurrency.description), /concurrently running/i);
   assert.ok(pi.messageRenderers.has("native-workflow-result"));
   assert.ok(pi.messageRenderers.has("native-subagent-result"));
   assert.ok(pi.entryRenderers.has("native-human-subagent"));
   assert.throws(() => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }), /loaded more than once/);
 
-  const ctx = context([{ type: "custom", customType: "native-subagents-harness", data: { harness: "pi" } }]);
+  const ctx = context([
+    { type: "message", message: { role: "user", content: "Discuss the parent-thread bridge", timestamp: 1_000 } },
+    { type: "message", message: { role: "assistant", content: [{ type: "thinking", thinking: "hidden" }, { type: "text", text: "Use a pull-based tool." }], timestamp: 2_000 } },
+    { type: "custom", customType: "native-subagents-harness", data: { harness: "pi" } },
+  ]);
   ctx.cwd = extensionRoot;
   pi.handlers.get("session_start")?.({}, ctx);
   await pi.commands.get("subagents").handler("profiles", ctx);
@@ -195,6 +233,7 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.equal(background.details.job.access, "full", "trusted generic agents default to full access");
   const ordinaryBackgroundRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "background");
   assert.ok(!ordinaryBackgroundRequest?.policy.piTools.includes("mcp"), "model-triggered spawns keep the explicit capability contract");
+  assert.equal(ordinaryBackgroundRequest?.parentThread, undefined, "model-triggered spawns do not receive parent-thread content");
   await new Promise((resolve) => setImmediate(resolve));
   pi.handlers.get("agent_settled")?.();
   assert.equal((pi.messages[0] as any)?.customType, "native-subagent-result", "unconsumed background result is delivered once");
@@ -215,6 +254,11 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.equal((humanResult.data as any).job.output, "claude-ok");
   const humanRequest = backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "human task");
   assert.equal(humanRequest?.policy.model, "caller-model");
+  assert.deepEqual(humanRequest?.parentThread?.messages.map((message) => [message.role, message.text]), [
+    ["user", "Discuss the parent-thread bridge"],
+    ["assistant", "Use a pull-based tool."],
+  ], "human jobs receive a filtered spawn-time snapshot without assistant thinking");
+  assert.match(humanRequest?.systemPrompt ?? "", /parent_thread_context/, "human jobs are told to pull parent context only when needed");
   const humanCard = pi.entryRenderers.get("native-human-subagent")(humanStart, { expanded: true }, theme).render(120).join("\n");
   assert.match(humanCard, /claude\/caller-model/);
   assert.match(humanCard, /claude-ok/, "the original card settles with the terminal output");
@@ -231,13 +275,14 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.equal(defaultHumanRequest?.policy.model, undefined, "an omitted human model uses the native default");
   assert.ok(defaultHumanRequest?.policy.piTools.includes("mcp"), "full human Pi jobs inherit permitted MCP/extension gateways");
   assert.ok(defaultHumanRequest?.policy.piTools.includes("browser"));
+  assert.ok(defaultHumanRequest?.policy.piTools.includes("parent_thread_context"));
   assert.ok(!defaultHumanRequest?.policy.piTools.includes("subagent_spawn"));
   assert.ok(!defaultHumanRequest?.policy.piTools.includes("workflow"));
   assert.ok(!defaultHumanRequest?.policy.piTools.includes("ask_user"));
 
   await pi.commands.get("subagent").handler("--access readOnly read-only human task", ctx);
   const readOnlyHumanRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "read-only human task");
-  assert.deepEqual(readOnlyHumanRequest?.policy.piTools, ["read", "grep", "find", "ls"]);
+  assert.deepEqual(readOnlyHumanRequest?.policy.piTools, ["read", "grep", "find", "ls", "parent_thread_context"]);
 
   const consumed = await pi.tools.get("subagent_spawn").execute("spawn", { name: "reader", task: "consumed", access: "readOnly", effort: "high" }, undefined, undefined, ctx);
   assert.equal(consumed.details.job.effort, "high");

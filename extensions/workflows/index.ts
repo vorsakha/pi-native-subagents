@@ -15,6 +15,7 @@ import {
 } from "../../src/workflows/manager.ts";
 import type { WorkflowSnapshot } from "../../src/workflows/types.ts";
 import { openWorkflowsDashboard } from "./dashboard.ts";
+import { sanitizeInline, shortId } from "../subagents/render.ts";
 import { renderWorkflowCall, renderWorkflowCard, renderWorkflowFailure } from "./render.ts";
 
 const WORKFLOW_MESSAGE = "native-workflow-result";
@@ -87,15 +88,30 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
   };
 }
 
+function failedCallText(snapshot: WorkflowSnapshot): string {
+  const failed = snapshot.agents.filter((agent) =>
+    agent.state === "failed" || agent.state === "cancelled" || agent.state === "aborted" || agent.error,
+  ).slice(-4);
+  if (!failed.length) return "";
+  const lines = failed.map((agent) => {
+    const call = agent.callIndex ?? agent.index;
+    const route = `${agent.harness ?? "?"}/${agent.model ?? "?"}`;
+    const job = agent.jobId ? ` · job ${shortId(agent.jobId)}` : "";
+    const reason = sanitizeInline(agent.error ?? "no reason recorded").slice(0, 2_000);
+    return `- call ${call} · ${sanitizeInline(agent.name)} · ${agent.state} · ${route}${job} · ${reason}`;
+  });
+  return `\nFailed calls:\n${lines.join("\n")}`;
+}
+
 function resultText(snapshot: WorkflowSnapshot): string {
   const heading = `Workflow ${snapshot.runId} ${snapshot.status}: ${snapshot.name}`;
-  const error = snapshot.error ? `\nError: ${snapshot.error}` : "";
+  const error = snapshot.error ? `\nError: ${sanitizeInline(snapshot.error)}` : "";
   let result = "";
   if (snapshot.result !== undefined) {
     try { result = JSON.stringify(serializeWorkflowValue(snapshot.result, { maxTotalBytes: MAX_RESULT_TEXT_BYTES - 512 }), null, 2); }
     catch { result = String(snapshot.result); }
   }
-  const body = `${heading}${error}${result ? `\n\nResult:\n${result}` : ""}\nInspect private artifacts with /workflows.`;
+  const body = `${heading}${error}${failedCallText(snapshot)}${result ? `\n\nResult:\n${result}` : ""}\nInspect private artifacts with /workflows.`;
   const buffer = Buffer.from(body);
   if (buffer.byteLength <= MAX_RESULT_TEXT_BYTES) return body;
   return `${buffer.subarray(0, MAX_RESULT_TEXT_BYTES - 64).toString("utf8")}\n[workflow result truncated — inspect /workflows]`;
@@ -207,18 +223,22 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     name: "workflow",
     renderShell: "self",
     label: "Workflow",
-    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Scripts export a default async function and may call phase(title), log(message), agent(prompt,{name?,label?,access?,harness?,model?,effort?,independent?,independentOf?,profile?,phase?,schema?,isolation?}), parallel(tasks,{concurrency?}), and pipeline(items,...stages). isolation='worktree' runs a mutating agent in a clean Git worktree and preserves changed work with a patch. Runs are limited to 32 agent calls and four concurrent agents; resumeFromRunId replays an exact interrupted run's completed call prefix.",
+    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Export a default async function and use the injected globals phase(), log(), agent(), parallel(), and pipeline(); parallel receives deferred task functions, not already-started promises. Use exactly one source (script, workflowName, or scriptPath) and one input form (input or legacy args). isolation='worktree' runs a mutating agent in a clean Git worktree and preserves changed work with a patch. Runs are limited to 32 agent calls and four concurrent agents; resumeFromRunId replays an exact interrupted run's completed call prefix.",
     promptSnippet: "Run a sandboxed multi-agent workflow with phases and bounded parallelism",
     promptGuidelines: [
-      "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls.",
+      "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls; use direct spawning for a small simple fan-out.",
+      "Workflow scripts export a default async function; helpers are globals: use phase(), log(), agent(), parallel(), and pipeline(). Do not destructure a callback context object.",
+      "Use parallel only with deferred functions such as () => agent(...); never pass already-started agent promises.",
+      "Use exactly one source (script, workflowName, or scriptPath) and exactly one input form (input or legacy args).",
       "agent(prompt) is generic and defaults to full access after project trust; set access=readOnly for inspection.",
-      "Use independent=true to differ from the parent; use independentOf=<jobId> to differ from the agent that produced the work.",
+      "Use independent=true only for a different native provider; use independentOf=<jobId> to review with a provider different from the producer.",
       "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
       "Scripts cannot access files, network, environment variables, subprocesses, imports, or credentials; only agent, parallel, pipeline, phase, log, and JSON args are available.",
       "Use background=true for independent long work; completion is delivered automatically as a follow-up.",
       "Keep workflow results JSON-serializable and branch explicitly on each agent result's ok field.",
       "Use pipeline for independent multi-stage item processing; use parallel only when the next step needs a barrier across all results.",
       "Read-only workflow agents can run concurrently; mutating agents sharing the checkout are serialized unless each uses isolation='worktree'.",
+      "maxTurns is aggregate native-provider turns across all workflow agents; size it for the full fan-out rather than per-agent turns.",
       "Use log for concise progress updates that are useful without opening an agent transcript.",
       "Set resumeFromRunId only to replay an interrupted run with the exact same script, input, project, and routing context.",
       "Use approval=plan for read-only planning or approval=onMutate to require a host confirmation before mutation.",
@@ -236,11 +256,11 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       resumeFromRunId: Type.Optional(Type.String({ pattern: "^wf_[a-f0-9]+$", description: "Terminal run whose matching completed call prefix should be replayed" })),
       approval: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("plan"), Type.Literal("onMutate")])),
       budget: Type.Optional(Type.Object({
-        maxAgents: Type.Optional(Type.Integer({ minimum: 1, maximum: 32 })),
-        maxConcurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 4 })),
-        maxTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000_000 })),
-        maxCost: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 10_000 })),
-        maxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
+        maxAgents: Type.Optional(Type.Integer({ minimum: 1, maximum: 32, description: "Maximum child agent calls in this workflow" })),
+        maxConcurrency: Type.Optional(Type.Integer({ minimum: 1, maximum: 4, description: "Maximum concurrently running child agents" })),
+        maxTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000_000, description: "Aggregate input plus output token budget across workflow agents" })),
+        maxCost: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 10_000, description: "Aggregate cost budget across workflow agents" })),
+        maxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000, description: "Aggregate native-provider turns across all workflow agents; not a per-agent allowance" })),
       })),
       background: Type.Optional(Type.Boolean()),
     }),

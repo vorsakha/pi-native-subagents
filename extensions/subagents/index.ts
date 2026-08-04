@@ -3,7 +3,7 @@ import { homedir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { CONFIG_DIR_NAME, getAgentDir, keyHint, SessionManager } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, getAgentDir, keyHint, SessionManager, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { ClaudeBackend, CodexAppServerBackend, PiRpcBackend } from "../../src/backends/index.ts";
@@ -27,6 +27,7 @@ import { CapabilityService, type CapabilityRouter } from "../../src/capability-s
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { claimExtensionInstall } from "../../src/install-guard.ts";
 import { providerFamily } from "../../src/policy.ts";
+import { captureParentThread, type ParentThreadSnapshot } from "../../src/parent-thread-context.ts";
 import { openSubagentsDashboard } from "./dashboard.ts";
 import {
   emptyComponent,
@@ -140,10 +141,10 @@ export default function nativeSubagents(pi: ExtensionAPI): void {
 }
 
 export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationOptions = {}): void {
+  const env = options.env ?? process.env;
   // A Pi child launched by this package must never register the delegation
   // surface again: nested orchestration is denied by construction, not by prompt.
-  if ((options.env ?? process.env)[PI_CHILD_MARKER] === "1") return;
-  const env = options.env ?? process.env;
+  if (env[PI_CHILD_MARKER] === "1") return;
   const legacyRoot = options.legacyRoot === false
     ? undefined
     : options.legacyRoot ?? resolve(homedir(), ".pi/agent/extensions/subagents");
@@ -186,6 +187,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     ctx: { cwd: string; isProjectTrusted(): boolean; model?: { provider?: string } },
     signal?: AbortSignal,
     humanVisible = false,
+    parentThread?: ParentThreadSnapshot,
   ) => spawn(getManager(), capabilities, params, {
     parentCwd: ctx.cwd,
     trusted: ctx.isProjectTrusted(),
@@ -194,6 +196,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     profile: params.profile ? profileCatalog.profiles.get(params.profile.trim()) : undefined,
     humanVisible,
     humanPiTools: humanVisible ? permittedHumanPiToolNames(parentTools(pi)) : undefined,
+    parentThread,
     signal,
   });
   const jobCallTarget = (jobId: string): { accent: string; detail: string } => {
@@ -555,7 +558,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
       try {
         const params = parseHumanSubagentCommand(args);
-        const initial = await spawnJob(params, ctx, undefined, true);
+        const messages = ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
+        const parentThread = captureParentThread(messages);
+        const initial = await spawnJob(params, ctx, undefined, true, parentThread);
         appendHumanAnchor(initial);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
@@ -573,7 +578,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     task: Type.String({ minLength: 1, maxLength: 100_000 }),
     name: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
     cwd: Type.Optional(Type.String()),
-    harness: Type.Optional(StringEnum(REQUESTED_HARNESSES, { description: "Explicit harness, or auto to pick the harness that actually provides requires" })),
+    harness: Type.Optional(StringEnum(REQUESTED_HARNESSES, { description: "Explicit harness, or auto to pick a healthy/authenticated route and satisfy any supplied requirements" })),
     requires: Type.Optional(Type.Array(
       Type.String({ minLength: 1, maxLength: MAX_REQUIREMENT_LENGTH }),
       { maxItems: MAX_REQUIREMENTS, description: "Capability IDs from subagent_capabilities the child must really have; verified live before dispatch" },
@@ -595,6 +600,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     promptGuidelines: [
       "Call this before requiring a capability; requires must use IDs reported here, never guessed names.",
       "Discovery is live and model-free; use refresh only after the human changed their harness configuration.",
+      "Match the discovery access ceiling to the child request; use readOnly for review and inspection.",
     ],
     parameters: Type.Object({
       query: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Case-insensitive filter over capability ID, name, description, and origin" })),
@@ -647,8 +653,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     promptGuidelines: [
       "Give each isolated agent a complete task with all relevant paths, requirements, constraints, and expected verification.",
       "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
-      "Use access=readOnly for inspection; use independent=true to differ from the parent, or independentOf=<jobId> to differ from the job that produced the work.",
+      "Use access=readOnly for inspection; use independent=true only for a different native provider, or independentOf=<jobId> to review with a different provider than the producer.",
       "Use requires only for capabilities confirmed by subagent_capabilities; pair it with harness=auto to let the capable harness be chosen.",
+      "Omit model to use the native harness default; a different model on the same provider is not independent.",
     ],
     parameters: spawnParameters,
     async execute(_id, params, signal, _onUpdate, ctx) {
@@ -827,8 +834,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       "Use subagent_spawn for independent work that can run in parallel; use subagent_wait before consuming its result.",
       "Use subagent for a single foreground delegation.",
       "Subagents have isolated context; include all required paths, requirements, constraints, and verification evidence in task.",
-      "Use access=readOnly for inspection; use independent=true to differ from the parent, or independentOf=<jobId> to differ from the job that produced the work.",
+      "Use access=readOnly for inspection; use independent=true only for a different native provider, or independentOf=<jobId> to review with a provider different from the producer.",
       "Use requires only for capabilities confirmed by subagent_capabilities; pair it with harness=auto to let the capable harness be chosen.",
+      "Omit model to use the native harness default; a different model on the same provider is not independent.",
       "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
     ],
     parameters: spawnParameters,
@@ -1168,6 +1176,7 @@ async function spawn(
     profile?: ProfileDefinition;
     humanVisible?: boolean;
     humanPiTools?: string[];
+    parentThread?: ParentThreadSnapshot;
     signal?: AbortSignal;
   },
 ): Promise<JobSnapshot> {
@@ -1188,6 +1197,7 @@ async function spawn(
     parentProvider: context.parentProvider,
     humanVisible: context.humanVisible,
     humanPiTools: context.humanPiTools,
+    parentThread: context.parentThread,
   };
   const routing = await routeCapabilities(router, {
     request: { ...request, harness: params.harness, requires: params.requires },

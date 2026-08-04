@@ -16,6 +16,7 @@ import {
   dashboardMaxHeight,
 } from "../dashboard-style.ts";
 import { aggregateWorkflowUsage, workflowIsTerminal } from "../../src/workflows/manager.ts";
+import { formatWorkflowBudget } from "../../src/workflows/budget.ts";
 import type {
   WorkflowAgentRecord,
   WorkflowPhase,
@@ -389,13 +390,16 @@ export class WorkflowsDashboardOverlay {
     const allAgents = this.allPhaseAgents(run, phase);
     const agents = this.phaseAgents(run, phase);
     const status = traceStatusMeta(run.status, this.#now());
-    const usage = formatUsage(aggregateWorkflowUsage(run));
+    const usageSnapshot = aggregateWorkflowUsage(run);
+    const usage = formatUsage(usageSnapshot);
+    const budget = formatWorkflowBudget(run, usageSnapshot);
     const lines: string[] = [
       `${this.theme.fg("accent", this.theme.bold(sanitizeInline(run.name) || "Workflow"))} ${this.theme.fg("dim", `· ${shortId(sanitizeText(run.runId))} · ${status.glyph} ${run.status} · ${formatElapsed(run, this.#now())}`)}`,
       this.theme.fg("dim", sanitizeInline(run.description) || "(no workflow description)"),
       phase ? this.renderPhase(phase, run.phases.length) : this.theme.fg("dim", "Phase · waiting for the first phase"),
     ];
     if (usage) lines.push(this.theme.fg("dim", `Usage · ${usage}`));
+    if (budget) lines.push(this.theme.fg("dim", `Budget · ${budget}`));
     for (const warning of run.warnings?.slice(0, 2) ?? []) lines.push(this.theme.fg("warning", `⚠ ${sanitizeInline(warning)}`));
     lines.push(this.theme.fg("muted", `Agents · ${agents.length}/${allAgents.length} shown · filter ${this.#agentFilter} · Tab select · Enter inspect`));
 

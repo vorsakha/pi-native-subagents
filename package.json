@@ -18,12 +18,16 @@
   "pi": {
     "extensions": [
       "./extensions/subagents/index.ts"
+    ],
+    "skills": [
+      "./skills"
     ]
   },
   "files": [
     "extensions",
     "src",
     "scripts",
+    "skills",
     "README.md",
     "LICENSE"
   ],
@@ -44,7 +48,8 @@
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.210",
     "@earendil-works/pi-tui": "^0.80.7",
-    "yaml": "2.9.0"
+    "yaml": "2.9.0",
+    "zod": "4.4.3"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",

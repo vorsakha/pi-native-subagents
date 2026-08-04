@@ -55,10 +55,18 @@ function failure(message) {
   return JSON.stringify({ ok: false, output: "", error: message });
 }
 
+function formatWorkflowError(error) {
+  const message = errorMessage(error);
+  if (/Cannot destructure property ['"](?:phase|log|agent|parallel)['"]/.test(message)) {
+    return `${message}. Workflow helpers are globals: use phase(), log(), agent(), and parallel().`;
+  }
+  return message;
+}
+
 function finishError(error) {
   if (finished) return;
   finished = true;
-  const message = errorMessage(error).slice(0, 32 * KIB);
+  const message = formatWorkflowError(error).slice(0, 32 * KIB);
   send({ type: "error", message });
   for (const resolve of pendingAgents.values()) resolve(failure("Workflow sandbox stopped"));
   pendingAgents.clear();
@@ -186,7 +194,7 @@ function installApi(context, argsJson) {
         if (!Array.isArray(items)) throw new TypeError("parallel requires an array");
         const hasWorker = typeof workerOrConcurrency === "function";
         const worker = hasWorker ? workerOrConcurrency : (task) => {
-          if (typeof task !== "function") throw new TypeError("parallel tasks must be functions");
+          if (typeof task !== "function") throw new TypeError("parallel() requires deferred functions: () => agent(...); do not pass already-started promises");
           return task();
         };
         const specification = hasWorker ? maybeConcurrency : workerOrConcurrency;

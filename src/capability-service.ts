@@ -160,9 +160,6 @@ export class CapabilityService {
     if (explicit && !this.#backends.has(explicit)) {
       throw new Error(`Harness is unavailable: ${explicit}`);
     }
-    if (auto && requires.length === 0) {
-      throw new Error("harness auto requires at least one capability in requires; choose an explicit harness otherwise");
-    }
     if (!auto && !explicit) throw new Error("Capability routing requires an explicit harness or harness auto");
     const candidates = auto
       ? orderCandidates(request.candidates ?? this.harnesses, request.preference ?? [])
@@ -197,7 +194,7 @@ export class CapabilityService {
         },
       };
     }
-    const alternatives = requires.length ? await this.#alternatives(request, requires, candidates) : [];
+    const alternatives = requires.length && !request.refresh ? await this.#alternatives(request, requires, candidates) : [];
     throw new Error(
       `${auto ? "No harness satisfies" : "Selected harness cannot satisfy"} the required capabilities: ${requires.join(", ")}`
       + (failures.length ? ` — ${failures.join("; ")}` : "")
@@ -216,10 +213,31 @@ export class CapabilityService {
    * cites an inventory observed after the caller's last chance to change it.
    */
   async route(request: CapabilityRouteRequest): Promise<CapabilityRouteResult> {
-    const chosen = await this.resolveRoute(request);
+    let chosen = await this.resolveRoute(request);
     if (request.refresh) return chosen;
-    const live = await this.revalidate({ ...request, harness: chosen.harness });
-    return chosen.auto ? { ...live, auto: true, route: { ...live.route, auto: true } } : live;
+    const excluded = new Set<HarnessName>();
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= this.harnesses.length; attempt++) {
+      try {
+        const live = await this.revalidate({ ...request, harness: chosen.harness });
+        return chosen.auto ? { ...live, auto: true, route: { ...live.route, auto: true } } : live;
+      } catch (error) {
+        if (request.signal?.aborted) throw error;
+        lastError = error;
+        // A cached browse result can become invalid between selection and the
+        // authoritative pre-dispatch check (most commonly auth expiry). For
+        // auto routes, refresh the remaining candidate set and exclude every
+        // provider that already failed live validation so an auth failure does
+        // not immediately retry the same provider. Explicit routes retain
+        // fail-closed semantics.
+        if (!chosen.auto) throw error;
+        excluded.add(chosen.harness);
+        const remaining = (request.candidates ?? this.harnesses).filter((harness) => !excluded.has(harness));
+        if (!remaining.length) break;
+        chosen = await this.resolveRoute({ ...request, refresh: true, candidates: remaining });
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError ?? "No healthy harness remains"));
   }
 
   async #alternatives(request: CapabilityRequest, requires: string[], tried: HarnessName[]): Promise<HarnessName[]> {
