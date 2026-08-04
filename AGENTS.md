@@ -1,31 +1,21 @@
 # Pi Native Subagents
 
-## Purpose
+Standalone Pi extension for generic task-driven subagents and sandboxed workflows across Pi, Claude Code, and Codex.
 
-Build a standalone Pi extension providing first-class generic subagent lifecycle management across native Pi, Claude Code, and Codex harnesses.
+## Working rules
 
-## Required behavior
+- Keep the API generic and provider-neutral: default to Pi; expose Claude/Codex explicitly; compose harness, access, model, effort, independence, and profiles. Do not add roles, model tiers, concrete model IDs, recommendation tables, or private routing.
+- Runtime policy, schemas, and lifecycle code are authoritative. If a change affects tool contracts, workflow mechanics, routing, access/approval, child capabilities, CLI commands, or user-facing recovery, update `skills/pi-native-subagents/SKILL.md` in the same change. Keep the skill concise; do not add tests for prose or skill contents.
+- Keep the README package-generic. Do not document local/private skill or routing assumptions there.
+- Preserve trusted-project and cwd containment, subscription-auth sanitation, deny-by-construction read-only execution, and the no-nested-delegation boundary. Children must not receive subagent/workflow capabilities.
+- Human `/subagent` jobs may pull only a bounded, read-only `parent_thread_context` snapshot. Model-spawned children receive no parent content.
+- Preserve bounded lifecycle and scheduler guarantees: four concurrent jobs, direct-job priority, startup/output/cancel/shutdown deadlines, process-tree cleanup, retained-session follow-ups, and one-shot delivery.
+- Keep workflows sandboxed and durable: bounded phases/agents/logs, deferred `parallel` tasks, structured input/schema, journals/replay/restart, approvals/budgets, private artifacts, and foreground/background inspection. Serialize shared-checkout mutations; worktree isolation requires a clean source and explicit preservation metadata.
+- Keep transcripts, artifacts, credentials, auth files, and machine-local runtime state out of Git.
 
-- Use generic task-driven agents by default.
-- Keep access, harness, optional exact model, effort, provider independence, and optional explicit profiles as composable policy fields.
-- Load global profiles from the Pi agent directory and trusted project profiles from `.pi/subagents`, with project precedence and validation warnings.
-- Keep concrete model names and recommendations out of runtime code and profiles; the editable routing skill supplies request-scoped harness-local IDs, while omission uses native harness defaults.
-- Default to the Pi harness so provider and model choice come from the user's Pi configuration; keep native Claude and Codex as equal explicit routes.
-- Preserve subscription authentication for native Claude and Codex and never inherit environment state that could silently switch billing modes; Pi children inherit Pi's provider environment.
-- Provide background spawn/wait/check/send/cancel/list, retained-session follow-up, foreground `subagent`, and one-shot delivery for unconsumed background results.
-- Give every human `/subagent` job a pull-based, read-only `parent_thread_context` tool backed by a bounded spawn-time snapshot; keep model/tool-spawned jobs isolated from parent-thread content.
-- Provide sandboxed workflows with phases, bounded progress logs, sequential/bounded-parallel/pipelined generic agents, schemas, structured inputs, append-only call journals, deterministic prefix replay, pause/resume and selected-agent restart, saved definitions, host approvals, budgets, foreground/background execution, private durable artifacts, delivery, and `/workflows` inspection/control.
-- Disable nested child delegation. Children must not receive subagent or workflow capabilities.
-- Default-deny untrusted execution and constrain child working directories to the trusted project.
-- Preserve four concurrent jobs, direct-job queue priority, bounded startup/output/shutdown/cancellation, process-tree cleanup, and workflow source/args/result limits. Serialize mutating workflow agents that share one checkout unless they use clean-source worktree isolation with explicit preservation metadata.
-- Keep full transcripts and workflow runtime artifacts private and out of Git.
+## Engineering
 
-## Engineering constraints
-
-- Plain TypeScript; prefer explicit interfaces, reducers/state machines, and dependency-injected harness adapters.
-- No credentials, auth files, transcripts, runtime state, or machine-local paths in commits.
-- Keep focused, risk-based tests. Favor broad invariants over helper/status/cosmetic permutations.
-- Preserve high-value contracts: trust/read-only/subscription auth, generic routing and profile ceilings, shared scheduling, cancellation/process cleanup, sandbox capability denial, persistence recovery, result-delivery deduplication, and one renderer/dashboard contract per surface.
-- Use opt-in live smoke tests for provider compatibility.
-- Required release checks: typecheck, thin tests, package dry-run, and available-harness live smokes before installation.
-- Keep changes reviewable and modular. Do not commit or push unless explicitly requested.
+- Use plain TypeScript with explicit interfaces/state transitions and dependency-injected adapters.
+- Add focused, risk-based tests for security, routing, scheduling, lifecycle, persistence, and sandbox invariants—not helper, status, cosmetic, prose, or skill-content permutations.
+- Release checks: `npm run typecheck`, `npm test`, `npm run pack:check`, and available opt-in live provider smokes.
+- Keep changes modular and reviewable. Do not commit or push unless explicitly requested.
