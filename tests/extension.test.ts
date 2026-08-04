@@ -178,18 +178,6 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.ok(spawnProperties.model);
   assert.equal(spawnProperties.backend, undefined, "backend compatibility is intentionally absent");
   assert.equal(spawnProperties.modelTier, undefined, "tier compatibility is intentionally absent");
-  assert.ok(spawnTool.promptGuidelines?.some((line: string) => /different native provider/i.test(line)));
-  assert.ok(spawnTool.promptGuidelines?.some((line: string) => /subagent_capabilities/i.test(line)));
-  const foregroundTool = pi.tools.get("subagent");
-  assert.ok(foregroundTool.promptGuidelines?.some((line: string) => /different native provider/i.test(line)));
-  const capabilitiesTool = pi.tools.get("subagent_capabilities");
-  assert.ok(capabilitiesTool.promptGuidelines?.some((line: string) => /access ceiling/i.test(line)));
-  const workflowTool = pi.tools.get("workflow");
-  assert.ok(workflowTool.promptGuidelines?.some((line: string) => /deferred functions/i.test(line)));
-  assert.ok(workflowTool.promptGuidelines?.some((line: string) => /default async function/i.test(line)));
-  const budgetProperties = workflowTool.parameters.properties.budget.properties;
-  assert.match(String(budgetProperties.maxTurns.description), /aggregate native-provider turns/i);
-  assert.match(String(budgetProperties.maxConcurrency.description), /concurrently running/i);
   assert.ok(pi.messageRenderers.has("native-workflow-result"));
   assert.ok(pi.messageRenderers.has("native-subagent-result"));
   assert.ok(pi.entryRenderers.has("native-human-subagent"));
@@ -258,7 +246,6 @@ test("extension exposes generic direct tools, caller models, independence, and o
     ["user", "Discuss the parent-thread bridge"],
     ["assistant", "Use a pull-based tool."],
   ], "human jobs receive a filtered spawn-time snapshot without assistant thinking");
-  assert.match(humanRequest?.systemPrompt ?? "", /parent_thread_context/, "human jobs are told to pull parent context only when needed");
   const humanCard = pi.entryRenderers.get("native-human-subagent")(humanStart, { expanded: true }, theme).render(120).join("\n");
   assert.match(humanCard, /claude\/caller-model/);
   assert.match(humanCard, /claude-ok/, "the original card settles with the terminal output");

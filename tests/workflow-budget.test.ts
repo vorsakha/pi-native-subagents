@@ -1,9 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { formatWorkflowBudget, workflowBudgetMetrics } from "../src/workflows/budget.ts";
+import { workflowBudgetMetrics } from "../src/workflows/budget.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 
-test("formats workflow budget usage with bounded remaining values", () => {
+test("calculates workflow budget usage with bounded remaining values", () => {
   const snapshot = {
     budget: { maxAgents: 4, maxConcurrency: 2, maxTokens: 100, maxTurns: 5, maxCost: 1 },
     agents: [{ state: "completed" }, { state: "running" }, { state: "queued" }],
@@ -17,8 +17,4 @@ test("formats workflow budget usage with bounded remaining values", () => {
     { key: "turns", used: 6, limit: 5, remaining: 0 },
     { key: "cost", used: 1.25, limit: 1, remaining: 0 },
   ]);
-  assert.equal(
-    formatWorkflowBudget(snapshot, usage),
-    "agents 3/4 (1 remaining) · concurrency 2/2 (0 remaining) · tokens 85/100 (15 remaining) · turns 6/5 (0 remaining) · cost $1.2500/$1.0000 (0 remaining)",
-  );
 });

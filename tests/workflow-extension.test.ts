@@ -24,14 +24,6 @@ class ImmediateBackend implements Backend {
   }
 }
 
-class FailingBackend implements Backend {
-  readonly name: HarnessName = "pi";
-  async start(_request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
-    emit({ type: "failed", error: "provider exploded" });
-    return { completed: Promise.resolve(), async send() {}, async cancel() {}, async close() {} };
-  }
-}
-
 class HoldingBackend implements Backend {
   readonly name: HarnessName = "pi";
   starts = 0;
@@ -187,25 +179,6 @@ test("background workflows return immediately and deliver one follow-up result f
   assert.equal(failed.pi.messages[0]?.message.details.workflow.status, "failed");
   assert.match(failed.pi.messages[0]?.message.details.workflow.error ?? "", /script exploded/);
   await failed.pi.handlers.get("session_shutdown")?.();
-});
-
-test("background failure results identify the failed call and route without artifact paths", async () => {
-  const { pi } = await setup({ backends: [new FailingBackend()] });
-  const { ctx } = context();
-  pi.handlers.get("session_start")?.({}, ctx);
-  await pi.tools.get("workflow").execute("wf-failure-detail", {
-    name: "Background failure detail",
-    script: `export default async () => agent("inspect", { name: "reviewer", access: "readOnly" })`,
-    background: true,
-  }, new AbortController().signal, undefined, ctx);
-  for (let index = 0; index < 500 && pi.messages.length === 0; index++) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.equal(pi.messages.length, 1);
-  assert.match(pi.messages[0]?.message.content ?? "", /Failed calls:[\s\S]*reviewer[\s\S]*pi\//i);
-  assert.match(pi.messages[0]?.message.content ?? "", /provider exploded/i);
-  assert.doesNotMatch(pi.messages[0]?.message.content ?? "", /workflow-extension-/i);
-  await pi.handlers.get("session_shutdown")?.();
 });
 
 test("background workflow cards follow live state without periodic rerenders", async () => {

@@ -14,7 +14,6 @@ Standalone Pi package for generic task-driven Pi, Claude Code, and Codex subagen
 - Bounded conversation cards, `/subagents` supervision, and normalized user/assistant/thinking/tool/queued-message state.
 - Pull-based `parent_thread_context` access for human `/subagent` jobs: a filtered, read-only spawn-time snapshot is available on demand without injecting the parent conversation.
 - Sandboxed `workflow` orchestration with phases, sequential or bounded-parallel `agent()` calls, structured schemas, foreground/background execution, private artifacts, and `/workflows` inspection.
-- A package-owned `pi-native-subagents` skill with the stable tool/workflow contract, canonical templates, and common failure corrections.
 - Pi persistent JSONL RPC, Claude Code through the official Agent SDK and installed CLI, and Codex through the installed app-server.
 - Abortable startup, bounded shutdown, and process-tree cleanup.
 
@@ -37,7 +36,7 @@ The fork is registered as a Pi-backed managed job. Its returned `jobId` works wi
 
 `access` is `readOnly` or `full` and defaults to `full` only after Pi's project-trust gate succeeds. The configured harness defaults to Pi, which delegates through the user's existing Pi provider and model configuration. Native Codex and Claude execution remain equal explicit choices through `harness`. `model` never selects or changes a harness; it is forwarded only to the chosen harness. Omitting it uses that harness's configured default. Claude and Codex also omit effort by default so provider behavior remains adaptive; callers may set `low`, `medium`, `high`, `xhigh`, or `max`.
 
-The extension contains no concrete model names or model recommendation table. The package-owned `pi-native-subagents` skill documents stable tool and workflow mechanics; the separately installed, easy-to-edit `subagents` skill owns current cost/capability guidance and supplies exact models when useful. Runtime code remains responsible for trust, access, provider diversity, subscription authentication, sandboxing, and lifecycle constraints.
+The extension contains no concrete model names or model recommendation table. Select a harness and optional model per request; omitted values use the native defaults. Runtime code remains responsible for trust, access, provider diversity, subscription authentication, sandboxing, and lifecycle constraints.
 
 `independent: true` forces a different native provider from the parent: OpenAI/GPT/Codex parent → Claude, Claude parent → Codex. `independentOf: <jobId>` instead forces a different provider from the referenced session-scoped producer job, so delegated implementation and review cannot silently land on the same provider. The target must be an existing native Claude or Codex job; unknown, evicted, or Pi-backed targets fail closed. Explicit Pi or same-provider routes are rejected. For an unknown parent provider, `independent: true` falls back to Claude.
 
@@ -165,7 +164,7 @@ npm test
 npm run pack:check
 ```
 
-The suite uses broad, risk-based tests around the package's security and lifecycle contracts. Opt-in authentication smoke commands are `npm run smoke`, `npm run smoke:{pi,claude,codex}`, and `npm run smoke:access:{claude,codex}`; set `PI_NATIVE_SUBAGENTS_LIVE=1` to invoke models.
+The suite uses focused, risk-based tests around the package's security and lifecycle contracts. Opt-in authentication smoke commands are `npm run smoke`, `npm run smoke:{pi,claude,codex}`, and `npm run smoke:access:{claude,codex}`; set `PI_NATIVE_SUBAGENTS_LIVE=1` to invoke models.
 
 ## Architecture
 
