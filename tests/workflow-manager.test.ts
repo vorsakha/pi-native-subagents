@@ -3,17 +3,10 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
-import type {
-  Backend,
-  BackendEvent,
-  BackendRequest,
-  BackendRun,
-  ProfileDefinition,
-  Usage,
-} from "../src/types.ts";
+import type { ProfileDefinition } from "../src/types.ts";
+import { ControlledBackend, tempDir, tick, waitFor } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal } from "../src/workflows/artifacts.ts";
 import { workflowCallFingerprint, workflowDefinitionFingerprint } from "../src/workflows/journal.ts";
 import {
@@ -21,83 +14,6 @@ import {
   WorkflowManager,
 } from "../src/workflows/manager.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
-
-interface FakeRun {
-  request: BackendRequest;
-  emit: (event: BackendEvent) => void;
-  settle: () => void;
-  settled: boolean;
-}
-
-class ControlledBackend implements Backend {
-  readonly name: "codex" | "claude";
-  readonly requests: BackendRequest[] = [];
-  readonly cancels: Array<{ jobId: string; reason?: string }> = [];
-  readonly runs = new Map<string, FakeRun>();
-  active = 0;
-  maxActive = 0;
-
-  constructor(name: "codex" | "claude" = "codex") {
-    this.name = name;
-  }
-
-  async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
-    this.requests.push(request);
-    this.active++;
-    this.maxActive = Math.max(this.maxActive, this.active);
-    let finish!: () => void;
-    const run: FakeRun = {
-      request,
-      emit,
-      settled: false,
-      settle: () => {
-        if (run.settled) return;
-        run.settled = true;
-        this.active--;
-        finish();
-      },
-    };
-    const completed = new Promise<void>((resolve) => { finish = resolve; });
-    this.runs.set(request.jobId, run);
-    return {
-      completed,
-      async send() {},
-      cancel: async (reason) => {
-        this.cancels.push({ jobId: request.jobId, reason });
-        emit({ type: "cancelled", reason });
-        run.settle();
-      },
-      async close() {},
-    };
-  }
-
-  requestForTask(task: string): BackendRequest | undefined {
-    return [...this.requests].reverse().find((request) => request.task === task);
-  }
-
-  activeRuns(): FakeRun[] {
-    return [...this.runs.values()].filter((run) => !run.settled);
-  }
-
-  completeTask(task: string, output = `${task} output`, usage?: Partial<Usage>): void {
-    const request = this.requestForTask(task);
-    assert.ok(request, `backend did not start task ${task}`);
-    const run = this.runs.get(request.jobId);
-    assert.ok(run && !run.settled, `task ${task} is not active`);
-    if (usage) run.emit({ type: "usage", usage });
-    run.emit({ type: "completed", output });
-    run.settle();
-  }
-
-  failTask(task: string, error: string): void {
-    const request = this.requestForTask(task);
-    assert.ok(request, `backend did not start task ${task}`);
-    const run = this.runs.get(request.jobId);
-    assert.ok(run && !run.settled, `task ${task} is not active`);
-    run.emit({ type: "failed", error });
-    run.settle();
-  }
-}
 
 const reviewer: ProfileDefinition = {
   name: "reviewer",
@@ -110,25 +26,13 @@ const reviewer: ProfileDefinition = {
 };
 
 const execFileAsync = promisify(execFile);
-const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
-async function waitFor(
-  predicate: () => boolean,
-  description: string,
-  timeoutMs = 2_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (!predicate()) {
-    if (Date.now() >= deadline) assert.fail(`timed out waiting for ${description}`);
-    await new Promise<void>((resolve) => setTimeout(resolve, 5));
-  }
-}
 
 async function fixture(
   concurrency = 4,
   approveMutation?: ConstructorParameters<typeof WorkflowManager>[0]["approveMutation"],
 ) {
-  const parent = await mkdtemp(join(tmpdir(), "workflow-manager-"));
+  const parent = await tempDir("workflow-manager");
   const cwd = join(parent, "cwd");
   await import("node:fs/promises").then(({ mkdir }) => mkdir(cwd));
   const artifactRoot = join(parent, "artifacts");

@@ -1,15 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { tempDir } from "./helpers.ts";
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { runWorkflowSandbox, type WorkflowSandboxOptions } from "../src/workflows/sandbox.ts";
 
 async function fixture(
   source: string,
   overrides: Partial<WorkflowSandboxOptions> = {},
 ) {
-  const cwd = await mkdtemp(join(tmpdir(), "workflow-sandbox-"));
+  const cwd = await tempDir("workflow-sandbox");
   const controller = new AbortController();
   const phases: string[] = [];
   const logs: string[] = [];

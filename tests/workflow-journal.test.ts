@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { tempDir } from "./helpers.ts";
 import { appendFile, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   appendWorkflowJournal,
@@ -17,7 +17,7 @@ import {
 const usage = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5, turns: 1 };
 
 async function fixture() {
-  const parent = await mkdtemp(join(tmpdir(), "workflow-journal-"));
+  const parent = await tempDir("workflow-journal");
   const root = join(parent, "artifacts");
   const now = Date.now();
   const created = await createWorkflowArtifacts(root, {

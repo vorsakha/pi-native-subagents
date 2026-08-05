@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { delay, tempDir } from "./helpers.ts";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ClaudeBackend } from "../src/backends/claude.ts";
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
@@ -113,14 +113,12 @@ setInterval(() => {}, 1000);
 `;
 
 async function fixture(source: string): Promise<{ dir: string; command: string }> {
-  const dir = await mkdtemp(join(tmpdir(), "native-subagents-backend-"));
+  const dir = await tempDir("native-subagents-backend");
   const command = join(dir, "fixture.mjs");
   await writeFile(command, source);
   await chmod(command, 0o755);
   return { dir, command };
 }
-
-const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 function request(harness: HarnessName, cwd: string, env: NodeJS.ProcessEnv): BackendRequest {
   return {

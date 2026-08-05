@@ -1,6 +1,21 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
+/*
+ * The panel shell shared by /subagents and /workflows, following Pi's `/ps`
+ * visual grammar:
+ *
+ *   Native subagents · 2 jobs          title and count above the panel
+ *   ╭─ jobs · 1 active / 2 ──────╮     one rounded border, titled dividers
+ *   │ ● worker      codex   1m   │     selection marker and status glyph left,
+ *   ├─ detail · worker ──────────┤     operational metadata right-aligned
+ *   ╰────────────────────────────╯
+ *   Esc close · j/k move                keyboard guidance below the panel
+ *
+ * Panels use the full available width and cap at 80% of terminal height. Status
+ * is never communicated by color alone, focus stays visible, and every action is
+ * keyboard reachable including Pi's cancel binding and Escape.
+ */
 const DASHBOARD_MAX_HEIGHT_RATIO = 0.8;
 
 export function dashboardMaxHeight(terminalRows: number): number {

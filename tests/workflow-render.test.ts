@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import { theme } from "./helpers.ts";
 import {
   MAX_COLLAPSED_LINES,
   MAX_EXPANDED_LINES,
@@ -12,12 +12,6 @@ import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 
 const ESC = "\u001b";
 const CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;
-
-const theme = {
-  fg: (_color: string, text: string) => text,
-  bg: (_color: string, text: string) => text,
-  bold: (text: string) => text,
-} as unknown as Theme;
 
 function workflow(overrides: Partial<WorkflowSnapshot> = {}): WorkflowSnapshot {
   const createdAt = 1_000;

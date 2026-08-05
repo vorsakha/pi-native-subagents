@@ -1,17 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { theme } from "./helpers.ts";
 import { type KeybindingsManager, visibleWidth } from "@earendil-works/pi-tui";
-import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
   createWorkflowsDashboardOverlay,
 } from "../extensions/workflows/dashboard.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
-
-const theme = {
-  fg: (_color: string, text: string) => text,
-  bg: (_color: string, text: string) => text,
-  bold: (text: string) => text,
-} as unknown as Theme;
 
 function workflow(id: string, status: WorkflowSnapshot["status"] = "running"): WorkflowSnapshot {
   const settledAgentState = status === "pending" ? "queued" as const : status === "paused" ? "running" as const : status;

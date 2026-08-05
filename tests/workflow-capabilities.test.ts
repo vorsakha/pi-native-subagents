@@ -1,41 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
-import type { DiscoveredCapability } from "../src/capabilities.ts";
 import { CapabilityService } from "../src/capability-service.ts";
 import { JobManager } from "../src/manager.ts";
-import type { Backend, BackendEvent, BackendRequest, BackendRun, DiscoveryRequest, DiscoveryResult, HarnessName } from "../src/types.ts";
+import { DiscoverableBackend, tempDir } from "./helpers.ts";
 import { WorkflowManager } from "../src/workflows/manager.ts";
 
-class DiscoverableBackend implements Backend {
-  readonly name: HarnessName;
-  readonly requests: BackendRequest[] = [];
-  #capabilities: DiscoveredCapability[];
-
-  constructor(name: HarnessName, capabilities: DiscoveredCapability[] = []) {
-    this.name = name;
-    this.#capabilities = capabilities;
-  }
-
-  async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
-    this.requests.push(request);
-    emit({ type: "completed", output: `${this.name}-ok` });
-    return { completed: Promise.resolve(), async send() {}, async cancel() {}, async close() {} };
-  }
-
-  async discover(_request: DiscoveryRequest): Promise<DiscoveryResult> {
-    return { capabilities: this.#capabilities, sources: [{ source: `${this.name}-fixture`, health: "healthy" }] };
-  }
-
-  requestForTask(task: string): BackendRequest | undefined {
-    return this.requests.find((request) => request.task === task);
-  }
-}
-
 async function fixture() {
-  const parent = await mkdtemp(join(tmpdir(), "workflow-capabilities-"));
+  const parent = await tempDir("workflow-capabilities");
   const cwd = join(parent, "cwd");
   await mkdir(cwd);
   const artifactRoot = join(parent, "artifacts");
@@ -96,7 +69,7 @@ test("workflow agent() with an explicit harness that cannot satisfy requires fai
 });
 
 test("workflow agent() with requires but no router configured fails that call instead of silently ignoring requires", async () => {
-  const parent = await mkdtemp(join(tmpdir(), "workflow-capabilities-norouter-"));
+  const parent = await tempDir("workflow-capabilities-norouter");
   const cwd = join(parent, "cwd");
   await mkdir(cwd);
   const codex = new DiscoverableBackend("codex", []);

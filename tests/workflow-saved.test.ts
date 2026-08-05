@@ -1,12 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { tempDir } from "./helpers.ts";
 import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { listSavedWorkflows, loadSavedWorkflow, loadWorkflowScriptPath } from "../src/workflows/saved.ts";
 
 async function fixture() {
-  const parent = await mkdtemp(join(tmpdir(), "workflow-saved-"));
+  const parent = await tempDir("workflow-saved");
   const cwd = join(parent, "project");
   const globalRoot = join(parent, "global");
   await mkdir(join(cwd, ".pi", "workflows"), { recursive: true });

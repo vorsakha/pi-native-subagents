@@ -1,16 +1,16 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { tempDir } from "./helpers.ts";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { finishWorkflowWorktree, prepareWorkflowWorktree } from "../src/workflows/worktree.ts";
 
 const exec = promisify(execFile);
 
 async function fixture() {
-  const parent = await mkdtemp(join(tmpdir(), "workflow-worktree-"));
+  const parent = await tempDir("workflow-worktree");
   const repo = join(parent, "repo");
   const artifactDir = join(parent, "artifacts", "wf_aaaaaaaa");
   await mkdir(repo);
