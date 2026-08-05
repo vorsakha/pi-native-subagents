@@ -1,7 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
   MAX_COLLAPSED_LINES,
   MAX_EXPANDED_LINES,
@@ -13,55 +12,17 @@ import {
   statusMeta,
 } from "../extensions/subagents/render.ts";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
-import type { Backend, BackendEvent, HarnessName, BackendRequest, BackendRun, JobSnapshot, ToolTrace } from "../src/types.ts";
+import type { ToolTrace } from "../src/types.ts";
+import { ImmediateBackend, ansiTheme, fakePi, jobSnapshot as job, theme, usage } from "./helpers.ts";
 
 const ESC = "\u001B";
 const CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;
-
-const theme = {
-  fg: (_color: string, text: string) => text,
-  bg: (_color: string, text: string) => text,
-  bold: (text: string) => text,
-} as unknown as Theme;
-
-const ansiTheme = {
-  fg: (color: string, text: string) => `\u001b[3${color.length % 8}m${text}\u001b[0m`,
-  bg: (_color: string, text: string) => `\u001b[48;5;24m${text}\u001b[0m`,
-  bold: (text: string) => `\u001b[1m${text}\u001b[0m`,
-} as unknown as Theme;
-
-function usage(overrides: Partial<JobSnapshot["usage"]> = {}): JobSnapshot["usage"] {
-  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0, ...overrides };
-}
 
 function tool(id: string, status: ToolTrace["status"] = "completed"): ToolTrace {
   return { id, name: `tool-${id}`, summary: `summary ${id}`, status };
 }
 
-function job(overrides: Partial<JobSnapshot> = {}): JobSnapshot {
-  return {
-    id: "0123456789abcdef",
-    name: "worker", access: "full", independent: false,
-    harness: "codex",
-    model: "fixture-model",
-    task: "Implement the widget",
-    cwd: "/tmp",
-    status: "running",
-    createdAt: 1_000,
-    startedAt: 2_000,
-    output: "",
-    truncated: false,
-    usage: usage(),
-    tools: [],
-    ...overrides,
-    generation: overrides.generation ?? 0,
-    transcript: [],
-    liveThinking: "",
-    queuedMessages: [],
-  };
-}
-
-test("renderer sanitizes output, enforces line budgets, and registers runtime renderers", () => {
+test("renderer sanitizes output and enforces collapsed/expanded line budgets", () => {
   const clean = sanitizeText(`${ESC}[31mred${ESC}[0m\tline1 \nline2${ESC}]0;title${ESC}\\end`);
   assert.equal(clean.includes(ESC), false);
   assert.equal(CONTROL_CHARS.test(clean), false);
@@ -125,35 +86,9 @@ test("renderer sanitizes output, enforces line budgets, and registers runtime re
   assert.ok(expandedLines.length <= MAX_EXPANDED_LINES, `expanded produced ${expandedLines.length} lines`);
   assert.ok(expandedLines.every((line) => !CONTROL_CHARS.test(line)));
   assert.ok(expandedLines.some((line) => line.includes("/subagents")));
-  assertRuntimeRenderers();
 });
 
-class ImmediateBackend implements Backend {
-  readonly name: HarnessName;
-  constructor(name: HarnessName) { this.name = name; }
-  async start(_request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
-    emit({ type: "completed", output: `${this.name}-ok` });
-    return { completed: Promise.resolve(), async send() {}, async cancel() {}, async close() {} };
-  }
-}
-
-function fakePi() {
-  const tools = new Map<string, any>();
-  return {
-    api: {
-      on() {},
-      registerTool(toolDef: any) { tools.set(toolDef.name, toolDef); },
-      registerCommand() {},
-      registerMessageRenderer() {},
-      registerEntryRenderer() {},
-      sendMessage() {},
-      appendEntry() {},
-    } as any,
-    tools,
-  };
-}
-
-function assertRuntimeRenderers(): void {
+test("every direct tool registers width-safe, sanitized trace renderers", () => {
   const pi = fakePi();
   const backends = [new ImmediateBackend("pi"), new ImmediateBackend("claude"), new ImmediateBackend("codex")];
   registerNativeSubagents(pi.api, { registry: {}, legacyRoot: false, backends });
@@ -216,4 +151,4 @@ function assertRuntimeRenderers(): void {
   ).render(80).join("\n");
   assert.match(timedOut, /^⌁\s+/);
   assert.match(timedOut, /running after 30s wait timeout ·/);
-}
+});

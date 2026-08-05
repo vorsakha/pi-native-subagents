@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { tempDir } from "./helpers.ts";
 import { mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   checkpointWorkflow,
@@ -47,7 +47,7 @@ function snapshot(sessionId: string, now = Date.now()): Omit<WorkflowSnapshot, "
 }
 
 async function fixture() {
-  const parent = await mkdtemp(join(tmpdir(), "workflow-artifacts-"));
+  const parent = await tempDir("workflow-artifacts");
   return { root: join(parent, "workflows-equivalent") };
 }
 

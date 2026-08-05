@@ -1,49 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { JobManager } from "../src/manager.ts";
-import type { Backend, BackendEvent, BackendRequest, BackendRun, JobSnapshot, ProfileDefinition } from "../src/types.ts";
+import type { Backend, BackendRun, JobSnapshot, ProfileDefinition } from "../src/types.ts";
+import { ControlledBackend, tick } from "./helpers.ts";
 
-class FakeBackend implements Backend {
-  readonly name: "codex" | "claude";
-  active = 0;
-  maxActive = 0;
-  starts: string[] = [];
-  policies: BackendRequest["policy"][] = [];
-  cancels: string[] = [];
-  closes: string[] = [];
-  sends: Array<{ id: string; message: string; behavior: string }> = [];
-  readonly runs = new Map<string, { emit: (event: BackendEvent) => void; resolve: () => void }>();
-
-  constructor(name: "codex" | "claude" = "codex") {
-    this.name = name;
-  }
-
-  async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
-    this.active++;
-    this.maxActive = Math.max(this.maxActive, this.active);
-    this.starts.push(request.jobId);
-    this.policies.push(request.policy);
-    let resolve!: () => void;
-    const completed = new Promise<void>((done) => { resolve = () => { this.active--; done(); }; });
-    this.runs.set(request.jobId, { emit, resolve });
-    return {
-      completed,
-      send: async (message, behavior = "steer") => { this.sends.push({ id: request.jobId, message, behavior }); },
-      cancel: async (reason) => { this.cancels.push(request.jobId); emit({ type: "cancelled", reason }); resolve(); },
-      close: async () => { this.closes.push(request.jobId); },
-    };
-  }
-
-  complete(id: string, output = "ok"): void {
-    const run = this.runs.get(id)!;
-    run.emit({ type: "completed", output });
-    run.resolve();
-  }
-}
-
-const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 function setup(concurrency = 4) {
-  const backend = new FakeBackend();
+  const backend = new ControlledBackend();
   const manager = new JobManager({ backends: [backend], concurrency });
   return { backend, manager };
 }
@@ -142,7 +104,7 @@ test("an evicted terminal job closes a native run that returns after eviction", 
 });
 
 test("manager forwards caller models and labels omitted models as native defaults", async () => {
-  const backend = new FakeBackend();
+  const backend = new ControlledBackend();
   const manager = new JobManager({ backends: [backend] });
   const selected = manager.spawn({ ...request(1), model: "configured-model" });
   const nativeDefault = manager.spawn(request(2));
@@ -157,8 +119,8 @@ test("manager forwards caller models and labels omitted models as native default
 });
 
 test("independentOf routes against the producer job rather than the parent provider", async () => {
-  const codex = new FakeBackend("codex");
-  const claude = new FakeBackend("claude");
+  const codex = new ControlledBackend("codex");
+  const claude = new ControlledBackend("claude");
   const manager = new JobManager({ backends: [codex, claude] });
   const producer = manager.spawn({ ...request(1), harness: "claude" });
   const reviewer = manager.spawn({
@@ -226,7 +188,7 @@ test("cancel removes queued jobs and tears down running backend", async () => {
   await tick();
   assert.equal((await manager.cancel(queued.id)).status, "cancelled");
   assert.equal((await manager.cancel(running.id)).status, "cancelled");
-  assert.deepEqual(backend.cancels, [running.id]);
+  assert.deepEqual(backend.cancels.map((cancel) => cancel.jobId), [running.id]);
   assert.equal(runningCancellationEvents, 2); // one queued job and one running job, no backend duplicate
   await manager.shutdown();
 });
@@ -447,7 +409,7 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
 });
 
 test("manager rejects unknown explicit profiles, untrusted execution, and empty tasks", () => {
-  const backend = new FakeBackend();
+  const backend = new ControlledBackend();
   const audit: ProfileDefinition = { name: "audit", description: "", systemPrompt: "audit", filePath: "audit.md", origin: "global" };
   const manager = new JobManager({ backends: [backend], profiles: new Map([[audit.name, audit]]) });
   assert.throws(() => manager.spawn({ ...request(1), profile: "missing" }), /Unknown subagent profile/);

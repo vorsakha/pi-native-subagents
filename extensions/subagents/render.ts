@@ -5,6 +5,21 @@ import { isTerminal } from "../../src/manager.ts";
 import type { PeerSessionSummary } from "../../src/session-peers.ts";
 import type { JobSnapshot, JobStatus, SendBehavior, ToolTrace, Usage } from "../../src/types.ts";
 
+/*
+ * Trace grammar shared by every direct tool and by the workflow renderers:
+ *
+ *   ⌁ <call row>      opens the group and carries the task text
+ *   │ <result row>    every result line rides the continuation rail
+ *
+ * Cards prioritize status, policy, outcome, recent activity, informational usage,
+ * and end with a single dashboard-pointer footer. `subagent_spawn` owns the live
+ * card; check/wait/send/cancel collapse to one-line receipts so the transcript is
+ * never duplicated. Output is sanitized before Pi renders it as Markdown, and
+ * cards are pinned to job id + generation so retained-session follow-ups do not
+ * rewrite historical rows. Colors come from the active theme; status is always
+ * carried by a glyph as well, never by color alone.
+ */
+
 /** Hard rendered-line budgets so no tool call/result can spam the transcript. */
 export const MAX_COLLAPSED_LINES = 10;
 export const MAX_EXPANDED_LINES = 36;

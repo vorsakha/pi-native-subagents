@@ -1,8 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { delay } from "./helpers.ts";
 import { createActivityWatchdog } from "../src/activity-watchdog.ts";
-
-const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 test("activity watchdog resets on progress and disarms cleanly", async () => {
   let expirations = 0;

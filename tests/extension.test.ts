@@ -1,114 +1,24 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { registerParentThreadChildTool } from "../extensions/parent-thread/index.ts";
 import { configuredHarnessFromEnv, parseHumanSubagentCommand, permittedHumanPiToolNames, registerNativeSubagents } from "../extensions/subagents/index.ts";
 import { PI_CHILD_MARKER } from "../src/backends/pi-rpc.ts";
 import { PI_PARENT_THREAD_FILE } from "../src/parent-thread-context.ts";
-import type { Backend, BackendEvent, HarnessName, BackendRequest, BackendRun } from "../src/types.ts";
+import { HoldingBackend, ImmediateBackend, context, fakePi, tempDir, theme } from "./helpers.ts";
 
-class HoldingBackend implements Backend {
-  readonly name: HarnessName;
-  constructor(name: HarnessName) { this.name = name; }
-  async start(_request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
-    let resolveCompleted!: () => void;
-    const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
-    emit({ type: "started", backendSessionId: `${this.name}-session` });
-    const settle = (event: BackendEvent) => { emit(event); resolveCompleted(); };
-    return {
-      completed,
-      async send() {},
-      async cancel(reason = "Cancelled") { settle({ type: "cancelled", reason }); },
-      async close() { resolveCompleted(); },
-    };
-  }
-}
-
-class ImmediateBackend implements Backend {
-  readonly starts: BackendRequest[] = [];
-  readonly name: HarnessName;
-  constructor(name: HarnessName) { this.name = name; }
-  async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
-    this.starts.push(request);
-    emit({ type: "completed", output: `${this.name}-ok` });
-    return {
-      completed: Promise.resolve(),
-      send: async (message: string) => { emit({ type: "completed", output: `${this.name}-${message}` }); },
-      async cancel() {},
-      async close() {},
-    };
-  }
-}
-
-function fakePi() {
-  const handlers = new Map<string, (...args: any[]) => any>();
-  const tools = new Map<string, any>();
-  const commands = new Map<string, any>();
-  const messageRenderers = new Map<string, any>();
-  const entryRenderers = new Map<string, any>();
-  const messages: unknown[] = [];
-  const entries: Array<{ id: string; customType: string; data: unknown }> = [];
-  return {
-    api: {
-      on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
-      registerTool(tool: any) {
-        if (tools.has(tool.name)) throw new Error(`duplicate tool: ${tool.name}`);
-        tools.set(tool.name, tool);
-      },
-      registerCommand(name: string, command: any) {
-        if (commands.has(name)) throw new Error(`duplicate command: ${name}`);
-        commands.set(name, command);
-      },
-      registerMessageRenderer(name: string, renderer: any) { messageRenderers.set(name, renderer); },
-      registerEntryRenderer(name: string, renderer: any) { entryRenderers.set(name, renderer); },
-      getAllTools() {
-        return [
-          { name: "mcp", description: "MCP gateway", sourceInfo: { source: "npm:pi-mcp-adapter" } },
-          { name: "browser", description: "Browser automation", sourceInfo: { source: "npm:pi-agent-browser" } },
-          { name: "subagent_spawn", description: "Spawn a nested subagent", sourceInfo: { source: "extension" } },
-          { name: "workflow", description: "Run a nested workflow", sourceInfo: { source: "extension" } },
-          { name: "ask_user", description: "Prompt the user", sourceInfo: { source: "extension" } },
-        ];
-      },
-      sendMessage(message: unknown) { messages.push(message); },
-      appendEntry(customType: string, data: unknown) { entries.push({ id: `entry-${entries.length}`, customType, data }); },
-    } as any,
-    handlers,
-    tools,
-    commands,
-    messageRenderers,
-    entryRenderers,
-    messages,
-    entries,
-  };
-}
-
-const theme = {
-  fg: (_color: string, text: string) => text,
-  bold: (text: string) => text,
-};
-
-function context(branch: unknown[] = [], provider?: string, trusted = true) {
-  const notifications: string[] = [];
-  return {
-    cwd: process.cwd(),
-    model: provider ? { provider, id: "parent-model" } : undefined,
-    mode: "rpc",
-    isProjectTrusted: () => trusted,
-    isIdle: () => false,
-    sessionManager: { getBranch: () => branch, buildContextEntries: () => branch, getSessionId: () => "extension-session" },
-    ui: {
-      notifications,
-      setStatus() {},
-      notify(message: string) { notifications.push(message); },
-    },
-  } as any;
-}
+/** The parent session's tool inventory, including surfaces children must never inherit. */
+const PARENT_TOOLS = [
+  { name: "mcp", description: "MCP gateway", sourceInfo: { source: "npm:pi-mcp-adapter" } },
+  { name: "browser", description: "Browser automation", sourceInfo: { source: "npm:pi-agent-browser" } },
+  { name: "subagent_spawn", description: "Spawn a nested subagent", sourceInfo: { source: "extension" } },
+  { name: "workflow", description: "Run a nested workflow", sourceInfo: { source: "extension" } },
+  { name: "ask_user", description: "Prompt the user", sourceInfo: { source: "extension" } },
+];
 
 test("a Pi child with a parent snapshot registers only parent_thread_context", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "parent-thread-child-"));
+  const root = await tempDir("parent-thread-child");
   t.after(() => rm(root, { recursive: true, force: true }));
   const snapshotPath = join(root, "snapshot.json");
   await writeFile(snapshotPath, JSON.stringify({
@@ -121,15 +31,15 @@ test("a Pi child with a parent snapshot registers only parent_thread_context", a
   registerParentThreadChildTool(child.api, { [PI_CHILD_MARKER]: "1", [PI_PARENT_THREAD_FILE]: snapshotPath });
   assert.deepEqual([...child.tools.keys()], ["parent_thread_context"]);
   assert.deepEqual([...child.commands.keys()], []);
-  const result = await child.tools.get("parent_thread_context").execute("context", {}, undefined, undefined, context());
+  const result = await child.tools.get("parent_thread_context").execute("context", {}, undefined, undefined, context().ctx);
   assert.match(result.content[0].text, /Analyze this decision/);
 });
 
-test("extension exposes generic direct tools, caller models, independence, and one-shot delivery", async () => {
-  const pi = fakePi();
+test("the subagent extension surface", async (t) => {
+  const pi = fakePi({ allTools: PARENT_TOOLS });
   const registry = {};
-  const backends = [new ImmediateBackend("pi"), new ImmediateBackend("claude"), new ImmediateBackend("codex")];
-  const extensionRoot = await mkdtemp(join(tmpdir(), "extension-workflows-"));
+  const backends = ["pi", "claude", "codex"].map((name) => new ImmediateBackend(name as any, { echoSend: true }));
+  const extensionRoot = await tempDir("extension-workflows");
   const workflowArtifactRoot = join(extensionRoot, "runs");
   const globalProfilesDir = join(extensionRoot, "profiles");
   await mkdir(globalProfilesDir);
@@ -147,198 +57,219 @@ test("extension exposes generic direct tools, caller models, independence, and o
   };
   registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir, sessionPeerSource });
 
-  assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_HARNESS: "claude" }), "claude");
-  assert.equal(configuredHarnessFromEnv({}), "pi", "Pi is the provider-agnostic default harness");
-  assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_BACKEND: "codex" }), "pi", "obsolete backend env is ignored");
-  assert.deepEqual([...pi.tools.keys()].sort(), [
-    "session_peer_fork", "session_peer_list",
-    "subagent", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
-  ]);
-  assert.deepEqual([...pi.commands.keys()].sort(), ["subagent", "subagents", "subagents-config", "workflows"]);
-  assert.deepEqual(parseHumanSubagentCommand('--harness claude --model opus --name "auth review" --effort high --access readOnly "Review the auth flow"'), {
-    harness: "claude",
-    model: "opus",
-    name: "auth review",
-    effort: "high",
-    access: "readOnly",
-    task: "Review the auth flow",
-  });
-  assert.throws(() => parseHumanSubagentCommand("--harness nope investigate"), /Unknown harness/);
-  assert.throws(() => parseHumanSubagentCommand("--model opus"), /A task is required/);
-  assert.deepEqual(permittedHumanPiToolNames([
-    { name: "mcp", description: "MCP gateway", source: "extension" },
-    { name: "browser", description: "Browser automation", source: "extension" },
-    { name: "subagent_spawn", description: "nested delegation", source: "extension" },
-    { name: "workflow", source: "extension" },
-    { name: "ask_user", source: "extension" },
-  ]), ["mcp", "browser"]);
-  const spawnTool = pi.tools.get("subagent_spawn");
-  const spawnProperties = spawnTool.parameters.properties;
-  assert.ok(spawnProperties.harness);
-  assert.ok(spawnProperties.model);
-  assert.equal(spawnProperties.backend, undefined, "backend compatibility is intentionally absent");
-  assert.equal(spawnProperties.modelTier, undefined, "tier compatibility is intentionally absent");
-  assert.ok(pi.messageRenderers.has("native-workflow-result"));
-  assert.ok(pi.messageRenderers.has("native-subagent-result"));
-  assert.ok(pi.entryRenderers.has("native-human-subagent"));
-  assert.throws(() => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }), /loaded more than once/);
-
-  const ctx = context([
+  const { ctx, notifications } = context({ sessionId: "extension-session", branch: [
     { type: "message", message: { role: "user", content: "Discuss the parent-thread bridge", timestamp: 1_000 } },
     { type: "message", message: { role: "assistant", content: [{ type: "thinking", thinking: "hidden" }, { type: "text", text: "Use a pull-based tool." }], timestamp: 2_000 } },
     { type: "custom", customType: "native-subagents-harness", data: { harness: "pi" } },
-  ]);
+  ] });
   ctx.cwd = extensionRoot;
   pi.handlers.get("session_start")?.({}, ctx);
-  await pi.commands.get("subagents").handler("profiles", ctx);
-  assert.match(ctx.ui.notifications.at(-1) ?? "", /audit \(global\)/);
 
-  const listedPeers = await pi.tools.get("session_peer_list").execute("peer-list", { query: "design" }, undefined, undefined, ctx);
-  assert.equal(listedPeers.details.peers[0].sessionId, "saved-session");
-  await assert.rejects(
-    pi.tools.get("session_peer_list").execute("untrusted-list", {}, undefined, undefined, context([], undefined, false)),
-    /disabled for untrusted projects/,
-  );
-  const peer = await pi.tools.get("session_peer_fork").execute("peer-fork", {
-    sessionId: "saved-session", message: "What trade-off did you settle on?", name: "design-peer",
-  }, undefined, undefined, ctx);
-  assert.equal(peer.details.job.peer.sourceSessionId, "saved-session");
-  assert.equal(peer.details.job.access, "readOnly");
-  assert.deepEqual(peerForks, [{ sourcePath: "/sessions/saved.jsonl", targetCwd: extensionRoot }]);
-  await pi.tools.get("subagent_wait").execute("peer-wait", { jobId: peer.details.job.id }, undefined, undefined, ctx);
-  const peerRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.resumeSessionFile === "/sessions/forked.jsonl");
-  assert.equal(peerRequest?.rawInitialMessage, true, "peer questions are sent without the generic Task prefix");
-  assert.deepEqual(peerRequest?.policy.piTools, [], "session peers cannot access child tools");
-  await pi.tools.get("subagent_send").execute("peer-follow-up", {
-    jobId: peer.details.job.id, message: "Why?", behavior: "followUp",
-  }, undefined, undefined, ctx);
-  await pi.tools.get("subagent_wait").execute("peer-follow-up-wait", { jobId: peer.details.job.id }, undefined, undefined, ctx);
-  assert.match(backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.resumeSessionFile === "/sessions/forked.jsonl")?.systemPrompt ?? "", /read-only session peer/);
+  await t.test("registers the generic tool and command surface exactly once", async () => {
+    assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_HARNESS: "claude" }), "claude");
+    assert.equal(configuredHarnessFromEnv({}), "pi", "Pi is the provider-agnostic default harness");
+    assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_BACKEND: "codex" }), "pi", "obsolete backend env is ignored");
+    assert.deepEqual([...pi.tools.keys()].sort(), [
+      "session_peer_fork", "session_peer_list",
+      "subagent", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
+    ]);
+    assert.deepEqual([...pi.commands.keys()].sort(), ["subagent", "subagents", "subagents-config", "workflows"]);
+    assert.deepEqual(parseHumanSubagentCommand('--harness claude --model opus --name "auth review" --effort high --access readOnly "Review the auth flow"'), {
+      harness: "claude",
+      model: "opus",
+      name: "auth review",
+      effort: "high",
+      access: "readOnly",
+      task: "Review the auth flow",
+    });
+    assert.throws(() => parseHumanSubagentCommand("--harness nope investigate"), /Unknown harness/);
+    assert.throws(() => parseHumanSubagentCommand("--model opus"), /A task is required/);
+    assert.deepEqual(permittedHumanPiToolNames([
+      { name: "mcp", description: "MCP gateway", source: "extension" },
+      { name: "browser", description: "Browser automation", source: "extension" },
+      { name: "subagent_spawn", description: "nested delegation", source: "extension" },
+      { name: "workflow", source: "extension" },
+      { name: "ask_user", source: "extension" },
+    ]), ["mcp", "browser"]);
+    const spawnTool = pi.tools.get("subagent_spawn");
+    const spawnProperties = spawnTool.parameters.properties;
+    assert.ok(spawnProperties.harness);
+    assert.ok(spawnProperties.model);
+    assert.equal(spawnProperties.backend, undefined, "backend compatibility is intentionally absent");
+    assert.equal(spawnProperties.modelTier, undefined, "tier compatibility is intentionally absent");
+    assert.ok(pi.messageRenderers.has("native-workflow-result"));
+    assert.ok(pi.messageRenderers.has("native-subagent-result"));
+    assert.ok(pi.entryRenderers.has("native-human-subagent"));
+    assert.throws(() => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }), /loaded more than once/);
+  });
 
-  const background = await pi.tools.get("subagent_spawn").execute("spawn", { name: "research", task: "background" }, undefined, undefined, ctx);
-  assert.equal(background.details.job.harness, "pi", "background spawn uses the configured harness");
-  assert.equal(background.details.job.model, "default", "omitted models use the native harness default");
-  assert.equal(background.details.job.access, "full", "trusted generic agents default to full access");
-  const ordinaryBackgroundRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "background");
-  assert.ok(!ordinaryBackgroundRequest?.policy.piTools.includes("mcp"), "model-triggered spawns keep the explicit capability contract");
-  assert.equal(ordinaryBackgroundRequest?.parentThread, undefined, "model-triggered spawns do not receive parent-thread content");
-  await new Promise((resolve) => setImmediate(resolve));
-  pi.handlers.get("agent_settled")?.();
-  assert.equal((pi.messages[0] as any)?.customType, "native-subagent-result", "unconsumed background result is delivered once");
+  await t.test("resolves global profiles and forks read-only session peers", async () => {
+    await pi.commands.get("subagents").handler("profiles", ctx);
+    assert.match(notifications.at(-1)?.message ?? "", /audit \(global\)/);
 
-  const entriesBeforeHumanCommand = pi.entries.length;
-  const messagesBeforeHumanCommand = pi.messages.length;
-  await pi.commands.get("subagent").handler('--harness claude --model caller-model --name "human review" "human task"', ctx);
-  assert.equal(pi.messages.length, messagesBeforeHumanCommand, "human-triggered jobs do not notify the orchestrator");
-  assert.equal(pi.entries.length, entriesBeforeHumanCommand + 2, "human jobs persist one card anchor and one hidden terminal update");
-  const humanStart = pi.entries[entriesBeforeHumanCommand];
-  const humanResult = pi.entries[entriesBeforeHumanCommand + 1];
-  assert.equal(humanStart.customType, "native-human-subagent");
-  assert.equal((humanStart.data as any).kind, "anchor");
-  assert.equal((humanStart.data as any).job.status, "queued");
-  assert.equal((humanStart.data as any).job.humanVisible, true);
-  assert.equal((humanResult.data as any).kind, "update");
-  assert.equal((humanResult.data as any).job.status, "completed");
-  assert.equal((humanResult.data as any).job.output, "claude-ok");
-  const humanRequest = backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "human task");
-  assert.equal(humanRequest?.policy.model, "caller-model");
-  assert.deepEqual(humanRequest?.parentThread?.messages.map((message) => [message.role, message.text]), [
-    ["user", "Discuss the parent-thread bridge"],
-    ["assistant", "Use a pull-based tool."],
-  ], "human jobs receive a filtered spawn-time snapshot without assistant thinking");
-  const humanCard = pi.entryRenderers.get("native-human-subagent")(humanStart, { expanded: true }, theme).render(120).join("\n");
-  assert.match(humanCard, /claude\/caller-model/);
-  assert.match(humanCard, /claude-ok/, "the original card settles with the terminal output");
-  assert.deepEqual(
-    pi.entryRenderers.get("native-human-subagent")(humanResult, { expanded: true }, theme).render(120),
-    [],
-    "the durable terminal update does not create a second visible card",
-  );
-
-  const entriesBeforeDefaultHumanCommand = pi.entries.length;
-  await pi.commands.get("subagent").handler("default human task", ctx);
-  assert.equal(pi.entries.length, entriesBeforeDefaultHumanCommand + 2);
-  const defaultHumanRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "default human task");
-  assert.equal(defaultHumanRequest?.policy.model, undefined, "an omitted human model uses the native default");
-  assert.ok(defaultHumanRequest?.policy.piTools.includes("mcp"), "full human Pi jobs inherit permitted MCP/extension gateways");
-  assert.ok(defaultHumanRequest?.policy.piTools.includes("browser"));
-  assert.ok(defaultHumanRequest?.policy.piTools.includes("parent_thread_context"));
-  assert.ok(!defaultHumanRequest?.policy.piTools.includes("subagent_spawn"));
-  assert.ok(!defaultHumanRequest?.policy.piTools.includes("workflow"));
-  assert.ok(!defaultHumanRequest?.policy.piTools.includes("ask_user"));
-
-  await pi.commands.get("subagent").handler("--access readOnly read-only human task", ctx);
-  const readOnlyHumanRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "read-only human task");
-  assert.deepEqual(readOnlyHumanRequest?.policy.piTools, ["read", "grep", "find", "ls", "parent_thread_context"]);
-
-  const consumed = await pi.tools.get("subagent_spawn").execute("spawn", { name: "reader", task: "consumed", access: "readOnly", effort: "high" }, undefined, undefined, ctx);
-  assert.equal(consumed.details.job.effort, "high");
-  const waitCall = pi.tools.get("subagent_wait").renderCall({ jobId: consumed.details.job.id, timeoutMs: 600_000 }, theme).render(100);
-  assert.deepEqual(waitCall, [], "wait orchestration does not create a second transcript block");
-  const waited = await pi.tools.get("subagent_wait").execute("wait", { jobId: consumed.details.job.id }, undefined, undefined, ctx);
-  const waitReceipt = pi.tools.get("subagent_wait").renderResult(waited, { expanded: false, isPartial: false }, theme, { args: {} }).render(100);
-  assert.deepEqual(waitReceipt, [], "successful completion stays on the original live job card");
-  pi.handlers.get("agent_settled")?.();
-  assert.equal(pi.messages.length, 1, "wait consumes deferred delivery without duplication");
-  const historicalContext = { args: {}, state: {}, invalidate() {} };
-  const generationZero = pi.tools.get("subagent_spawn").renderResult(consumed, { expanded: true, isPartial: false }, theme, historicalContext).render(100).join("\n");
-  assert.match(generationZero, /pi-ok/);
-  const reused = await pi.tools.get("subagent_send").execute("send", { jobId: consumed.details.job.id, message: "second generation", behavior: "followUp" }, undefined, undefined, ctx);
-  assert.equal(reused.details.job.effort, "high", "retained-session generations preserve request effort metadata");
-  await new Promise((resolve) => setImmediate(resolve));
-  pi.handlers.get("agent_settled")?.();
-  assert.equal(pi.messages.length, 2, "consumption is scoped to one generation; reused-session output still delivers once");
-  const historicalAfterFollowUp = pi.tools.get("subagent_spawn").renderResult(consumed, { expanded: true, isPartial: false }, theme, historicalContext).render(100).join("\n");
-  assert.match(historicalAfterFollowUp, /pi-ok/);
-  assert.doesNotMatch(historicalAfterFollowUp, /second generation/, "older thread cards stay pinned to their own generation");
-
-  const explicitClaude = await pi.tools.get("subagent_spawn").execute("claude-model", {
-    name: "implementation", task: "explicit Claude model", harness: "claude", model: "caller-model", effort: "max",
-  }, undefined, undefined, ctx);
-  assert.equal(explicitClaude.details.job.harness, "claude");
-  assert.equal(explicitClaude.details.job.model, "caller-model");
-  await pi.tools.get("subagent_wait").execute("wait-claude-model", { jobId: explicitClaude.details.job.id }, undefined, undefined, ctx);
-  const explicitRequest = backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "explicit Claude model");
-  assert.equal(explicitRequest?.policy.model, "caller-model");
-  assert.equal(explicitRequest?.policy.effort, "max");
-  const producerAdversary = await pi.tools.get("subagent_spawn").execute("producer-adversary", {
-    name: "producer-adversary", task: "review the delegated implementation", independentOf: explicitClaude.details.job.id, access: "readOnly",
-  }, undefined, undefined, ctx);
-  assert.equal(producerAdversary.details.job.harness, "codex", "independentOf routes opposite the producer instead of the unknown parent fallback");
-  assert.equal(producerAdversary.details.job.independentOf, explicitClaude.details.job.id);
-  await pi.tools.get("subagent_wait").execute("wait-producer-adversary", { jobId: producerAdversary.details.job.id }, undefined, undefined, ctx);
-  await assert.rejects(
-    pi.tools.get("subagent_spawn").execute("blank-model", { task: "invalid", model: "   " }, undefined, undefined, ctx),
-    /1–256/,
-  );
-
-  const profiled = await pi.tools.get("subagent").execute("profiled", { task: "profiled audit", profile: "audit", access: "full" }, undefined, undefined, ctx);
-  assert.equal(profiled.details.job.access, "readOnly", "profile access is a ceiling in direct tools");
-  assert.match(backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "profiled audit")?.systemPrompt ?? "", /Audit carefully/);
-
-  const foreground = await pi.tools.get("subagent").execute("foreground", { name: "foreground", task: "foreground" }, undefined, undefined, ctx);
-  assert.equal(foreground.details.job.harness, "pi", "foreground uses the same configured generic route");
-  const independentDefault = await pi.tools.get("subagent").execute("foreground-independent", { name: "independent", independent: true, task: "cross-provider default" }, undefined, undefined, ctx);
-  assert.equal(independentDefault.details.job.harness, "claude", "unknown parent provider uses native Claude for independent work");
-  assert.equal(independentDefault.details.job.model, "default");
-  const claudeParent = context([], "anthropic");
-  const independentAgainstClaude = await pi.tools.get("subagent_spawn").execute("independent-codex", { name: "second-opinion", independent: true, task: "review Claude independently" }, undefined, undefined, claudeParent);
-  assert.equal(independentAgainstClaude.details.job.harness, "codex");
-  assert.equal(independentAgainstClaude.details.job.model, "default");
-  await assert.rejects(
-    pi.tools.get("subagent_spawn").execute("independent-same", { independent: true, harness: "claude", task: "invalid same provider" }, undefined, undefined, claudeParent),
-    /different from the parent claude/,
-  );
-  for (const stale of [{ role: "worker" }, { backend: "codex" }]) {
+    const listedPeers = await pi.tools.get("session_peer_list").execute("peer-list", { query: "design" }, undefined, undefined, ctx);
+    assert.equal(listedPeers.details.peers[0].sessionId, "saved-session");
     await assert.rejects(
-      pi.tools.get("subagent_spawn").execute("schema-mismatch", { ...stale, task: "wrong schema" }, undefined, undefined, ctx),
-      /Subagent API schema mismatch: reload Pi to use the current task-driven schema\./,
+      pi.tools.get("session_peer_list").execute("untrusted-list", {}, undefined, undefined, context({ trusted: false }).ctx),
+      /disabled for untrusted projects/,
     );
-  }
+    const peer = await pi.tools.get("session_peer_fork").execute("peer-fork", {
+      sessionId: "saved-session", message: "What trade-off did you settle on?", name: "design-peer",
+    }, undefined, undefined, ctx);
+    assert.equal(peer.details.job.peer.sourceSessionId, "saved-session");
+    assert.equal(peer.details.job.access, "readOnly");
+    assert.deepEqual(peerForks, [{ sourcePath: "/sessions/saved.jsonl", targetCwd: extensionRoot }]);
+    await pi.tools.get("subagent_wait").execute("peer-wait", { jobId: peer.details.job.id }, undefined, undefined, ctx);
+    const peerRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.resumeSessionFile === "/sessions/forked.jsonl");
+    assert.equal(peerRequest?.rawInitialMessage, true, "peer questions are sent without the generic Task prefix");
+    assert.deepEqual(peerRequest?.policy.piTools, [], "session peers cannot access child tools");
+    await pi.tools.get("subagent_send").execute("peer-follow-up", {
+      jobId: peer.details.job.id, message: "Why?", behavior: "followUp",
+    }, undefined, undefined, ctx);
+    await pi.tools.get("subagent_wait").execute("peer-follow-up-wait", { jobId: peer.details.job.id }, undefined, undefined, ctx);
+    assert.match(backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.resumeSessionFile === "/sessions/forked.jsonl")?.systemPrompt ?? "", /read-only session peer/);
+  });
+
+  await t.test("delivers an unconsumed background result exactly once", async () => {
+    const background = await pi.tools.get("subagent_spawn").execute("spawn", { name: "research", task: "background" }, undefined, undefined, ctx);
+    assert.equal(background.details.job.harness, "pi", "background spawn uses the configured harness");
+    assert.equal(background.details.job.model, "default", "omitted models use the native harness default");
+    assert.equal(background.details.job.access, "full", "trusted generic agents default to full access");
+    const ordinaryBackgroundRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "background");
+    assert.ok(!ordinaryBackgroundRequest?.policy.piTools.includes("mcp"), "model-triggered spawns keep the explicit capability contract");
+    assert.equal(ordinaryBackgroundRequest?.parentThread, undefined, "model-triggered spawns do not receive parent-thread content");
+    await new Promise((resolve) => setImmediate(resolve));
+    pi.handlers.get("agent_settled")?.();
+    assert.equal(pi.messages[0]?.message.customType, "native-subagent-result", "unconsumed background result is delivered once");
+  });
+
+  await t.test("human jobs persist cards and receive a filtered parent snapshot", async () => {
+    const entriesBeforeHumanCommand = pi.entries.length;
+    const messagesBeforeHumanCommand = pi.messages.length;
+    await pi.commands.get("subagent").handler('--harness claude --model caller-model --name "human review" "human task"', ctx);
+    assert.equal(pi.messages.length, messagesBeforeHumanCommand, "human-triggered jobs do not notify the orchestrator");
+    assert.equal(pi.entries.length, entriesBeforeHumanCommand + 2, "human jobs persist one card anchor and one hidden terminal update");
+    const humanStart = pi.entries[entriesBeforeHumanCommand];
+    const humanResult = pi.entries[entriesBeforeHumanCommand + 1];
+    assert.equal(humanStart.customType, "native-human-subagent");
+    assert.equal((humanStart.data as any).kind, "anchor");
+    assert.equal((humanStart.data as any).job.status, "queued");
+    assert.equal((humanStart.data as any).job.humanVisible, true);
+    assert.equal((humanResult.data as any).kind, "update");
+    assert.equal((humanResult.data as any).job.status, "completed");
+    assert.equal((humanResult.data as any).job.output, "claude-ok");
+    const humanRequest = backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "human task");
+    assert.equal(humanRequest?.policy.model, "caller-model");
+    assert.deepEqual(humanRequest?.parentThread?.messages.map((message) => [message.role, message.text]), [
+      ["user", "Discuss the parent-thread bridge"],
+      ["assistant", "Use a pull-based tool."],
+    ], "human jobs receive a filtered spawn-time snapshot without assistant thinking");
+    const humanCard = pi.entryRenderers.get("native-human-subagent")(humanStart, { expanded: true }, theme).render(120).join("\n");
+    assert.match(humanCard, /claude\/caller-model/);
+    assert.match(humanCard, /claude-ok/, "the original card settles with the terminal output");
+    assert.deepEqual(
+      pi.entryRenderers.get("native-human-subagent")(humanResult, { expanded: true }, theme).render(120),
+      [],
+      "the durable terminal update does not create a second visible card",
+    );
+  });
+
+  await t.test("human jobs inherit permitted parent tools, bounded by access", async () => {
+    const entriesBeforeDefaultHumanCommand = pi.entries.length;
+    await pi.commands.get("subagent").handler("default human task", ctx);
+    assert.equal(pi.entries.length, entriesBeforeDefaultHumanCommand + 2);
+    const defaultHumanRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "default human task");
+    assert.equal(defaultHumanRequest?.policy.model, undefined, "an omitted human model uses the native default");
+    assert.ok(defaultHumanRequest?.policy.piTools.includes("mcp"), "full human Pi jobs inherit permitted MCP/extension gateways");
+    assert.ok(defaultHumanRequest?.policy.piTools.includes("browser"));
+    assert.ok(defaultHumanRequest?.policy.piTools.includes("parent_thread_context"));
+    assert.ok(!defaultHumanRequest?.policy.piTools.includes("subagent_spawn"));
+    assert.ok(!defaultHumanRequest?.policy.piTools.includes("workflow"));
+    assert.ok(!defaultHumanRequest?.policy.piTools.includes("ask_user"));
+
+    await pi.commands.get("subagent").handler("--access readOnly read-only human task", ctx);
+    const readOnlyHumanRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "read-only human task");
+    assert.deepEqual(readOnlyHumanRequest?.policy.piTools, ["read", "grep", "find", "ls", "parent_thread_context"]);
+  });
+
+  await t.test("wait consumes delivery once per retained-session generation", async () => {
+    const consumed = await pi.tools.get("subagent_spawn").execute("spawn", { name: "reader", task: "consumed", access: "readOnly", effort: "high" }, undefined, undefined, ctx);
+    assert.equal(consumed.details.job.effort, "high");
+    const waitCall = pi.tools.get("subagent_wait").renderCall({ jobId: consumed.details.job.id, timeoutMs: 600_000 }, theme).render(100);
+    assert.deepEqual(waitCall, [], "wait orchestration does not create a second transcript block");
+    const waited = await pi.tools.get("subagent_wait").execute("wait", { jobId: consumed.details.job.id }, undefined, undefined, ctx);
+    const waitReceipt = pi.tools.get("subagent_wait").renderResult(waited, { expanded: false, isPartial: false }, theme, { args: {} }).render(100);
+    assert.deepEqual(waitReceipt, [], "successful completion stays on the original live job card");
+    pi.handlers.get("agent_settled")?.();
+    assert.equal(pi.messages.length, 1, "wait consumes deferred delivery without duplication");
+    const historicalContext = { args: {}, state: {}, invalidate() {} };
+    const generationZero = pi.tools.get("subagent_spawn").renderResult(consumed, { expanded: true, isPartial: false }, theme, historicalContext).render(100).join("\n");
+    assert.match(generationZero, /pi-ok/);
+    const reused = await pi.tools.get("subagent_send").execute("send", { jobId: consumed.details.job.id, message: "second generation", behavior: "followUp" }, undefined, undefined, ctx);
+    assert.equal(reused.details.job.effort, "high", "retained-session generations preserve request effort metadata");
+    await new Promise((resolve) => setImmediate(resolve));
+    pi.handlers.get("agent_settled")?.();
+    assert.equal(pi.messages.length, 2, "consumption is scoped to one generation; reused-session output still delivers once");
+    const historicalAfterFollowUp = pi.tools.get("subagent_spawn").renderResult(consumed, { expanded: true, isPartial: false }, theme, historicalContext).render(100).join("\n");
+    assert.match(historicalAfterFollowUp, /pi-ok/);
+    assert.doesNotMatch(historicalAfterFollowUp, /second generation/, "older thread cards stay pinned to their own generation");
+  });
+
+  await t.test("routes explicit harness, model, and effort, and independence against a producer", async () => {
+    const explicitClaude = await pi.tools.get("subagent_spawn").execute("claude-model", {
+      name: "implementation", task: "explicit Claude model", harness: "claude", model: "caller-model", effort: "max",
+    }, undefined, undefined, ctx);
+    assert.equal(explicitClaude.details.job.harness, "claude");
+    assert.equal(explicitClaude.details.job.model, "caller-model");
+    await pi.tools.get("subagent_wait").execute("wait-claude-model", { jobId: explicitClaude.details.job.id }, undefined, undefined, ctx);
+    const explicitRequest = backends.find((backend) => backend.name === "claude")?.starts.find((request) => request.task === "explicit Claude model");
+    assert.equal(explicitRequest?.policy.model, "caller-model");
+    assert.equal(explicitRequest?.policy.effort, "max");
+    const producerAdversary = await pi.tools.get("subagent_spawn").execute("producer-adversary", {
+      name: "producer-adversary", task: "review the delegated implementation", independentOf: explicitClaude.details.job.id, access: "readOnly",
+    }, undefined, undefined, ctx);
+    assert.equal(producerAdversary.details.job.harness, "codex", "independentOf routes opposite the producer instead of the unknown parent fallback");
+    assert.equal(producerAdversary.details.job.independentOf, explicitClaude.details.job.id);
+    await pi.tools.get("subagent_wait").execute("wait-producer-adversary", { jobId: producerAdversary.details.job.id }, undefined, undefined, ctx);
+    await assert.rejects(
+      pi.tools.get("subagent_spawn").execute("blank-model", { task: "invalid", model: "   " }, undefined, undefined, ctx),
+      /1–256/,
+    );
+  });
+
+  await t.test("applies profiles as an access ceiling in direct tools", async () => {
+    const profiled = await pi.tools.get("subagent").execute("profiled", { task: "profiled audit", profile: "audit", access: "full" }, undefined, undefined, ctx);
+    assert.equal(profiled.details.job.access, "readOnly", "profile access is a ceiling in direct tools");
+    assert.match(backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "profiled audit")?.systemPrompt ?? "", /Audit carefully/);
+  });
+
+  await t.test("resolves independence against the parent provider and rejects stale schemas", async () => {
+    const foreground = await pi.tools.get("subagent").execute("foreground", { name: "foreground", task: "foreground" }, undefined, undefined, ctx);
+    assert.equal(foreground.details.job.harness, "pi", "foreground uses the same configured generic route");
+    const independentDefault = await pi.tools.get("subagent").execute("foreground-independent", { name: "independent", independent: true, task: "cross-provider default" }, undefined, undefined, ctx);
+    assert.equal(independentDefault.details.job.harness, "claude", "unknown parent provider uses native Claude for independent work");
+    assert.equal(independentDefault.details.job.model, "default");
+    const { ctx: claudeParent } = context({ provider: "anthropic" });
+    const independentAgainstClaude = await pi.tools.get("subagent_spawn").execute("independent-codex", { name: "second-opinion", independent: true, task: "review Claude independently" }, undefined, undefined, claudeParent);
+    assert.equal(independentAgainstClaude.details.job.harness, "codex");
+    assert.equal(independentAgainstClaude.details.job.model, "default");
+    await assert.rejects(
+      pi.tools.get("subagent_spawn").execute("independent-same", { independent: true, harness: "claude", task: "invalid same provider" }, undefined, undefined, claudeParent),
+      /different from the parent claude/,
+    );
+    for (const stale of [{ role: "worker" }, { backend: "codex" }]) {
+      await assert.rejects(
+        pi.tools.get("subagent_spawn").execute("schema-mismatch", { ...stale, task: "wrong schema" }, undefined, undefined, ctx),
+        /Subagent API schema mismatch: reload Pi to use the current task-driven schema\./,
+      );
+    }
+  });
 
   await pi.handlers.get("session_shutdown")?.();
+});
 
-  const blinkPi = fakePi();
+test("thread and human cards follow live job state without periodic rerenders", async () => {
+  const blinkPi = fakePi({ allTools: PARENT_TOOLS });
   const blinkTimers = new Map<object, () => void>();
   let blinkDelay = 0;
   const fakeSetInterval = ((callback: () => void, delay: number) => {
@@ -351,13 +282,13 @@ test("extension exposes generic direct tools, caller models, independence, and o
   registerNativeSubagents(blinkPi.api, {
     registry: {},
     legacyRoot: false,
-    backends: [new HoldingBackend("pi"), new HoldingBackend("claude"), new HoldingBackend("codex")],
-    workflowArtifactRoot: join(await mkdtemp(join(tmpdir(), "extension-blink-workflows-")), "runs"),
-    globalProfilesDir: join(await mkdtemp(join(tmpdir(), "extension-blink-profiles-")), "profiles"),
+    backends: ["pi", "claude", "codex"].map((name) => new HoldingBackend(name as any, { emitStarted: true })),
+    workflowArtifactRoot: join(await tempDir("extension-blink-workflows"), "runs"),
+    globalProfilesDir: join(await tempDir("extension-blink-profiles"), "profiles"),
     setInterval: fakeSetInterval,
     clearInterval: fakeClearInterval,
   });
-  const blinkCtx = context();
+  const { ctx: blinkCtx } = context();
   blinkPi.handlers.get("session_start")?.({}, blinkCtx);
   const active = await blinkPi.tools.get("subagent_spawn").execute("blink", { name: "blink", task: "show blink" }, undefined, undefined, blinkCtx);
   await new Promise((resolve) => setImmediate(resolve));
@@ -393,6 +324,4 @@ test("extension exposes generic direct tools, caller models, independence, and o
   assert.match(humanLiveCard.render(100).join("\n"), /cancelled/, "the existing component settles in place");
   const humanUpdate = blinkPi.entries[humanEntryCount + 1];
   assert.deepEqual(blinkPi.entryRenderers.get("native-human-subagent")(humanUpdate, { expanded: false }, theme).render(100), []);
-
-  await blinkPi.handlers.get("session_shutdown")?.();
 });

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { jobSnapshot, theme } from "./helpers.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { KeybindingsManager } from "@earendil-works/pi-tui";
 import { createDashboardOverlay, truncateDashboardLine } from "../extensions/subagents/dashboard.ts";
 import { TakeoverView, buildTranscript } from "../extensions/subagents/takeover.ts";
@@ -20,33 +20,14 @@ test("dashboard truncation respects terminal display width for Unicode and ANSI"
   assert.equal(truncateDashboardLine("anything", 0), "");
 });
 
-const theme = {
-  fg: (_color: string, text: string) => text,
-  bg: (_color: string, text: string) => text,
-  bold: (text: string) => text,
-} as unknown as Theme;
-
 function job(id: string, status: JobSnapshot["status"] = "running"): JobSnapshot {
-  return {
+  return jobSnapshot({
     id,
-    name: "worker", access: "full", independent: false,
-    harness: "codex",
-    model: "fixture-model",
+    status,
     effort: "high",
     task: "Review Unicode output 你好世界",
-    cwd: "/tmp",
-    status,
-    generation: 0,
-    createdAt: 1_000,
-    startedAt: 2_000,
     output: "first line\n你好世界\nlast line",
-    truncated: false,
-    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-    tools: [],
-    transcript: [],
-    liveThinking: "",
-    queuedMessages: [],
-  };
+  });
 }
 
 function dashboard(
