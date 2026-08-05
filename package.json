@@ -6,6 +6,14 @@
   "main": "extensions/subagents/index.ts",
   "license": "MIT",
   "author": "@vorsakha",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vorsakha/pi-native-subagents.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vorsakha/pi-native-subagents/issues"
+  },
+  "homepage": "https://github.com/vorsakha/pi-native-subagents#readme",
   "keywords": [
     "pi-package",
     "pi",
