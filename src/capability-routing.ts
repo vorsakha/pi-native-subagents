@@ -40,6 +40,7 @@ export async function routeCapabilities(
   const { request } = input;
   const auto = request.harness === "auto";
   const requires = normalizeRequirements(request.requires);
+  if (auto && request.model) throw new Error("harness:auto cannot use a harness-local model override; omit model or choose an explicit harness");
   if (!auto && !requires) return {};
   if (!router) throw new Error("Capability requirements are unavailable in this session (capability routing is unavailable)");
 
@@ -65,6 +66,7 @@ export async function routeCapabilities(
     cwd: request.cwd,
     access: selectAccess({ ...request, harness: undefined }, input.profile),
     customization: request.customization,
+    model: request.model,
     harness: explicit ?? "auto",
     requires,
     preference: input.preference,

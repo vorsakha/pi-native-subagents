@@ -22,7 +22,7 @@ import type {
   WorkflowPhase,
   WorkflowSnapshot,
 } from "../../src/workflows/types.ts";
-import { formatUsage, sanitizeInline, sanitizeText, shortId, traceStatusMeta } from "../subagents/render.ts";
+import { formatContext, formatUsage, sanitizeInline, sanitizeText, shortId, traceStatusMeta } from "../subagents/render.ts";
 
 const MAX_RESULT_CHARS = 16_384;
 const MAX_RESULT_ROWS = 400;
@@ -440,6 +440,8 @@ export class WorkflowsDashboardOverlay {
       this.theme.fg("dim", `${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${route} · effort ${effort} · ${duration}`),
       this.theme.fg("dim", `${phase ? `${sanitizeInline(run.name)} · ${sanitizeInline(phase.name)}` : sanitizeInline(run.name)}${usage ? ` · ${usage}` : ""}`),
     ];
+    const context = formatContext(agent.context);
+    if (context) lines.push(this.theme.fg("dim", `Context · ${context}`));
     if (agent.isolation) {
       lines.push(this.theme.fg("dim", `Isolation · worktree ${agent.isolation.state} · branch ${sanitizeInline(agent.isolation.branch)}${agent.isolation.patchArtifact ? ` · patch ${sanitizeInline(agent.isolation.patchArtifact)}` : ""}`));
     }

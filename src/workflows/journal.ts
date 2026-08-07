@@ -53,10 +53,10 @@ export function workflowDefinitionFingerprint(input: {
   });
 }
 
-/** Return only the contiguous prefix of successfully completed calls. A
- * started, failed, missing, duplicated, or fingerprint-inconsistent call ends
- * replay so the runtime reruns that call and every suffix call. */
-export function replayableJournalPrefix(records: WorkflowJournalRecord[]): WorkflowReplayCall[] {
+/** Return every independently replayable completed call. Failed, incomplete,
+ * duplicated, or fingerprint-inconsistent ordinals are excluded without
+ * discarding later parallel calls whose own journal pairs remain valid. */
+export function replayableJournalCalls(records: WorkflowJournalRecord[]): WorkflowReplayCall[] {
   const started = new Map<number, WorkflowJournalRecord>();
   const completed = new Map<number, WorkflowJournalRecord>();
   const invalid = new Set<number>();
@@ -76,17 +76,13 @@ export function replayableJournalPrefix(records: WorkflowJournalRecord[]): Workf
     else invalid.add(record.callIndex);
   }
 
-  const prefix: WorkflowReplayCall[] = [];
-  for (let callIndex = 0; ; callIndex++) {
-    if (invalid.has(callIndex)) break;
-    const record = completed.get(callIndex);
-    if (!record?.result) break;
-    prefix.push({
+  return [...completed.entries()]
+    .filter(([callIndex, record]) => !invalid.has(callIndex) && !!record.result)
+    .sort(([left], [right]) => left - right)
+    .map(([callIndex, record]) => ({
       callIndex,
       fingerprint: record.fingerprint,
       result: structuredClone(record.result) as WorkflowJournalResult,
       route: record.route ? { ...record.route } : undefined,
-    });
-  }
-  return prefix;
+    }));
 }

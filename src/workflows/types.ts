@@ -1,4 +1,4 @@
-import type { AccessMode, EffortLevel, HarnessName, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
+import type { AccessMode, ContextSnapshot, EffortLevel, HarnessName, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
 import type { WorkflowWorktreeResult } from "./worktree.ts";
 
 export type WorkflowStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -86,6 +86,8 @@ export interface WorkflowAgentRecord {
   transcript?: TranscriptEntry[];
   error?: string;
   usage: WorkflowUsage;
+  /** Latest native request occupancy, when exposed by the harness. */
+  context?: ContextSnapshot;
 }
 
 export interface WorkflowPhase {
@@ -149,7 +151,10 @@ export type WorkflowApprovalMode = "auto" | "plan" | "onMutate";
 export interface WorkflowBudgetPolicy {
   maxAgents?: number;
   maxConcurrency?: number;
+  /** Aggregate fresh input plus output tokens. */
   maxTokens?: number;
+  /** Fresh input plus output ceiling for any single agent. */
+  maxTokensPerAgent?: number;
   maxCost?: number;
   maxTurns?: number;
 }

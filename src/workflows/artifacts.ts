@@ -493,9 +493,11 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
   const usage = snapshot.agents.reduce((total, agent) => ({
     input: total.input + agent.usage.input,
     output: total.output + agent.usage.output,
+    cacheRead: total.cacheRead + agent.usage.cacheRead,
+    cacheWrite: total.cacheWrite + agent.usage.cacheWrite,
     cost: total.cost + agent.usage.cost,
     turns: total.turns + agent.usage.turns,
-  }), { input: 0, output: 0, cost: 0, turns: 0 });
+  }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
   const budget = formatWorkflowBudget(snapshot, usage);
   const lines = [
     `# ${snapshot.name}`,
@@ -505,7 +507,7 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
     `- Run: \`${snapshot.runId}\``,
     `- Status: **${snapshot.status}**`,
     `- Agents: ${snapshot.agents.length}`,
-    `- Usage: ${usage.input} input / ${usage.output} output tokens · ${usage.turns} turns · $${usage.cost.toFixed(4)}`,
+    `- Usage: ${usage.input} fresh input / ${usage.output} output / ${usage.cacheRead} cache-read / ${usage.cacheWrite} cache-write tokens · ${usage.turns} turns · $${usage.cost.toFixed(4)}`,
     ...(budget ? [`- Budget: ${budget}`] : []),
     "",
     "## Phases",
@@ -579,7 +581,7 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
     && (candidate.approval === undefined || candidate.approval === "auto" || candidate.approval === "plan" || candidate.approval === "onMutate")
     && (candidate.replacementOf === undefined || validReplacementReference(candidate.replacementOf))
     && (candidate.budget === undefined || !!candidate.budget && typeof candidate.budget === "object" && !Array.isArray(candidate.budget)
-      && Object.keys(candidate.budget).every((key) => ["maxAgents", "maxConcurrency", "maxTokens", "maxCost", "maxTurns"].includes(key))
+      && Object.keys(candidate.budget).every((key) => ["maxAgents", "maxConcurrency", "maxTokens", "maxTokensPerAgent", "maxCost", "maxTurns"].includes(key))
       && Object.values(candidate.budget).every((item) => item === undefined || typeof item === "number" && Number.isFinite(item) && item > 0))
     && Array.isArray(candidate.phases)
     && Array.isArray(candidate.agents)

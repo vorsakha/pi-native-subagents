@@ -119,6 +119,9 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
         if (typeof value === "number" && Number.isFinite(value)) next.usage[key] += value;
       }
       break;
+    case "context":
+      next.context = { ...event.context };
+      break;
     case "completed":
       if (event.output !== undefined) {
         const bounded = boundedAppend("", event.output);

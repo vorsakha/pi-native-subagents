@@ -17,6 +17,7 @@ interface CapabilityRoutingBaseRequest {
   trusted: boolean;
   harness?: "pi" | "claude" | "codex" | "auto";
   requires?: string[];
+  model?: string;
   independent?: boolean;
   independentOf?: string;
   parentProvider?: "claude" | "codex" | "other";
@@ -54,13 +55,17 @@ test("a request with neither requires nor harness:auto passes through untouched 
   assert.equal(router.calls.length, 0);
 });
 
-test("harness:auto without requires delegates health/auth-based selection to the router", async () => {
+test("harness:auto without requires delegates health/auth-based selection to the router and rejects local model IDs", async () => {
   const router = new RecordingRouter(fakeResult("codex", [], true));
   const routing = await routeCapabilities(router, { request: baseRequest({ harness: "auto" }) });
   assert.equal(router.calls.length, 1);
   assert.equal(router.calls[0]!.harness, "auto");
   assert.deepEqual(router.calls[0]!.requires, undefined);
   assert.equal(routing.harness, "codex");
+  await assert.rejects(
+    routeCapabilities(router, { request: baseRequest({ harness: "auto", model: "local-model" }) }),
+    /harness:auto cannot use a harness-local model override/,
+  );
 });
 
 test("requires without a router configured fails closed", async () => {
@@ -72,9 +77,10 @@ test("requires without a router configured fails closed", async () => {
 
 test("an explicit harness with requires resolves the harness through selectHarness and forwards it, not auto", async () => {
   const router = new RecordingRouter(fakeResult("codex", ["codex:tool:lint"]));
-  const routing = await routeCapabilities(router, { request: baseRequest({ harness: "codex", requires: ["codex:tool:lint"] }) });
+  const routing = await routeCapabilities(router, { request: baseRequest({ harness: "codex", model: "review-model", requires: ["codex:tool:lint"] }) });
   assert.equal(router.calls.length, 1);
   assert.equal(router.calls[0]!.harness, "codex");
+  assert.equal(router.calls[0]!.model, "review-model");
   assert.equal(routing.harness, "codex");
   assert.deepEqual(routing.requires, ["codex:tool:lint"]);
   assert.deepEqual(routing.capabilityRoute?.matched, ["codex:tool:lint"]);

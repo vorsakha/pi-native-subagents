@@ -27,8 +27,8 @@ Give every child a self-contained task packet:
 Usage rules:
 
 - Use `access: "readOnly"` for inspection, review, and planning. Request `full` only when mutation is required and the project is trusted.
-- Omit `model` unless a concrete harness-local override is needed. A model name is not a cross-harness tier.
-- Use `harness: "auto"` when capability or provider failover may choose the route. An explicit harness fails closed if it cannot satisfy the request.
+- Omit `model` unless a concrete harness-local override is needed. A model name is not a cross-harness tier, and `harness: "auto"` rejects harness-local model overrides.
+- Use `harness: "auto"` when capability or provider failover may choose the route. Auto routing live-checks native model/auth readiness before dispatch; an explicit harness remains fail-closed.
 - Use `requires` only with IDs returned by `subagent_capabilities`; pair it with `harness: "auto"` when any capable harness is acceptable.
 - Use `independent: true` only when the child must use a different native provider from the parent. A different model on the same provider is not independent.
 - Use `independentOf: "<producer-job-id>"` when a reviewer must differ from the provider that produced the reviewed work. The target must be an existing job.
@@ -137,10 +137,10 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 - Results, metadata, agent requests, logs, phases, source, and arguments are bounded and must be JSON-serializable.
 - A workflow may make at most 32 agent calls and use at most four concurrent workers.
 - `background: true` returns a start snapshot; completion is delivered as one follow-up and remains inspectable with `/workflows`.
-- `resumeFromRunId` replays the exact matching completed call prefix and reruns the first incomplete call. Keep source, input, project, and routing context identical; only increase replay budgets when the runtime permits it.
+- `resumeFromRunId` replays every independently matching completed call, including later calls from a parallel batch when an earlier lane failed. Failed, incomplete, duplicated, or fingerprint-mismatched ordinals rerun. Keep source, input, project, and routing context identical; only increase replay budgets when the runtime permits it.
 - `approval: "plan"` is for read-only planning. Use `approval: "onMutate"` when a workflow may mutate and host approval is required.
 - Mutating agents sharing one checkout are serialized. Use `isolation: "worktree"` for explicit clean-worktree concurrency and preserve the resulting patch metadata.
-- `maxAgents` and `maxConcurrency` limit work shape. `maxTokens`, `maxCost`, and `maxTurns` limit aggregate workflow usage. `maxTurns` is aggregate native-provider turns across all child agents, not a per-agent allowance; include orchestration overhead when sizing it.
+- `maxAgents` and `maxConcurrency` limit work shape. `maxTokens` limits aggregate fresh input plus output; cached reads remain visible but do not consume that budget. `maxTokensPerAgent` applies the same ceiling to one child. `maxCost` and `maxTurns` remain aggregate, and `maxTurns` is not a per-agent allowance. Native context occupancy is displayed separately when exposed by the harness.
 
 ## Common failures and corrections
 
@@ -148,7 +148,8 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 - `Cannot destructure ... of null`: use the default async function with the injected globals; do not assume a callback context object.
 - `parallel tasks must be functions`: wrap every agent call in `() => agent(...)`.
 - `Workflow returned before N agent call(s) settled`: await all calls, including calls started in loops or branches.
-- `Workflow turn budget exceeded`: the budget covers aggregate child usage. Increase it with realistic orchestration overhead, or use direct `subagent_spawn` for a small fan-out.
+- `Workflow token budget exceeded`: narrow the offending lane before raising the aggregate fresh-input/output allowance; use `maxTokensPerAgent` to contain one runaway child.
+- `Workflow turn budget exceeded`: the budget covers aggregate child turns. Increase it with realistic orchestration overhead, or use direct `subagent_spawn` for a small fan-out.
 - `independent` rejected for the same provider: independence means provider diversity, not model escalation. Omit it for same-provider escalation or route to the opposite provider.
 - Requirement rejected: rediscover capabilities with `subagent_capabilities`, use the returned ID, and keep the access ceiling consistent.
 - A workflow or child fails: inspect the returned `ok`, `error`, route, and job ID; use `/workflows` for durable workflow state. Do not hide a failed route behind a success-only summary.

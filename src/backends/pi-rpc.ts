@@ -51,6 +51,18 @@ interface PendingCommand {
   timer: NodeJS.Timeout;
 }
 
+interface PiModelRecord {
+  provider: string;
+  id: string;
+}
+
+interface PiChildInventory {
+  commands: Array<{ name: string; description?: string; source?: string }>;
+  commandError?: string;
+  selectedModel?: PiModelRecord;
+  availableModels: PiModelRecord[];
+}
+
 export class PiRpcBackend implements Backend {
   readonly name = "pi" as const;
   readonly #command: string;
@@ -111,8 +123,8 @@ export class PiRpcBackend implements Backend {
     }
 
     try {
-      const commands = await this.#childCommands(request);
-      for (const command of commands) {
+      const inventory = await this.#childInventory(request);
+      for (const command of inventory.commands) {
         capabilities.push({
           kind: command.source === "skill" ? "skill" : "command",
           name: command.name,
@@ -120,15 +132,31 @@ export class PiRpcBackend implements Backend {
           origin: command.source ? `child:${command.source}` : "child",
         });
       }
-      sources.push({ source: "pi-child", health: "healthy" });
+      if (inventory.commandError) {
+        sources.push({ source: "pi-child", health: "unknown", detail: inventory.commandError });
+        warnings.push(`Pi child command inventory unavailable: ${inventory.commandError}`);
+      } else {
+        sources.push({ source: "pi-child", health: "healthy" });
+      }
+      const selected = inventory.selectedModel;
+      const ready = selected && inventory.availableModels.some((model) => model.provider === selected.provider && model.id === selected.id);
+      if (ready) {
+        sources.push({ source: "pi-model", health: "healthy", detail: `${selected.provider}/${selected.id}` });
+      } else {
+        const detail = selected
+          ? `selected model ${selected.provider}/${selected.id} is not available with current credentials`
+          : "Pi has no selected authenticated model";
+        sources.push({ source: "pi-model", health: "unavailable", detail });
+        warnings.unshift(`Pi model unavailable: ${detail}`);
+      }
     } catch (error) {
-      sources.push({ source: "pi-child", health: "unknown", detail: message(error) });
-      warnings.push(`Pi child command inventory unavailable: ${message(error)}`);
+      sources.push({ source: "pi-child", health: "unavailable", detail: message(error) });
+      warnings.unshift(`Pi child readiness probe unavailable: ${message(error)}`);
     }
     return { capabilities, sources, warnings };
   }
 
-  async #childCommands(request: DiscoveryRequest): Promise<Array<{ name: string; description?: string; source?: string }>> {
+  async #childInventory(request: DiscoveryRequest): Promise<PiChildInventory> {
     request.signal.throwIfAborted();
     const args = [
       "--mode", "rpc", "--approve",
@@ -136,32 +164,73 @@ export class PiRpcBackend implements Backend {
       "--name", "subagent-capability-probe",
       "--no-tools",
     ];
+    if (request.model) args.push("--model", request.model);
     const managed = spawnManaged(this.#command, args, { cwd: request.cwd, env: piChildEnv(request.env) });
     const framer = new JsonlFramer();
     try {
-      return await new Promise<Array<{ name: string; description?: string; source?: string }>>((resolveCommands, reject) => {
-        const id = "capability-probe";
-        const settle = (fn: () => void) => { cleanup(); fn(); };
+      return await new Promise<PiChildInventory>((resolveInventory, reject) => {
+        const ids = {
+          state: "capability-probe-state",
+          models: "capability-probe-models",
+          commands: "capability-probe-commands",
+        } as const;
+        const knownIds = new Set<string>(Object.values(ids));
+        let stateReceived = false;
+        let selectedModel: PiModelRecord | undefined;
+        let availableModels: PiModelRecord[] | undefined;
+        let commands: PiChildInventory["commands"] | undefined;
+        let commandError: string | undefined;
+        let settled = false;
+        const model = (value: unknown): PiModelRecord | undefined => {
+          const record = asObject(value);
+          return typeof record.provider === "string" && record.provider && typeof record.id === "string" && record.id
+            ? { provider: record.provider, id: record.id }
+            : undefined;
+        };
+        const settle = (fn: () => void) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          fn();
+        };
         const onAbort = () => settle(() => reject(request.signal.reason ?? new Error("Pi capability discovery aborted")));
         const cleanup = () => {
           request.signal.removeEventListener("abort", onAbort);
           clearTimeout(timer);
         };
-        const timer = setTimeout(() => settle(() => reject(new Error("Pi get_commands timed out"))), this.#requestTimeoutMs);
+        const timer = setTimeout(() => settle(() => reject(new Error("Pi readiness probe timed out"))), this.#requestTimeoutMs);
+        const maybeResolve = () => {
+          if (!stateReceived || availableModels === undefined || commands === undefined) return;
+          settle(() => resolveInventory({ selectedModel, availableModels: availableModels!, commands: commands!, commandError }));
+        };
         const handle = (record: string) => {
           const event = parseJsonRecord(record);
-          if (!event || event.type !== "response" || event.id !== id) return;
-          if (event.success === false) return settle(() => reject(new Error(String(event.error ?? "Pi rejected get_commands"))));
+          if (!event || event.type !== "response" || !knownIds.has(String(event.id))) return;
+          if (event.success === false) {
+            const detail = String(event.error ?? `Pi rejected ${event.command ?? "readiness probe"}`);
+            if (event.id === ids.commands) {
+              commandError = detail;
+              commands = [];
+              maybeResolve();
+              return;
+            }
+            return settle(() => reject(new Error(detail)));
+          }
           const data = asObject(event.data);
-          const list = Array.isArray(data.commands) ? data.commands : [];
-          settle(() => resolveCommands(list.map((item) => {
+          if (event.id === ids.state) {
+            stateReceived = true;
+            selectedModel = model(data.model);
+          }
+          if (event.id === ids.models) availableModels = (Array.isArray(data.models) ? data.models : []).map(model).filter((item): item is PiModelRecord => !!item);
+          if (event.id === ids.commands) commands = (Array.isArray(data.commands) ? data.commands : []).map((item) => {
             const command = asObject(item);
             return {
               name: String(command.name ?? ""),
               description: typeof command.description === "string" ? command.description : undefined,
               source: typeof command.source === "string" ? command.source : undefined,
             };
-          }).filter((command) => command.name)));
+          }).filter((command) => command.name);
+          maybeResolve();
         };
         managed.child.stdout.on("data", (chunk: Buffer) => {
           try { for (const record of framer.push(chunk)) handle(record); }
@@ -170,8 +239,13 @@ export class PiRpcBackend implements Backend {
         managed.child.on("error", (error) => settle(() => reject(error)));
         managed.child.on("close", (code, signal) => settle(() => reject(new Error(`Pi capability probe exited (${code ?? signal ?? "signal"})`))));
         request.signal.addEventListener("abort", onAbort, { once: true });
-        try { managed.child.stdin.write(`${JSON.stringify({ id, type: "get_commands" })}\n`); }
-        catch (error) { settle(() => reject(error instanceof Error ? error : new Error(String(error)))); }
+        try {
+          managed.child.stdin.write(`${JSON.stringify({ id: ids.state, type: "get_state" })}\n`);
+          managed.child.stdin.write(`${JSON.stringify({ id: ids.models, type: "get_available_models" })}\n`);
+          managed.child.stdin.write(`${JSON.stringify({ id: ids.commands, type: "get_commands" })}\n`);
+        } catch (error) {
+          settle(() => reject(error instanceof Error ? error : new Error(String(error))));
+        }
       });
     } finally {
       await managed.terminate(0).catch(() => undefined);

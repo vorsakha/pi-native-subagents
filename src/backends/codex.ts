@@ -10,7 +10,7 @@ import {
   PARENT_THREAD_TOOL_NAME,
   renderParentThreadContext,
 } from "../parent-thread-context.ts";
-import type { Backend, BackendEvent, BackendPolicy, BackendRequest, BackendRun, DiscoveryRequest, DiscoveryResult, SendBehavior } from "../types.ts";
+import type { Backend, BackendEvent, BackendPolicy, BackendRequest, BackendRun, ContextSnapshot, DiscoveryRequest, DiscoveryResult, SendBehavior, Usage } from "../types.ts";
 
 const CLIENT_INFO = { name: "pi-native-subagents", title: "Pi Native Subagents", version: "0.1.0" };
 /** Optional native integrations whose failure must not take down unrelated work. */
@@ -19,6 +19,46 @@ const OPTIONAL_INTEGRATION = /mcp|plugin|marketplace|oauth|invalid_grant|refresh
 interface CodexBackendOptions {
   requestTimeoutMs?: number;
   inactivityTimeoutMs?: number;
+}
+
+export interface CodexTokenTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+function counterDelta(current: number, previous: number | undefined): number {
+  if (previous === undefined || current < previous) return current;
+  return current - previous;
+}
+
+/** Normalize Codex's cumulative gross-input counters to the shared fresh-input usage contract. */
+export function codexUsageDelta(current: CodexTokenTotals, previous?: CodexTokenTotals): Usage {
+  const grossInput = counterDelta(current.input, previous?.input);
+  const cacheRead = counterDelta(current.cacheRead, previous?.cacheRead);
+  const cacheWrite = counterDelta(current.cacheWrite, previous?.cacheWrite);
+  return {
+    input: Math.max(0, grossInput - cacheRead - cacheWrite),
+    output: counterDelta(current.output, previous?.output),
+    cacheRead,
+    cacheWrite,
+    cost: 0,
+    turns: 0,
+  };
+}
+
+function codexTokenTotals(value: Record<string, unknown>): CodexTokenTotals {
+  return {
+    input: num(value.inputTokens),
+    output: num(value.outputTokens),
+    cacheRead: num(value.cachedInputTokens),
+    cacheWrite: num(value.cacheWriteInputTokens),
+  };
+}
+
+function hasUsage(usage: Usage): boolean {
+  return usage.input > 0 || usage.output > 0 || usage.cacheRead > 0 || usage.cacheWrite > 0;
 }
 
 /**
@@ -222,6 +262,8 @@ export class CodexAppServerBackend implements Backend {
     let closing = false;
     let cancellingReason: string | undefined;
     let stderr = "";
+    let previousTokenTotals: CodexTokenTotals | undefined;
+    let servingModel = request.policy.model;
     const followUps: string[] = [];
     let resolveCompleted!: () => void;
     const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
@@ -298,8 +340,27 @@ export class CodexAppServerBackend implements Backend {
           } else emit({ type: "tool_end", id: String(item.id ?? type), name: type, output: itemOutput(item), error: item.status === "failed" });
         } else if (method === "thread/tokenUsage/updated") {
           const tokenUsage = asObject(params.tokenUsage ?? params.usage);
-          const usage = asObject(tokenUsage.last ?? tokenUsage);
-          emit({ type: "usage", usage: { input: num(usage.inputTokens), output: num(usage.outputTokens), cacheRead: num(usage.cachedInputTokens) } });
+          const total = asObject(tokenUsage.total);
+          const last = asObject(tokenUsage.last ?? tokenUsage);
+          if (Object.keys(total).length) {
+            const current = codexTokenTotals(total);
+            const usage = codexUsageDelta(current, previousTokenTotals);
+            previousTokenTotals = current;
+            if (hasUsage(usage)) emit({ type: "usage", usage });
+          } else {
+            const usage = codexUsageDelta(codexTokenTotals(last));
+            if (hasUsage(usage)) emit({ type: "usage", usage });
+          }
+          const contextTokens = num(last.totalTokens) || num(last.inputTokens) + num(last.outputTokens);
+          const contextWindow = num(tokenUsage.modelContextWindow ?? params.modelContextWindow);
+          if (contextTokens || contextWindow || servingModel) {
+            const context: ContextSnapshot = {
+              tokens: contextTokens,
+              ...(contextWindow ? { window: contextWindow } : {}),
+              ...(servingModel ? { servingModel } : {}),
+            };
+            emit({ type: "context", context });
+          }
         } else if (method === "turn/completed") {
           const turn = asObject(params.turn);
           const status = String(turn.status ?? "failed");
@@ -384,6 +445,8 @@ export class CodexAppServerBackend implements Backend {
           threadResult = await startThread({ ...(baseConfig ?? {}), mcp_servers: {}, hooks: {} });
         }
         const thread = asObject(threadResult.thread);
+        servingModel = [threadResult.model, thread.model]
+          .find((value): value is string => typeof value === "string" && value.length > 0) ?? servingModel;
         const returnedProviders = [threadResult.modelProvider, thread.modelProvider]
           .filter((value): value is string => typeof value === "string" && value.length > 0);
         if (returnedProviders.length === 0 || returnedProviders.some((provider) => provider !== "openai")) {

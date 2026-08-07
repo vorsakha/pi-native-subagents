@@ -17,12 +17,14 @@ test("reducer tracks lifecycle, tools, usage, and authoritative final message", 
   state = reduceJob(state, { type: "tool_start", id: "1", name: "read" });
   state = reduceJob(state, { type: "tool_end", id: "1", error: false });
   state = reduceJob(state, { type: "usage", usage: { input: 10, output: 2, turns: 1 } });
+  state = reduceJob(state, { type: "context", context: { tokens: 12_000, window: 100_000, servingModel: "served-model" } });
   state = reduceJob(state, { type: "message", text: "final" });
   state = reduceJob(state, { type: "completed", at: 3 });
   assert.equal(state.status, "completed");
   assert.equal(state.output, "final");
   assert.equal(state.tools[0]?.status, "completed");
   assert.equal(state.usage.input, 10);
+  assert.deepEqual(state.context, { tokens: 12_000, window: 100_000, servingModel: "served-model" });
   assert.deepEqual(state.transcript.map((entry) => entry.kind), ["user", "thinking", "tool", "assistant"]);
   assert.deepEqual(state.queuedMessages, []);
   assert.equal(state.endedAt, 3);

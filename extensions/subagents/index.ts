@@ -583,7 +583,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       Type.String({ minLength: 1, maxLength: MAX_REQUIREMENT_LENGTH }),
       { maxItems: MAX_REQUIREMENTS, description: "Capability IDs from subagent_capabilities the child must really have; verified live before dispatch" },
     )),
-    model: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Harness-local model ID; omit to use the harness default" })),
+    model: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Harness-local model ID; omit with harness auto or to use the explicit harness default" })),
     effort: Type.Optional(StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" })),
     access: Type.Optional(StringEnum(ACCESS, { description: "Access policy; defaults to full after project trust is established" })),
     independent: Type.Optional(Type.Boolean({ description: "Require a native provider different from the parent" })),

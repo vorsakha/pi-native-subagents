@@ -3,7 +3,7 @@ import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { isTerminal } from "../../src/manager.ts";
 import type { PeerSessionSummary } from "../../src/session-peers.ts";
-import type { JobSnapshot, JobStatus, SendBehavior, ToolTrace, Usage } from "../../src/types.ts";
+import type { ContextSnapshot, JobSnapshot, JobStatus, SendBehavior, ToolTrace, Usage } from "../../src/types.ts";
 
 /*
  * Trace grammar shared by every direct tool and by the workflow renderers:
@@ -120,6 +120,12 @@ export function formatUsage(usage: Usage): string {
   if (usage.cacheWrite) parts.push(`W${formatTokens(usage.cacheWrite)}`);
   if (usage.cost) parts.push(`$${usage.cost.toFixed(4)}`);
   return parts.join(" ");
+}
+
+export function formatContext(context?: ContextSnapshot): string {
+  if (!context) return "";
+  const occupancy = context.window ? `${formatTokens(context.tokens)}/${formatTokens(context.window)}` : formatTokens(context.tokens);
+  return `context ${occupancy}${context.servingModel ? ` · serving ${sanitizeInline(context.servingModel)}` : ""}`;
 }
 
 export type TraceStatusColor = "accent" | "success" | "warning" | "error" | "muted" | "dim";
@@ -268,6 +274,8 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
 
   const usage = formatUsage(job.usage);
   if (usage) lines.push(sectionLine(theme, "Usage", usage, "dim"));
+  const context = formatContext(job.context);
+  if (context) lines.push(sectionLine(theme, "Context", context, "dim"));
 
   const footer = theme.fg("dim", expanded
     ? `full bounded output: ${DASHBOARD_POINTER}`

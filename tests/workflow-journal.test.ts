@@ -9,7 +9,7 @@ import {
   loadWorkflowJournal,
 } from "../src/workflows/artifacts.ts";
 import {
-  replayableJournalPrefix,
+  replayableJournalCalls,
   workflowCallFingerprint,
   workflowDefinitionFingerprint,
 } from "../src/workflows/journal.ts";
@@ -51,10 +51,11 @@ test("workflow fingerprints are canonical and bind definitions to execution cont
   assert.notEqual(first, second);
 });
 
-test("journal loading keeps a durable valid prefix and replay stops at the first failed call", async () => {
+test("journal loading replays valid completed calls independently across a failed parallel lane", async () => {
   const f = await fixture();
   const first = workflowCallFingerprint("first", { access: "readOnly" });
   const second = workflowCallFingerprint("second", {});
+  const third = workflowCallFingerprint("third", { access: "readOnly" });
   try {
     await appendWorkflowJournal(f.root, f.created.runId, {
       version: 1, sequence: 0, callIndex: 0, fingerprint: first, state: "started", at: 1,
@@ -72,15 +73,29 @@ test("journal loading keeps a durable valid prefix and replay stops at the first
       version: 1, sequence: 3, callIndex: 1, fingerprint: second, state: "failed", at: 4,
       result: { ok: false, output: "", error: "interrupted" },
     });
+    await appendWorkflowJournal(f.root, f.created.runId, {
+      version: 1, sequence: 4, callIndex: 2, fingerprint: third, state: "started", at: 5,
+    });
+    await appendWorkflowJournal(f.root, f.created.runId, {
+      version: 1, sequence: 5, callIndex: 2, fingerprint: third, state: "completed", at: 6,
+      agentIndex: 2,
+      result: { ok: true, output: "later", jobId: "job-later", usage },
+      route: { jobId: "job-later", harness: "claude", model: "review-model" },
+    });
     await appendFile(join(f.created.artifactDir, "journal.jsonl"), "{partial crash tail", "utf8");
 
     const records = await loadWorkflowJournal(f.root, f.created.runId);
-    assert.equal(records.length, 4, "an unterminated crash tail is ignored");
-    assert.deepEqual(replayableJournalPrefix(records), [{
+    assert.equal(records.length, 6, "an unterminated crash tail is ignored");
+    assert.deepEqual(replayableJournalCalls(records), [{
       callIndex: 0,
       fingerprint: first,
       result: { ok: true, output: "done", jobId: "job-old", usage },
       route: { jobId: "job-old", harness: "codex", model: "review-model" },
+    }, {
+      callIndex: 2,
+      fingerprint: third,
+      result: { ok: true, output: "later", jobId: "job-later", usage },
+      route: { jobId: "job-later", harness: "claude", model: "review-model" },
     }]);
   } finally {
     await f.cleanup();

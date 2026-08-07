@@ -21,6 +21,8 @@ export interface CapabilityRequest {
   cwd: string;
   access: AccessMode;
   customization?: CustomizationMode;
+  /** Optional harness-local model included in readiness discovery. */
+  model?: string;
   refresh?: boolean;
   signal?: AbortSignal;
 }
@@ -73,7 +75,7 @@ export interface CapabilityServiceOptions {
 }
 
 /**
- * Live, model-free capability discovery with a bounded browse cache and
+ * Live, zero-turn capability and model-readiness discovery with a bounded browse cache and
  * mandatory revalidation before any requirement-carrying dispatch.
  */
 export class CapabilityService {
@@ -108,7 +110,7 @@ export class CapabilityService {
 
   async catalog(harness: HarnessName, request: CapabilityRequest): Promise<CapabilityCatalog> {
     const customization = request.customization ?? "native";
-    const key = `${harness}|${request.cwd}|${request.access}|${customization}`;
+    const key = `${harness}|${request.cwd}|${request.access}|${customization}|${request.model ?? "default"}`;
     const fingerprint = this.#fingerprint(harness, request.cwd);
     const cached = this.#cache.get(key);
     if (!request.refresh && cached && cached.fingerprint === fingerprint && this.#now() - cached.catalog.discoveredAt < this.#ttlMs) {
@@ -140,6 +142,7 @@ export class CapabilityService {
       cwd: request.cwd,
       access: request.access,
       customization: request.customization,
+      model: request.model,
       refresh: request.refresh,
       signal: request.signal,
       harnesses: request.harness ? [request.harness] : undefined,
@@ -275,6 +278,7 @@ export class CapabilityService {
         cwd: request.cwd,
         access: request.access,
         customization,
+        model: request.model,
         env: this.#env,
         signal: controller.signal,
         refresh: request.refresh === true,

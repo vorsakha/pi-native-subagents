@@ -17,7 +17,7 @@ import {
   writeWorkflowReport,
   writeWorkflowResult,
 } from "./artifacts.ts";
-import { replayableJournalPrefix, workflowCallFingerprint, workflowDefinitionFingerprint } from "./journal.ts";
+import { replayableJournalCalls, workflowCallFingerprint, workflowDefinitionFingerprint } from "./journal.ts";
 import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
 import { finishWorkflowWorktree, prepareWorkflowWorktree, type WorkflowWorktreeHandle } from "./worktree.ts";
 import type {
@@ -54,7 +54,7 @@ export interface StartWorkflowRequest {
   trusted: boolean;
   parentProvider?: ProviderFamily;
   defaultHarness?: HarnessName;
-  /** Replay the completed call prefix from this terminal run. The definition and execution context must match exactly. */
+  /** Replay matching completed calls from this terminal run. The definition and execution context must match exactly. */
   resumeFromRunId?: string;
   /** Internal dashboard control: force replay invalidation at this call ordinal. */
   restartFromCallIndex?: number;
@@ -158,7 +158,7 @@ function replacementReason(agent: WorkflowAgentRecord): string {
 }
 
 function budgetsAllowReplay(source: WorkflowBudgetPolicy | undefined, next: WorkflowBudgetPolicy | undefined): boolean {
-  for (const key of ["maxAgents", "maxConcurrency", "maxTokens", "maxCost", "maxTurns"] as const) {
+  for (const key of ["maxAgents", "maxConcurrency", "maxTokens", "maxTokensPerAgent", "maxCost", "maxTurns"] as const) {
     const previous = source?.[key] ?? Number.POSITIVE_INFINITY;
     const current = next?.[key] ?? Number.POSITIVE_INFINITY;
     if (current < previous) return false;
@@ -287,8 +287,8 @@ export class WorkflowManager {
       if (restartAt !== undefined && (!Number.isSafeInteger(restartAt) || restartAt < 0 || restartAt >= 32)) {
         throw new Error("restartFromCallIndex must be an agent call ordinal from 0 to 31");
       }
-      const prefix = replayableJournalPrefix(await loadWorkflowJournal(this.#artifactRoot, source.snapshot.runId));
-      const calls = restartAt === undefined ? prefix : prefix.filter((call) => call.callIndex < restartAt);
+      const replayable = replayableJournalCalls(await loadWorkflowJournal(this.#artifactRoot, source.snapshot.runId));
+      const calls = restartAt === undefined ? replayable : replayable.filter((call) => call.callIndex < restartAt);
       replay = {
         sourceRunId: source.snapshot.runId,
         calls,
@@ -526,7 +526,7 @@ export class WorkflowManager {
     await this.#waitUntilResumed(entry, signal);
 
     const expected = entry.replay?.active && callIndex < (entry.snapshot.budget?.maxAgents ?? 32)
-      ? entry.replay.calls[callIndex]
+      ? entry.replay.calls.find((call) => call.callIndex === callIndex)
       : undefined;
     if (entry.replay?.active && expected?.fingerprint === fingerprint) {
       const record = this.#recordReplayedAgent(entry, prompt, options, callIndex, fingerprint, expected);
@@ -545,8 +545,7 @@ export class WorkflowManager {
       return clone(expected.result);
     }
     if (entry.replay?.active) {
-      entry.replay.active = false;
-      entry.snapshot.replay!.invalidatedAt = callIndex;
+      entry.snapshot.replay!.invalidatedAt ??= callIndex;
       this.#touch(entry);
     }
 
@@ -953,6 +952,8 @@ export class WorkflowManager {
     const usage = aggregateWorkflowUsage(entry.snapshot);
     const tokens = usage.input + usage.output;
     if (budget.maxTokens !== undefined && tokens > budget.maxTokens) return `Workflow token budget exceeded (${tokens}/${budget.maxTokens})`;
+    const agent = budget.maxTokensPerAgent === undefined ? undefined : entry.snapshot.agents.find((candidate) => candidate.usage.input + candidate.usage.output > budget.maxTokensPerAgent!);
+    if (agent) return `Workflow per-agent token budget exceeded for ${agent.name} (${agent.usage.input + agent.usage.output}/${budget.maxTokensPerAgent})`;
     if (budget.maxCost !== undefined && usage.cost > budget.maxCost) return `Workflow cost budget exceeded ($${usage.cost.toFixed(4)}/$${budget.maxCost})`;
     if (budget.maxTurns !== undefined && usage.turns > budget.maxTurns) return `Workflow turn budget exceeded (${usage.turns}/${budget.maxTurns})`;
     return undefined;
@@ -1042,6 +1043,7 @@ export class WorkflowManager {
       truncated: job.truncated,
       error: job.error,
       usage: workflowUsage(job.usage),
+      context: job.context ? { ...job.context } : undefined,
       timestamps: {
         ...agent.timestamps,
         updatedAt: Date.now(),
@@ -1075,6 +1077,7 @@ export class WorkflowManager {
     agent.preview = job.output.slice(-500);
     agent.error = job.error;
     agent.usage = workflowUsage(job.usage);
+    agent.context = job.context ? { ...job.context } : undefined;
     agent.timestamps.updatedAt = now;
     agent.timestamps.startedAt ??= job.startedAt;
     agent.timestamps.endedAt = job.endedAt;
@@ -1091,7 +1094,7 @@ export class WorkflowManager {
       agent.instructionShaped = looksInstructionShaped(job.output);
     }
     this.#touch(entry);
-    if (event.type === "usage") {
+    if (event.type === "usage" || event.type === "context") {
       const violation = this.#budgetViolation(entry);
       if (violation && !entry.controller.signal.aborted) {
         entry.snapshot.error = violation;
@@ -1260,6 +1263,7 @@ function normalizeWorkflowBudget(value: WorkflowBudgetPolicy | undefined): Workf
     maxAgents: integer("maxAgents", 32),
     maxConcurrency: integer("maxConcurrency", 4),
     maxTokens: integer("maxTokens", 100_000_000),
+    maxTokensPerAgent: integer("maxTokensPerAgent", 100_000_000),
     maxCost,
     maxTurns: integer("maxTurns", 10_000),
   };
@@ -1270,7 +1274,8 @@ function workflowBudgetWarnings(budget: WorkflowBudgetPolicy | undefined): strin
   const warnings: string[] = [];
   if ((budget.maxAgents ?? 0) > 16) warnings.push(`Large workflow allowance: ${budget.maxAgents} agents`);
   if ((budget.maxConcurrency ?? 0) === 4) warnings.push("Maximum workflow concurrency requested");
-  if ((budget.maxTokens ?? 0) > 500_000) warnings.push(`Large token allowance: ${budget.maxTokens} tokens`);
+  if ((budget.maxTokens ?? 0) > 500_000) warnings.push(`Large token allowance: ${budget.maxTokens} fresh/output tokens`);
+  if ((budget.maxTokensPerAgent ?? 0) > 250_000) warnings.push(`Large per-agent token allowance: ${budget.maxTokensPerAgent} fresh/output tokens`);
   if ((budget.maxCost ?? 0) > 20) warnings.push(`Large cost allowance: $${budget.maxCost}`);
   return warnings;
 }

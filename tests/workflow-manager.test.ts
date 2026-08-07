@@ -317,7 +317,7 @@ test("cancelling a pending host approval never dispatches the mutating agent", a
   } finally { await f.cleanup(); }
 });
 
-test("workflow budgets bound calls, concurrency, tokens, turns, and cost", async () => {
+test("workflow budgets bound calls, concurrency, aggregate and per-agent tokens, turns, and cost", async () => {
   const f = await fixture(4);
   try {
     const calls = await f.workflows.start(f.request(`
@@ -353,6 +353,13 @@ test("workflow budgets bound calls, concurrency, tokens, turns, and cost", async
     const exceededFinal = await exceeded.completion;
     assert.equal(exceededFinal.status, "aborted");
     assert.match(exceededFinal.error ?? "", /token budget exceeded/);
+
+    const perAgent = await f.workflows.start(f.request(`export default async () => agent("runaway", { access: "readOnly" });`, { budget: { maxTokens: 100, maxTokensPerAgent: 5 } }));
+    await waitFor(() => f.backend.requests.length === 5, "per-agent budget overage agent");
+    f.backend.completeTask("runaway", "spent", { input: 6, output: 1, turns: 1 });
+    const perAgentFinal = await perAgent.completion;
+    assert.equal(perAgentFinal.status, "aborted");
+    assert.match(perAgentFinal.error ?? "", /per-agent token budget exceeded/);
   } finally { await f.cleanup(); }
 });
 
@@ -823,6 +830,52 @@ test("replays the completed journal prefix and reruns the first incomplete call"
   } finally {
     await f.cleanup();
   }
+});
+
+test("replay preserves completed parallel lanes after an earlier-index failure", async () => {
+  const f = await fixture();
+  const prompts = ["lane zero", "lane one", "lane two"];
+  const script = `export default async () => parallel([
+    () => agent("lane zero", { access: "readOnly" }),
+    () => agent("lane one", { access: "readOnly" }),
+    () => agent("lane two", { access: "readOnly" })
+  ], { concurrency: 3 });`;
+  const now = Date.now();
+  try {
+    const source = await createWorkflowArtifacts(f.artifactRoot, {
+      script,
+      args: null,
+      snapshot: {
+        sessionId: "session-1", name: "parallel replay", description: "", background: false, status: "aborted",
+        timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now }, currentPhase: null, phases: [], agents: [],
+        definitionFingerprint: workflowDefinitionFingerprint({ script, argsJson: "null", cwd: f.cwd, defaultHarness: "codex" }),
+        journalArtifact: "journal.jsonl",
+      },
+    });
+    for (const [callIndex, prompt] of prompts.entries()) {
+      const fingerprint = workflowCallFingerprint(prompt, { access: "readOnly" });
+      await appendWorkflowJournal(f.artifactRoot, source.runId, {
+        version: 1, sequence: callIndex * 2, callIndex, fingerprint, state: "started", at: now + callIndex * 2,
+      });
+      await appendWorkflowJournal(f.artifactRoot, source.runId, callIndex === 1 ? {
+        version: 1, sequence: callIndex * 2 + 1, callIndex, fingerprint, state: "failed", at: now + callIndex * 2 + 1,
+        result: { ok: false, output: "", error: "interrupted" },
+      } : {
+        version: 1, sequence: callIndex * 2 + 1, callIndex, fingerprint, state: "completed", at: now + callIndex * 2 + 1,
+        result: { ok: true, output: `cached ${callIndex}`, jobId: `prior-${callIndex}` },
+        route: { jobId: `prior-${callIndex}`, harness: "codex", model: "default" },
+      });
+    }
+
+    const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: source.runId }));
+    await waitFor(() => f.backend.requests.length === 1, "only failed parallel lane reruns");
+    assert.equal(f.backend.requests[0]?.task, "lane one");
+    f.backend.completeTask("lane one", "fresh one");
+    const final = await resumed.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.replay?.matchedCalls, 2);
+    assert.deepEqual(final.agents.map((agent) => agent.output), ["cached 0", "fresh one", "cached 2"]);
+  } finally { await f.cleanup(); }
 });
 
 test("replay permits a monotonic budget increase and preserves the completed prefix", async () => {

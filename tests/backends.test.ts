@@ -27,7 +27,13 @@ process.stdin.on("data", chunk => {
     const line = buffer.slice(0, at); buffer = buffer.slice(at + 1);
     const value = JSON.parse(line);
     if (process.env.MODE === "hang") continue;
-    if (value.id) process.stdout.write(JSON.stringify({ type: "response", id: value.id, command: value.type, success: true }) + "\\n");
+    if (value.id) {
+      let data;
+      if (value.type === "get_state") data = { model: { provider: "fixture", id: "fixture-model" } };
+      if (value.type === "get_available_models") data = { models: process.env.MODE === "unauthenticated" ? [] : [{ provider: "fixture", id: "fixture-model" }] };
+      if (value.type === "get_commands") data = { commands: [{ name: "review", source: "skill" }] };
+      process.stdout.write(JSON.stringify({ type: "response", id: value.id, command: value.type, success: true, data }) + "\\n");
+    }
     if (value.type === "prompt" && process.env.MODE === "complete") complete(value.message.startsWith("Task:") ? "PI_OK" : value.message);
     if (value.type === "prompt" && process.env.MODE === "activity") {
       for (const delay of [80, 160, 240]) setTimeout(() => process.stdout.write(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "." } }) + "\\n"), delay);
@@ -94,6 +100,15 @@ process.stdin.on("data", chunk => {
       if (process.env.PARAM_FILE) fs.appendFileSync(process.env.PARAM_FILE, JSON.stringify(value.params) + "\\n");
       const number = ++turns; const id = "turn-" + number;
       reply(value.id, { turn: { id } });
+      if (process.env.MODE === "usage") {
+        const params = { tokenUsage: {
+          total: { inputTokens: 104685, outputTokens: 106, cachedInputTokens: 102144, cacheWriteInputTokens: 0 },
+          last: { inputTokens: 104685, outputTokens: 106, cachedInputTokens: 102144, totalTokens: 104791 },
+          modelContextWindow: 258400,
+        } };
+        process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params }) + "\\n");
+        process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params }) + "\\n");
+      }
       if (process.env.MODE === "dynamic-tool") {
         process.stdout.write(JSON.stringify({ id: "server-tool-1", method: "item/tool/call", params: { threadId: "thread-1", turnId: id, callId: "call-1", tool: "parent_thread_context", arguments: { query: "decision" } } }) + "\\n");
       }
@@ -139,6 +154,27 @@ function terminal(events: BackendEvent[]): BackendEvent | undefined {
   }
   return undefined;
 }
+
+test("Codex usage separates cached input, ignores duplicate totals, and reports current context", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+      .start(request("codex", fake.dir, { ...process.env, MODE: "usage" }), (event) => events.push(event));
+    await run.completed;
+    const usage = events.filter((event): event is Extract<BackendEvent, { type: "usage" }> => event.type === "usage")
+      .reduce((total, event) => ({
+        input: total.input + (event.usage.input ?? 0),
+        output: total.output + (event.usage.output ?? 0),
+        cacheRead: total.cacheRead + (event.usage.cacheRead ?? 0),
+      }), { input: 0, output: 0, cacheRead: 0 });
+    assert.deepEqual(usage, { input: 2_541, output: 106, cacheRead: 102_144 });
+    assert.deepEqual(events.filter((event): event is Extract<BackendEvent, { type: "context" }> => event.type === "context").at(-1)?.context, {
+      tokens: 104_791, window: 258_400, servingModel: "fixture-model",
+    });
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
 
 test("native harness watchdogs allow active turns beyond one inactivity window", async (t) => {
   await t.test("pi", async () => {
@@ -320,6 +356,26 @@ test("Pi RPC maps assistant, stream, extension, and exhausted-retry errors at se
       } finally { await rm(fake.dir, { recursive: true, force: true }); }
     });
   }
+});
+
+test("Pi capability discovery marks an unavailable selected model before auto routing", async () => {
+  const fake = await fixture(PI_FIXTURE);
+  const argFile = join(fake.dir, "probe-args.json");
+  try {
+    const result = await new PiRpcBackend(fake.command, { requestTimeoutMs: 2_000 }).discover({
+      cwd: fake.dir,
+      access: "readOnly",
+      customization: "native",
+      model: "fixture/fixture-model",
+      env: { ...process.env, MODE: "unauthenticated", ARG_FILE: argFile },
+      signal: new AbortController().signal,
+      refresh: true,
+    });
+    assert.equal(result.sources.find((source) => source.source === "pi-model")?.health, "unavailable");
+    assert.match(result.warnings?.[0] ?? "", /selected model fixture\/fixture-model is not available/);
+    const args = JSON.parse(await readFile(argFile, "utf8")) as string[];
+    assert.equal(args[args.indexOf("--model") + 1], "fixture/fixture-model");
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
 
 test("Claude capability discovery performs auth preflight before opening an SDK session", async () => {

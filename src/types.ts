@@ -13,12 +13,20 @@ export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export interface Usage {
+  /** Fresh, non-cached input tokens. */
   input: number;
   output: number;
   cacheRead: number;
   cacheWrite: number;
   cost: number;
   turns: number;
+}
+
+/** Latest native request occupancy. This is a gauge, not cumulative usage. */
+export interface ContextSnapshot {
+  tokens: number;
+  window?: number;
+  servingModel?: string;
 }
 
 export type BackendEvent =
@@ -32,6 +40,7 @@ export type BackendEvent =
   | { type: "tool_start"; id: string; name: string; summary?: string; at?: number }
   | { type: "tool_end"; id: string; name?: string; output?: string; error?: boolean; at?: number }
   | { type: "usage"; usage: Partial<Usage>; at?: number }
+  | { type: "context"; context: ContextSnapshot; at?: number }
   | { type: "completed"; output?: string; at?: number }
   | { type: "failed"; error: string; at?: number }
   | { type: "cancelled"; reason?: string; at?: number }
@@ -103,11 +112,13 @@ export interface BackendRun {
   forceClose?(): Promise<void>;
 }
 
-/** Model-free capability discovery request. Discovery never sends a user message. */
+/** Zero-turn capability/readiness discovery request. Discovery never sends a user message. */
 export interface DiscoveryRequest {
   cwd: string;
   access: AccessMode;
   customization: CustomizationMode;
+  /** Optional harness-local model whose readiness must be verified. */
+  model?: string;
   env: NodeJS.ProcessEnv;
   signal: AbortSignal;
   /** Bypass native caches (Codex `forceReload`, fresh SDK/RPC initialization). */
@@ -247,6 +258,8 @@ export interface JobSnapshot {
   error?: string;
   truncated: boolean;
   usage: Usage;
+  /** Latest native request occupancy, when the harness exposes it. */
+  context?: ContextSnapshot;
   tools: ToolTrace[];
   transcript: TranscriptEntry[];
   liveThinking: string;
