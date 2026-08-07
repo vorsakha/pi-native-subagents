@@ -130,6 +130,13 @@ The workflow runner owns invocation order, concurrency, call numbering, cancella
 
 Use `parallel` when the next step needs the complete result set. Use `pipeline` when each item can advance through its own stages without a global barrier. Check every returned agent result's `ok` field and preserve bounded error details in the final result.
 
+## Dashboard supervision
+
+- `/subagents` opens the adaptive dashboard through Pi's public overlay API; fullscreen mode uses the available terminal height without replacing Pi's host layout root.
+- Wide terminals show a jobs rail beside the selected inspector; narrower terminals stack or drill into a single pane. `j/k` or arrows select, `Enter` enters in-panel takeover, and `Esc` backs out before closing.
+- Fullscreen-safe transcript navigation is `Shift+↑↓`, `Ctrl+U/D`, and `g/G`; Page Up/Down are compatibility aliases only and are not the primary fullscreen controls.
+- Cancellation is intentionally two-step: press `x` once to arm it and again to confirm. Failed steer/follow-up submissions retain the draft when the request fails.
+
 ## Runtime limits and lifecycle
 
 - The sandbox allows workflow orchestration only; it does not allow imports, filesystem, network, environment variables, subprocesses, credentials, `require`, `process`, or nested delegation.

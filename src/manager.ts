@@ -97,6 +97,11 @@ export class JobManager {
     this.#operationTimeoutMs = Math.max(1, options.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS);
   }
 
+  /** The single global concurrent-job budget shared by direct and workflow jobs. */
+  get concurrency(): number {
+    return this.#concurrency;
+  }
+
   spawn(request: SpawnRequest): JobSnapshot {
     if (this.#closed) throw new Error("Job manager is closed");
     if (!request.task.trim()) throw new Error("Task must not be empty");
@@ -202,6 +207,9 @@ export class JobManager {
     }
     if (job.snapshot.status === "failed" || job.snapshot.status === "cancelled") {
       throw new Error(`Cannot reuse ${id}: job is ${job.snapshot.status}`);
+    }
+    if (job.snapshot.status === "queued" && job.pendingRestart) {
+      throw new Error(`Cannot send to ${id}: a follow-up is waiting for an available slot`);
     }
     if (job.snapshot.status === "completed") {
       if (!job.run) throw new Error(`Cannot reuse ${id}: native session is no longer available`);

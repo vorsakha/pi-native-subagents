@@ -4,15 +4,15 @@ import {
   Key,
   matchesKey,
   truncateToWidth,
-  visibleWidth,
-  wrapTextWithAnsi,
   type Focusable,
   type KeybindingsManager,
   type TUI,
 } from "@earendil-works/pi-tui";
 import { isTerminal, type JobManager } from "../../src/manager.ts";
-import type { JobSnapshot, TranscriptEntry } from "../../src/types.ts";
-import { formatContext, formatEffort, formatUsage, sanitizeInline, sanitizeText, shortId, statusMeta } from "./render.ts";
+import type { JobSnapshot } from "../../src/types.ts";
+import { formatContext, formatEffort, formatUsage, sanitizeInline, shortId, statusMeta } from "./render.ts";
+import { openSubagentsDashboard, type SubagentsDashboardManager } from "./dashboard.ts";
+import { buildTranscript } from "./transcript.ts";
 
 interface TakeoverManager extends Pick<JobManager, "check" | "send" | "cancel" | "subscribe"> {}
 
@@ -102,11 +102,13 @@ class TakeoverView implements Focusable {
     const header = `${this.#theme.fg(status.color, status.glyph)} ${this.#theme.fg("accent", this.#theme.bold(`${sanitizeInline(job.name)} · ${shortId(job.id)}`))}${this.#theme.fg("dim", ` · ${job.status} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}${owner}`)}`;
     const meta = [job.access, job.profile ? `profile ${job.profile}` : "", job.independent ? "independent" : "", `effort ${formatEffort(job.effort)}`, usage, formatContext(job.context), job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""].filter(Boolean).join(" · ");
     const transcript = buildTranscript(job, width, this.#theme);
-    const terminalRows = Math.max(10, this.#tui.terminal.rows || 24);
+    const terminalRows = Math.max(1, this.#tui.terminal.rows || 24);
     const reusable = !job.workflow && job.status !== "failed" && job.status !== "cancelled";
     const inputRows = reusable ? Math.max(1, this.#input.render(width).length) : 1;
-    const chrome = 6 + inputRows;
-    this.#viewportRows = Math.max(4, terminalRows - chrome);
+    // Keep every emitted line inside the host overlay's maxHeight. The old
+    // `Math.max(4, ...)` viewport floor produced terminalRows + 1 lines and
+    // clipped the bottom border in fullscreen mode.
+    this.#viewportRows = Math.max(0, terminalRows - 7 - inputRows);
     this.#transcriptRows = transcript.length;
     const maxOffset = Math.max(0, transcript.length - this.#viewportRows);
     this.#scrollFromBottom = Math.min(this.#scrollFromBottom, maxOffset);
@@ -128,9 +130,9 @@ class TakeoverView implements Focusable {
       : "Session unavailable — read-only transcript"));
     else lines.push(...this.#input.render(width));
     if (this.#notice) lines.push(truncateToWidth(this.#theme.fg("warning", this.#notice), width, "…"));
-    else lines.push(truncateToWidth(this.#theme.fg("dim", `${job.status === "completed" ? "Enter follow-up" : "Enter steer"} · Shift+↑↓/Pg scroll · Ctrl+L abort · Esc close`), width, "…"));
+    else lines.push(truncateToWidth(this.#theme.fg("dim", `${job.status === "completed" ? "Enter follow-up" : "Enter steer"} · Shift+↑↓/Pg scroll · Esc close`), width, "…"));
     lines.push(border);
-    return lines;
+    return lines.slice(0, terminalRows);
   }
 
   handleInput(data: string): void {
@@ -148,6 +150,7 @@ class TakeoverView implements Focusable {
     else if (matchesKey(data, Key.shift(Key.down))) this.scroll(-4);
     else if (matchesKey(data, Key.pageUp)) this.scroll(this.#viewportRows - 1);
     else if (matchesKey(data, Key.pageDown)) this.scroll(-(this.#viewportRows - 1));
+    else if (this.#keybindings.matches(data, "tui.input.submit") || matchesKey(data, Key.enter)) this.#input.onSubmit?.(this.#input.getValue());
     else {
       const job = this.#manager.check(this.#jobId);
       if (!job.workflow && job.status !== "failed" && job.status !== "cancelled") this.#input.handleInput(data);
@@ -177,46 +180,19 @@ class TakeoverView implements Focusable {
   }
 }
 
-function buildTranscript(job: JobSnapshot, width: number, theme: Theme): string[] {
-  const lines: string[] = [];
-  const pushWrapped = (prefix: string, text: string, color: Parameters<Theme["fg"]>[0]) => {
-    const clean = sanitizeText(text).trim();
-    if (!clean) return;
-    const prefixWidth = visibleWidth(prefix);
-    const wrapped = wrapTextWithAnsi(clean, Math.max(1, width - prefixWidth));
-    for (let index = 0; index < wrapped.length; index++) {
-      lines.push((index === 0 ? prefix : " ".repeat(prefixWidth)) + theme.fg(color, wrapped[index]!));
-    }
-  };
-  for (const entry of job.transcript) renderEntry(entry, pushWrapped, theme);
-  if (job.liveThinking.trim()) pushWrapped(theme.fg("dim", "~ "), job.liveThinking, "muted");
-  const lastAssistant = [...job.transcript].reverse().find((entry) => entry.kind === "assistant");
-  if (!isTerminal(job.status) && job.output.trim() && lastAssistant?.text !== job.output) {
-    pushWrapped(theme.fg("accent", "• "), job.output, "text");
-  }
-  for (const queued of job.queuedMessages) {
-    pushWrapped(theme.fg("warning", `> [${queued.behavior}] `), queued.text, "muted");
-  }
-  if (!lines.length) lines.push(theme.fg("dim", "(no transcript yet)"));
-  return lines;
-}
-
-function renderEntry(
-  entry: TranscriptEntry,
-  push: (prefix: string, text: string, color: Parameters<Theme["fg"]>[0]) => void,
-  theme: Theme,
-): void {
-  if (entry.kind === "user") push(theme.fg("accent", "> "), entry.text, "userMessageText");
-  else if (entry.kind === "thinking") push(theme.fg("dim", "~ "), entry.text, "muted");
-  else if (entry.kind === "assistant") push("", entry.text, "text");
-  else {
-    const glyph = entry.error ? theme.fg("error", "× ") : theme.fg("muted", "→ ");
-    push(glyph, `${entry.name}${entry.text ? ` · ${entry.text}` : ""}`, entry.error ? "error" : "muted");
-  }
-}
-
-export async function openSubagentTakeover(ctx: ExtensionCommandContext, manager: TakeoverManager, jobId: string): Promise<void> {
+export async function openSubagentTakeover(
+  ctx: ExtensionCommandContext,
+  manager: TakeoverManager & { list?: SubagentsDashboardManager["list"]; concurrency?: number },
+  jobId: string,
+): Promise<void> {
+  // Preserve the historical non-TUI no-op and structural manager contract for
+  // deep-import callers. Real JobManager instances take the new stateful route;
+  // narrow test/host doubles retain the legacy view as a compatibility fallback.
   if (ctx.mode !== "tui") return;
+  if (typeof manager.list === "function") {
+    await openSubagentsDashboard(ctx, manager as SubagentsDashboardManager, { focusJobId: jobId, mode: "takeover" });
+    return;
+  }
   await ctx.ui.custom<null>((tui, theme, keybindings, done) => new TakeoverView(tui, theme, keybindings, manager, jobId, done), {
     overlay: true,
     overlayOptions: { width: "100%", maxHeight: "100%", anchor: "center" },
