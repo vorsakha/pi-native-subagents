@@ -408,6 +408,31 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
   await manager.shutdown();
 });
 
+test("queued retained follow-ups cannot bypass the global scheduler", async () => {
+  const { backend, manager } = setup(1);
+  const first = manager.spawn(request(1));
+  await tick();
+  backend.complete(first.id, "first result");
+  await manager.wait(first.id);
+
+  const blocker = manager.spawn(request(2));
+  await tick();
+  const queued = await manager.send(first.id, "first follow-up", "followUp");
+  assert.equal(queued.status, "queued");
+  await assert.rejects(
+    manager.send(first.id, "second follow-up", "followUp"),
+    /waiting for an available slot/,
+  );
+  assert.deepEqual(backend.sends, []);
+
+  backend.complete(blocker.id, "blocker result");
+  await tick();
+  assert.deepEqual(backend.sends, [{ id: first.id, message: "first follow-up", behavior: "followUp" }]);
+  backend.complete(first.id, "follow-up result");
+  assert.equal((await manager.wait(first.id)).output, "follow-up result");
+  await manager.shutdown();
+});
+
 test("manager rejects unknown explicit profiles, untrusted execution, and empty tasks", () => {
   const backend = new ControlledBackend();
   const audit: ProfileDefinition = { name: "audit", description: "", systemPrompt: "audit", filePath: "audit.md", origin: "global" };
