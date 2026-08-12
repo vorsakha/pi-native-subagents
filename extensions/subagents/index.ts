@@ -4,7 +4,8 @@ import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { CONFIG_DIR_NAME, getAgentDir, keyHint, SessionManager, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
+import { truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { ClaudeBackend, CodexAppServerBackend, PiRpcBackend } from "../../src/backends/index.ts";
 import { PI_CHILD_MARKER } from "../../src/backends/pi-rpc.ts";
@@ -98,6 +99,7 @@ const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const ACCESS = ["readOnly", "full"] as const;
 const MAX_CAPABILITY_LINES = 40;
 const HUMAN_SUBAGENT_ENTRY = "native-human-subagent";
+const SUBAGENT_ACTIVITY_WIDGET = "native-subagents-active";
 const HUMAN_SUBAGENT_USAGE = "/subagent [--harness pi|claude|codex] [--model ID] [--name NAME] [--effort LEVEL] [--access readOnly|full] [--cwd PATH] [--profile NAME] [--independent] <task>";
 
 interface HumanSubagentEntryData {
@@ -157,6 +159,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   let manager: JobManager | undefined;
   let unsubscribeManager: (() => void) | undefined;
   let sessionContext: { isIdle(): boolean } | undefined;
+  let sessionUi: ExtensionUIContext | undefined;
+  let displayedHarness: HarnessName | undefined;
+  let displayedActivity: string | undefined;
   const deferredResults = new Map<string, JobSnapshot>();
   const cardSnapshots = new Map<string, JobSnapshot>();
   const liveCardBlinks = new Set<LiveCardBlink>();
@@ -182,6 +187,48 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     backends,
   });
   const getManager = () => manager ??= createManager();
+  const updateSessionUi = (ui: ExtensionUIContext, sessionManager: JobManager, harness: HarnessName) => {
+    if (displayedHarness !== harness) {
+      displayedHarness = harness;
+      ui.setStatus("native-subagents", `subagents:${harness}`);
+    }
+
+    const jobs = sessionManager.list();
+    const running = jobs.filter((job) => job.status === "running").length;
+    const queued = jobs.filter((job) => job.status === "queued").length;
+    const activity = `${running}:${queued}`;
+    if (displayedActivity === activity) return;
+    displayedActivity = activity;
+
+    const active = running + queued;
+    if (!active) {
+      ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, undefined);
+      return;
+    }
+
+    const summary = queued === 0
+      ? `${running} subagent${running === 1 ? "" : "s"} running`
+      : running === 0
+        ? `${queued} subagent${queued === 1 ? "" : "s"} queued`
+        : `${active} subagents active`;
+    const breakdown = running && queued
+      ? ` · ${running} running · ${queued} queued`
+      : "";
+
+    ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, (_tui, theme) => {
+      const line =
+        theme.fg("accent", "◆ ") +
+        theme.fg("text", summary) +
+        theme.fg("dim", breakdown) +
+        theme.fg("dim", " • ") +
+        theme.fg("accent", "/subagents") +
+        theme.fg("dim", " to view");
+      return {
+        render: (width: number) => [truncateToWidth(line, Math.max(0, width), "")],
+        invalidate() {},
+      };
+    });
+  };
   const spawnJob = (
     params: SpawnToolParams,
     ctx: { cwd: string; isProjectTrusted(): boolean; model?: { provider?: string } },
@@ -419,6 +466,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 
   pi.on("session_start", (_event, ctx) => {
     clearCardBlinks();
+    displayedHarness = undefined;
+    displayedActivity = undefined;
+    sessionUi = ctx.ui;
     profileCatalog = loadProfiles(
       globalProfilesDir,
       ctx.isProjectTrusted() ? resolve(ctx.cwd, CONFIG_DIR_NAME, "subagents") : undefined,
@@ -452,13 +502,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     unsubscribeManager = sessionManager.subscribe((job, event) => {
       rememberCardSnapshot(job);
       refreshCardBlinks();
-      updateStatus(ctx, sessionManager, activeHarness);
+      updateSessionUi(ctx.ui, sessionManager, activeHarness);
       if (event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown")) {
         if (job.humanVisible) publishHumanResult(job);
         else deferResult(job);
       }
     });
-    updateStatus(ctx, sessionManager, activeHarness);
+    updateSessionUi(ctx.ui, sessionManager, activeHarness);
     workflows.sessionStart(ctx, sessionManager);
   });
 
@@ -477,6 +527,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     humanResultsPublished.clear();
     pendingHumanResults.clear();
     hiddenLegacyHumanEntries.clear();
+    try {
+      sessionUi?.setStatus("native-subagents", undefined);
+      sessionUi?.setWidget(SUBAGENT_ACTIVITY_WIDGET, undefined);
+    } catch { /* UI may already be unavailable during teardown. */ }
+    sessionUi = undefined;
+    displayedHarness = undefined;
+    displayedActivity = undefined;
     try {
       await workflows.sessionShutdown();
       await manager?.shutdown();
@@ -513,7 +570,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     if (selected) {
       activeHarness = selected;
       pi.appendEntry(STATE_ENTRY, { harness: selected });
-      updateStatus(ctx, getManager(), activeHarness);
+      updateSessionUi(ctx.ui, getManager(), activeHarness);
       ctx.ui.notify(`Default subagent harness: ${selected}`, "info");
     } else if (value === "status") {
       ctx.ui.notify(`Default harness: ${activeHarness}\nProfiles: ${profileCatalog.profiles.size}\nModels: caller-selected or native harness default`, "info");
@@ -1248,13 +1305,6 @@ export function normalizeHarness(value: unknown): HarnessName | undefined {
   if (text === "claude" || text === "anthropic") return "claude";
   if (text === "pi") return "pi";
   return undefined;
-}
-
-function updateStatus(ctx: { ui: { setStatus(key: string, text: string | undefined): void } }, manager: JobManager, harness: HarnessName): void {
-  const jobs = manager.list();
-  const running = jobs.filter((job) => job.status === "running" || job.status === "queued").length;
-  const finished = jobs.filter((job) => isTerminal(job.status)).length;
-  ctx.ui.setStatus("native-subagents", `subagents:${harness}${running ? ` ${running}↻` : ""}${finished ? ` ${finished}✓` : ""}`);
 }
 
 function statusLine(job: JobSnapshot): string {

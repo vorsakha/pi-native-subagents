@@ -354,8 +354,10 @@ export function context(options: ContextOptions = {}) {
   const branch = options.branch ?? [];
   const notifications: Array<{ message: string; type?: string }> = [];
   const statuses = new Map<string, string | undefined>();
+  const widgets = new Map<string, unknown>();
   const ui: Record<string, unknown> = {
     setStatus(key: string, value: string | undefined) { statuses.set(key, value); },
+    setWidget(key: string, value: unknown) { widgets.set(key, value); },
     notify(message: string, type?: string) { notifications.push({ message, type }); },
   };
   if (options.confirm) ui.confirm = options.confirm;
@@ -373,7 +375,7 @@ export function context(options: ContextOptions = {}) {
     ui,
   };
   if (options.hasUI !== undefined) ctx.hasUI = options.hasUI;
-  return { ctx: ctx as any, notifications, statuses };
+  return { ctx: ctx as any, notifications, statuses, widgets };
 }
 
 /* ── snapshot builders ───────────────────────────────────────────────────── */
