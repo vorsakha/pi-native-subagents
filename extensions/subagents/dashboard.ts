@@ -701,10 +701,10 @@ class DashboardOverlay implements Focusable {
       optional.push(truncate(this.theme.fg("warning", `!  ${sanitizeInline(warning)}`), width));
     }
     if (job.truncated) optional.push(truncate(this.theme.fg("warning", "!  bounded output truncated — earliest lines dropped"), width));
-    for (const tool of job.tools.slice(-2)) {
-      const glyph = tool.status === "running" ? "…" : tool.status === "failed" ? "×" : "✓";
-      optional.push(truncate(this.theme.fg("muted", `${glyph}  ${sanitizeInline(tool.name)}${tool.summary ? `: ${sanitizeInline(tool.summary)}` : ""}`), width));
-    }
+
+    // Tool activity lives in the transcript's Pi-style execution shells. Keeping
+    // a second recent-tools list here duplicates the same calls and steals rows
+    // from the more legible call/result presentation below.
 
     // Reserve the transcript label plus one transcript row before spending rows on metadata.
     const budget = Math.max(0, rows - pinned.length - 2);

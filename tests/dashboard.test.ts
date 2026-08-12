@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { jobSnapshot, theme, tick } from "./helpers.ts";
+import { ansiTheme, jobSnapshot, theme, tick } from "./helpers.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { KeybindingsManager } from "@earendil-works/pi-tui";
 import {
@@ -196,6 +196,32 @@ test("dashboard caches Markdown rendering by transcript and width", (t) => {
   assert.equal(calls, 3, "manager events invalidate equal-length transcript changes");
 });
 
+test("transcript pairs native tool events into Pi-style execution shells", () => {
+  const current = {
+    ...job("tools"),
+    output: "",
+    tools: [
+      { id: "grep-1", name: "Grep", status: "completed" as const },
+      { id: "read-1", name: "Read", status: "failed" as const },
+    ],
+    transcript: [
+      { kind: "tool" as const, toolId: "grep-1", name: "Grep", text: JSON.stringify({ pattern: "480", path: "frontend", glob: "*.ts" }) },
+      { kind: "tool" as const, toolId: "read-1", name: "Read", text: JSON.stringify({ path: "missing.ts" }) },
+      { kind: "tool" as const, toolId: "grep-1", name: "tool", text: JSON.stringify("src/a.ts:1: match\nsrc/b.ts:2: match") },
+      { kind: "tool" as const, toolId: "read-1", name: "tool", text: "File not found", error: true },
+    ],
+  };
+  const lines = buildTranscript(current, 48, ansiTheme);
+  const plain = lines.join("\n").replace(/\u001b\[[0-9;]*m/g, "");
+
+  assert.match(plain, /✓ grep \/480\/ in frontend \(\*\.ts\)/);
+  assert.match(plain, /src\/a\.ts:1: match\s*\n\s*src\/b\.ts:2: match/);
+  assert.match(plain, /× read missing\.ts/);
+  assert.doesNotMatch(plain, /tool ·/);
+  assert.ok(lines.filter((line) => line.includes("\u001b[48;5;24m")).length >= 6, "call and result rows use a semantic tool background");
+  assert.ok(lines.every((line) => visibleWidth(line) <= 48));
+});
+
 test("takeover restores a rejected draft without overwriting newer input", async (t) => {
   const current = job("draft");
   const { overlay } = dashboard([current], 24, () => {}, undefined, { focusJobId: current.id, sendError: "send failed", submitKey: "\u0011" });
@@ -264,7 +290,7 @@ test("takeover renders normalized thinking, tools, queued messages, and closes r
   const lines = view.render(72);
   assert.equal(lines.length, 24, "takeover stays within the fullscreen overlay height");
   assert.ok(lines.some((line) => line.includes("considering options")));
-  assert.ok(lines.some((line) => line.includes("read · file.ts")));
+  assert.ok(lines.some((line) => line.includes("read") && line.includes("file.ts")));
   assert.ok(lines.some((line) => line.includes("also verify tests")));
   assert.ok(lines.some((line) => line.includes("effort high")), "takeover metadata shows request effort");
   const compactTakeover = view.render(48);
