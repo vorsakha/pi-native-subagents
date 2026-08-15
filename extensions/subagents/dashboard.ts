@@ -1,8 +1,7 @@
-import { getMarkdownTheme, type ExtensionCommandContext, type Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   Input,
   Key,
-  Markdown,
   matchesKey,
   truncateToWidth,
   visibleWidth,
@@ -26,7 +25,12 @@ import {
   shortId,
   statusMeta,
 } from "./render.ts";
-import { buildTranscript, takeoverPolicy, transcriptSignature } from "./transcript.ts";
+import {
+  buildTranscript,
+  renderAssistantMarkdown,
+  takeoverPolicy,
+  transcriptSignature,
+} from "./transcript.ts";
 import type { JobSnapshot, SendBehavior } from "../../src/types.ts";
 
 /*
@@ -852,10 +856,7 @@ export async function openSubagentsDashboard(
 }
 
 export function renderMarkdown(text: string, width: number): string[] {
-  const safeWidth = Math.max(1, width);
-  return new Markdown(sanitizeText(text), 0, 0, getMarkdownTheme())
-    .render(safeWidth)
-    .map((line) => truncateToWidth(line, safeWidth, ""));
+  return renderAssistantMarkdown(text, width);
 }
 
 export function truncateDashboardLine(value: string, width: number): string {

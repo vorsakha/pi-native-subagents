@@ -9,6 +9,7 @@ import {
   truncateDashboardLine,
 } from "../extensions/subagents/dashboard.ts";
 import { TakeoverView, buildTranscript } from "../extensions/subagents/takeover.ts";
+import { renderAssistantMarkdown } from "../extensions/subagents/transcript.ts";
 import type { JobSnapshot } from "../src/types.ts";
 
 test("dashboard truncation respects terminal display width for Unicode and ANSI", () => {
@@ -171,6 +172,19 @@ test("dashboard pins errors and exposes queued empty states", (t) => {
   const queuedLines = overlay.render(72);
   assert.ok(queuedLines.some((line) => line.includes("queued")));
   assert.ok(queuedLines.some((line) => line.includes("waiting for an agent slot")));
+});
+
+test("assistant transcripts use regular Pi Markdown message padding by default", () => {
+  const current = {
+    ...job("pi-markdown", "completed"),
+    transcript: [{ kind: "assistant" as const, text: "assistant prose" }],
+  };
+  const expected = renderAssistantMarkdown("assistant prose", 20);
+  const rendered = buildTranscript(current, 20, theme);
+
+  assert.deepEqual(rendered, expected);
+  assert.equal(rendered[0]?.startsWith(" "), true, "regular Pi assistant output keeps one column of padding");
+  assert.ok(rendered.every((line) => visibleWidth(line) <= 20));
 });
 
 test("dashboard caches Markdown rendering by transcript and width", (t) => {

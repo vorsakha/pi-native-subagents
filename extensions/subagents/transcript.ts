@@ -1,5 +1,5 @@
-import type { Theme } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import { getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
+import { Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import { isTerminal } from "../../src/manager.ts";
 import type { JobSnapshot, SendBehavior, TranscriptEntry } from "../../src/types.ts";
 import { sanitizeInline, sanitizeText } from "./render.ts";
@@ -11,14 +11,22 @@ import { sanitizeInline, sanitizeText } from "./render.ts";
  * compact role prefixes; tool start/result events are paired into Pi-style
  * execution shells with semantic backgrounds, explicit status glyphs, a bold
  * call row, and separated output. Meaning never depends on color alone.
- * Assistant prose can optionally be rendered as Markdown by injecting a
- * renderer, which lets the dashboard cache the expensive pass per job
- * generation and width.
+ * Assistant prose uses the same Markdown component configuration as regular
+ * Pi assistant messages. A renderer can still be injected so dashboards can
+ * cache the expensive pass per job generation and width.
  */
 
 export interface TranscriptOptions {
-  /** Renders assistant prose as Markdown instead of plain wrapped text. */
+  /** Overrides Pi's regular assistant Markdown renderer. */
   renderMarkdown?: (text: string, width: number) => string[];
+}
+
+/** Render assistant prose with regular Pi message padding, theme, and wrapping. */
+export function renderAssistantMarkdown(text: string, width: number): string[] {
+  const safeWidth = Math.max(1, width);
+  return new Markdown(sanitizeText(text).trim(), 1, 0, getMarkdownTheme())
+    .render(safeWidth)
+    .map((line) => truncateToWidth(line, safeWidth, ""));
 }
 
 type ToolEntry = Extract<TranscriptEntry, { kind: "tool" }>;
@@ -218,9 +226,8 @@ export function buildTranscript(
       lines.push((index === 0 ? prefix : " ".repeat(prefixWidth)) + theme.fg(color, wrapped[index]!));
     }
   };
-  const pushProse = (prefix: string, text: string, color: Parameters<Theme["fg"]>[0]) => {
-    const render = options.renderMarkdown;
-    if (!render) return pushWrapped(prefix, text, color);
+  const pushProse = (prefix: string, text: string, _color: Parameters<Theme["fg"]>[0]) => {
+    const render = options.renderMarkdown ?? renderAssistantMarkdown;
     const clean = sanitizeText(text).trim();
     if (!clean) return;
     const prefixWidth = visibleWidth(prefix);
