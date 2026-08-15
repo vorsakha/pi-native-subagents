@@ -1,4 +1,10 @@
-import type { BackendEvent, JobSnapshot, Usage } from "./types.ts";
+import type {
+  BackendEvent,
+  JobSnapshot,
+  ToolResultContent,
+  ToolResultSnapshot,
+  Usage,
+} from "./types.ts";
 
 export const MAX_OUTPUT_BYTES = 50 * 1024;
 export const MAX_TOOL_TRACES = 200;
@@ -30,15 +36,87 @@ function boundedText(text: string, maxBytes: number): string {
   return buffer.subarray(buffer.byteLength - maxBytes).toString("utf8").replace(/^�/, "");
 }
 
+function boundedJson(value: unknown, maxBytes: number): unknown {
+  if (value === undefined) return undefined;
+  const seen = new WeakSet<object>();
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value, (_key, nested: unknown) => {
+      if (typeof nested === "string") return boundedText(nested, 4 * 1024);
+      if (typeof nested === "bigint") return String(nested);
+      if (Array.isArray(nested) && nested.length > 32) return [...nested.slice(0, 32), `[${nested.length - 32} items omitted]`];
+      if (nested !== null && typeof nested === "object") {
+        if (seen.has(nested)) return "[circular]";
+        seen.add(nested);
+      }
+      return nested;
+    });
+  } catch {
+    return { unavailable: true };
+  }
+  if (Buffer.byteLength(serialized) <= maxBytes) return JSON.parse(serialized) as unknown;
+  return { truncated: true, preview: boundedText(serialized, Math.max(0, maxBytes - 64)) };
+}
+
+function boundedArgs(value: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  const bounded = boundedJson(value, 8 * 1024);
+  return bounded !== null && typeof bounded === "object" && !Array.isArray(bounded)
+    ? bounded as Record<string, unknown>
+    : undefined;
+}
+
+function boundedResult(
+  value: ToolResultSnapshot | undefined,
+  output: string | undefined,
+  error: boolean | undefined,
+): ToolResultSnapshot | undefined {
+  if (!value && output === undefined && error === undefined) return undefined;
+  const source = value?.content ?? (output === undefined ? [] : [{ type: "text", text: output }]);
+  const content: ToolResultContent[] = [];
+  let remaining = 10 * 1024;
+  for (const part of source.slice(0, 16)) {
+    if (remaining <= 0) break;
+    const text = part.text === undefined ? undefined : boundedText(part.text, remaining);
+    remaining -= text === undefined ? 0 : Buffer.byteLength(text);
+    const data = part.data === undefined || remaining <= 0 ? undefined : boundedText(part.data, remaining);
+    remaining -= data === undefined ? 0 : Buffer.byteLength(data);
+    content.push({
+      type: boundedText(String(part.type || "text"), 64),
+      text,
+      data,
+      mimeType: part.mimeType === undefined ? undefined : boundedText(part.mimeType, 128),
+    });
+  }
+  return {
+    content,
+    details: boundedJson(value?.details, 4 * 1024),
+    isError: value?.isError === true || error === true,
+  };
+}
+
+function transcriptEntryBytes(entry: JobSnapshot["transcript"][number]): number {
+  try { return Buffer.byteLength(JSON.stringify(entry)); }
+  catch { return MAX_TRANSCRIPT_ENTRY_BYTES; }
+}
+
 function pushTranscript(job: JobSnapshot, entry: JobSnapshot["transcript"][number]): void {
   const previous = job.transcript.at(-1);
-  if (previous?.kind === entry.kind && previous.text === entry.text && (entry.kind !== "tool" || previous.kind === "tool" && previous.toolId === entry.toolId)) return;
+  if (previous?.kind === entry.kind && previous.text === entry.text && (
+    entry.kind !== "tool" || previous.kind === "tool" && previous.toolId === entry.toolId && previous.phase === entry.phase
+  )) return;
   if (entry.kind === "tool") {
-    job.transcript.push({ ...entry, text: entry.text === undefined ? undefined : boundedText(entry.text, MAX_TRANSCRIPT_ENTRY_BYTES) });
+    job.transcript.push({
+      ...entry,
+      args: boundedArgs(entry.args),
+      result: entry.phase === "end" || entry.result
+        ? boundedResult(entry.result, entry.text, entry.error)
+        : undefined,
+      text: entry.text === undefined ? undefined : boundedText(entry.text, MAX_TRANSCRIPT_ENTRY_BYTES),
+    });
   } else {
     job.transcript.push({ ...entry, text: boundedText(entry.text, MAX_TRANSCRIPT_ENTRY_BYTES) });
   }
-  const bytes = () => job.transcript.reduce((total, item) => total + Buffer.byteLength(item.kind === "tool" ? item.text ?? item.name : item.text), 0);
+  const bytes = () => job.transcript.reduce((total, item) => total + transcriptEntryBytes(item), 0);
   while (job.transcript.length > MAX_TRANSCRIPT_ENTRIES || bytes() > MAX_TRANSCRIPT_BYTES) {
     job.transcript.splice(job.transcript.length > 1 ? 1 : 0, 1);
   }
@@ -85,24 +163,52 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
     case "queue_changed":
       next.queuedMessages = event.messages.slice(-32).map((message) => ({ ...message, text: boundedText(message.text, 4 * 1024) }));
       break;
-    case "tool_start":
+    case "tool_start": {
+      const args = boundedArgs(event.args);
       next.tools = job.tools.map((tool) => ({ ...tool }));
       next.transcript = job.transcript.map((entry) => ({ ...entry }));
-      next.tools.push({ id: event.id, name: event.name, summary: event.summary, status: "running" });
-      pushTranscript(next, { kind: "tool", toolId: event.id, name: event.name, text: event.summary, at: event.at ?? now });
+      next.tools.push({
+        id: event.id,
+        name: event.name,
+        ...(args ? { args } : {}),
+        summary: event.summary,
+        status: "running",
+      });
+      pushTranscript(next, {
+        kind: "tool",
+        phase: "start",
+        toolId: event.id,
+        name: event.name,
+        args,
+        text: event.summary,
+        at: event.at ?? now,
+      });
       if (next.tools.length > MAX_TOOL_TRACES) next.tools.splice(0, next.tools.length - MAX_TOOL_TRACES);
       break;
+    }
     case "tool_end": {
+      const result = boundedResult(event.result, event.output, event.error);
+      const failed = result?.isError ?? event.error === true;
       next.tools = job.tools.map((tool) => ({ ...tool }));
       next.transcript = job.transcript.map((entry) => ({ ...entry }));
       for (let index = next.tools.length - 1; index >= 0; index--) {
         const tool = next.tools[index];
         if (tool?.id === event.id) {
-          tool.status = event.error ? "failed" : "completed";
+          tool.status = failed ? "failed" : "completed";
+          tool.result = result;
           break;
         }
       }
-      pushTranscript(next, { kind: "tool", toolId: event.id, name: event.name ?? "tool", text: event.output, error: event.error, at: event.at ?? now });
+      pushTranscript(next, {
+        kind: "tool",
+        phase: "end",
+        toolId: event.id,
+        name: event.name ?? "tool",
+        result,
+        text: event.result ? undefined : event.output,
+        error: failed,
+        at: event.at ?? now,
+      });
       break;
     }
     case "degraded": {

@@ -12,7 +12,17 @@ import {
   PARENT_THREAD_TOOL_NAME,
   renderParentThreadContext,
 } from "../parent-thread-context.ts";
-import type { Backend, BackendEvent, BackendPolicy, BackendRequest, BackendRun, DiscoveryRequest, DiscoveryResult, SendBehavior } from "../types.ts";
+import type {
+  Backend,
+  BackendEvent,
+  BackendPolicy,
+  BackendRequest,
+  BackendRun,
+  DiscoveryRequest,
+  DiscoveryResult,
+  SendBehavior,
+  ToolResultSnapshot,
+} from "../types.ts";
 
 const READ_ONLY_DENY = ["Bash", "Edit", "Write", "NotebookEdit", "Agent"];
 /** Orchestration and interactivity are denied in every access mode. */
@@ -473,7 +483,7 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
     return;
   }
   if (message.type === "system" && message.subtype === "permission_denied") {
-    emit({ type: "tool_start", id: message.tool_use_id, name: message.tool_name, summary: "Denied by read-only policy" });
+    emit({ type: "tool_start", id: message.tool_use_id, name: message.tool_name, args: {}, summary: "Denied by read-only policy" });
     emit({ type: "tool_end", id: message.tool_use_id, name: message.tool_name, error: true });
     return;
   }
@@ -492,7 +502,13 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
       if (block.type === "text") text += block.text;
       else if (block.type === "thinking") emit({ type: "thinking_message", text: block.thinking });
       else if (block.type === "redacted_thinking") emit({ type: "thinking_message", text: "[redacted reasoning]" });
-      else if (block.type === "tool_use") emit({ type: "tool_start", id: block.id, name: block.name, summary: summarize(block.input) });
+      else if (block.type === "tool_use") emit({
+        type: "tool_start",
+        id: block.id,
+        name: block.name,
+        args: record(block.input),
+        summary: summarize(block.input),
+      });
     }
     if (text) emit({ type: "message", text: boundedAppend("", text).text });
     if (message.error) return { success: false, output: "", error: `Claude assistant error: ${message.error}` };
@@ -500,7 +516,15 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
   }
   if (message.type === "user" && Array.isArray(message.message.content)) {
     for (const block of message.message.content) {
-      if (block.type === "tool_result") emit({ type: "tool_end", id: block.tool_use_id, output: summarize(block.content), error: block.is_error === true });
+      if (block.type !== "tool_result") continue;
+      const result = toolResultSnapshot(block.content, block.is_error === true);
+      emit({
+        type: "tool_end",
+        id: block.tool_use_id,
+        result,
+        output: result.content.map((part) => part.text ?? "").filter(Boolean).join("\n"),
+        error: result.isError,
+      });
     }
     return;
   }
@@ -550,6 +574,26 @@ function appendOutput(current: string, next: string): string {
   return boundedAppend(current, `${current && next ? "\n\n" : ""}${next}`).text;
 }
 function num(value: unknown): number { return typeof value === "number" && Number.isFinite(value) ? value : 0; }
+function record(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+function toolText(value: unknown): string {
+  if (typeof value === "string") return value.slice(0, 4_096);
+  if (Array.isArray(value)) {
+    return value.map((part) => {
+      const item = record(part);
+      if (typeof item.text === "string") return item.text;
+      if (typeof item.content === "string") return item.content;
+      try { return JSON.stringify(part); } catch { return ""; }
+    }).filter(Boolean).join("\n").slice(0, 4_096);
+  }
+  try { return JSON.stringify(value).slice(0, 4_096); } catch { return ""; }
+}
+function toolResultSnapshot(value: unknown, isError: boolean): ToolResultSnapshot {
+  return { content: [{ type: "text", text: toolText(value) }], isError };
+}
 function summarize(value: unknown): string {
   try { return JSON.stringify(value).replace(/\s+/g, " ").slice(0, 160); } catch { return ""; }
 }

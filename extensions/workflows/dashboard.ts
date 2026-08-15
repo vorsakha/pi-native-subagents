@@ -651,7 +651,17 @@ function boundedHeadTailText(text: string, limit: number, label: string): string
 
 function transcriptDisplayText(entry: TranscriptEntry): string {
   if (entry.kind !== "tool") return sanitizeText(entry.text);
-  return sanitizeText(`${entry.name}${entry.text ? ` · ${entry.text}` : ""}`);
+  const resultText = entry.result?.content
+    .map((part) => part.text ?? "")
+    .filter(Boolean)
+    .join("\n");
+  let argsText = entry.text ?? "";
+  if (!argsText && entry.args && Object.keys(entry.args).length) {
+    try { argsText = JSON.stringify(entry.args); }
+    catch { argsText = "[unrenderable arguments]"; }
+  }
+  const detail = entry.phase === "end" ? resultText || entry.text : argsText;
+  return sanitizeText(`${entry.name}${detail ? ` · ${detail}` : ""}`);
 }
 
 function boundedTranscriptParts(

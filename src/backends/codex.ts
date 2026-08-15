@@ -10,7 +10,19 @@ import {
   PARENT_THREAD_TOOL_NAME,
   renderParentThreadContext,
 } from "../parent-thread-context.ts";
-import type { Backend, BackendEvent, BackendPolicy, BackendRequest, BackendRun, ContextSnapshot, DiscoveryRequest, DiscoveryResult, SendBehavior, Usage } from "../types.ts";
+import type {
+  Backend,
+  BackendEvent,
+  BackendPolicy,
+  BackendRequest,
+  BackendRun,
+  ContextSnapshot,
+  DiscoveryRequest,
+  DiscoveryResult,
+  SendBehavior,
+  ToolResultSnapshot,
+  Usage,
+} from "../types.ts";
 
 const CLIENT_INFO = { name: "pi-native-subagents", title: "Pi Native Subagents", version: "0.1.0" };
 /** Optional native integrations whose failure must not take down unrelated work. */
@@ -327,7 +339,13 @@ export class CodexAppServerBackend implements Backend {
         } else if (method === "item/started") {
           const item = asObject(params.item);
           const type = String(item.type ?? "item");
-          if (type !== "agentMessage" && type !== "reasoning") emit({ type: "tool_start", id: String(item.id ?? type), name: type, summary: itemSummary(item) });
+          if (type !== "agentMessage" && type !== "reasoning") emit({
+            type: "tool_start",
+            id: String(item.id ?? type),
+            name: itemToolName(item),
+            args: itemArguments(item),
+            summary: itemSummary(item),
+          });
         } else if (method === "item/completed") {
           const item = asObject(params.item);
           const type = String(item.type ?? "item");
@@ -337,7 +355,17 @@ export class CodexAppServerBackend implements Backend {
           } else if (type === "reasoning") {
             const reasoning = [...stringArray(item.summary), ...stringArray(item.content)].join("\n");
             if (reasoning) emit({ type: "thinking_message", text: reasoning });
-          } else emit({ type: "tool_end", id: String(item.id ?? type), name: type, output: itemOutput(item), error: item.status === "failed" });
+          } else {
+            const result = itemResult(item);
+            emit({
+              type: "tool_end",
+              id: String(item.id ?? type),
+              name: itemToolName(item),
+              result,
+              output: itemOutput(item),
+              error: result.isError,
+            });
+          }
         } else if (method === "thread/tokenUsage/updated") {
           const tokenUsage = asObject(params.tokenUsage ?? params.usage);
           const total = asObject(tokenUsage.total);
@@ -538,6 +566,28 @@ function errorMessage(error: unknown): string { return error instanceof Error ? 
 function itemSummary(item: Record<string, unknown>): string {
   const candidate = item.command ?? item.path ?? item.query ?? item.name ?? "";
   return String(candidate).replace(/\s+/g, " ").slice(0, 160);
+}
+function itemToolName(item: Record<string, unknown>): string {
+  const type = String(item.type ?? "item");
+  if (type === "commandExecution") return "bash";
+  return String(item.tool ?? item.name ?? type);
+}
+function itemArguments(item: Record<string, unknown>): Record<string, unknown> {
+  const type = String(item.type ?? "item");
+  if (type === "commandExecution") return { command: String(item.command ?? "") };
+  const nested = asObject(item.arguments ?? item.input);
+  if (Object.keys(nested).length) return nested;
+  return Object.fromEntries(
+    ["path", "query", "url", "name", "command"]
+      .filter((key) => item[key] !== undefined)
+      .map((key) => [key, item[key]]),
+  );
+}
+function itemResult(item: Record<string, unknown>): ToolResultSnapshot {
+  return {
+    content: [{ type: "text", text: itemOutput(item) }],
+    isError: item.status === "failed",
+  };
 }
 function stringArray(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];

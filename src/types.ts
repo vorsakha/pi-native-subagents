@@ -29,6 +29,19 @@ export interface ContextSnapshot {
   servingModel?: string;
 }
 
+export interface ToolResultContent {
+  type: string;
+  text?: string;
+  data?: string;
+  mimeType?: string;
+}
+
+export interface ToolResultSnapshot {
+  content: ToolResultContent[];
+  details?: unknown;
+  isError: boolean;
+}
+
 export type BackendEvent =
   | { type: "started"; backendSessionId?: string; sessionFile?: string; at?: number }
   | { type: "user_message"; text: string; at?: number }
@@ -37,8 +50,8 @@ export type BackendEvent =
   | { type: "thinking_message"; text: string; at?: number }
   | { type: "message"; text: string; at?: number }
   | { type: "queue_changed"; messages: QueuedMessage[]; at?: number }
-  | { type: "tool_start"; id: string; name: string; summary?: string; at?: number }
-  | { type: "tool_end"; id: string; name?: string; output?: string; error?: boolean; at?: number }
+  | { type: "tool_start"; id: string; name: string; args?: Record<string, unknown>; summary?: string; at?: number }
+  | { type: "tool_end"; id: string; name?: string; result?: ToolResultSnapshot; output?: string; error?: boolean; at?: number }
   | { type: "usage"; usage: Partial<Usage>; at?: number }
   | { type: "context"; context: ContextSnapshot; at?: number }
   | { type: "completed"; output?: string; at?: number }
@@ -101,7 +114,17 @@ export type TranscriptEntry =
   | { kind: "user"; text: string; at?: number }
   | { kind: "assistant"; text: string; at?: number }
   | { kind: "thinking"; text: string; at?: number }
-  | { kind: "tool"; toolId: string; name: string; text?: string; error?: boolean; at?: number };
+  | {
+      kind: "tool";
+      phase?: "start" | "end";
+      toolId: string;
+      name: string;
+      args?: Record<string, unknown>;
+      result?: ToolResultSnapshot;
+      text?: string;
+      error?: boolean;
+      at?: number;
+    };
 
 export interface BackendRun {
   completed: Promise<void>;
@@ -228,6 +251,8 @@ export interface SpawnRequest {
 export interface ToolTrace {
   id: string;
   name: string;
+  args?: Record<string, unknown>;
+  result?: ToolResultSnapshot;
   summary?: string;
   status: "running" | "completed" | "failed";
 }

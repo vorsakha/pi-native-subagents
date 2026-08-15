@@ -35,6 +35,11 @@ process.stdin.on("data", chunk => {
       process.stdout.write(JSON.stringify({ type: "response", id: value.id, command: value.type, success: true, data }) + "\\n");
     }
     if (value.type === "prompt" && process.env.MODE === "complete") complete(value.message.startsWith("Task:") ? "PI_OK" : value.message);
+    if (value.type === "prompt" && process.env.MODE === "tool-events") {
+      process.stdout.write(JSON.stringify({ type: "tool_execution_start", toolCallId: "read-1", toolName: "read", args: { path: "src/index.ts" } }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "tool_execution_end", toolCallId: "read-1", toolName: "read", result: { content: [{ type: "text", text: "source" }], details: { lineCount: 1 } }, isError: false }) + "\\n");
+      complete("PI_TOOL_OK");
+    }
     if (value.type === "prompt" && process.env.MODE === "activity") {
       for (const delay of [80, 160, 240]) setTimeout(() => process.stdout.write(JSON.stringify({ type: "message_update", assistantMessageEvent: { type: "text_delta", delta: "." } }) + "\\n"), delay);
       setTimeout(() => complete("ACTIVE"), 320);
@@ -116,6 +121,10 @@ process.stdin.on("data", chunk => {
         for (const delay of [80, 160, 240]) setTimeout(() => process.stdout.write(JSON.stringify({ method: "item/reasoning/summaryTextDelta", params: { delta: "." } }) + "\\n"), delay);
       }
       if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool") setTimeout(() => {
+        if (process.env.MODE === "tool-events") {
+          process.stdout.write(JSON.stringify({ method: "item/started", params: { item: { id: "command-1", type: "commandExecution", command: "pwd" } } }) + "\\n");
+          process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { id: "command-1", type: "commandExecution", command: "pwd", aggregatedOutput: "/tmp", status: "completed" } } }) + "\\n");
+        }
         process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { type: "agentMessage", text: number === 1 ? "FIRST" : "SECOND" } } }) + "\\n");
         process.stdout.write(JSON.stringify({ method: "turn/completed", params: { turn: { id, status: "completed" } } }) + "\\n");
       }, process.env.MODE === "activity" ? 320 : 40);
@@ -172,6 +181,25 @@ test("Codex usage separates cached input, ignores duplicate totals, and reports 
     assert.deepEqual(events.filter((event): event is Extract<BackendEvent, { type: "context" }> => event.type === "context").at(-1)?.context, {
       tokens: 104_791, window: 258_400, servingModel: "fixture-model",
     });
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex preserves command arguments and results for Pi tool rendering", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+      .start(request("codex", fake.dir, { ...process.env, MODE: "tool-events" }), (event) => events.push(event));
+    await run.completed;
+    assert.ok(events.some((event) => event.type === "tool_start"
+      && event.id === "command-1"
+      && event.name === "bash"
+      && event.args?.command === "pwd"));
+    assert.ok(events.some((event) => event.type === "tool_end"
+      && event.id === "command-1"
+      && event.result?.content[0]?.text === "/tmp"
+      && event.result.isError === false));
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
@@ -280,6 +308,24 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
       openai: "pi-provider-key",
       codex: "pi-provider-token",
     }, "Pi inherits provider configuration instead of applying a native-harness subscription policy");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Pi RPC preserves native tool arguments, content, and details", async () => {
+  const fake = await fixture(PI_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 20_000, inactivityTimeoutMs: 20_000 })
+      .start(request("pi", fake.dir, { ...process.env, MODE: "tool-events" }), (event) => events.push(event));
+    await run.completed;
+    assert.ok(events.some((event) => event.type === "tool_start"
+      && event.id === "read-1"
+      && event.args?.path === "src/index.ts"));
+    assert.ok(events.some((event) => event.type === "tool_end"
+      && event.id === "read-1"
+      && event.result?.content[0]?.text === "source"
+      && (event.result.details as { lineCount?: number } | undefined)?.lineCount === 1));
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
@@ -409,6 +455,8 @@ test("Claude emits live events and reopens a completed subscription session", as
     yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "thinking_delta", thinking: "live thought" } } };
     yield { type: "stream_event", event: { type: "content_block_delta", delta: { type: "text_delta", text: "live" } } };
     yield { type: "assistant", message: { content: [{ type: "thinking", thinking: "final thought" }, { type: "text", text: "message" }] } };
+    yield { type: "assistant", message: { content: [{ type: "tool_use", id: "read-1", name: "Read", input: { path: "src/index.ts" } }] } };
+    yield { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "read-1", content: [{ type: "text", text: "source text" }], is_error: false }] } };
     yield { type: "system", subtype: "permission_denied", tool_use_id: "denied-write", tool_name: "Write" };
     yield { type: "result", subtype: "success", result: huge, usage: {}, total_cost_usd: 0, num_turns: 1 };
     await secondTurn;
@@ -462,6 +510,8 @@ test("Claude emits live events and reopens a completed subscription session", as
   assert.ok(events.some((event) => event.type === "thinking_message" && event.text === "final thought"));
   assert.ok(events.some((event) => event.type === "user_message" && event.text === "second turn"));
   assert.ok(events.some((event) => event.type === "message" && event.text === "message"));
+  assert.ok(events.some((event) => event.type === "tool_start" && event.id === "read-1" && event.args?.path === "src/index.ts"));
+  assert.ok(events.some((event) => event.type === "tool_end" && event.id === "read-1" && event.result?.content[0]?.text === "source text"));
   assert.ok(events.some((event) => event.type === "tool_end" && event.id === "denied-write" && event.error));
   assert.ok(Buffer.byteLength(final.output ?? "") <= MAX_OUTPUT_BYTES);
   assert.equal(events.filter((event) => event.type === "completed").length, 2);

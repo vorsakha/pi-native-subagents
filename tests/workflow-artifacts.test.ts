@@ -40,7 +40,12 @@ function snapshot(sessionId: string, now = Date.now()): Omit<WorkflowSnapshot, "
       harness: "codex",
       model: "review-model",
       preview: "working",
-      transcript: [{ kind: "user", text: "inspect" }, { kind: "assistant", text: "working" }],
+      transcript: [
+        { kind: "user", text: "inspect" },
+        { kind: "tool", phase: "start", toolId: "read-1", name: "read", args: { path: "src/index.ts" } },
+        { kind: "tool", phase: "end", toolId: "read-1", name: "read", result: { content: [{ type: "text", text: "source" }], isError: false } },
+        { kind: "assistant", text: "working" },
+      ],
       usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
     }],
   };
@@ -138,7 +143,12 @@ test("loads session summaries, ignores corrupt files, and durably aborts stale r
 
   const saved = JSON.parse(await readFile(join(first.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
   assert.equal(saved.status, "aborted");
-  assert.equal(summaries[0]?.agents[0]?.transcript?.at(-1)?.kind, "assistant");
+  const transcript = summaries[0]?.agents[0]?.transcript ?? [];
+  assert.equal(transcript.at(-1)?.kind, "assistant");
+  const toolEntries = transcript.filter((entry) => entry.kind === "tool");
+  assert.deepEqual(toolEntries.map((entry) => entry.phase), ["start", "end"]);
+  assert.equal(toolEntries[0]?.args?.path, "src/index.ts");
+  assert.equal(toolEntries[1]?.result?.content[0]?.text, "source");
 });
 
 test("no-resume loading aborts paused future checkpoints plus queued agents and pending phases", async () => {

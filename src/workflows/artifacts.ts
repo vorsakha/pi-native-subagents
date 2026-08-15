@@ -11,7 +11,7 @@ import {
   rm,
 } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import type { TranscriptEntry } from "../types.ts";
+import type { ToolResultSnapshot, TranscriptEntry } from "../types.ts";
 import { formatWorkflowBudget } from "./budget.ts";
 import type { WorkflowJournalRecord, WorkflowSnapshot } from "./types.ts";
 
@@ -237,6 +237,12 @@ function boundedTranscript(entries: TranscriptEntry[] = []): TranscriptEntry[] {
     ...entry,
     text: entry.text === undefined ? undefined : truncateUtf8(entry.text, TRANSCRIPT_ENTRY_BYTES),
     name: entry.kind === "tool" ? truncateUtf8(entry.name, 512) : undefined,
+    args: entry.kind === "tool" && entry.args
+      ? serializeWorkflowValue(entry.args, { maxTotalBytes: TRANSCRIPT_ENTRY_BYTES })
+      : undefined,
+    result: entry.kind === "tool" && entry.result
+      ? serializeWorkflowValue(entry.result, { maxTotalBytes: TRANSCRIPT_ENTRY_BYTES })
+      : undefined,
   })) as TranscriptEntry[];
   const size = (items: TranscriptEntry[]) => Buffer.byteLength(JSON.stringify(items));
   if (size(bounded) <= TRANSCRIPT_AGENT_BYTES) return bounded;
@@ -530,6 +536,24 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
   await atomicWrite(join(directory, "report.md"), lines.join("\n"));
 }
 
+function normalizeToolResult(value: unknown): ToolResultSnapshot | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record.content)) return undefined;
+  return {
+    content: record.content
+      .filter((item): item is Record<string, unknown> => item !== null && typeof item === "object" && !Array.isArray(item))
+      .map((item) => ({
+        type: String(item.type ?? "text"),
+        text: typeof item.text === "string" ? item.text : undefined,
+        data: typeof item.data === "string" ? item.data : undefined,
+        mimeType: typeof item.mimeType === "string" ? item.mimeType : undefined,
+      })),
+    details: record.details,
+    isError: record.isError === true,
+  };
+}
+
 function normalizeTranscript(value: unknown): TranscriptEntry[] | undefined {
   if (!Array.isArray(value)) return undefined;
   const entries: TranscriptEntry[] = [];
@@ -539,7 +563,20 @@ function normalizeTranscript(value: unknown): TranscriptEntry[] | undefined {
     if (entry.kind === "user" || entry.kind === "assistant" || entry.kind === "thinking") {
       if (typeof entry.text === "string") entries.push({ kind: entry.kind, text: entry.text, at: typeof entry.at === "number" ? entry.at : undefined });
     } else if (entry.kind === "tool" && typeof entry.toolId === "string" && typeof entry.name === "string") {
-      entries.push({ kind: "tool", toolId: entry.toolId, name: entry.name, text: typeof entry.text === "string" ? entry.text : undefined, error: entry.error === true, at: typeof entry.at === "number" ? entry.at : undefined });
+      const args = entry.args !== null && typeof entry.args === "object" && !Array.isArray(entry.args)
+        ? entry.args as Record<string, unknown>
+        : undefined;
+      entries.push({
+        kind: "tool",
+        phase: entry.phase === "start" || entry.phase === "end" ? entry.phase : undefined,
+        toolId: entry.toolId,
+        name: entry.name,
+        args,
+        result: normalizeToolResult(entry.result),
+        text: typeof entry.text === "string" ? entry.text : undefined,
+        error: entry.error === true,
+        at: typeof entry.at === "number" ? entry.at : undefined,
+      });
     }
   }
   return boundedTranscript(entries);

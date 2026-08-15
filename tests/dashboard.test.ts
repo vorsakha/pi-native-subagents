@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { initTheme } from "@earendil-works/pi-coding-agent";
 import { ansiTheme, jobSnapshot, theme, tick } from "./helpers.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { KeybindingsManager } from "@earendil-works/pi-tui";
@@ -11,6 +12,8 @@ import {
 import { TakeoverView, buildTranscript } from "../extensions/subagents/takeover.ts";
 import { renderAssistantMarkdown } from "../extensions/subagents/transcript.ts";
 import type { JobSnapshot } from "../src/types.ts";
+
+initTheme("dark", false);
 
 test("dashboard truncation respects terminal display width for Unicode and ANSI", () => {
   for (const value of [
@@ -210,7 +213,7 @@ test("dashboard caches Markdown rendering by transcript and width", (t) => {
   assert.equal(calls, 3, "manager events invalidate equal-length transcript changes");
 });
 
-test("transcript pairs native tool events into Pi-style execution shells", () => {
+test("transcript delegates structured tool events to Pi execution components", () => {
   const current = {
     ...job("tools"),
     output: "",
@@ -219,20 +222,22 @@ test("transcript pairs native tool events into Pi-style execution shells", () =>
       { id: "read-1", name: "Read", status: "failed" as const },
     ],
     transcript: [
-      { kind: "tool" as const, toolId: "grep-1", name: "Grep", text: JSON.stringify({ pattern: "480", path: "frontend", glob: "*.ts" }) },
-      { kind: "tool" as const, toolId: "read-1", name: "Read", text: JSON.stringify({ path: "missing.ts" }) },
-      { kind: "tool" as const, toolId: "grep-1", name: "tool", text: JSON.stringify("src/a.ts:1: match\nsrc/b.ts:2: match") },
-      { kind: "tool" as const, toolId: "read-1", name: "tool", text: "File not found", error: true },
+      { kind: "tool" as const, phase: "start" as const, toolId: "grep-1", name: "Grep", args: { pattern: "480", path: "frontend", glob: "*.ts" } },
+      { kind: "tool" as const, phase: "start" as const, toolId: "read-1", name: "Read", args: { path: "missing.ts" } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "grep-1", name: "Grep", result: { content: [{ type: "text", text: "src/a.ts:1: match\nsrc/b.ts:2: match" }], isError: false } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "read-1", name: "Read", result: { content: [{ type: "text", text: "File not found" }], isError: true }, error: true },
     ],
   };
   const lines = buildTranscript(current, 48, ansiTheme);
   const plain = lines.join("\n").replace(/\u001b\[[0-9;]*m/g, "");
+  const backgrounds = new Set(lines.flatMap((line) => line.match(/\u001b\[48;[^m]+m/g) ?? []));
 
-  assert.match(plain, /✓ grep \/480\/ in frontend \(\*\.ts\)/);
+  assert.match(plain, /grep \/480\/ in frontend \(\*\.ts\)/);
   assert.match(plain, /src\/a\.ts:1: match\s*\n\s*src\/b\.ts:2: match/);
-  assert.match(plain, /× read missing\.ts/);
-  assert.doesNotMatch(plain, /tool ·/);
-  assert.ok(lines.filter((line) => line.includes("\u001b[48;5;24m")).length >= 6, "call and result rows use a semantic tool background");
+  assert.match(plain, /read .*missing\.ts/);
+  assert.match(plain, /File not found/);
+  assert.doesNotMatch(plain, /[✓×]/, "Pi's native tool shell does not add custom status glyphs");
+  assert.ok(backgrounds.size >= 2, "success and error use Pi's distinct semantic tool backgrounds");
   assert.ok(lines.every((line) => visibleWidth(line) <= 48));
 });
 

@@ -9,7 +9,17 @@ import { JsonlFramer, parseJsonRecord } from "../framing.ts";
 import { spawnManaged } from "../process-tree.ts";
 import { boundedAppend } from "../reducer.ts";
 import { PI_PARENT_THREAD_FILE } from "../parent-thread-context.ts";
-import type { Backend, BackendEvent, BackendPolicy, BackendRequest, BackendRun, DiscoveryRequest, DiscoveryResult, SendBehavior } from "../types.ts";
+import type {
+  Backend,
+  BackendEvent,
+  BackendPolicy,
+  BackendRequest,
+  BackendRun,
+  DiscoveryRequest,
+  DiscoveryResult,
+  SendBehavior,
+  ToolResultSnapshot,
+} from "../types.ts";
 
 /** Marks a Pi child so this package registers nothing inside it. */
 export const PI_CHILD_MARKER = "PI_NATIVE_SUBAGENTS_CHILD";
@@ -401,9 +411,24 @@ export class PiRpcBackend implements Backend {
           if (text) emit({ type: "user_message", text });
         }
       } else if (event.type === "tool_execution_start") {
-        emit({ type: "tool_start", id: String(event.toolCallId ?? "tool"), name: String(event.toolName ?? "tool"), summary: summarize(asObject(event.args)) });
+        const args = asObject(event.args);
+        emit({
+          type: "tool_start",
+          id: String(event.toolCallId ?? "tool"),
+          name: String(event.toolName ?? "tool"),
+          args,
+          summary: summarize(args),
+        });
       } else if (event.type === "tool_execution_end") {
-        emit({ type: "tool_end", id: String(event.toolCallId ?? "tool"), name: String(event.toolName ?? "tool"), output: resultPreview(event.result), error: event.isError === true });
+        const result = toolResultSnapshot(event.result, event.isError === true);
+        emit({
+          type: "tool_end",
+          id: String(event.toolCallId ?? "tool"),
+          name: String(event.toolName ?? "tool"),
+          result,
+          output: resultPreview(event.result),
+          error: result.isError,
+        });
       } else if (event.type === "queue_update") {
         const steering = Array.isArray(event.steering) ? event.steering : [];
         const followUp = Array.isArray(event.followUp) ? event.followUp : [];
@@ -569,6 +594,21 @@ function resultPreview(value: unknown): string {
   const content = textContent(record.content);
   if (content) return content.slice(0, 4_096);
   try { return JSON.stringify(value).slice(0, 4_096); } catch { return ""; }
+}
+function toolResultSnapshot(value: unknown, isError: boolean): ToolResultSnapshot {
+  if (typeof value === "string") {
+    return { content: [{ type: "text", text: value }], isError };
+  }
+  const record = asObject(value);
+  const content = Array.isArray(record.content)
+    ? record.content.map((item) => asObject(item)).map((item) => ({
+        type: String(item.type ?? "text"),
+        text: typeof item.text === "string" ? item.text : undefined,
+        data: typeof item.data === "string" ? item.data : undefined,
+        mimeType: typeof item.mimeType === "string" ? item.mimeType : undefined,
+      }))
+    : [{ type: "text", text: resultPreview(value) }];
+  return { content, details: record.details, isError };
 }
 function summarize(args: Record<string, unknown>): string {
   const value = args.path ?? args.command ?? args.query ?? args.url ?? "";

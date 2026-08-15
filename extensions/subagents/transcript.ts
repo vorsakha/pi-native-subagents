@@ -1,24 +1,47 @@
-import { getMarkdownTheme, type Theme } from "@earendil-works/pi-coding-agent";
-import { Markdown, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
+import {
+  getMarkdownTheme,
+  ToolExecutionComponent,
+  UserMessageComponent,
+  type Theme,
+} from "@earendil-works/pi-coding-agent";
+import {
+  Markdown,
+  truncateToWidth,
+  visibleWidth,
+  wrapTextWithAnsi,
+  type TUI,
+} from "@earendil-works/pi-tui";
 import { isTerminal } from "../../src/manager.ts";
-import type { JobSnapshot, SendBehavior, TranscriptEntry } from "../../src/types.ts";
+import type {
+  JobSnapshot,
+  SendBehavior,
+  ToolResultSnapshot,
+  TranscriptEntry,
+} from "../../src/types.ts";
 import { sanitizeInline, sanitizeText } from "./render.ts";
 
 /*
- * One normalized transcript for every supervision surface. Harness events are
- * already reduced into `job.transcript`; this module turns that bounded state
- * into display lines with a stable vocabulary. User messages and thinking keep
- * compact role prefixes; tool start/result events are paired into Pi-style
- * execution shells with semantic backgrounds, explicit status glyphs, a bold
- * call row, and separated output. Meaning never depends on color alone.
- * Assistant prose uses the same Markdown component configuration as regular
- * Pi assistant messages. A renderer can still be injected so dashboards can
- * cache the expensive pass per job generation and width.
+ * One normalized transcript for every supervision surface. Assistant and user
+ * prose use Pi's own message configuration, while tool lifecycle events are
+ * adapted into Pi's public ToolExecutionComponent. Backend adapters preserve
+ * structured arguments/results so built-in tools receive their native Pi
+ * renderer; unknown native tools use Pi's generic fallback shell.
  */
+
+export interface ToolRenderSnapshot {
+  key: string;
+  name: string;
+  args: Record<string, unknown>;
+  result?: ToolResultSnapshot;
+  status: "running" | "completed" | "failed";
+  cwd: string;
+}
 
 export interface TranscriptOptions {
   /** Overrides Pi's regular assistant Markdown renderer. */
   renderMarkdown?: (text: string, width: number) => string[];
+  /** Overrides Pi's regular tool execution renderer. */
+  renderTool?: (tool: ToolRenderSnapshot, width: number) => string[];
 }
 
 /** Render assistant prose with regular Pi message padding, theme, and wrapping. */
@@ -29,11 +52,34 @@ export function renderAssistantMarkdown(text: string, width: number): string[] {
     .map((line) => truncateToWidth(line, safeWidth, ""));
 }
 
+/** Render a user turn through Pi's public user-message component. */
+export function renderUserMessage(text: string, width: number): string[] {
+  const safeWidth = Math.max(1, width);
+  return new UserMessageComponent(sanitizeText(text), getMarkdownTheme(), 1)
+    .render(safeWidth)
+    .map((line) => truncateToWidth(line, safeWidth, ""));
+}
+
+/** Match Pi's visible thinking treatment without exposing message internals. */
+function renderThinking(text: string, width: number, theme: Theme): string[] {
+  const safeWidth = Math.max(1, width);
+  const rows = new Markdown(
+    sanitizeText(text).trim(),
+    1,
+    0,
+    getMarkdownTheme(),
+    {
+      color: (content) => theme.fg("thinkingText", content),
+      italic: true,
+    },
+  ).render(safeWidth);
+  return ["", ...rows.map((line) => truncateToWidth(line, safeWidth, ""))];
+}
+
 type ToolEntry = Extract<TranscriptEntry, { kind: "tool" }>;
 type ToolTrace = JobSnapshot["tools"][number];
-type ToolBackground = "toolPendingBg" | "toolSuccessBg" | "toolErrorBg";
 type TranscriptBlock =
-  | { kind: "entry"; entry: TranscriptEntry }
+  | { kind: "entry"; entry: Exclude<TranscriptEntry, ToolEntry> }
   | { kind: "tool"; call: ToolEntry; result?: ToolEntry };
 
 /** Pair native start/result events by id, even when parallel calls interleave. */
@@ -45,12 +91,19 @@ function transcriptBlocks(entries: TranscriptEntry[]): TranscriptBlock[] {
       blocks.push({ kind: "entry", entry });
       continue;
     }
+
     const open = openTools.get(entry.toolId);
-    if (open) {
+    const isResult = entry.phase === "end" || entry.phase === undefined && open !== undefined;
+    if (isResult && open) {
       open.result = entry;
       openTools.delete(entry.toolId);
       continue;
     }
+    if (isResult) {
+      blocks.push({ kind: "tool", call: entry, result: entry });
+      continue;
+    }
+
     const block: Extract<TranscriptBlock, { kind: "tool" }> = { kind: "tool", call: entry };
     blocks.push(block);
     openTools.set(entry.toolId, block);
@@ -70,65 +123,26 @@ function jsonRecord(value: string | undefined): Record<string, unknown> | undefi
   }
 }
 
-function field(record: Record<string, unknown> | undefined, ...names: string[]): string {
-  for (const name of names) {
-    const value = record?.[name];
-    if (typeof value === "string" && value.trim()) return sanitizeInline(value);
-  }
-  return "";
+const BUILT_IN_TOOL_NAMES = new Set(["bash", "edit", "find", "grep", "ls", "read", "write"]);
+
+function piToolName(value: string): string {
+  const clean = sanitizeInline(value) || "tool";
+  const lower = clean.toLowerCase();
+  return BUILT_IN_TOOL_NAMES.has(lower) ? lower : clean;
 }
 
-function knownToolName(name: string): string {
-  const lower = sanitizeInline(name).toLowerCase();
-  const known: Record<string, string> = {
-    bash: "bash",
-    edit: "edit",
-    find: "find",
-    glob: "glob",
-    grep: "grep",
-    ls: "ls",
-    read: "read",
-    webfetch: "web fetch",
-    websearch: "web search",
-    write: "write",
-  };
-  return known[lower] ?? sanitizeInline(name);
+function legacyArgs(name: string, text: string | undefined): Record<string, unknown> {
+  const parsed = jsonRecord(text);
+  if (parsed) return parsed;
+  const value = sanitizeText(text ?? "").trim();
+  if (!value) return {};
+  const lower = name.toLowerCase();
+  if (lower === "bash") return { command: value };
+  if (["edit", "read", "write"].includes(lower)) return { path: value };
+  return { input: value };
 }
 
-/** Format the common native tools with the same call vocabulary as Pi. */
-function formatToolCall(entry: ToolEntry, theme: Theme): string {
-  const label = knownToolName(entry.name);
-  const lower = label.toLowerCase();
-  const summary = sanitizeInline(entry.text ?? "");
-  const args = jsonRecord(entry.text);
-  if (lower === "bash") {
-    const command = field(args, "command") || summary;
-    return theme.fg("toolTitle", theme.bold(`$ ${command || "…"}`));
-  }
-
-  let detail = summary;
-  if (lower === "grep" && args) {
-    const pattern = field(args, "pattern");
-    const path = field(args, "path") || ".";
-    const glob = field(args, "glob");
-    detail = `${pattern ? `/${pattern}/` : "/…/"} in ${path}${glob ? ` (${glob})` : ""}`;
-  } else if ((lower === "glob" || lower === "find") && args) {
-    const pattern = field(args, "pattern");
-    const path = field(args, "path") || ".";
-    detail = [pattern, `in ${path}`].filter(Boolean).join(" ");
-  } else if (["read", "edit", "write"].includes(lower) && args) {
-    detail = field(args, "path", "file_path") || summary;
-  } else if (lower === "web search" && args) {
-    detail = field(args, "query") || summary;
-  } else if (lower === "web fetch" && args) {
-    detail = field(args, "url") || summary;
-  }
-
-  const title = theme.fg("toolTitle", theme.bold(label || "tool"));
-  return detail ? `${title} ${theme.fg("accent", detail)}` : title;
-}
-
-/** Claude often returns a JSON-encoded string; show its actual lines, not quotes and \\n escapes. */
+/** Claude sometimes JSON-encodes textual tool output; expose the actual text. */
 function normalizeToolOutput(value: string | undefined): string {
   const clean = sanitizeText(value ?? "").trimEnd();
   if (!clean) return "";
@@ -148,54 +162,58 @@ function normalizeToolOutput(value: string | undefined): string {
   return clean;
 }
 
-function paintToolRow(theme: Theme, background: ToolBackground, content: string, width: number): string {
-  const padding = width >= 3 ? 1 : 0;
-  const contentWidth = Math.max(1, width - padding * 2);
-  const clipped = truncateToWidth(content, contentWidth, "");
-  const row = `${" ".repeat(padding)}${clipped}${" ".repeat(Math.max(0, width - padding - visibleWidth(clipped)))}`;
-  return theme.bg(background, truncateToWidth(row, width, ""));
+function resolvedTool(
+  job: JobSnapshot,
+  block: Extract<TranscriptBlock, { kind: "tool" }>,
+  trace: ToolTrace | undefined,
+): ToolRenderSnapshot {
+  const callName = block.call.name === "tool" ? "" : block.call.name;
+  const resultName = block.result?.name === "tool" ? "" : block.result?.name;
+  const name = piToolName(callName || resultName || trace?.name || "tool");
+  const args = block.call.args ?? trace?.args ?? legacyArgs(name, block.call.phase === "end" ? trace?.summary : block.call.text);
+  const status = block.result?.error === true || block.result?.result?.isError === true || trace?.status === "failed"
+    ? "failed"
+    : block.result || trace?.status === "completed"
+      ? "completed"
+      : "running";
+  const legacyOutput = normalizeToolOutput(block.result?.text ?? (
+    block.call.phase === "end" ? block.call.text : undefined
+  ));
+  const result = block.result?.result ?? trace?.result ?? (status === "running"
+    ? undefined
+    : {
+        content: legacyOutput ? [{ type: "text", text: legacyOutput }] : [],
+        isError: status === "failed",
+      });
+  return {
+    key: `${job.id}:${block.call.toolId}`,
+    name,
+    args,
+    result,
+    status,
+    cwd: job.cwd,
+  };
 }
 
-function renderToolBlock(
-  block: Extract<TranscriptBlock, { kind: "tool" }>,
-  tool: ToolTrace | undefined,
-  width: number,
-  theme: Theme,
-): string[] {
-  const failed = block.result?.error === true || block.call.error === true || tool?.status === "failed";
-  const settled = block.result !== undefined || failed || tool?.status === "completed";
-  const background: ToolBackground = failed ? "toolErrorBg" : settled ? "toolSuccessBg" : "toolPendingBg";
-  const glyph = failed
-    ? theme.fg("error", "×")
-    : settled
-      ? theme.fg("success", "✓")
-      : theme.fg("accent", "…");
-  // Bounded transcript eviction can leave a settled result without its start
-  // event. Reconstruct the call from the durable ToolTrace in that case.
-  const loneResult = block.result === undefined && tool !== undefined && tool.status !== "running" && (
-    block.call.name === "tool" || block.call.text !== tool.summary
-  );
-  const call = loneResult && tool
-    ? { ...block.call, name: tool.name, text: tool.summary }
-    : block.call.name === "tool" && block.result?.name
-      ? { ...block.call, name: block.result.name }
-      : block.call;
-  const header = `${glyph} ${formatToolCall(call, theme)}`;
-  const padding = width >= 3 ? 1 : 0;
-  const contentWidth = Math.max(1, width - padding * 2);
-  const rows = wrapTextWithAnsi(header, contentWidth)
-    .map((line) => paintToolRow(theme, background, line, width));
-  const output = normalizeToolOutput(block.result?.text ?? (loneResult ? block.call.text : undefined));
-  if (!output) return rows;
+const transcriptTui = {
+  requestRender() {},
+} as unknown as TUI;
 
-  rows.push(paintToolRow(theme, background, "", width));
-  for (const rawLine of output.split("\n")) {
-    const styled = theme.fg(failed ? "error" : "toolOutput", rawLine || " ");
-    for (const line of wrapTextWithAnsi(styled, contentWidth)) {
-      rows.push(paintToolRow(theme, background, line, width));
-    }
-  }
-  return rows;
+/** Render a normalized tool lifecycle through Pi's own execution component. */
+export function renderPiTool(tool: ToolRenderSnapshot, width: number): string[] {
+  const safeWidth = Math.max(1, width);
+  const component = new ToolExecutionComponent(
+    tool.name,
+    tool.key,
+    tool.args,
+    { showImages: false },
+    undefined,
+    transcriptTui,
+    tool.cwd,
+  );
+  component.setArgsComplete();
+  if (tool.result) component.updateResult(tool.result, false);
+  return component.render(safeWidth).map((line) => truncateToWidth(line, safeWidth, ""));
 }
 
 /** Why a job's transcript is empty, in the job's own lifecycle terms. */
@@ -217,6 +235,8 @@ export function buildTranscript(
 ): string[] {
   const safeWidth = Math.max(1, width);
   const lines: string[] = [];
+  const renderMarkdown = options.renderMarkdown ?? renderAssistantMarkdown;
+  const renderTool = options.renderTool ?? renderPiTool;
   const pushWrapped = (prefix: string, text: string, color: Parameters<Theme["fg"]>[0]) => {
     const clean = sanitizeText(text).trim();
     if (!clean) return;
@@ -226,56 +246,44 @@ export function buildTranscript(
       lines.push((index === 0 ? prefix : " ".repeat(prefixWidth)) + theme.fg(color, wrapped[index]!));
     }
   };
-  const pushProse = (prefix: string, text: string, _color: Parameters<Theme["fg"]>[0]) => {
-    const render = options.renderMarkdown ?? renderAssistantMarkdown;
+  const pushAssistant = (text: string) => {
     const clean = sanitizeText(text).trim();
     if (!clean) return;
-    const prefixWidth = visibleWidth(prefix);
-    const rendered = render(clean, Math.max(1, safeWidth - prefixWidth));
-    for (let index = 0; index < rendered.length; index++) {
-      lines.push((index === 0 ? prefix : " ".repeat(prefixWidth)) + truncateToWidth(rendered[index]!, Math.max(1, safeWidth - prefixWidth), ""));
-    }
+    lines.push(...renderMarkdown(clean, safeWidth));
   };
   const toolTraces = new Map(job.tools.map((tool) => [tool.id, tool]));
+
   for (const block of transcriptBlocks(job.transcript)) {
-    if (block.kind === "entry") {
-      renderEntry(block.entry, pushWrapped, pushProse, theme);
+    if (block.kind === "tool") {
+      const tool = resolvedTool(job, block, toolTraces.get(block.call.toolId));
+      lines.push(...renderTool(tool, safeWidth));
       continue;
     }
-    if (lines.length && lines.at(-1) !== "") lines.push("");
-    lines.push(...renderToolBlock(block, toolTraces.get(block.call.toolId), safeWidth, theme));
+    if (block.entry.kind === "user") lines.push(...renderUserMessage(block.entry.text, safeWidth));
+    else if (block.entry.kind === "thinking") lines.push(...renderThinking(block.entry.text, safeWidth, theme));
+    else pushAssistant(block.entry.text);
   }
-  if (job.liveThinking.trim()) pushWrapped(theme.fg("dim", "~ "), job.liveThinking, "muted");
+
+  if (job.liveThinking.trim()) lines.push(...renderThinking(job.liveThinking, safeWidth, theme));
   const lastAssistant = [...job.transcript].reverse().find((entry) => entry.kind === "assistant");
   if (!isTerminal(job.status) && job.output.trim() && lastAssistant?.text !== job.output) {
-    pushProse(theme.fg("accent", "• "), job.output, "text");
+    pushAssistant(job.output);
   }
   for (const queued of job.queuedMessages) {
     pushWrapped(theme.fg("warning", `> [${queued.behavior}] `), queued.text, "muted");
   }
   if (!lines.length) lines.push(theme.fg("dim", emptyTranscriptLabel(job)));
-  return lines;
+  return lines.map((line) => truncateToWidth(line, safeWidth, ""));
 }
 
-function renderEntry(
-  entry: TranscriptEntry,
-  push: (prefix: string, text: string, color: Parameters<Theme["fg"]>[0]) => void,
-  pushProse: (prefix: string, text: string, color: Parameters<Theme["fg"]>[0]) => void,
-  theme: Theme,
-): void {
-  if (entry.kind === "user") push(theme.fg("accent", "> "), entry.text, "userMessageText");
-  else if (entry.kind === "thinking") push(theme.fg("dim", "~ "), entry.text, "muted");
-  else if (entry.kind === "assistant") pushProse("", entry.text, "text");
+function signatureValue(value: unknown): string {
+  if (value === undefined) return "";
+  try { return JSON.stringify(value); }
+  catch { return "[unserializable]"; }
 }
 
-/**
- * Cheap identity for a job's rendered transcript. Every mutation the reducer can
- * perform — appended entries, evicted entries, streamed output, queue changes —
- * moves at least one component, so a cache keyed on this never serves stale text.
- */
+/** Cheap, content-sensitive identity for a job's rendered transcript. */
 export function transcriptSignature(job: JobSnapshot): string {
-  // Keep the cache cheap enough for streaming, but content-sensitive: bounded
-  // output can replace its tail without changing any length/count fields.
   let chars = 0;
   let hash = 2_166_136_261;
   const mix = (value: string) => {
@@ -290,10 +298,13 @@ export function transcriptSignature(job: JobSnapshot): string {
     chars += text.length;
     mix(text);
     if (entry.kind === "tool") {
-      chars += entry.name.length + entry.toolId.length;
+      const structured = `${signatureValue(entry.args)}${signatureValue(entry.result)}`;
+      chars += entry.name.length + entry.toolId.length + structured.length;
       mix(entry.name);
       mix(entry.toolId);
+      mix(entry.phase ?? "legacy");
       mix(entry.error ? "1" : "0");
+      mix(structured);
     }
   }
   mix(job.output);
