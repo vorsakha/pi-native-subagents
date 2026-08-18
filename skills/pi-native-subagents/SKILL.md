@@ -136,6 +136,7 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 - Wide terminals show a jobs rail beside the selected inspector; narrower terminals stack or drill into a single pane. `j/k` or arrows select, `Enter` enters in-panel takeover, and `Esc` backs out before closing.
 - Fullscreen-safe transcript navigation is `Shift+↑↓`, `Ctrl+U/D`, and `g/G`; Page Up/Down are compatibility aliases only and are not the primary fullscreen controls.
 - Cancellation is intentionally two-step: press `x` once to arm it and again to confirm. Failed steer/follow-up submissions retain the draft when the request fails.
+- `/subagents providers` reports each native provider as installed, authenticated, or ready, with the masked account email, plan, auth method, and Pi's selected model. `/subagents providers refresh` re-probes. It reads account and auth state only: no model request is made, credentials are never displayed, and Pi exposes no account email.
 
 ## Runtime limits and lifecycle
 
@@ -159,6 +160,7 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 - `Workflow turn budget exceeded`: the budget covers aggregate child turns. Increase it with realistic orchestration overhead, or use direct `subagent_spawn` for a small fan-out.
 - `independent` rejected for the same provider: independence means provider diversity, not model escalation. Omit it for same-provider escalation or route to the opposite provider.
 - Requirement rejected: rediscover capabilities with `subagent_capabilities`, use the returned ID, and keep the access ceiling consistent.
+- A harness rejected for login or readiness: check `/subagents providers` to see which provider is authenticated and ready before retrying, and switch routes rather than guessing at the account state.
 - A workflow or child fails: inspect the returned `ok`, `error`, route, and job ID; use `/workflows` for durable workflow state. Do not hide a failed route behind a success-only summary.
 
 ## Safe routing defaults

@@ -6,6 +6,8 @@ import { registerParentThreadChildTool } from "../extensions/parent-thread/index
 import { configuredHarnessFromEnv, parseHumanSubagentCommand, permittedHumanPiToolNames, registerNativeSubagents } from "../extensions/subagents/index.ts";
 import { PI_CHILD_MARKER } from "../src/backends/pi-rpc.ts";
 import { PI_PARENT_THREAD_FILE } from "../src/parent-thread-context.ts";
+import { buildCatalog } from "../src/capabilities.ts";
+import { claudeStatus, codexStatus, parseClaudeAuthStatus, parseCodexAccount, piStatusFromCatalog } from "../src/provider-status.ts";
 import { HoldingBackend, ImmediateBackend, context, fakePi, tempDir, theme } from "./helpers.ts";
 
 /** The parent session's tool inventory, including surfaces children must never inherit. */
@@ -55,7 +57,23 @@ test("the subagent extension surface", async (t) => {
       return { sessionFile: "/sessions/forked.jsonl", sessionId: "forked-session" };
     },
   };
-  registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir, sessionPeerSource });
+  const providerStatusRequests: Array<{ cwd: string; refresh?: boolean }> = [];
+  const providerStatus = {
+    async statuses(request: { cwd: string; refresh?: boolean }) {
+      providerStatusRequests.push({ cwd: request.cwd, refresh: request.refresh });
+      return [
+        piStatusFromCatalog(buildCatalog({
+          harness: "pi", cwd: request.cwd, access: "full", discoveredAt: 1_000, capabilities: [],
+          sources: [{ source: "pi-model", health: "healthy", detail: "anthropic/claude-opus-5" }],
+        }), 1_000),
+        claudeStatus(parseClaudeAuthStatus(JSON.stringify({
+          loggedIn: true, authMethod: "claude.ai", email: "engineer@example.com", subscriptionType: "max",
+        })), 1_000),
+        codexStatus(parseCodexAccount({ account: { type: "none" } }), 1_000),
+      ];
+    },
+  };
+  registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir, sessionPeerSource, providerStatus });
 
   const { ctx, notifications } = context({ sessionId: "extension-session", branch: [
     { type: "message", message: { role: "user", content: "Discuss the parent-thread bridge", timestamp: 1_000 } },
@@ -128,6 +146,27 @@ test("the subagent extension surface", async (t) => {
     }, undefined, undefined, ctx);
     await pi.tools.get("subagent_wait").execute("peer-follow-up-wait", { jobId: peer.details.job.id }, undefined, undefined, ctx);
     assert.match(backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.resumeSessionFile === "/sessions/forked.jsonl")?.systemPrompt ?? "", /read-only session peer/);
+  });
+
+  await t.test("reports masked provider readiness and gates it on project trust", async () => {
+    await pi.commands.get("subagents").handler("providers", ctx);
+    const report = notifications.at(-1)?.message ?? "";
+    assert.match(report, /no model request was made/);
+    assert.match(report, /claude\s+ready · account e\*\*\*@example\.com · plan max/);
+    assert.match(report, /codex\s+installed, not authenticated/);
+    assert.ok(!report.includes("engineer@example.com"), "the command output never prints a full address");
+    assert.deepEqual(providerStatusRequests, [{ cwd: extensionRoot, refresh: false }]);
+
+    await pi.commands.get("subagents").handler("providers refresh", ctx);
+    assert.equal(providerStatusRequests.at(-1)?.refresh, true, "the refresh argument bypasses the status cache");
+
+    const untrusted = context({ trusted: false });
+    await pi.commands.get("subagents").handler("providers", untrusted.ctx);
+    assert.match(untrusted.notifications.at(-1)?.message ?? "", /disabled for untrusted projects/);
+    assert.equal(providerStatusRequests.length, 2, "an untrusted project never probes a provider");
+
+    const completions = pi.commands.get("subagents").getArgumentCompletions("prov").map((item: { value: string }) => item.value);
+    assert.deepEqual(completions, ["providers", "providers refresh"]);
   });
 
   await t.test("delivers an unconsumed background result exactly once", async () => {

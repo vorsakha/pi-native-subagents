@@ -24,7 +24,8 @@ import type {
   Usage,
 } from "../types.ts";
 
-const CLIENT_INFO = { name: "pi-native-subagents", title: "Pi Native Subagents", version: "0.1.0" };
+/** App-server identity shared by every Codex connection this package opens. */
+export const CODEX_CLIENT_INFO = { name: "pi-native-subagents", title: "Pi Native Subagents", version: "0.1.0" };
 /** Optional native integrations whose failure must not take down unrelated work. */
 const OPTIONAL_INTEGRATION = /mcp|plugin|marketplace|oauth|invalid_grant|refresh token|hook/i;
 
@@ -118,7 +119,7 @@ export class CodexAppServerBackend implements Backend {
     const abort = () => void peer.close();
     request.signal.addEventListener("abort", abort, { once: true });
     try {
-      const initialize = asObject(await peer.request("initialize", { clientInfo: CLIENT_INFO }, this.#requestTimeoutMs));
+      const initialize = asObject(await peer.request("initialize", { clientInfo: CODEX_CLIENT_INFO }, this.#requestTimeoutMs));
       const userAgent = asObject(initialize.userAgent);
       nativeVersion = typeof initialize.version === "string"
         ? initialize.version
@@ -450,7 +451,7 @@ export class CodexAppServerBackend implements Backend {
     const initialization = (async () => {
       try {
         await peer.request("initialize", {
-          clientInfo: CLIENT_INFO,
+          clientInfo: CODEX_CLIENT_INFO,
           ...(request.parentThread ? { capabilities: { experimentalApi: true } } : {}),
         }, this.#requestTimeoutMs);
         peer.notify("initialized");

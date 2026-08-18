@@ -52,7 +52,7 @@ export default async function () {
 /subagent [--harness pi|claude|codex] [--model ID] [--effort LEVEL]
           [--access readOnly|full] [--cwd DIR] [--profile NAME]
           [--independent] [--independent-of JOB] <task>
-/subagents [status|profiles|capabilities|pi|claude|codex]
+/subagents [status|profiles|providers|capabilities|pi|claude|codex]
 /subagents-config [pi|claude|codex]
 /workflows
 ```

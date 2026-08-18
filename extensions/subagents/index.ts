@@ -25,6 +25,11 @@ import {
 } from "../../src/capabilities.ts";
 import { routeCapabilities, type RequestedHarness } from "../../src/capability-routing.ts";
 import { CapabilityService, type CapabilityRouter } from "../../src/capability-service.ts";
+import {
+  formatProviderStatusReport,
+  ProviderStatusService,
+  type ProviderStatusReader,
+} from "../../src/provider-status.ts";
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { claimExtensionInstall } from "../../src/install-guard.ts";
 import { providerFamily } from "../../src/policy.ts";
@@ -119,6 +124,8 @@ export interface RegistrationOptions {
   globalProfilesDir?: string;
   /** Injectable for tests; production uses the real Pi SessionManager. */
   sessionPeerSource?: SessionPeerSource;
+  /** Injectable for tests; production probes the real provider CLIs. */
+  providerStatus?: ProviderStatusReader;
   /** Injectable for tests; production reads the real process environment. */
   env?: NodeJS.ProcessEnv;
 }
@@ -181,6 +188,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     new CodexAppServerBackend(),
   ];
   const capabilities = new CapabilityService({ backends, env });
+  // Pi readiness reuses the zero-turn capability catalog; Claude and Codex are
+  // probed through their own account surfaces, never through a model request.
+  const providerStatus = options.providerStatus ?? new ProviderStatusService({ piReadiness: capabilities, env });
   const createManager = () => new JobManager({
     profiles: profileCatalog.profiles,
     concurrency: 4,
@@ -476,6 +486,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     manager = createManager();
     // A new session may open a different project or follow a configuration change.
     capabilities.invalidate();
+    providerStatus.invalidate?.();
     sessionContext = ctx;
     deferredResults.clear();
     cardSnapshots.clear();
@@ -591,14 +602,26 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       } catch (error) {
         ctx.ui.notify(`Capability discovery failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
       }
+    } else if (value === "providers" || value.startsWith("providers ")) {
+      if (!ctx.isProjectTrusted()) {
+        ctx.ui.notify("Subagent provider status is disabled for untrusted projects.", "warning");
+        return;
+      }
+      const refresh = value.slice("providers".length).trim() === "refresh";
+      try {
+        const statuses = await providerStatus.statuses({ cwd: ctx.cwd, refresh });
+        ctx.ui.notify(formatProviderStatusReport(statuses, Date.now()), statuses.some((status) => status.ready) ? "info" : "warning");
+      } catch (error) {
+        ctx.ui.notify(`Provider status failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
     } else {
-      ctx.ui.notify("Usage: /subagents [status|profiles|capabilities [refresh]|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <harness>", "warning");
+      ctx.ui.notify("Usage: /subagents [status|profiles|providers [refresh]|capabilities [refresh]|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <harness>", "warning");
     }
   };
 
   pi.registerCommand("subagents", {
-    description: "Open the subagent dashboard; inspect profiles with /subagents profiles and native capabilities with /subagents capabilities.",
-    getArgumentCompletions: (prefix) => ["status", "profiles", "capabilities", "capabilities refresh", ...HARNESSES, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    description: "Open the subagent dashboard; inspect profiles with /subagents profiles, provider login state with /subagents providers, and native capabilities with /subagents capabilities.",
+    getArgumentCompletions: (prefix) => ["status", "profiles", "providers", "providers refresh", "capabilities", "capabilities refresh", ...HARNESSES, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (args.trim()) await configure(args, ctx);
       else await openSubagentsDashboard(ctx, getManager());
