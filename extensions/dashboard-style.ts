@@ -19,13 +19,80 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
  *   │ ❯ ● worker  12s │ worker · 0123abcd       │
  *   ╰─────────────────┴─────────────────────────╯
  *
- * Panels use the full available width. Height comes from `dashboardMaxHeight`
- * (80% of the terminal, leaving Pi's transcript visible) or, for surfaces that
- * opt into fullscreen, `dashboardOverlayRows`. Status is never communicated by
- * color alone, focus stays visible, and every action is keyboard reachable
- * including Pi's cancel binding and Escape.
+ * Panels use the full available width. Height comes from `dashboardOverlayRows`
+ * (80% of the terminal in regular TUI mode, or all available rows for a
+ * fullscreen surface). Status is never communicated by color alone, focus stays
+ * visible, and every action is keyboard reachable including Pi's cancel binding
+ * and Escape.
  */
 const DASHBOARD_MAX_HEIGHT_RATIO = 0.8;
+
+/** A wide terminal earns a list rail beside the inspector; a medium one stacks them. */
+export const DASHBOARD_WIDE_MIN_WIDTH = 96;
+export const DASHBOARD_MEDIUM_MIN_WIDTH = 64;
+/** Content rows below which the panel drops to a single-pane drill-down. */
+export const DASHBOARD_SPLIT_MIN_ROWS = 10;
+/** Panel rows below which only a compact summary fits. */
+export const DASHBOARD_COMPACT_ROWS = 6;
+/** Header, top border, bottom border, and hint around the content area. */
+export const DASHBOARD_CHROME_ROWS = 4;
+
+export type DashboardLayoutKind = "wide" | "medium" | "narrow";
+
+export interface DashboardLayout {
+  kind: DashboardLayoutKind;
+  /** Total lines the panel is allowed to render. */
+  height: number;
+  /** Rows between the top and bottom borders. */
+  contentRows: number;
+  /** Visible width of the list rail. `wide` only. */
+  railWidth: number;
+  /** Rows above the detail divider. `medium` only. */
+  listRows: number;
+  /** Rows given to the inspector. */
+  detailRows: number;
+}
+
+export function dashboardLayout(width: number, rows: number): DashboardLayout {
+  const height = Math.max(0, Math.floor(rows));
+  const contentRows = Math.max(1, height - DASHBOARD_CHROME_ROWS);
+  const innerWidth = Math.max(0, Math.floor(width) - 2);
+  if (width >= DASHBOARD_WIDE_MIN_WIDTH && contentRows >= DASHBOARD_SPLIT_MIN_ROWS) {
+    const railWidth = Math.max(26, Math.min(44, Math.round(innerWidth * 0.32)));
+    return {
+      kind: "wide",
+      height,
+      contentRows,
+      railWidth,
+      listRows: contentRows,
+      detailRows: contentRows,
+    };
+  }
+  if (width >= DASHBOARD_MEDIUM_MIN_WIDTH && contentRows >= DASHBOARD_SPLIT_MIN_ROWS) {
+    const listRows = Math.max(2, Math.min(6, Math.floor((contentRows - 1) * 0.3)));
+    return {
+      kind: "medium",
+      height,
+      contentRows,
+      railWidth: 0,
+      listRows,
+      detailRows: Math.max(1, contentRows - 1 - listRows),
+    };
+  }
+  return {
+    kind: "narrow",
+    height,
+    contentRows,
+    railWidth: 0,
+    listRows: contentRows,
+    detailRows: contentRows,
+  };
+}
+
+/** Pi 0.81+ reports its renderer mode; older hosts use regular overlay mode. */
+export function isFullscreenTui(tui: unknown): boolean {
+  return (tui as { mode?: unknown } | undefined)?.mode === "fullscreen";
+}
 
 export function dashboardMaxHeight(terminalRows: number): number {
   const availableRows = Math.max(10, terminalRows || 30);
@@ -58,8 +125,10 @@ export function createDashboardFrame(theme: Theme, width: number, focused: boole
   const segment = (title: string, width: number) => {
     const target = Math.max(0, width);
     if (!target) return "";
-    const label = title
-      ? ` ${truncateToWidth(title, Math.max(0, target - 3))} `
+    // A titled segment needs one leading rule plus two label spaces. At tiny
+    // widths the rule is the only representation that can fit.
+    const label = title && target >= 4
+      ? ` ${truncateToWidth(title, target - 3)} `
       : "";
     const labelWidth = visibleWidth(label);
     return (
@@ -69,6 +138,7 @@ export function createDashboardFrame(theme: Theme, width: number, focused: boole
     );
   };
   const borderSegment = (title: string) => segment(title, innerWidth);
+  const fitFrameLine = (line: string) => truncateToWidth(line, safeWidth, "");
 
   /** Column widths for a vertical split: `left │ right` inside the panel. */
   const columns = (leftWidth: number) => {
@@ -90,28 +160,28 @@ export function createDashboardFrame(theme: Theme, width: number, focused: boole
       );
     },
     top(title: string): string {
-      return border("╭") + borderSegment(title) + border("╮");
+      return fitFrameLine(border("╭") + borderSegment(title) + border("╮"));
     },
     divider(title: string): string {
-      return border("├") + borderSegment(title) + border("┤");
+      return fitFrameLine(border("├") + borderSegment(title) + border("┤"));
     },
     row(text: string): string {
-      return border("│") + pad(text) + border("│");
+      return fitFrameLine(border("│") + pad(text) + border("│"));
     },
     bottom(): string {
-      return border("╰") + border("─".repeat(innerWidth)) + border("╯");
+      return fitFrameLine(border("╰") + border("─".repeat(innerWidth)) + border("╯"));
     },
     splitTop(leftTitle: string, rightTitle: string, leftWidth: number): string {
       const { left, right } = columns(leftWidth);
-      return border("╭") + segment(leftTitle, left) + border("┬") + segment(rightTitle, right) + border("╮");
+      return fitFrameLine(border("╭") + segment(leftTitle, left) + border("┬") + segment(rightTitle, right) + border("╮"));
     },
     splitRow(leftText: string, rightText: string, leftWidth: number): string {
       const { left, right } = columns(leftWidth);
-      return border("│") + padTo(leftText, left) + border("│") + padTo(rightText, right) + border("│");
+      return fitFrameLine(border("│") + padTo(leftText, left) + border("│") + padTo(rightText, right) + border("│"));
     },
     splitBottom(leftWidth: number): string {
       const { left, right } = columns(leftWidth);
-      return border("╰") + border("─".repeat(left)) + border("┴") + border("─".repeat(right)) + border("╯");
+      return fitFrameLine(border("╰") + border("─".repeat(left)) + border("┴") + border("─".repeat(right)) + border("╯"));
     },
     hint(text: string, right?: string): string {
       if (!right) {

@@ -12,7 +12,20 @@ import {
 import {
   alignDashboardRow,
   createDashboardFrame,
+  DASHBOARD_COMPACT_ROWS,
+  dashboardLayout,
+  isFullscreenTui,
   dashboardOverlayRows,
+} from "../dashboard-style.ts";
+import type { DashboardLayout } from "../dashboard-style.ts";
+export {
+  DASHBOARD_CHROME_ROWS,
+  DASHBOARD_COMPACT_ROWS,
+  DASHBOARD_MEDIUM_MIN_WIDTH,
+  DASHBOARD_SPLIT_MIN_ROWS,
+  DASHBOARD_WIDE_MIN_WIDTH,
+  dashboardLayout,
+  isFullscreenTui,
 } from "../dashboard-style.ts";
 import { isTerminal } from "../../src/manager.ts";
 import {
@@ -68,52 +81,7 @@ export interface DashboardOverlayOptions {
 }
 
 export type DashboardMode = "browse" | "takeover";
-export type DashboardLayoutKind = "wide" | "medium" | "narrow";
-
-/** A wide terminal earns a jobs rail beside the inspector; a medium one stacks them. */
-export const DASHBOARD_WIDE_MIN_WIDTH = 96;
-export const DASHBOARD_MEDIUM_MIN_WIDTH = 64;
-/** Content rows below which the panel drops to a single-pane drill-down. */
-export const DASHBOARD_SPLIT_MIN_ROWS = 10;
-/** Panel rows below which only a summary fits. */
-const DASHBOARD_COMPACT_ROWS = 6;
-/** Chrome around the content area: header, top border, bottom border, hint. */
-const DASHBOARD_CHROME_ROWS = 4;
-
-export interface DashboardLayout {
-  kind: DashboardLayoutKind;
-  /** Total lines the panel renders. Never exceeds the overlay's height budget. */
-  height: number;
-  /** Rows between the top and bottom borders. */
-  contentRows: number;
-  /** Visible width of the jobs rail. `wide` only. */
-  railWidth: number;
-  /** Rows above the detail divider. `medium` only. */
-  listRows: number;
-  /** Rows given to the inspector. */
-  detailRows: number;
-}
-
-export function dashboardLayout(width: number, rows: number): DashboardLayout {
-  const height = Math.max(0, rows);
-  const contentRows = Math.max(1, height - DASHBOARD_CHROME_ROWS);
-  const innerWidth = Math.max(0, width - 2);
-  if (width >= DASHBOARD_WIDE_MIN_WIDTH && contentRows >= DASHBOARD_SPLIT_MIN_ROWS) {
-    const railWidth = Math.max(26, Math.min(44, Math.round(innerWidth * 0.32)));
-    return { kind: "wide", height, contentRows, railWidth, listRows: contentRows, detailRows: contentRows };
-  }
-  if (width >= DASHBOARD_MEDIUM_MIN_WIDTH && contentRows >= DASHBOARD_SPLIT_MIN_ROWS) {
-    // The list keeps a scannable head; the detail pane gets everything else.
-    const listRows = Math.max(2, Math.min(6, Math.floor((contentRows - 1) * 0.3)));
-    return { kind: "medium", height, contentRows, railWidth: 0, listRows, detailRows: Math.max(1, contentRows - 1 - listRows) };
-  }
-  return { kind: "narrow", height, contentRows, railWidth: 0, listRows: contentRows, detailRows: contentRows };
-}
-
-/** Pi 0.81+ reports its renderer mode; older hosts only ever render the regular main screen. */
-export function isFullscreenTui(tui: unknown): boolean {
-  return (tui as { mode?: unknown } | undefined)?.mode === "fullscreen";
-}
+export type { DashboardLayout, DashboardLayoutKind } from "../dashboard-style.ts";
 
 export function createDashboardOverlay(
   tui: Pick<TUI, "requestRender" | "terminal">,
@@ -150,6 +118,9 @@ class DashboardOverlay implements Focusable {
   #input = new Input();
   #jobs: JobSnapshot[] | undefined;
   #layout: DashboardLayout | undefined;
+  /** The destructive controls that were present in the last rendered hint. */
+  #renderedCancelId: string | undefined;
+  #renderedConfirmationId: string | undefined;
   #transcriptCache: { key: string; lines: string[] } | undefined;
   #ticker: ReturnType<typeof setInterval> | undefined;
   #coalesce: ReturnType<typeof setTimeout> | undefined;
@@ -211,17 +182,29 @@ class DashboardOverlay implements Focusable {
 
   render(width: number): string[] {
     width = Math.max(0, width);
+    this.#layout = undefined;
+    this.#renderedCancelId = undefined;
+    this.#renderedConfirmationId = undefined;
     const jobs = this.manager.list();
     this.#jobs = jobs;
     const chosen = this.syncSelection(jobs);
     this.syncTicker(jobs);
 
     const rows = dashboardOverlayRows(this.tui.terminal?.rows ?? 0, this.fullscreen());
-    if (!rows) return [];
-    if (width < 4) return [truncate(`Subagents ${jobs.length}`, width)];
+    if (!rows) {
+      this.resetCompactHierarchy();
+      return [];
+    }
+    if (width < 4) {
+      this.resetCompactHierarchy();
+      return [truncate(`Subagents ${jobs.length}`, width)];
+    }
 
     const frame = createDashboardFrame(this.theme, width, this.#focused);
-    if (rows < DASHBOARD_COMPACT_ROWS) return this.renderCompact(rows, jobs.length, frame, width);
+    if (rows < DASHBOARD_COMPACT_ROWS) {
+      this.resetCompactHierarchy();
+      return this.renderCompact(rows, jobs.length, frame, width);
+    }
 
     const layout = dashboardLayout(width, rows);
     this.#layout = layout;
@@ -242,52 +225,107 @@ class DashboardOverlay implements Focusable {
 
   handleInput(data: string): void {
     if (this.#finished) return;
-    const jobs = this.#jobs ?? this.manager.list();
+    const jobs = this.manager.list();
+    this.#jobs = jobs;
+    this.syncSelection(jobs);
     // Both the cancel arm and the notice are answers to the previous keystroke.
-    const armed = this.#confirmCancelId;
+    const compact = this.isCompactGeometry();
+    const armed = compact ? undefined : this.#confirmCancelId;
     this.#confirmCancelId = undefined;
     this.#notice = "";
     const job = this.currentJob(jobs);
-    const drillDown = this.#layout?.kind === "narrow";
+    const cancel = matchesKey(data, Key.escape) || this.keybindings.matches(data, "tui.select.cancel");
 
-    if (matchesKey(data, Key.escape) || this.keybindings.matches(data, "tui.select.cancel")) {
-      if (armed) this.#notice = "Cancellation dismissed.";
-      else if (this.#mode === "takeover") this.leaveTakeover();
-      else if (drillDown && this.#pane === "detail") this.#pane = "list";
+    if (compact) {
+      this.resetCompactHierarchy();
+      if (cancel) this.finish();
+      else this.tui.requestRender();
+      return;
+    }
+
+    // A clipped one-line summary has no interactive pane. Keep the global
+    // close binding available, but do not route pane actions through hidden
+    // layout state while the panel is below its interactive width.
+    if (!this.#layout) {
+      this.resetCompactHierarchy();
+      if (cancel) this.finish();
+      else this.tui.requestRender();
+      return;
+    }
+
+    if (armed) {
+      if (cancel) {
+        this.#notice = "Cancellation dismissed.";
+        this.tui.requestRender();
+        return;
+      }
+      if (
+        data === "x" &&
+        armed === job?.id &&
+        this.#renderedConfirmationId === armed &&
+        this.cancelableJob(job)
+      ) {
+        this.requestCancel(job, armed);
+        this.tui.requestRender();
+        return;
+      }
+      this.#notice = "Cancellation dismissed.";
+      this.tui.requestRender();
+      return;
+    }
+
+    if (cancel) {
+      if (this.#mode === "takeover") this.leaveTakeover();
+      else if (this.#layout?.kind === "narrow" && this.#pane === "detail") {
+        this.#pane = "list";
+        this.resetScroll();
+      }
       else return this.finish();
       this.tui.requestRender();
       return;
     }
 
-    if (matchesKey(data, Key.shift(Key.up))) this.scroll(-1);
-    else if (matchesKey(data, Key.shift(Key.down))) this.scroll(1);
-    else if (matchesKey(data, Key.pageUp)) this.scroll(-this.pageStep());
-    else if (matchesKey(data, Key.pageDown)) this.scroll(this.pageStep());
-    else if (this.#mode !== "takeover" && matchesKey(data, Key.ctrl("u"))) this.scroll(-this.halfPageStep());
-    else if (this.#mode !== "takeover" && matchesKey(data, Key.ctrl("d"))) this.scroll(this.halfPageStep());
-    else if (this.#mode !== "takeover" && matchesKey(data, "g")) this.scrollTo(0);
-    else if (this.#mode !== "takeover" && matchesKey(data, Key.shift("g"))) this.scrollTo(Number.MAX_SAFE_INTEGER);
-    else if (this.#mode === "takeover") {
+    const narrowList = this.#layout?.kind === "narrow" && this.#pane === "list";
+    const takeover = this.#mode === "takeover";
+    if (takeover) {
       // Route the host's configured input-submit binding explicitly; the
       // bundled Input component otherwise consults its own TUI keybinding
       // singleton. Printable navigation keys must remain ordinary text here.
-      if (this.keybindings.matches(data, "tui.input.submit") || matchesKey(data, Key.enter)) this.submit(this.#input.getValue());
+      if (matchesKey(data, Key.shift(Key.up))) this.scroll(-1);
+      else if (matchesKey(data, Key.shift(Key.down))) this.scroll(1);
+      else if (this.keybindings.matches(data, "tui.input.submit") || matchesKey(data, Key.enter)) this.submit(this.#input.getValue());
       else {
         this.#inputRevision++;
         this.#input.handleInput(data);
       }
     }
+    else if (narrowList) {
+      if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectJob(-1, jobs);
+      else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(1, jobs);
+      else if (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter)) {
+        if (job) {
+          this.#pane = "detail";
+          this.resetScroll();
+        }
+      }
+      else if (matchesKey(data, "x") && this.cancelControlVisible(job)) this.requestCancel(job, undefined);
+    }
+    else if (matchesKey(data, Key.shift(Key.up))) this.scroll(-1);
+    else if (matchesKey(data, Key.shift(Key.down))) this.scroll(1);
+    else if (this.#mode !== "takeover" && this.#layout?.kind !== "narrow" && matchesKey(data, Key.pageUp)) this.scroll(-this.pageStep());
+    else if (this.#mode !== "takeover" && this.#layout?.kind !== "narrow" && matchesKey(data, Key.pageDown)) this.scroll(this.pageStep());
+    else if (matchesKey(data, Key.ctrl("u"))) this.scroll(-this.halfPageStep());
+    else if (matchesKey(data, Key.ctrl("d"))) this.scroll(this.halfPageStep());
+    else if (matchesKey(data, "g")) this.scrollTo(0);
+    else if (matchesKey(data, Key.shift("g"))) this.scrollTo(Number.MAX_SAFE_INTEGER);
     else if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectJob(-1, jobs);
     else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(1, jobs);
-    else if (drillDown && (matchesKey(data, Key.left) || matchesKey(data, "h"))) this.#pane = "list";
-    else if (drillDown && this.#pane === "list" && (matchesKey(data, Key.right) || matchesKey(data, "l"))) this.#pane = "detail";
     else if (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter)) {
-      if (drillDown && this.#pane === "list") this.#pane = "detail";
-      else this.enterTakeover(job);
+      if (this.takeoverControlVisible(job)) this.enterTakeover(job);
     }
-    else if (matchesKey(data, "s")) this.enterTakeover(job, "steer");
-    else if (matchesKey(data, "f")) this.enterTakeover(job, "followUp");
-    else if (matchesKey(data, "x")) this.requestCancel(job, armed);
+    else if (matchesKey(data, "s") && this.steerControlVisible(job)) this.enterTakeover(job, "steer");
+    else if (matchesKey(data, "f") && this.followUpControlVisible(job)) this.enterTakeover(job, "followUp");
+    else if (matchesKey(data, "x") && this.cancelControlVisible(job)) this.requestCancel(job, undefined);
     this.tui.requestRender();
   }
 
@@ -345,6 +383,24 @@ class DashboardOverlay implements Focusable {
     return this.#forceFullscreen ?? isFullscreenTui(this.tui);
   }
 
+  private isCompactGeometry(): boolean {
+    return dashboardOverlayRows(this.tui.terminal?.rows ?? 0, this.fullscreen()) < DASHBOARD_COMPACT_ROWS;
+  }
+
+  private resetCompactHierarchy(): void {
+    this.#mode = "browse";
+    this.#pane = "list";
+    this.#behavior = undefined;
+    this.#confirmCancelId = undefined;
+    this.#renderedCancelId = undefined;
+    this.#renderedConfirmationId = undefined;
+    this.#notice = "";
+    this.#inputRevision++;
+    this.#input.setValue("");
+    this.#input.focused = false;
+    this.resetScroll();
+  }
+
   /* ── selection and actions ─────────────────────────────────────────────── */
 
   private syncSelection(jobs: JobSnapshot[]): JobSnapshot | undefined {
@@ -396,6 +452,7 @@ class DashboardOverlay implements Focusable {
   }
 
   private submit(raw: string): void {
+    if (this.#mode !== "takeover") return;
     const message = raw.trim();
     if (!message) return;
     if (this.#pendingSend) {
@@ -436,9 +493,18 @@ class DashboardOverlay implements Focusable {
   }
 
   private requestCancel(job: JobSnapshot | undefined, armed: string | undefined): void {
-    if (!job || isTerminal(job.status)) return;
+    if (!this.cancelableJob(job)) return;
     if (armed !== job.id) {
+      if (!this.cancelControlVisible(job)) return;
       this.#confirmCancelId = job.id;
+      // The host normally renders immediately after requestRender. Retain the
+      // already-visible control for a same-turn confirmation before that paint;
+      // a later render clears or replaces this exact state.
+      this.#renderedConfirmationId = job.id;
+      return;
+    }
+    if (this.#renderedConfirmationId !== job.id) {
+      this.#notice = "Cancellation dismissed.";
       return;
     }
     this.#notice = `Cancelling ${sanitizeInline(job.name)}…`;
@@ -469,15 +535,17 @@ class DashboardOverlay implements Focusable {
   private scrollTo(offset: number): void {
     const max = this.maxScroll();
     this.#scroll = clamp(offset, 0, max);
-    this.#followTail = this.#scroll >= max;
-  }
-
-  private pageStep(): number {
-    return Math.max(1, this.#transcriptRows - 1);
+    // Keep an explicit top request unpinned even before the first detail
+    // render has established a non-zero transcript viewport.
+    this.#followTail = offset !== 0 && this.#scroll >= max;
   }
 
   private halfPageStep(): number {
     return Math.max(1, Math.floor(this.#transcriptRows / 2));
+  }
+
+  private pageStep(): number {
+    return Math.max(1, this.#transcriptRows - 1);
   }
 
   /* ── rendering ─────────────────────────────────────────────────────────── */
@@ -547,9 +615,9 @@ class DashboardOverlay implements Focusable {
       this.theme.fg("accent", this.theme.bold("Native subagents")),
       this.theme.fg("muted", `${count} job${count === 1 ? "" : "s"}`),
     );
-    if (rows <= 1) return [truncate("Subagents", width)];
+    if (rows <= 1) return [truncate("Esc close", width)];
     if (rows === 2) return [header, frame.hint("Esc close")];
-    if (rows === 3) return [header, frame.top("jobs"), frame.bottom()];
+    if (rows === 3) return [header, frame.row(this.theme.fg("dim", "  Screen too short — resize to supervise jobs.")), frame.hint("Esc close")];
     if (rows === 4) return [header, frame.top("jobs"), frame.bottom(), frame.hint("Esc close")];
     return [
       header,
@@ -762,13 +830,29 @@ class DashboardOverlay implements Focusable {
     const right = `· Esc ${back ? "back" : "close"}`;
     if (this.#confirmCancelId) {
       const name = sanitizeInline(this.#jobs?.find((item) => item.id === this.#confirmCancelId)?.name ?? "job");
-      return frame.hint(`Cancel ${name}? Press x again to confirm`, "· any other key keeps it running");
+      const marker = "Press x again to confirm";
+      const candidates = [
+        [`Cancel ${name}? ${marker}`, "· any other key keeps it running"],
+        [`Cancel ${name}? ${marker}`, "· any key dismisses"],
+        [`Cancel? ${marker}`, "· any key"],
+        [marker, "· any key"],
+      ] as const;
+      for (const [text, hintRight] of candidates) {
+        const rendered = frame.hint(text, hintRight);
+        if (rendered.includes(marker)) {
+          this.#renderedConfirmationId = this.#confirmCancelId;
+          return rendered;
+        }
+      }
+      return frame.hint("Cancellation pending", right);
     }
     if (this.#notice) return frame.hint(`! ${sanitizeInline(this.#notice)}`, right);
-    return frame.hint(this.controls(job), right);
+    const rendered = frame.hint(this.controls(frame, job), right);
+    if (this.cancelableJob(job) && rendered.includes("x cancel")) this.#renderedCancelId = job.id;
+    return rendered;
   }
 
-  private controls(job: JobSnapshot | undefined): string {
+  private controls(frame: DashboardFrame, job: JobSnapshot | undefined): string {
     const scroll = "Shift+↑↓ scroll";
     if (this.#mode === "takeover") {
       const behavior = job ? (this.#behavior ?? takeoverPolicy(job).behavior) : "steer";
@@ -777,16 +861,44 @@ class DashboardOverlay implements Focusable {
     const live = job && !isTerminal(job.status);
     const sendable = job && takeoverPolicy(job).reusable;
     if (this.#layout?.kind === "narrow" && this.#pane === "list") {
-      return `↑↓/jk select · Enter open${live ? " · x cancel" : ""}`;
+      const navigation = frame.innerWidth < 60 ? "↑↓/jk" : "↑↓/jk select";
+      return [live ? "x cancel" : "", navigation, "Enter open"].filter(Boolean).join(" · ");
     }
     return [
+      live ? "x cancel" : "",
       "↑↓/jk select",
       sendable ? "Enter takeover" : "",
       sendable && live ? "s steer" : "",
       sendable && !live ? "f follow-up" : "",
-      live ? "x cancel" : "",
       `${scroll} · Ctrl+U/D · g/G`,
     ].filter(Boolean).join(" · ");
+  }
+
+  private takeoverControlVisible(job: JobSnapshot | undefined): boolean {
+    return this.#mode !== "takeover"
+      && !(this.#layout?.kind === "narrow" && this.#pane === "list")
+      && !!job
+      && takeoverPolicy(job).reusable;
+  }
+
+  private steerControlVisible(job: JobSnapshot | undefined): boolean {
+    return this.takeoverControlVisible(job) && !isTerminal(job!.status);
+  }
+
+  private followUpControlVisible(job: JobSnapshot | undefined): boolean {
+    return this.takeoverControlVisible(job) && isTerminal(job!.status);
+  }
+
+  private cancelControlVisible(job: JobSnapshot | undefined): boolean {
+    return this.cancelableJob(job)
+      && this.#renderedCancelId === job.id;
+  }
+
+  private cancelableJob(job: JobSnapshot | undefined): job is JobSnapshot {
+    return this.#mode !== "takeover"
+      && this.#layout !== undefined
+      && !!job
+      && !isTerminal(job.status);
   }
 
   private selectedIndex(jobs: JobSnapshot[]): number {

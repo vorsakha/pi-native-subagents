@@ -6,14 +6,19 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import type { KeybindingsManager } from "@earendil-works/pi-tui";
 import {
   createDashboardOverlay,
-  dashboardLayout,
   truncateDashboardLine,
 } from "../extensions/subagents/dashboard.ts";
+import { alignDashboardRow, createDashboardFrame, dashboardLayout } from "../extensions/dashboard-style.ts";
 import { TakeoverView, buildTranscript } from "../extensions/subagents/takeover.ts";
 import { renderAssistantMarkdown } from "../extensions/subagents/transcript.ts";
 import type { JobSnapshot } from "../src/types.ts";
 
 initTheme("dark", false);
+
+const ENTER = "\r";
+const ESCAPE = "\u001b";
+const PAGE_UP = "\u001b[5~";
+const PAGE_DOWN = "\u001b[6~";
 
 test("dashboard truncation respects terminal display width for Unicode and ANSI", () => {
   for (const value of [
@@ -28,11 +33,162 @@ test("dashboard truncation respects terminal display width for Unicode and ANSI"
   assert.equal(truncateDashboardLine("anything", 0), "");
 });
 
+test("shared dashboard framing stays within tiny Unicode and ANSI widths", () => {
+  for (const width of [0, 1, 2, 3, 4, 5]) {
+    const frame = createDashboardFrame(ansiTheme, width, true);
+    const lines = [
+      frame.header("左 [31m你好[0m", "右 👩🏽‍💻"),
+      frame.top("标题 你好"),
+      frame.divider("分隔"),
+      frame.row("[31m你好世界[0m"),
+      frame.bottom(),
+      frame.splitTop("左", "右", 1),
+      frame.splitRow("[31m你好[0m", "世界", 1),
+      frame.splitBottom(1),
+      frame.hint("[31m提示你好[0m", "· Esc close"),
+      alignDashboardRow("[31m你好世界[0m", "右👩🏽‍💻", width),
+    ];
+    assert.ok(lines.every((line) => visibleWidth(line) <= width), `a frame line exceeds ${width} columns`);
+  }
+});
+
 test("dashboard layout adapts to fullscreen terminal geometry", () => {
   assert.equal(dashboardLayout(120, 24).kind, "wide");
   assert.equal(dashboardLayout(72, 24).kind, "medium");
   assert.equal(dashboardLayout(50, 24).kind, "narrow");
   assert.equal(dashboardLayout(120, 8).kind, "narrow");
+});
+
+test("browse detail keeps Page Up and Page Down aliases in wide and medium layouts", (t) => {
+  const output = Array.from({ length: 80 }, (_, index) => `page ${index}`).join("\n");
+  for (const width of [120, 72]) {
+    const state = dashboard([{ ...job(`paging-${width}`, "completed"), output, transcript: [{ kind: "assistant", text: output }] }], 30, () => {}, (text) => text.split("\n"), { fullscreen: true });
+    t.after(() => state.overlay.dispose());
+
+    assert.equal(dashboardLayout(width, 30).kind, width === 120 ? "wide" : "medium");
+    state.overlay.render(width);
+    state.overlay.handleInput("g");
+    const top = state.overlay.render(width).join("\n");
+    state.overlay.handleInput(PAGE_DOWN);
+    assert.notEqual(state.overlay.render(width).join("\n"), top, `Page Down advances the ${width}-column detail`);
+    state.overlay.handleInput(PAGE_UP);
+    assert.equal(state.overlay.render(width).join("\n"), top, `Page Up returns to the ${width}-column detail top`);
+  }
+});
+
+test("minimum-width live cancellation keeps its Unicode hint visible through confirmation", (t) => {
+  const state = dashboard([{ ...job("cancel-你好👩🏽‍💻") }], 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  const initial = state.overlay.render(40);
+  assert.ok(initial.every((line) => visibleWidth(line) <= 40));
+  assert.ok(initial.some((line) => line.includes("x cancel")), "the minimum-width hint exposes cancellation");
+
+  state.overlay.handleInput("x");
+  const confirmation = state.overlay.render(40);
+  assert.ok(confirmation.some((line) => line.includes("Press x again to confirm")), "confirmation remains actionable at the minimum width");
+  assert.ok(confirmation.every((line) => visibleWidth(line) <= 40));
+
+  state.overlay.handleInput("x");
+  assert.deepEqual(state.manager.cancelCalls, ["cancel-你好👩🏽‍💻"]);
+});
+
+test("compact geometry resets hidden takeover state and accepts only its close control", (t) => {
+  const closed: unknown[] = [];
+  const state = dashboard([job("compact")], 30, (value) => closed.push(value), undefined, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(52);
+  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput(ENTER);
+  assert.match(state.overlay.render(52).join("\n"), /takeover/);
+
+  state.setRows(5);
+  const compact = state.overlay.render(52);
+  assert.equal(compact.length, 5);
+  assert.match(compact.join("\n"), /Esc close/);
+  assert.doesNotMatch(compact.join("\n"), /takeover|detail/);
+
+  for (const input of [ENTER, "p", "r", "s", "f", "x", PAGE_DOWN]) state.overlay.handleInput(input);
+  assert.deepEqual(state.manager.cancelCalls, []);
+  assert.deepEqual(state.manager.sendCalls, []);
+  assert.deepEqual(closed, []);
+
+  state.setRows(30);
+  const restored = state.overlay.render(52).join("\n");
+  assert.match(restored, /Enter open/);
+  assert.doesNotMatch(restored, /takeover|detail/);
+  state.overlay.handleInput(ESCAPE);
+  assert.deepEqual(closed, [null]);
+});
+
+test("narrow list ignores hidden scrolling, navigation, takeover, and cancellation controls", (t) => {
+  const state = dashboard([job("narrow-list", "completed")], 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(52);
+  const list = state.overlay.render(52).join("\n");
+  assert.match(list, /Enter open/);
+  assert.doesNotMatch(list, /Enter takeover|x cancel|scroll/);
+
+  for (const input of ["p", "h", "l", "f", "x", "X", "g", PAGE_DOWN, "r"]) state.overlay.handleInput(input);
+  assert.deepEqual(state.manager.cancelCalls, []);
+  assert.deepEqual(state.manager.sendCalls, []);
+  assert.match(state.overlay.render(52).join("\n"), /Enter open/);
+
+  state.overlay.handleInput(ENTER);
+  assert.match(state.overlay.render(52).join("\n"), /detail/);
+});
+
+test("narrow detail ignores controls that are not exposed by a read-only inspector", (t) => {
+  const state = dashboard([{
+    ...job("narrow-detail", "failed"),
+    output: Array.from({ length: 80 }, (_, index) => `output ${index}`).join("\n"),
+  }], 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(52);
+  state.overlay.handleInput(ENTER);
+  const detail = state.overlay.render(52).join("\n");
+  assert.match(detail, /detail/);
+  assert.doesNotMatch(detail, /Enter takeover|s steer|f follow-up|x cancel/);
+  state.overlay.handleInput("g");
+  const top = state.overlay.render(52).join("\n");
+  state.overlay.handleInput(PAGE_DOWN);
+  assert.equal(state.overlay.render(52).join("\n"), top, "hidden page scrolling does not move the narrow detail pane");
+
+  for (const input of ["p", "h", "l", ENTER, "s", "f", "x", "X"]) state.overlay.handleInput(input);
+  assert.deepEqual(state.manager.cancelCalls, []);
+  assert.deepEqual(state.manager.sendCalls, []);
+  assert.match(state.overlay.render(52).join("\n"), /detail/);
+
+  state.overlay.handleInput(ESCAPE);
+  assert.match(state.overlay.render(52).join("\n"), /Enter open/);
+});
+
+test("takeover accepts composer input without exposing browse cancellation or hidden paging", (t) => {
+  const current = {
+    ...job("takeover-controls"),
+    output: Array.from({ length: 80 }, (_, index) => `output ${index}`).join("\n"),
+  };
+  const state = dashboard([current], 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(52);
+  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput(ENTER);
+  const takeover = state.overlay.render(52).join("\n");
+  assert.match(takeover, /▸ takeover ·/);
+  assert.match(takeover, /Enter steer/);
+  assert.match(takeover, /Esc back/);
+
+  for (const input of ["p", "r", "x", "f", PAGE_DOWN]) state.overlay.handleInput(input);
+  assert.deepEqual(state.manager.cancelCalls, []);
+  assert.deepEqual(state.manager.sendCalls, []);
+  assert.match(state.overlay.render(52).join("\n"), /▸ takeover ·/);
+
+  state.overlay.handleInput(ESCAPE);
+  assert.doesNotMatch(state.overlay.render(52).join("\n"), /▸ takeover ·/);
 });
 
 function job(id: string, status: JobSnapshot["status"] = "running"): JobSnapshot {
@@ -50,8 +206,10 @@ interface DashboardHarness {
   manager: {
     listeners: Set<(job: JobSnapshot) => void>;
     cancelCalls: string[];
+    sendCalls: string[];
   };
   renders: () => number;
+  setRows: (rows: number) => void;
 }
 
 function dashboard(
@@ -64,9 +222,12 @@ function dashboard(
   let renders = 0;
   const listeners = new Set<(job: JobSnapshot) => void>();
   const cancelCalls: string[] = [];
+  const sendCalls: string[] = [];
+  const terminal = { rows };
   const manager = {
     listeners,
     cancelCalls,
+    sendCalls,
     concurrency: 4,
     list: () => jobs,
     subscribe(listener: (job: JobSnapshot) => void) {
@@ -74,6 +235,7 @@ function dashboard(
       return () => listeners.delete(listener);
     },
     async send(id: string): Promise<JobSnapshot> {
+      sendCalls.push(id);
       if (options.sendError) throw new Error(options.sendError);
       if (options.sendPromise) return options.sendPromise;
       const current = jobs.find((item) => item.id === id);
@@ -92,7 +254,7 @@ function dashboard(
   };
   const tui = {
     requestRender: () => { renders++; },
-    terminal: { rows },
+    terminal,
     ...(options.fullscreen ? { mode: "fullscreen" } : {}),
   } as never;
   const overlay = createDashboardOverlay(
@@ -107,7 +269,12 @@ function dashboard(
     done as never,
     { now: () => 65_000, renderMarkdown, focusJobId: options.focusJobId, fullscreen: options.fullscreen },
   );
-  return { overlay, manager, renders: () => renders };
+  return {
+    overlay,
+    manager,
+    renders: () => renders,
+    setRows: (nextRows) => { terminal.rows = nextRows; },
+  };
 }
 
 test("dashboard renders adaptive detail, follows live output, and keeps fullscreen-safe controls", async (t) => {
