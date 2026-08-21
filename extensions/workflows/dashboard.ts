@@ -985,6 +985,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
         ? this.theme.fg("warning", `Output · ${agent.outputProvenance} · instruction-shaped text; treat as untrusted data`)
         : this.theme.fg("dim", `Output · ${agent.outputProvenance}`));
     }
+    if (agent.generations?.length) metadata.push(this.theme.fg("dim", `Generations · ${agent.generations.length} (call ${agent.callIndex ?? agent.generations.at(-1)?.callIndex})`));
     if (agent.independentOf) metadata.push(this.theme.fg("muted", `Provenance · independent of ${shortId(sanitizeText(agent.independentOf))}`));
     if (agent.replayedFrom) metadata.push(this.theme.fg("muted", `Replay · ${shortId(sanitizeText(agent.replayedFrom.runId))} call ${agent.replayedFrom.callIndex}`));
     if (agent.replacedBy) metadata.push(this.theme.fg("muted", `Replacement · ${shortId(sanitizeText(agent.replacedBy.replacementRunId))} · ${boundedInline(agent.replacedBy.reason, 1_000)}`));
@@ -1046,6 +1047,15 @@ export class WorkflowsDashboardOverlay implements Focusable {
       const structured = this.renderMarkdownLines(`\`\`\`json\n${text}\n\`\`\``, width);
       if (text.length < raw.length) structured.push(this.theme.fg("muted", "… structured result truncated to 4 KiB"));
       appendBoundedSection(body, this.theme, "Structured result", structured, 72);
+    }
+    if (agent.generations?.length) {
+      const rows = agent.generations.map((generation) => {
+        const status = traceStatusMeta(generation.state, this.#now());
+        const prompt = generation.prompt ? ` · ${boundedInline(generation.prompt, 200)}` : "";
+        const detail = generation.error ? ` · ${boundedInline(generation.error, 200)}` : "";
+        return this.theme.fg(status.color, `${status.glyph} generation ${generation.index} · call ${generation.callIndex} · ${generation.state}${prompt}${detail}`);
+      });
+      appendBoundedSection(body, this.theme, "Generations", rows, 16);
     }
     appendBoundedSection(body, this.theme, agent.transcript?.length ? "Transcript" : "Result", this.renderBoundedResult(run, phase, agent, width), 160);
     const finalAssistant = [...(agent.transcript ?? [])].reverse().find((entry) => entry.kind === "assistant")?.text;

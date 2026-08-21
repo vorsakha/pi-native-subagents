@@ -227,29 +227,7 @@ export class JobManager {
       await this.wait(id);
       return this.send(id, message, "followUp");
     }
-    if (job.snapshot.status === "completed") {
-      const boundary = firstReachedSpendWarning(job.snapshot.budget, job.snapshot.usage, job.snapshot.harness, "Subagent budget");
-      if (boundary) throw new Error(`Cannot reuse ${id}: ${boundary}`);
-      if (!job.run) throw new Error(`Cannot reuse ${id}: native session is no longer available`);
-      if (job.pendingRestart) throw new Error(`Cannot reuse ${id}: a follow-up is already queued`);
-      job.pendingRestart = { message, behavior: "followUp" };
-      job.snapshot = {
-        ...job.snapshot,
-        status: "queued",
-        generation: job.snapshot.generation + 1,
-        endedAt: undefined,
-        error: undefined,
-        output: "",
-        truncated: false,
-        tools: [],
-        liveThinking: "",
-        queuedMessages: [{ text: message, behavior: "followUp" }],
-      };
-      this.#queue.push(id);
-      this.#publish(job, { type: "queue_changed", messages: job.snapshot.queuedMessages });
-      this.#pump();
-      return clone(job.snapshot);
-    }
+    if (job.snapshot.status === "completed") return this.#queueFollowUp(job, message);
     const run = job.run ?? await new Promise<BackendRun | undefined>((resolve) => {
       const waiters = job.runWaiters ??= new Set();
       const ready = (value?: BackendRun) => { clearTimeout(timer); waiters.delete(ready); resolve(value); };
@@ -263,6 +241,64 @@ export class JobManager {
       }
       await run.send(message, behavior);
     });
+    return clone(job.snapshot);
+  }
+
+  /**
+   * Continue a completed, retained, workflow-owned job. This is the only
+   * follow-up path available to workflow lineages: public {@link send}
+   * rejects workflow-owned jobs outright, and this method rejects everything
+   * else (direct jobs, jobs still running, or jobs with no retained native
+   * session) so a workflow cannot resurrect a session it does not own.
+   */
+  async continueWorkflowJob(id: string, message: string): Promise<JobSnapshot> {
+    if (!message.trim()) throw new Error("Follow-up prompt must not be empty");
+    const job = this.#jobs.get(id);
+    if (!job) throw new Error(`Unknown job: ${id}`);
+    if (!job.snapshot.workflow) throw new Error(`Cannot continue ${id}: job is not workflow-owned`);
+    if (job.snapshot.status !== "completed") throw new Error(`Cannot continue ${id}: job is ${job.snapshot.status}`);
+    return this.#queueFollowUp(job, message);
+  }
+
+  /**
+   * Idempotently closes a retained native session. Used by the workflow
+   * runtime to release a workflow-owned job's session once its containing
+   * workflow terminates; a no-op when no session is retained.
+   */
+  async releaseRun(id: string): Promise<void> {
+    const job = this.#jobs.get(id);
+    if (!job || !job.run) return;
+    const run = job.run;
+    await this.#serialize(job, async () => {
+      if (job.run !== run) return;
+      job.run = undefined;
+      job.pendingRestart = undefined;
+      await run.close();
+    }).catch(() => undefined);
+  }
+
+  #queueFollowUp(job: InternalJob, message: string): JobSnapshot {
+    const id = job.snapshot.id;
+    const boundary = firstReachedSpendWarning(job.snapshot.budget, job.snapshot.usage, job.snapshot.harness, "Subagent budget");
+    if (boundary) throw new Error(`Cannot reuse ${id}: ${boundary}`);
+    if (!job.run) throw new Error(`Cannot reuse ${id}: native session is no longer available`);
+    if (job.pendingRestart) throw new Error(`Cannot reuse ${id}: a follow-up is already queued`);
+    job.pendingRestart = { message, behavior: "followUp" };
+    job.snapshot = {
+      ...job.snapshot,
+      status: "queued",
+      generation: job.snapshot.generation + 1,
+      endedAt: undefined,
+      error: undefined,
+      output: "",
+      truncated: false,
+      tools: [],
+      liveThinking: "",
+      queuedMessages: [{ text: message, behavior: "followUp" }],
+    };
+    this.#queue.push(id);
+    this.#publish(job, { type: "queue_changed", messages: job.snapshot.queuedMessages });
+    this.#pump();
     return clone(job.snapshot);
   }
 
@@ -488,7 +524,7 @@ export class JobManager {
       this.#resolveRunWaiters(job);
       const run = job.run;
       const advanced = job.snapshot.generation !== generation;
-      if (!advanced && (job.snapshot.status !== "completed" || !run || job.cancelRequested || job.snapshot.workflow)) {
+      if (!advanced && (job.snapshot.status !== "completed" || !run || job.cancelRequested)) {
         if (run) await this.#serialize(job, () => run.close()).catch(() => undefined);
         job.run = undefined;
       }
@@ -520,7 +556,7 @@ export class JobManager {
       }
     } finally {
       const advanced = job.snapshot.generation !== generation;
-      if (!advanced && (job.snapshot.status !== "completed" || job.run !== run || job.snapshot.workflow)) {
+      if (!advanced && (job.snapshot.status !== "completed" || job.run !== run)) {
         await this.#serialize(job, () => run.close()).catch(() => undefined);
         if (job.run === run) job.run = undefined;
       }

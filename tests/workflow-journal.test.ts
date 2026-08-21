@@ -89,11 +89,15 @@ test("journal loading replays valid completed calls independently across a faile
     assert.deepEqual(replayableJournalCalls(records), [{
       callIndex: 0,
       fingerprint: first,
+      kind: "agent",
+      agentIndex: 0,
       result: { ok: true, output: "done", jobId: "job-old", usage },
       route: { jobId: "job-old", harness: "codex", model: "review-model" },
     }, {
       callIndex: 2,
       fingerprint: third,
+      kind: "agent",
+      agentIndex: 2,
       result: { ok: true, output: "later", jobId: "job-later", usage },
       route: { jobId: "job-later", harness: "claude", model: "review-model" },
     }]);

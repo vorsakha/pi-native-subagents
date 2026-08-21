@@ -22,6 +22,11 @@ async function fixture(
       output: `${prompt}:${String(agentOptions.tag ?? "")}`,
       jobId: "job-1",
     }),
+    onFollowUp: async (jobId, prompt, followUpOptions) => ({
+      ok: true,
+      output: `${jobId}:${prompt}:${String(followUpOptions.tag ?? "")}`,
+      jobId,
+    }),
     onMeta: () => {},
     onPhase: (title) => phases.push(title),
     onLog: (message) => logs.push(message),

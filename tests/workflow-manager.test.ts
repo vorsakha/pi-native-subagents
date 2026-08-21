@@ -8,7 +8,7 @@ import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
 import { ControlledBackend, tempDir, tick, waitFor } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
-import { workflowCallFingerprint, workflowDefinitionFingerprint } from "../src/workflows/journal.ts";
+import { workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint } from "../src/workflows/journal.ts";
 import {
   aggregateWorkflowUsage,
   WorkflowManager,
@@ -1423,6 +1423,449 @@ test("aggregates usage across all workflow agents", async () => {
     assert.equal(final.agents[1]?.instructionShaped, true);
     assert.equal(final.status, "completed");
     assert.equal(final.error, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("followUp reuses the same jobId/native session across phases for a planner review and an implementer fix cycle", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        phase("plan");
+        const planner = await agent("Plan the change.", { name: "planner", access: "readOnly" });
+        phase("implement");
+        const implementer = await agent("Implement the plan.", { name: "implementer" });
+        phase("review");
+        const review = await followUp(planner.jobId, "Review the current implementation against your plan.");
+        phase("fix");
+        const fix = await followUp(implementer.jobId, "Apply this fix: " + review.output);
+        return { planner, implementer, review, fix };
+      }
+    `));
+    await waitFor(() => f.backend.requests.length === 1, "planner dispatched");
+    const plannerJobId = f.backend.starts[0]!;
+    f.backend.completeTask("Plan the change.", "plan v1", { input: 3, output: 1 });
+
+    await waitFor(() => f.backend.requests.length === 2, "implementer dispatched");
+    const implementerJobId = f.backend.starts[1]!;
+    f.backend.completeTask("Implement the plan.", "implementation v1", { input: 4, output: 2 });
+
+    await waitFor(() => f.backend.sends.length === 1, "review follow-up sent to the retained planner session");
+    assert.deepEqual(f.backend.sends[0], { id: plannerJobId, message: "Review the current implementation against your plan.", behavior: "followUp" });
+    f.backend.complete(plannerJobId, "looks correct", { input: 2, output: 1 });
+
+    await waitFor(() => f.backend.sends.length === 2, "fix follow-up sent to the retained implementer session");
+    assert.deepEqual(f.backend.sends[1], { id: implementerJobId, message: "Apply this fix: looks correct", behavior: "followUp" });
+    f.backend.complete(implementerJobId, "implementation v2", { input: 1, output: 1 });
+
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(f.backend.requests.length, 2, "no fresh child was spawned for either follow-up");
+    assert.equal(final.agents.length, 2, "follow-ups extend the existing lineage instead of creating new agent records");
+
+    const result = final.result as {
+      review: { ok: boolean; output: string };
+      fix: { ok: boolean; output: string };
+    };
+    assert.equal(result.review.ok, true);
+    assert.equal(result.review.output, "looks correct");
+    assert.equal(result.fix.ok, true);
+    assert.equal(result.fix.output, "implementation v2");
+
+    const planner = final.agents.find((agent) => agent.jobId === plannerJobId)!;
+    assert.equal(planner.generations?.length, 2);
+    assert.equal(planner.generations?.[0]?.output, "plan v1");
+    assert.equal(planner.generations?.[1]?.output, "looks correct");
+    assert.equal(planner.usage.input, 5, "usage sums across generations exactly once");
+
+    const implementer = final.agents.find((agent) => agent.jobId === implementerJobId)!;
+    assert.equal(implementer.generations?.length, 2);
+    assert.equal(implementer.generations?.[1]?.output, "implementation v2");
+    assert.equal(implementer.usage.input, 5);
+
+    assert.deepEqual(aggregateWorkflowUsage(final), { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("followUp enforces ownership and policy immutability: cross-workflow, direct, and policy-bearing targets are all rejected", async () => {
+  const f = await fixture();
+  try {
+    const direct = f.jobs.spawn({ name: "direct", task: "direct task", cwd: f.cwd, trusted: true, harness: "codex" });
+    await tick();
+    f.backend.complete(direct.id, "direct output");
+    await f.jobs.wait(direct.id);
+
+    const runA = await f.workflows.start(f.request(`export default async () => agent("A worker", { name: "a" });`));
+    await waitFor(() => f.backend.requests.length === 2, "workflow A worker dispatched");
+    const aJobId = f.backend.starts[1]!;
+    f.backend.completeTask("A worker", "a output");
+    assert.equal((await runA.completion).status, "completed");
+
+    const runB = await f.workflows.start(f.request(`
+      export default async () => {
+        const cross = await followUp(args.targetA, "peek at A");
+        const foreign = await followUp(args.targetDirect, "peek at direct");
+        const policy = await followUp(args.targetA, "change policy", { access: "readOnly" });
+        return { cross, foreign, policy };
+      }
+    `, { args: { targetA: aJobId, targetDirect: direct.id } }));
+    const finalB = await runB.completion;
+    assert.equal(finalB.status, "completed");
+    const result = finalB.result as {
+      cross: { ok: boolean; error?: string };
+      foreign: { ok: boolean; error?: string };
+      policy: { ok: boolean; error?: string };
+    };
+    assert.equal(result.cross.ok, false);
+    assert.match(result.cross.error ?? "", /does not belong to this workflow run/);
+    assert.equal(result.foreign.ok, false);
+    assert.match(result.foreign.error ?? "", /does not belong to this workflow run/);
+    assert.equal(result.policy.ok, false);
+    assert.match(result.policy.error ?? "", /does not accept policy options: access/);
+    assert.equal(f.backend.sends.length, 0, "no rejected follow-up ever dispatches a native turn");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a budget reached after the source agent completes blocks the follow-up before dispatch", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        const a = await agent("first", { access: "readOnly" });
+        return followUp(a.jobId, "second");
+      }
+    `, { budget: { maxTokens: 5 } }));
+    await waitFor(() => f.backend.requests.length === 1, "first agent dispatched");
+    f.backend.completeTask("first", "first output", { input: 5, output: 0 });
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    const result = final.result as { ok: boolean; error?: string };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /token budget exhausted/);
+    assert.equal(f.backend.sends.length, 0, "the blocked follow-up never sends a native turn");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("followUp cannot continue a worktree-isolated agent once its isolated worktree has been removed", async () => {
+  const f = await fixture();
+  try {
+    await execFileAsync("git", ["init", "-q", f.cwd]);
+    await execFileAsync("git", ["-C", f.cwd, "config", "user.email", "tests@example.invalid"]);
+    await execFileAsync("git", ["-C", f.cwd, "config", "user.name", "Workflow Tests"]);
+    await writeFile(join(f.cwd, "base.txt"), "base\n");
+    await execFileAsync("git", ["-C", f.cwd, "add", "base.txt"]);
+    await execFileAsync("git", ["-C", f.cwd, "commit", "-qm", "base"]);
+
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        const worker = await agent("isolated task", { name: "worker", isolation: "worktree" });
+        return followUp(worker.jobId, "second turn");
+      }
+    `));
+    await waitFor(() => f.backend.requests.length === 1, "isolated worker dispatched", 10_000);
+    f.backend.completeTask("isolated task", "done");
+
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    const result = final.result as { ok: boolean; error?: string };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /isolated worktree that already finalized/);
+    assert.equal(final.agents[0]?.isolation?.state, "removed");
+    assert.equal(f.backend.sends.length, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("followUp cannot continue a worktree-isolated agent once its isolated worktree has been preserved with changes", async () => {
+  const f = await fixture();
+  try {
+    await execFileAsync("git", ["init", "-q", f.cwd]);
+    await execFileAsync("git", ["-C", f.cwd, "config", "user.email", "tests@example.invalid"]);
+    await execFileAsync("git", ["-C", f.cwd, "config", "user.name", "Workflow Tests"]);
+    await writeFile(join(f.cwd, "base.txt"), "base\n");
+    await execFileAsync("git", ["-C", f.cwd, "add", "base.txt"]);
+    await execFileAsync("git", ["-C", f.cwd, "commit", "-qm", "base"]);
+
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        const worker = await agent("isolated task", { name: "worker", isolation: "worktree" });
+        return followUp(worker.jobId, "second turn");
+      }
+    `));
+    await waitFor(() => f.backend.requests.length === 1, "isolated worker dispatched", 10_000);
+    const request = f.backend.requests[0]!;
+    await writeFile(join(request.cwd, "worker.txt"), "changed\n");
+    f.backend.completeTask("isolated task", "done");
+
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    const result = final.result as { ok: boolean; error?: string };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /isolated worktree that already finalized/);
+    assert.equal(final.agents[0]?.isolation?.state, "preserved");
+    assert.equal(f.backend.sends.length, 0, "the rejected follow-up never dispatches an additional native turn");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+async function createFollowUpReplaySource(f: Awaited<ReturnType<typeof fixture>>, script: string) {
+  const now = Date.now();
+  const firstFingerprint = workflowCallFingerprint("cached producer", {});
+  const followUpFingerprint = workflowFollowUpFingerprint({ jobId: "prior-job", prompt: "cached review", options: {} });
+  const source = await createWorkflowArtifacts(f.artifactRoot, {
+    script,
+    args: null,
+    snapshot: {
+      sessionId: "session-1",
+      name: "replay source",
+      description: "",
+      background: false,
+      status: "aborted",
+      timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now },
+      currentPhase: null,
+      phases: [],
+      agents: [],
+      definitionFingerprint: workflowDefinitionFingerprint({ script, argsJson: "null", cwd: f.cwd, defaultHarness: "codex" }),
+      journalArtifact: "journal.jsonl",
+    },
+  });
+  await appendWorkflowJournal(f.artifactRoot, source.runId, {
+    version: 1, sequence: 0, callIndex: 0, fingerprint: firstFingerprint, kind: "agent", state: "started", at: now,
+  });
+  await appendWorkflowJournal(f.artifactRoot, source.runId, {
+    version: 1, sequence: 1, callIndex: 0, fingerprint: firstFingerprint, kind: "agent", state: "completed", at: now + 1,
+    agentIndex: 0,
+    result: { ok: true, output: "cached output", jobId: "prior-job" },
+    route: { jobId: "prior-job", harness: "codex", model: "default" },
+  });
+  await appendWorkflowJournal(f.artifactRoot, source.runId, {
+    version: 1, sequence: 2, callIndex: 1, fingerprint: followUpFingerprint, kind: "followUp", state: "started", at: now + 2,
+  });
+  await appendWorkflowJournal(f.artifactRoot, source.runId, {
+    version: 1, sequence: 3, callIndex: 1, fingerprint: followUpFingerprint, kind: "followUp", state: "completed", at: now + 3,
+    agentIndex: 0,
+    result: { ok: true, output: "cached review output", jobId: "prior-job" },
+    route: { jobId: "prior-job", harness: "codex", model: "default" },
+  });
+  return source;
+}
+
+test("resuming a workflow replays a matched follow-up without a duplicate native turn and reconstructs its generation", async () => {
+  const f = await fixture();
+  const script = `
+    export default async () => {
+      const producer = await agent("cached producer", {});
+      const review = await followUp(producer.jobId, "cached review");
+      return { producer, review };
+    }
+  `;
+  try {
+    const source = await createFollowUpReplaySource(f, script);
+    const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: source.runId }));
+    const final = await resumed.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(f.backend.requests.length, 0, "both the producer and its follow-up are replayed without dispatch");
+    assert.equal(final.replay?.matchedCalls, 2);
+    assert.equal(final.agents.length, 1, "a replayed follow-up reconstructs the same lineage, not a second agent");
+    assert.equal(final.agents[0]?.generations?.length, 2);
+    assert.equal(final.agents[0]?.generations?.[0]?.outputProvenance, "replay");
+    assert.equal(final.agents[0]?.generations?.[1]?.outputProvenance, "replay");
+    assert.equal(final.agents[0]?.generations?.[1]?.output, "cached review output");
+    assert.equal((final.result as { review: { output: string } }).review.output, "cached review output");
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    assert.deepEqual(journal.map((record) => [record.callIndex, record.kind, record.state]), [
+      [0, "agent", "started"], [0, "agent", "completed"], [1, "followUp", "started"], [1, "followUp", "completed"],
+    ]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("partial replay that excludes a follow-up's own journal entry fails cleanly instead of resuming or creating a new session", async () => {
+  const f = await fixture();
+  const script = `
+    export default async () => {
+      const producer = await agent("cached producer", {});
+      const review = await followUp(producer.jobId, "cached review");
+      return { producer, review };
+    }
+  `;
+  try {
+    const source = await createFollowUpReplaySource(f, script);
+    const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: source.runId, restartFromCallIndex: 1 }));
+    const final = await resumed.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(f.backend.requests.length, 0, "the fresh follow-up attempt is rejected before ever dispatching a native turn");
+    assert.equal(final.replay?.matchedCalls, 1, "only the replayed producer call counts as matched");
+    assert.equal(final.replay?.invalidatedAt, 1);
+    const result = final.result as { review: { ok: boolean; error?: string } };
+    assert.equal(result.review.ok, false);
+    assert.match(result.review.error ?? "", /does not belong to this workflow run/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("replayed follow-up reattaches by stable jobId even when the source run's parallel completion order drifts from replay reconstruction order", async () => {
+  const f = await fixture();
+  const script = `
+    export default async () => {
+      const results = await parallel([
+        () => agent("producer a", { name: "a" }),
+        () => agent("producer b", { name: "b" })
+      ], 2);
+      const review = await followUp(results[0].jobId, "review a");
+      return { results, review };
+    }
+  `;
+  try {
+    const now = Date.now();
+    const fingerprintA = workflowCallFingerprint("producer a", { name: "a" });
+    const fingerprintB = workflowCallFingerprint("producer b", { name: "b" });
+    const followUpFingerprint = workflowFollowUpFingerprint({ jobId: "job-a", prompt: "review a", options: {} });
+    const source = await createWorkflowArtifacts(f.artifactRoot, {
+      script,
+      args: null,
+      snapshot: {
+        sessionId: "session-1",
+        name: "replay source",
+        description: "",
+        background: false,
+        status: "aborted",
+        timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now },
+        currentPhase: null,
+        phases: [],
+        agents: [],
+        definitionFingerprint: workflowDefinitionFingerprint({ script, argsJson: "null", cwd: f.cwd, defaultHarness: "codex" }),
+        journalArtifact: "journal.jsonl",
+      },
+    });
+    // Original run dispatched callIndex 0 ("a") and 1 ("b") in parallel, but "b"
+    // finished first and was pushed to agents[0]; "a" finished second at agents[1].
+    await appendWorkflowJournal(f.artifactRoot, source.runId, {
+      version: 1, sequence: 0, callIndex: 0, fingerprint: fingerprintA, kind: "agent", state: "started", at: now,
+    });
+    await appendWorkflowJournal(f.artifactRoot, source.runId, {
+      version: 1, sequence: 1, callIndex: 1, fingerprint: fingerprintB, kind: "agent", state: "started", at: now + 1,
+    });
+    await appendWorkflowJournal(f.artifactRoot, source.runId, {
+      version: 1, sequence: 2, callIndex: 1, fingerprint: fingerprintB, kind: "agent", state: "completed", at: now + 2,
+      agentIndex: 0,
+      result: { ok: true, output: "output b", jobId: "job-b" },
+      route: { jobId: "job-b", harness: "codex", model: "default" },
+    });
+    await appendWorkflowJournal(f.artifactRoot, source.runId, {
+      version: 1, sequence: 3, callIndex: 0, fingerprint: fingerprintA, kind: "agent", state: "completed", at: now + 3,
+      agentIndex: 1,
+      result: { ok: true, output: "output a", jobId: "job-a" },
+      route: { jobId: "job-a", harness: "codex", model: "default" },
+    });
+    await appendWorkflowJournal(f.artifactRoot, source.runId, {
+      version: 1, sequence: 4, callIndex: 2, fingerprint: followUpFingerprint, kind: "followUp", state: "started", at: now + 4,
+    });
+    await appendWorkflowJournal(f.artifactRoot, source.runId, {
+      version: 1, sequence: 5, callIndex: 2, fingerprint: followUpFingerprint, kind: "followUp", state: "completed", at: now + 5,
+      agentIndex: 1,
+      result: { ok: true, output: "review of a", jobId: "job-a" },
+      route: { jobId: "job-a", harness: "codex", model: "default" },
+    });
+
+    const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: source.runId }));
+    const final = await resumed.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(f.backend.requests.length, 0, "every call is replayed without dispatch");
+    assert.equal(final.replay?.matchedCalls, 3);
+
+    const agentA = final.agents.find((agent) => agent.jobId === "job-a");
+    const agentB = final.agents.find((agent) => agent.jobId === "job-b");
+    assert.equal(agentA?.generations?.length, 2, "the follow-up reattached to producer a, not a sibling");
+    assert.equal(agentA?.generations?.[1]?.output, "review of a");
+    assert.equal(agentB?.generations?.length ?? 1, 1, "producer b's lineage is untouched");
+    assert.equal((final.result as { review: { output: string } }).review.output, "review of a");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("cancelling a workflow while a follow-up is in flight cancels its retained job and tears down cleanly", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        const worker = await agent("first", { name: "worker", access: "readOnly" });
+        return followUp(worker.jobId, "second");
+      }
+    `));
+    await waitFor(() => f.backend.requests.length === 1, "worker dispatched");
+    const workerJobId = f.backend.starts[0]!;
+    f.backend.completeTask("first", "first output");
+    await waitFor(() => f.backend.sends.length === 1, "follow-up sent to the retained session");
+
+    const final = await f.workflows.cancel(started.snapshot.runId, "test cancellation");
+    assert.equal(final.status, "aborted");
+    assert.ok(f.backend.cancels.some((entry) => entry.jobId === workerJobId), "the active follow-up's job is cancelled, not orphaned");
+    assert.equal(f.jobs.check(workerJobId).status, "cancelled");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a completed workflow-owned job's session stays retained until the workflow itself terminates, then is released", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        const a = await agent("first", { access: "readOnly" });
+        const b = await agent("second", { access: "readOnly" });
+        return { a, b };
+      }
+    `));
+    await waitFor(() => f.backend.requests.length === 1, "first agent dispatched");
+    const firstJobId = f.backend.starts[0]!;
+    f.backend.completeTask("first", "first output");
+
+    await waitFor(() => f.backend.requests.length === 2, "second agent dispatched");
+    assert.deepEqual(f.backend.closes, [], "the first agent's session stays retained while the workflow is still running");
+
+    f.backend.completeTask("second", "second output");
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.deepEqual(f.backend.closes.slice().sort(), [firstJobId, f.backend.starts[1]!].sort(), "every retained session this run owns is released once the workflow ends");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a workflow that ultimately fails still releases every retained session it owns", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        const a = await agent("first", { access: "readOnly" });
+        const b = await agent("second", { access: "readOnly" });
+        if (!b.ok) throw new Error("boom");
+        return { a, b };
+      }
+    `));
+    await waitFor(() => f.backend.requests.length === 1, "first agent dispatched");
+    const firstJobId = f.backend.starts[0]!;
+    f.backend.completeTask("first", "first output");
+    await waitFor(() => f.backend.requests.length === 2, "second agent dispatched");
+    f.backend.failTask("second", "second failed");
+
+    const final = await started.completion;
+    assert.equal(final.status, "failed");
+    assert.ok(f.backend.closes.includes(firstJobId), "the successful first agent's session is still released after the workflow fails");
   } finally {
     await f.cleanup();
   }

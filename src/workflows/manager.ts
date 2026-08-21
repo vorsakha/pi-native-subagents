@@ -18,11 +18,12 @@ import {
   writeWorkflowReport,
   writeWorkflowResult,
 } from "./artifacts.ts";
-import { replayableJournalCalls, workflowCallFingerprint, workflowDefinitionFingerprint } from "./journal.ts";
+import { replayableJournalCalls, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint } from "./journal.ts";
 import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
 import { workflowTaskOutcome } from "./outcome.ts";
 import { finishWorkflowWorktree, prepareWorkflowWorktree, type WorkflowWorktreeHandle } from "./worktree.ts";
 import type {
+  WorkflowAgentGeneration,
   WorkflowAgentRecord,
   WorkflowAgentState,
   WorkflowJournalRecord,
@@ -45,6 +46,10 @@ const MAX_RETAINED_RUNS = 64;
 const MAX_WORKFLOW_LOGS = 128;
 export const MAX_WORKFLOW_PHASES = 64;
 export const MAX_WORKFLOW_PHASE_NAME_LENGTH = 160;
+/** Bounded turn history retained per agent lineage; older generations are dropped, newest first preserved. */
+const MAX_AGENT_GENERATIONS = 8;
+/** followUp() options are presentation/validation only; every policy field stays fixed at the original agent() call. */
+const FOLLOWUP_OPTION_KEYS = new Set(["phase", "schema"]);
 
 export interface StartWorkflowRequest {
   sessionId: string;
@@ -500,6 +505,7 @@ export class WorkflowManager {
         onPhase: (title) => this.#activatePhase(entry, title),
         onLog: (message) => this.#recordLog(entry, message),
         onAgent: (prompt, options, signal, callIndex) => this.#runAgent(entry, request, prompt, options, signal, callIndex),
+        onFollowUp: (jobId, prompt, options, signal, callIndex) => this.#runFollowUpCall(entry, request, jobId, prompt, options, signal, callIndex),
       });
       this.#applyMeta(entry, sandbox.meta, false);
       entry.snapshot.result = sandbox.result;
@@ -515,6 +521,7 @@ export class WorkflowManager {
       this.#finishPhases(entry, entry.snapshot.status);
     } finally {
       this.#releasePause(entry);
+      await this.#releaseMemberRuns(entry);
       const now = Date.now();
       entry.snapshot.timestamps.updatedAt = now;
       entry.snapshot.timestamps.pausedAt = undefined;
@@ -554,6 +561,7 @@ export class WorkflowManager {
     await this.#appendJournal(entry, {
       callIndex,
       fingerprint,
+      kind: "agent",
       state: "started",
       at: Date.now(),
     });
@@ -562,12 +570,13 @@ export class WorkflowManager {
     const expected = entry.replay?.active && callIndex < (entry.snapshot.budget?.maxAgents ?? 32)
       ? entry.replay.calls.find((call) => call.callIndex === callIndex)
       : undefined;
-    if (entry.replay?.active && expected?.fingerprint === fingerprint) {
+    if (entry.replay?.active && expected?.fingerprint === fingerprint && expected.kind === "agent") {
       const record = this.#recordReplayedAgent(entry, prompt, options, callIndex, fingerprint, expected);
       entry.snapshot.replay!.matchedCalls++;
       await this.#appendJournal(entry, {
         callIndex,
         fingerprint,
+        kind: "agent",
         state: "completed",
         at: Date.now(),
         agentIndex: record.index,
@@ -596,6 +605,7 @@ export class WorkflowManager {
       await this.#appendJournal(entry, {
         callIndex,
         fingerprint,
+        kind: "agent",
         state: "failed",
         at: Date.now(),
         agentIndex: record?.index,
@@ -609,6 +619,115 @@ export class WorkflowManager {
     await this.#appendJournal(entry, {
       callIndex,
       fingerprint,
+      kind: "agent",
+      state: result.ok ? "completed" : "failed",
+      at: Date.now(),
+      agentIndex: record?.index,
+      result: clone(result) as WorkflowJournalResult,
+      route: journalRoute(record),
+      replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
+    });
+    return result;
+  }
+
+  /**
+   * Continues a completed workflow-owned agent's retained native session.
+   * Ownership, retention, and policy are enforced before any dispatch: the
+   * target must be a job this run's own agent() call started and must still
+   * be completed with a retained session, and followUp() options may only
+   * touch presentation/validation fields, never policy.
+   */
+  async #runFollowUpCall(
+    entry: RunEntry,
+    request: StartWorkflowRequest,
+    jobId: string,
+    prompt: string,
+    options: Record<string, unknown>,
+    signal: AbortSignal,
+    callIndex: number,
+  ): Promise<WorkflowAgentResult> {
+    if (callIndex !== entry.nextCallIndex || callIndex < 0 || callIndex >= 32) {
+      throw new Error(`Workflow agent call ordinal is invalid or out of sequence: ${callIndex}`);
+    }
+    entry.nextCallIndex++;
+    const fingerprint = workflowFollowUpFingerprint({ jobId, prompt, options });
+    await this.#appendJournal(entry, {
+      callIndex,
+      fingerprint,
+      kind: "followUp",
+      state: "started",
+      at: Date.now(),
+    });
+    await this.#waitUntilResumed(entry, signal);
+
+    const expected = entry.replay?.active && callIndex < (entry.snapshot.budget?.maxAgents ?? 32)
+      ? entry.replay.calls.find((call) => call.callIndex === callIndex)
+      : undefined;
+    if (entry.replay?.active && expected?.fingerprint === fingerprint && expected.kind === "followUp") {
+      // Reattach by the lineage's stable native jobId rather than the journaled
+      // agentIndex: that index reflects push order under the ORIGINAL run's
+      // (possibly reordered) parallel dispatch completion, which can differ
+      // from this reconstruction's push order and would otherwise mislabel
+      // a sibling agent's record.
+      const targetIndex = entry.snapshot.agents.findIndex((candidate) => candidate.jobId === jobId);
+      const record = targetIndex < 0 ? undefined : this.#recordReplayedFollowUp(entry, targetIndex, prompt, callIndex, fingerprint, expected);
+      if (!record) {
+        const error = "Workflow follow-up replay could not locate its source agent lineage";
+        await this.#appendJournal(entry, { callIndex, fingerprint, kind: "followUp", state: "failed", at: Date.now(), result: { ok: false, output: "", error } });
+        return { ok: false, output: "", error };
+      }
+      entry.snapshot.replay!.matchedCalls++;
+      await this.#appendJournal(entry, {
+        callIndex,
+        fingerprint,
+        kind: "followUp",
+        state: "completed",
+        at: Date.now(),
+        agentIndex: record.index,
+        result: clone(expected.result),
+        route: expected.route ? { ...expected.route } : undefined,
+        replayedFrom: { runId: entry.replay.sourceRunId, callIndex: expected.callIndex },
+      });
+      this.#touch(entry);
+      return clone(expected.result);
+    }
+    if (entry.replay?.active) {
+      entry.snapshot.replay!.invalidatedAt ??= callIndex;
+      this.#touch(entry);
+    }
+
+    let result: WorkflowAgentResult;
+    try {
+      const execute = () => this.#runFreshFollowUp(entry, request, jobId, prompt, options, signal, callIndex, fingerprint);
+      const owner = this.#jobOwners.get(jobId);
+      const targetAgent = owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined;
+      const isolated = () => targetAgent?.access === "readOnly"
+        ? execute()
+        : this.#withMutationLock(request.cwd, signal, execute);
+      result = await this.#withDispatchSlot(entry, signal, isolated);
+    } catch (error) {
+      const failed = { ok: false, output: "", error: boundedText(error) } satisfies WorkflowJournalResult;
+      const owner = this.#jobOwners.get(jobId);
+      const record = owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined;
+      await this.#appendJournal(entry, {
+        callIndex,
+        fingerprint,
+        kind: "followUp",
+        state: "failed",
+        at: Date.now(),
+        agentIndex: record?.index,
+        result: failed,
+        route: journalRoute(record),
+        replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
+      });
+      throw error;
+    }
+    const owner = this.#jobOwners.get(jobId);
+    const record = owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined;
+    await this.#appendJournal(entry, {
+      callIndex,
+      fingerprint,
+      kind: "followUp",
       state: result.ok ? "completed" : "failed",
       at: Date.now(),
       agentIndex: record?.index,
@@ -864,6 +983,186 @@ export class WorkflowManager {
     }
   }
 
+  /** Snapshot a record's current (pre-follow-up) fields as generation 0, so a
+   * lineage that never received a follow-up before now still has a complete
+   * generation history once one starts. */
+  #snapshotGeneration(record: WorkflowAgentRecord): WorkflowAgentGeneration {
+    return {
+      index: 0,
+      callIndex: record.callIndex ?? 0,
+      prompt: record.prompt,
+      state: record.state,
+      output: record.output,
+      structured: record.structured,
+      error: record.error,
+      outputProvenance: record.outputProvenance,
+      timestamps: { ...record.timestamps },
+    };
+  }
+
+  async #runFreshFollowUp(
+    entry: RunEntry,
+    request: StartWorkflowRequest,
+    jobId: string,
+    prompt: string,
+    options: Record<string, unknown>,
+    signal: AbortSignal,
+    callIndex: number,
+    fingerprint: string,
+  ): Promise<WorkflowAgentResult> {
+    if (!prompt.trim()) return { ok: false, output: "", error: "followUp() requires a non-empty prompt" };
+    const disallowed = Object.keys(options).filter((key) => !FOLLOWUP_OPTION_KEYS.has(key));
+    if (disallowed.length) {
+      return { ok: false, output: "", error: `followUp() does not accept policy options: ${disallowed.join(", ")}` };
+    }
+    const owner = this.#jobOwners.get(jobId);
+    if (!owner || owner.runId !== entry.snapshot.runId) {
+      return { ok: false, output: "", error: `followUp() target ${jobId} does not belong to this workflow run` };
+    }
+    const record = entry.snapshot.agents[owner.agentIndex];
+    if (!record) return { ok: false, output: "", error: `followUp() target ${jobId} is unknown` };
+    if (record.isolation) {
+      return { ok: false, output: "", error: `followUp() target ${jobId} used an isolated worktree that already finalized (${record.isolation.state}) and cannot continue` };
+    }
+    if (callIndex >= (entry.snapshot.budget?.maxAgents ?? 32)) {
+      return { ok: false, output: "", error: `Workflow agent budget exceeded (${entry.snapshot.budget?.maxAgents} calls)` };
+    }
+    const preflightError = this.#budgetPreflight(entry);
+    if (preflightError) return { ok: false, output: "", error: preflightError };
+    const schema = options.schema === undefined ? undefined : workflowSchema(options.schema);
+    if (options.schema !== undefined && !schema) {
+      return { ok: false, output: "", error: "followUp schema must be a bounded JSON Schema object" };
+    }
+    const message = schema
+      ? `${prompt}\n\nReturn ONLY valid JSON matching this JSON Schema (no markdown fences):\n${JSON.stringify(schema)}`
+      : prompt;
+    // Phase validation/progression mirrors agent(), but a follow-up continues
+    // its original lineage card rather than relisting it under a new phase.
+    const phase = this.#resolveAgentPhase(entry, options.phase);
+    this.#markPhaseRunning(entry, phase);
+
+    const now = Date.now();
+    record.generations ??= [this.#snapshotGeneration(record)];
+    record.generations.push({
+      index: record.generations.length,
+      callIndex,
+      prompt: boundedText(prompt, 2 * 1024),
+      state: "queued",
+      timestamps: { createdAt: now, updatedAt: now },
+    });
+    if (record.generations.length > MAX_AGENT_GENERATIONS) record.generations.splice(0, record.generations.length - MAX_AGENT_GENERATIONS);
+    record.callIndex = callIndex;
+    record.callFingerprint = fingerprint;
+    record.state = "queued";
+    record.prompt = boundedText(prompt, 2 * 1024);
+    record.error = undefined;
+    record.structured = undefined;
+    record.timestamps.updatedAt = now;
+    this.#touch(entry);
+
+    let queued: JobSnapshot;
+    try {
+      queued = await this.#jobs.continueWorkflowJob(jobId, message);
+    } catch (error) {
+      const failure = boundedText(error);
+      record.state = "failed";
+      record.error = failure;
+      record.timestamps.updatedAt = Date.now();
+      record.timestamps.endedAt = record.timestamps.updatedAt;
+      const generation = record.generations.at(-1);
+      if (generation) {
+        generation.state = "failed";
+        generation.error = failure;
+        generation.timestamps = { ...generation.timestamps, updatedAt: record.timestamps.updatedAt, endedAt: record.timestamps.endedAt };
+      }
+      this.#touch(entry);
+      return { ok: false, output: "", error: failure };
+    }
+    this.#updateAgentFromJob(queued);
+
+    const abort = () => { void this.#jobs.cancel(jobId, "Workflow follow-up cancelled").catch(() => undefined); };
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+    try {
+      const final = await this.#jobs.wait(jobId, { signal });
+      this.#updateAgentFromJob(final);
+      if (final.status === "completed") {
+        if (schema) {
+          const structured = parseStructuredOutput(final.output);
+          if (structured === undefined || !Check(schema, structured)) {
+            record.state = "failed";
+            record.error = "Agent output did not match the requested JSON Schema";
+            record.timestamps.updatedAt = Date.now();
+            record.timestamps.endedAt = record.timestamps.updatedAt;
+            record.structured = undefined;
+            const generation = record.generations.at(-1);
+            if (generation) {
+              generation.state = "failed";
+              generation.error = record.error;
+              generation.structured = undefined;
+              generation.timestamps = { ...generation.timestamps, updatedAt: record.timestamps.updatedAt, endedAt: record.timestamps.endedAt };
+            }
+            this.#touch(entry);
+            return { ok: false, output: final.output, jobId: final.id, error: record.error, usage: clone(final.usage) };
+          }
+          record.structured = structured;
+          const generation = record.generations.at(-1);
+          if (generation) generation.structured = structured;
+          this.#touch(entry);
+          return { ok: true, output: final.output, structured, jobId: final.id, usage: clone(final.usage) };
+        }
+        return { ok: true, output: final.output, jobId: final.id, usage: clone(final.usage) };
+      }
+      return { ok: false, output: final.output, jobId: final.id, error: final.error ?? `Agent ${final.status}`, usage: clone(final.usage) };
+    } catch (error) {
+      await this.#jobs.cancel(jobId, "Workflow follow-up wait aborted").catch(() => undefined);
+      const final = this.#jobs.check(jobId);
+      this.#updateAgentFromJob(final);
+      return { ok: false, output: final.output, jobId: final.id, error: boundedText(error), usage: clone(final.usage) };
+    } finally {
+      signal.removeEventListener("abort", abort);
+    }
+  }
+
+  #recordReplayedFollowUp(
+    entry: RunEntry,
+    targetAgentIndex: number,
+    prompt: string,
+    callIndex: number,
+    fingerprint: string,
+    replay: WorkflowReplayCall,
+  ): WorkflowAgentRecord | undefined {
+    const record = entry.snapshot.agents[targetAgentIndex];
+    if (!record) return undefined;
+    const now = Date.now();
+    const structured = replay.result.structured === undefined ? undefined : clone(replay.result.structured);
+    record.generations ??= [this.#snapshotGeneration(record)];
+    record.generations.push({
+      index: record.generations.length,
+      callIndex,
+      prompt: boundedText(prompt, 2 * 1024),
+      state: "completed",
+      output: replay.result.output,
+      structured,
+      outputProvenance: "replay",
+      timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now },
+    });
+    if (record.generations.length > MAX_AGENT_GENERATIONS) record.generations.splice(0, record.generations.length - MAX_AGENT_GENERATIONS);
+    record.callIndex = callIndex;
+    record.callFingerprint = fingerprint;
+    record.outputProvenance = "replay";
+    record.instructionShaped = looksInstructionShaped(replay.result.output);
+    record.prompt = boundedText(prompt, 2 * 1024);
+    record.state = "completed";
+    record.output = replay.result.output;
+    record.structured = structured;
+    record.error = undefined;
+    record.timestamps.updatedAt = now;
+    record.timestamps.endedAt = now;
+    this.#touch(entry);
+    return record;
+  }
+
   #recordReplayedAgent(
     entry: RunEntry,
     prompt: string,
@@ -1103,6 +1402,19 @@ export class WorkflowManager {
       agent.outputProvenance = "subagent";
       agent.instructionShaped = looksInstructionShaped(job.output);
     }
+    // The latest generation entry mirrors the same live fields as the
+    // top-level record whenever it is the one this event belongs to; prior
+    // generations were already frozen when their own follow-up settled.
+    const generation = agent.generations?.at(-1);
+    if (generation && generation.callIndex === agent.callIndex) {
+      generation.state = agent.state;
+      generation.error = agent.error;
+      generation.timestamps = { ...generation.timestamps, updatedAt: now, startedAt: generation.timestamps.startedAt ?? job.startedAt, endedAt: job.endedAt };
+      if (isTerminal(job.status)) {
+        generation.output = job.output;
+        generation.outputProvenance = "subagent";
+      }
+    }
     this.#touch(entry);
     this.#recordBudgetWarnings(entry);
   }
@@ -1296,6 +1608,16 @@ export class WorkflowManager {
       })
       .filter((job) => !isTerminal(job.status));
     await Promise.allSettled(jobs.map((job) => this.#jobs.cancel(job.id, reason)));
+  }
+
+  /** A completed workflow-owned job keeps its retained native session only for
+   * this run's lifetime; release every session this run owns once it ends so
+   * success, failure, abort, and shutdown all leave nothing retained behind. */
+  async #releaseMemberRuns(entry: RunEntry): Promise<void> {
+    const jobIds = entry.snapshot.agents
+      .map((agent) => agent.jobId)
+      .filter((id): id is string => id !== undefined && this.#jobOwners.get(id)?.runId === entry.snapshot.runId);
+    await Promise.allSettled(jobIds.map((id) => this.#jobs.releaseRun(id)));
   }
 
   #touch(entry: RunEntry): void {

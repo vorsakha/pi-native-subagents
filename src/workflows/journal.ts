@@ -33,6 +33,12 @@ export function workflowCallFingerprint(prompt: string, options: Record<string, 
   return fingerprint("agent-call", { options, prompt });
 }
 
+/** Binds prompt, options, and the exact retained target so a follow-up cannot
+ * replay against a different job than the one it originally continued. */
+export function workflowFollowUpFingerprint(input: { jobId: string; prompt: string; options: Record<string, unknown> }): string {
+  return fingerprint("followup-call", { jobId: input.jobId, options: input.options, prompt: input.prompt });
+}
+
 export function workflowDefinitionFingerprint(input: {
   script: string;
   argsJson: string;
@@ -82,6 +88,8 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
     .map(([callIndex, record]) => ({
       callIndex,
       fingerprint: record.fingerprint,
+      kind: record.kind ?? "agent",
+      agentIndex: record.agentIndex,
       result: structuredClone(record.result) as WorkflowJournalResult,
       route: record.route ? { ...record.route } : undefined,
     }));

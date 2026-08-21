@@ -541,6 +541,63 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
   await manager.shutdown();
 });
 
+test("continueWorkflowJob is the workflow-only follow-up path: it retains and reuses a completed job's session, accumulates usage, and releaseRun later closes it", async () => {
+  const { backend, manager } = setup(1);
+  const owned = manager.spawn({ ...request(1), workflow: { runId: "wf-1", agentIndex: 0, label: "planner" } });
+  await tick();
+  backend.complete(owned.id, "first output", { input: 3, output: 1 });
+  const settled = await manager.wait(owned.id);
+  assert.equal(settled.status, "completed");
+  assert.deepEqual(backend.closes, [], "a completed workflow job's session stays retained instead of closing on completion");
+
+  await assert.rejects(manager.send(owned.id, "direct override", "steer"), /workflow-owned agents are controlled by their workflow/);
+
+  const continuing = manager.continueWorkflowJob(owned.id, "continue the plan");
+  await tick();
+  assert.deepEqual(backend.sends, [{ id: owned.id, message: "continue the plan", behavior: "followUp" }]);
+  backend.complete(owned.id, "second output", { input: 2, output: 1 });
+  const queued = await continuing;
+  assert.ok(queued.status === "queued" || queued.status === "running");
+  const final = await manager.wait(owned.id);
+  assert.equal(final.output, "second output");
+  assert.equal(final.usage.input, 5, "usage accumulates across generations instead of resetting per follow-up");
+
+  await manager.releaseRun(owned.id);
+  assert.deepEqual(backend.closes, [owned.id]);
+  await manager.releaseRun(owned.id);
+  assert.deepEqual(backend.closes, [owned.id], "releaseRun is idempotent");
+  await assert.rejects(manager.continueWorkflowJob(owned.id, "too late"), /native session is no longer available/);
+
+  await manager.shutdown();
+});
+
+test("continueWorkflowJob rejects direct jobs, unsettled jobs, and jobs whose retained budget is already exhausted", async () => {
+  const { backend, manager } = setup(2);
+  const direct = manager.spawn(request(1));
+  await tick();
+  backend.complete(direct.id, "direct output");
+  await manager.wait(direct.id);
+  await assert.rejects(manager.continueWorkflowJob(direct.id, "x"), /not workflow-owned/, "direct subagent jobs can never be continued as a workflow lineage");
+
+  const owned = manager.spawn({ ...request(2), workflow: { runId: "wf-2", agentIndex: 0, label: "worker" } });
+  await tick();
+  await assert.rejects(manager.continueWorkflowJob(owned.id, "too early"), /job is running/);
+  backend.complete(owned.id, "done");
+  await manager.wait(owned.id);
+
+  const budgeted = manager.spawn({
+    ...request(3),
+    workflow: { runId: "wf-2", agentIndex: 1, label: "budgeted" },
+    budget: { maxTokens: 5 },
+  });
+  await tick();
+  backend.complete(budgeted.id, "within budget", { input: 5, output: 0 });
+  await manager.wait(budgeted.id);
+  await assert.rejects(manager.continueWorkflowJob(budgeted.id, "blocked"), /later dispatches are blocked/);
+
+  await manager.shutdown();
+});
+
 test("queued retained follow-ups cannot bypass the global scheduler", async () => {
   const { backend, manager } = setup(1);
   const first = manager.spawn(request(1));

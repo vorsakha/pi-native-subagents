@@ -76,7 +76,7 @@ export default async function () {
 
 Manage running jobs with `subagent_wait`, `subagent_check`, `subagent_send`, `subagent_cancel`, and `subagent_list`. Completed ordinary jobs keep their native session for follow-ups, bounded at 100 retained jobs.
 
-`workflow` takes exactly one source — inline `script`, saved `workflowName`, or a trusted project-local `scriptPath`. Inside a workflow the globals are `args`, `phase()`, `log()`, `agent()`, `parallel()`, and `pipeline()`. Await every `agent()` call before returning.
+`workflow` takes exactly one source — inline `script`, saved `workflowName`, or a trusted project-local `scriptPath`. Inside a workflow the globals are `args`, `phase()`, `log()`, `agent()`, `followUp()`, `parallel()`, and `pipeline()`. `followUp(jobId, prompt)` continues a completed `agent()` call's own retained session, for example returning to an earlier planner for review. Await every `agent()`/`followUp()` call before returning.
 
 Workflow spend budgets are also optional. Explicit token, cost, turn, and per-agent token limits stop later dispatches once observed usage reaches the boundary; they do not cancel active agents or change successful child results. A completed workflow reports its task outcome separately: `{ ok: true }` is successful, `{ ok: false }` is unsuccessful, and other results are unspecified.
 

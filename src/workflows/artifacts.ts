@@ -310,6 +310,13 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
       structured: serializeWorkflowValue(agent.structured, { maxNodes: 512, maxStringBytes: 8 * 1024, maxTotalBytes: 16 * 1024 }),
       transcript: undefined,
       error: agent.error ? truncateUtf8(agent.error, 2_000) : undefined,
+      generations: agent.generations?.slice(-8).map((generation) => ({
+        ...generation,
+        prompt: generation.prompt ? truncateUtf8(generation.prompt, 2 * 1024) : undefined,
+        output: serializeWorkflowValue(generation.output, { maxNodes: 256, maxStringBytes: 4 * 1024, maxTotalBytes: 6 * 1024 }),
+        structured: serializeWorkflowValue(generation.structured, { maxNodes: 512, maxStringBytes: 8 * 1024, maxTotalBytes: 16 * 1024 }),
+        error: generation.error ? truncateUtf8(generation.error, 2_000) : undefined,
+      })),
     })),
   }, {
     maxDepth: 16,
@@ -349,6 +356,7 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || typeof record.fingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(record.fingerprint)
       || !["started", "completed", "failed"].includes(record.state ?? "")
       || typeof record.at !== "number" || !Number.isFinite(record.at)) return false;
+  if (record.kind !== undefined && record.kind !== "agent" && record.kind !== "followUp") return false;
   if (record.agentIndex !== undefined && (!Number.isSafeInteger(record.agentIndex) || record.agentIndex! < 0 || record.agentIndex! >= 32)) return false;
   if (record.replayedFrom !== undefined && (typeof record.replayedFrom.runId !== "string"
       || !RUN_ID_PATTERN.test(record.replayedFrom.runId) || !Number.isSafeInteger(record.replayedFrom.callIndex)

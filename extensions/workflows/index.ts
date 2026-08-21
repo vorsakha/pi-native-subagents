@@ -65,6 +65,14 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
     agents: snapshot.agents.map((agent) => ({
       index: agent.index,
       callIndex: agent.callIndex,
+      generations: agent.generations?.map((generation) => ({
+        index: generation.index,
+        callIndex: generation.callIndex,
+        state: generation.state,
+        error: generation.error,
+        outputProvenance: generation.outputProvenance,
+        timestamps: structuredClone(generation.timestamps),
+      })),
       replayedFrom: agent.replayedFrom ? structuredClone(agent.replayedFrom) : undefined,
       outputProvenance: agent.outputProvenance,
       instructionShaped: agent.instructionShaped,

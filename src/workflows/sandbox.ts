@@ -32,6 +32,14 @@ export interface WorkflowSandboxOptions {
     signal: AbortSignal,
     callIndex: number,
   ): Promise<WorkflowAgentResult>;
+  /** Continues a retained workflow-owned job instead of starting a fresh one. */
+  onFollowUp(
+    jobId: string,
+    prompt: string,
+    options: Record<string, unknown>,
+    signal: AbortSignal,
+    callIndex: number,
+  ): Promise<WorkflowAgentResult>;
   onMeta(meta: unknown): void;
   onPhase(title: string): void;
   onLog(message: string): void;
@@ -44,6 +52,7 @@ export interface WorkflowSandboxResult {
 
 type ChildMessage =
   | { token: string; type: "agent"; id: number; prompt: string; options: Record<string, unknown> }
+  | { token: string; type: "followUp"; id: number; jobId: string; prompt: string; options: Record<string, unknown> }
   | { token: string; type: "meta"; meta: unknown }
   | { token: string; type: "phase"; title: string }
   | { token: string; type: "log"; message: string }
@@ -224,10 +233,13 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
         catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
         return;
       }
-      if (message.type === "agent") {
+      if (message.type === "agent" || message.type === "followUp") {
         if (!Number.isSafeInteger(message.id) || typeof message.prompt !== "string" ||
             !message.options || typeof message.options !== "object" || Array.isArray(message.options)) {
           return fail(new Error("Invalid agent request from workflow sandbox"));
+        }
+        if (message.type === "followUp" && (typeof message.jobId !== "string" || !message.jobId.trim() || message.jobId.length > 200)) {
+          return fail(new Error("Invalid follow-up request from workflow sandbox"));
         }
         if (message.id !== agentCalls + 1) return fail(new Error("Workflow sandbox agent call IDs are not contiguous"));
         agentCalls++;
@@ -237,8 +249,11 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
         }
         const controller = new AbortController();
         agentControllers.set(message.id, controller);
+        const dispatch = message.type === "followUp"
+          ? () => options.onFollowUp(message.jobId, message.prompt, message.options, controller.signal, message.id - 1)
+          : () => options.onAgent(message.prompt, message.options, controller.signal, message.id - 1);
         const task = Promise.resolve()
-          .then(() => options.onAgent(message.prompt, message.options, controller.signal, message.id - 1))
+          .then(dispatch)
           .catch(safeAgentFailure)
           .then((result) => {
             agentControllers.delete(message.id);

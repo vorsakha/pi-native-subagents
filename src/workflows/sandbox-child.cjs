@@ -57,8 +57,8 @@ function failure(message) {
 
 function formatWorkflowError(error) {
   const message = errorMessage(error);
-  if (/Cannot destructure property ['"](?:phase|log|agent|parallel)['"]/.test(message)) {
-    return `${message}. Workflow helpers are globals: use phase(), log(), agent(), and parallel().`;
+  if (/Cannot destructure property ['"](?:phase|log|agent|followUp|parallel)['"]/.test(message)) {
+    return `${message}. Workflow helpers are globals: use phase(), log(), agent(), followUp(), and parallel().`;
   }
   return message;
 }
@@ -98,7 +98,7 @@ function bridge(operation, payloadJson, resolve) {
     if (!send({ type: "log", message: payload.message })) return "Unable to emit workflow log message";
     return undefined;
   }
-  if (operation !== "agent" || typeof resolve !== "function") return;
+  if ((operation !== "agent" && operation !== "followUp") || typeof resolve !== "function") return;
   if (agentCalls >= MAX_AGENT_CALLS) {
     resolve(failure(`Agent call limit exceeded (${MAX_AGENT_CALLS})`));
     return;
@@ -114,9 +114,15 @@ function bridge(operation, payloadJson, resolve) {
     resolve(failure("agent requires a string prompt and an options object"));
     return;
   }
+  if (operation === "followUp" && (typeof payload.jobId !== "string" || !payload.jobId.trim())) {
+    resolve(failure("followUp requires a job ID, a string prompt, and an options object"));
+    return;
+  }
   const id = nextAgentId++;
   agentCalls++;
-  const request = { type: "agent", id, prompt: payload.prompt, options: payload.options };
+  const request = operation === "followUp"
+    ? { type: "followUp", id, jobId: payload.jobId, prompt: payload.prompt, options: payload.options }
+    : { type: "agent", id, prompt: payload.prompt, options: payload.options };
   if (frameSize({ token, ...request }) > MAX_IPC_BYTES || !send(request)) {
     resolve(failure("Agent request exceeds the 512 KiB IPC limit"));
     return;
@@ -190,6 +196,23 @@ function installApi(context, argsJson) {
           return asFailure(error);
         }
       };
+      const followUpApi = async (jobId, prompt, options = {}) => {
+        try {
+          if (typeof jobId !== "string" || !jobId.trim() || typeof prompt !== "string" || options === null || typeof options !== "object" || Array.isArray(options)) {
+            return asFailure(new TypeError("followUp requires a job ID, a string prompt, and an options object"));
+          }
+          const payload = JSON.stringify({ jobId, prompt, options });
+          if (payload === undefined) return asFailure(new TypeError("Follow-up request is not JSON-serializable"));
+          return await new Promise((resolve) => {
+            callHost("followUp", payload, (responseJson) => {
+              try { resolve(JSON.parse(responseJson)); }
+              catch (error) { resolve(asFailure(error)); }
+            });
+          });
+        } catch (error) {
+          return asFailure(error);
+        }
+      };
       const parallelApi = async (items, workerOrConcurrency, maybeConcurrency) => {
         if (!Array.isArray(items)) throw new TypeError("parallel requires an array");
         const hasWorker = typeof workerOrConcurrency === "function";
@@ -247,6 +270,7 @@ function installApi(context, argsJson) {
         phase: { value: phaseApi, writable: false, configurable: false },
         log: { value: logApi, writable: false, configurable: false },
         agent: { value: agentApi, writable: false, configurable: false },
+        followUp: { value: followUpApi, writable: false, configurable: false },
         parallel: { value: parallelApi, writable: false, configurable: false },
         pipeline: { value: pipelineApi, writable: false, configurable: false },
       });
@@ -300,6 +324,7 @@ async function execute(source, argsJson) {
     sandbox.parallel,
     sandbox.pipeline,
     sandbox.log,
+    sandbox.followUp,
   ]);
   if (pendingAgents.size > 0) {
     throw new Error(`Workflow returned before ${pendingAgents.size} agent call${pendingAgents.size === 1 ? "" : "s"} settled; await every agent() call`);

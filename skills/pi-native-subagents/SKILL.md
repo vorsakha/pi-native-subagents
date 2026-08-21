@@ -67,12 +67,13 @@ The `workflow` tool accepts exactly one source:
 
 Use either structured `input` or legacy JSON-string `args`, never both. The selected value is exposed to the script as the global `args` object. Workflows must be trusted and use a source contained by the trusted project rules.
 
-A workflow script must export a default async function. Workflow helpers are globals: use phase(), log(), agent(), and parallel(). The available globals are:
+A workflow script must export a default async function. Workflow helpers are globals: use phase(), log(), agent(), followUp(), and parallel(). The available globals are:
 
 - `args` — parsed workflow input;
 - `phase(title)` — report bounded progress;
 - `log(message)` — report bounded progress text;
 - `agent(prompt, options)` — request one generic child and return a result object;
+- `followUp(jobId, prompt, options)` — continue a completed agent() call's own retained native session and return the same result shape;
 - `parallel(tasks, { concurrency })` — run deferred tasks with a bounded worker pool;
 - `pipeline(items, ...stages)` — process independent items through ordered stages.
 
@@ -108,6 +109,30 @@ export default async function () {
 ```
 
 For a workflow with a known plan, add `phases` to the exported metadata, for example `export const meta = { name: "release review", phases: ["review", "verify", "summarize"] };`. The plan accepts 1–64 unique names; names are trimmed and internal whitespace is collapsed, matching is case-sensitive, and each normalized name is limited to 160 characters. Declared phases appear as pending before the first `phase(title)` call, and `phase(title)` must activate them forward in plan order (conditional phases may be skipped). Repeating the active phase is harmless; use `phase(title)` to advance rather than `agent({ phase })`. Omit `meta.phases` when phases are discovered dynamically.
+
+## Continuing a retained agent with followUp
+
+`followUp(jobId, prompt, options?)` sends another turn to an `agent()` call this same workflow run already completed successfully, reusing its retained native session instead of starting a fresh child. This is the only supported way to return to earlier reasoning — for example, asking the phase-1 planner to review phase-2's implementation, or sending review findings back to the implementer for a bounded fix cycle:
+
+```js
+phase("plan");
+const planner = await agent("Plan the change.", { name: "planner", access: "readOnly" });
+
+phase("implement");
+const implementation = await agent(`Implement this plan:\n${planner.output}`, { name: "implementer", access: "full" });
+
+phase("review");
+const review = await followUp(planner.jobId, "Review the current implementation against your plan.");
+if (!review.ok) return { ok: false, error: review.error };
+```
+
+Rules:
+
+- The target job must be a job this run's own `agent()` call started, and it must still be `completed` with a retained session; cross-workflow, direct (non-workflow) `subagent_spawn` jobs, expired, failed, cancelled, and not-yet-settled jobs are all rejected.
+- `options` accepts only `phase` and `schema` — the same non-policy presentation/validation fields `agent()` accepts for those concerns. Harness, model, effort, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original `agent()` call and cannot be changed by a follow-up.
+- A follow-up run in `isolation: "worktree"` can only be continued while its worktree is still `preserved` on disk; once `removed`, `followUp()` fails rather than guessing at a now-missing cwd.
+- Each `followUp()` call consumes its own agent-call ordinal (it counts toward the 32-call budget) and appears in `/workflows` as another bounded generation under the same agent, not a new agent card. Cumulative usage and per-agent token budgets already include every generation.
+- Await every `followUp()` call, exactly like `agent()`.
 
 ## Deferred parallel tasks are mandatory
 
@@ -150,7 +175,7 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 - The sandbox allows workflow orchestration only; it does not allow imports, filesystem, network, environment variables, subprocesses, credentials, `require`, `process`, or nested delegation.
 - Workflows are deterministic: do not use `Date.now()`, zero-argument `new Date()`, or `Math.random()`.
 - Results, metadata, agent requests, logs, phases, source, and arguments are bounded and must be JSON-serializable.
-- A workflow may make at most 32 agent calls and use at most four concurrent workers.
+- A workflow may make at most 32 agent calls and use at most four concurrent workers; `followUp()` calls draw from the same 32-call budget as `agent()`.
 - `background: true` returns a start snapshot; completion is delivered as one follow-up and remains inspectable with `/workflows`.
 - `resumeFromRunId` replays every independently matching completed call, including later calls from a parallel batch when an earlier lane failed. Failed, incomplete, duplicated, or fingerprint-mismatched ordinals rerun. Keep source, input, project, and routing context identical; only increase replay budgets when the runtime permits it.
 - `approval: "plan"` is for read-only planning. Use `approval: "onMutate"` when a workflow may mutate and host approval is required.

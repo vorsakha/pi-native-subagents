@@ -52,6 +52,27 @@ export interface WorkflowReplacementReference {
   reason: string;
 }
 
+/**
+ * One turn in a workflow-agent lineage: either the originating `agent()` call
+ * (index 0) or a later `followUp()` call against the same retained native
+ * session. Bounded and bookkept separately from the top-level record so a
+ * follow-up's live progress does not overwrite a prior turn's result.
+ */
+export interface WorkflowAgentGeneration {
+  /** Ordinal within this lineage; 0 is the originating agent() call. */
+  index: number;
+  /** Script-level agent()/followUp() call ordinal that produced this turn. */
+  callIndex: number;
+  /** Bounded caller prompt for this turn; excludes schema scaffolding. */
+  prompt?: string;
+  state: WorkflowAgentState;
+  output?: unknown;
+  structured?: unknown;
+  outputProvenance?: "subagent" | "replay";
+  error?: string;
+  timestamps: WorkflowTimestamps;
+}
+
 export interface WorkflowAgentRecord {
   index: number;
   /** Script-level agent() ordinal used by the durable replay journal. */
@@ -89,6 +110,12 @@ export interface WorkflowAgentRecord {
   usage: WorkflowUsage;
   /** Latest native request occupancy, when exposed by the harness. */
   context?: ContextSnapshot;
+  /**
+   * Bounded turn history for this lineage. Present once a `followUp()` call
+   * has targeted this agent; the top-level fields above always mirror the
+   * latest (last) entry. Absent for agents that never received a follow-up.
+   */
+  generations?: WorkflowAgentGeneration[];
 }
 
 export interface WorkflowPhase {
@@ -133,6 +160,8 @@ export interface WorkflowJournalRecord {
   fingerprint: string;
   state: "started" | "completed" | "failed";
   at: number;
+  /** Absent means "agent" for journals written before followUp() existed. */
+  kind?: "agent" | "followUp";
   agentIndex?: number;
   result?: WorkflowJournalResult;
   route?: WorkflowJournalRoute;
@@ -143,6 +172,9 @@ export interface WorkflowJournalRecord {
 export interface WorkflowReplayCall {
   callIndex: number;
   fingerprint: string;
+  kind: "agent" | "followUp";
+  /** The lineage this call belongs to; required to reconstruct a followUp() replay. */
+  agentIndex?: number;
   result: WorkflowJournalResult;
   route?: WorkflowJournalRoute;
 }
