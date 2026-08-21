@@ -7,12 +7,13 @@ import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
 import { ControlledBackend, tempDir, tick, waitFor } from "./helpers.ts";
-import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal } from "../src/workflows/artifacts.ts";
+import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import { workflowCallFingerprint, workflowDefinitionFingerprint } from "../src/workflows/journal.ts";
 import {
   aggregateWorkflowUsage,
   WorkflowManager,
 } from "../src/workflows/manager.ts";
+import { formatWorkflowBudget, workflowBudgetHealth } from "../src/workflows/budget.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 
 const reviewer: ProfileDefinition = {
@@ -395,6 +396,38 @@ test("workflow maxCost rejects unsupported routes before child dispatch", async 
   } finally { await f.cleanup(); }
 });
 
+test("sequential dispatch is blocked once maxTurns or maxCost is reached, mirroring maxTokens", async () => {
+  const f = await fixture();
+  try {
+    const turnsExceeded = await f.workflows.start(f.request(`export default async () => {
+      const first = await agent("turns first", { access: "readOnly" });
+      const second = await agent("blocked after turns", { access: "readOnly" });
+      return [first, second];
+    };`, { budget: { maxTurns: 2 } }));
+    await waitFor(() => f.backend.requests.length === 1, "turns budget agent");
+    f.backend.completeTask("turns first", "spent", { input: 1, output: 1, turns: 2 });
+    const turnsFinal = await turnsExceeded.completion;
+    assert.equal(turnsFinal.status, "completed");
+    assert.equal((turnsFinal.result as Array<{ ok: boolean }>)[0]?.ok, true, "natural child success is preserved");
+    assert.match((turnsFinal.result as Array<{ error?: string }>)[1]?.error ?? "", /turn budget exhausted/);
+    assert.equal(f.backend.requests.length, 1, "the second agent never dispatches once turns are exhausted");
+    assert.equal(f.backend.cancels.length, 0, "spend boundaries never cancel active work");
+
+    const costExceeded = await f.workflows.start(f.request(`export default async () => {
+      const first = await agent("cost first", { harness: "claude", access: "readOnly" });
+      const second = await agent("blocked after cost", { harness: "claude", access: "readOnly" });
+      return [first, second];
+    };`, { budget: { maxCost: 1 } }));
+    await waitFor(() => f.claude.requests.length === 1, "cost budget agent");
+    f.claude.completeTask("cost first", "spent", { cost: 1.5, turns: 1 });
+    const costFinal = await costExceeded.completion;
+    assert.equal(costFinal.status, "completed");
+    assert.equal((costFinal.result as Array<{ ok: boolean }>)[0]?.ok, true, "natural child success is preserved");
+    assert.match((costFinal.result as Array<{ error?: string }>)[1]?.error ?? "", /cost budget exhausted/);
+    assert.equal(f.claude.requests.length, 1, "the second agent never dispatches once cost is exhausted");
+  } finally { await f.cleanup(); }
+});
+
 test("workflow maxCost resolves live independentOf routes in both directions", async () => {
   const f = await fixture();
   try {
@@ -477,6 +510,45 @@ test("workflow concurrency budget wakes only one queued dispatch per slot", asyn
     }
     assert.equal((await run.completion).status, "completed");
     assert.equal(f.backend.maxActive, 1);
+  } finally { await f.cleanup(); }
+});
+
+test("an omitted workflow budget persists and replays as open, including once concurrency crosses the former implicit default cap", async () => {
+  const f = await fixture(5);
+  try {
+    const run = await f.workflows.start(f.request(`export default async () => Promise.all(
+      ["one", "two", "three", "four", "five"].map((prompt) => agent(prompt, { access: "readOnly" }))
+    );`));
+    await waitFor(() => f.backend.requests.length === 4, "the implicit maxConcurrency default admits only 4 at once even with an open budget");
+    assert.equal(f.backend.active, 4, "a fifth agent queues behind the former implicit concurrency default");
+
+    const live = f.workflows.check(run.snapshot.runId);
+    assert.equal(live.budget, undefined, "an omitted budget is never implicitly filled in on the live snapshot");
+    const liveUsage = aggregateWorkflowUsage(live);
+    assert.deepEqual(workflowBudgetHealth(live, liveUsage), { text: "budget open", abnormal: false }, "saturating the implicit default never reports as reached or abnormal while the budget is open");
+    assert.equal(formatWorkflowBudget(live, liveUsage), "open");
+
+    for (const prompt of ["one", "two", "three", "four"]) f.backend.completeTask(prompt, `${prompt}-done`);
+    await waitFor(() => f.backend.requests.length === 5, "the fifth agent dispatches once a slot frees");
+    f.backend.completeTask("five", "five-done");
+    const final = await run.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.budget, undefined);
+    assert.equal((final.result as unknown[]).length, 5);
+
+    const persisted = await loadWorkflowSummaries(f.artifactRoot, { sessionId: "session-1" });
+    const reloaded = persisted.find((entry) => entry.runId === final.runId)!;
+    assert.equal(reloaded.budget, undefined, "the omitted budget round-trips through persistence as open");
+    assert.equal(formatWorkflowBudget(reloaded, aggregateWorkflowUsage(reloaded)), "open");
+
+    const replayed = await f.workflows.start(f.request(`export default async () => Promise.all(
+      ["one", "two", "three", "four", "five"].map((prompt) => agent(prompt, { access: "readOnly" }))
+    );`, { resumeFromRunId: final.runId }));
+    const replayedFinal = await replayed.completion;
+    assert.equal(replayedFinal.status, "completed");
+    assert.equal(replayedFinal.budget, undefined, "replaying an open budget keeps it open rather than defaulting to a cap");
+    assert.equal(f.backend.requests.length, 5, "the fully matched replay redispatches no agents");
+    assert.equal((replayedFinal.result as unknown[]).length, 5);
   } finally { await f.cleanup(); }
 });
 

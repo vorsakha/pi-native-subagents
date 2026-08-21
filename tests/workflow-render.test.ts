@@ -154,6 +154,29 @@ test("workflow cards show lifecycle, task outcome, and open or unsupported budge
   assert.ok(settled.some((line) => line.startsWith("Result")), "settled collapsed cards report Result, not Latest");
 });
 
+test("collapsed and expanded cards share one budget-health verdict: unsupported metrics are named and abnormal, concurrency saturation is not", () => {
+  const coloredTheme = { ...theme, fg: (color: string, text: string) => `[${color}]${text}` } as unknown as Theme;
+
+  const unsupportedCost = workflow({ budget: { maxCost: 1 } });
+  const collapsedUnsupported = buildWorkflowCardLines(unsupportedCost, coloredTheme, { expanded: false, now: 6_000 });
+  assert.ok(collapsedUnsupported.some((line) => line.includes("cost unsupported")), "the collapsed card names the unsupported Codex maxCost metric instead of reporting budget ok");
+  assert.ok(collapsedUnsupported.every((line) => !line.includes("budget ok")), "an unsupported explicit metric is never folded into budget ok");
+  assert.ok(collapsedUnsupported.some((line) => line.includes("[warning]") && line.includes("cost unsupported")), "the unsupported metric is marked abnormal");
+  const expandedUnsupported = buildWorkflowCardLines(unsupportedCost, coloredTheme, { expanded: true, now: 6_000 });
+  assert.ok(expandedUnsupported.some((line) => line.includes("Budget") && line.includes("[warning]")), "the expanded Budget row uses the same abnormal verdict");
+
+  const saturated = workflow({ budget: { maxConcurrency: 1 } });
+  const collapsedSaturated = buildWorkflowCardLines(saturated, coloredTheme, { expanded: false, now: 6_000 });
+  assert.ok(collapsedSaturated.some((line) => line.includes("budget ok")), "reaching maxConcurrency alone is normal temporary scheduling saturation");
+  assert.ok(collapsedSaturated.every((line) => !line.includes("reached") && !/Usage.*\[warning\]/.test(line)), "concurrency saturation is never presented as exhausted spend or a warning");
+  const expandedSaturated = buildWorkflowCardLines(saturated, coloredTheme, { expanded: true, now: 6_000 });
+  assert.ok(expandedSaturated.some((line) => line.includes("Budget") && !line.includes("[warning]")), "the expanded Budget row agrees that saturation alone is not abnormal");
+
+  const agentsExhausted = workflow({ budget: { maxAgents: 2 } });
+  const collapsedExhausted = buildWorkflowCardLines(agentsExhausted, coloredTheme, { expanded: false, now: 6_000 });
+  assert.ok(collapsedExhausted.some((line) => line.includes("reached (agents)")), "hard call exhaustion remains distinct and accurately named");
+});
+
 test("the phase spine stays bounded for many phases while the current/total fraction stays authoritative", () => {
   const many = workflow({
     currentPhase: 6,

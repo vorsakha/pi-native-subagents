@@ -706,6 +706,113 @@ test("pause, resume, restart, filters, and configured cancel binding remain keyb
   assert.deepEqual(closed, [{ type: "close" }]);
 });
 
+test("widths below the interactive threshold accept only Escape or the configured cancel binding", (t) => {
+  const closed: WorkflowsDashboardAction[] = [];
+  const state = harness([workflow("tiny")], 30, (action) => closed.push(action), { fullscreen: true, cancelBinding: "q" });
+  t.after(() => state.overlay.dispose());
+
+  for (const width of [0, 1, 2, 3]) {
+    const line = state.overlay.render(width);
+    assertPanel(line, width, 1);
+    for (const input of [ENTER, "p", "r", "x", "X", "j", "k", "h", "l", "f", "\t", "g", PAGE_UP, PAGE_DOWN, SHIFT_UP, CTRL_D]) {
+      state.overlay.handleInput(input);
+    }
+    assert.deepEqual(state.actions, [], `width ${width} ignores every hidden control`);
+  }
+
+  state.overlay.render(2);
+  state.overlay.handleInput("q");
+  assert.deepEqual(closed, [{ type: "close" }], "the configured cancel binding still closes a sub-interactive-width panel");
+});
+
+test("Escape closes a sub-interactive-width panel, and an interactive width restores full navigation", (t) => {
+  const closed: WorkflowsDashboardAction[] = [];
+  const escapeState = harness([workflow("escape-tiny")], 30, (action) => closed.push(action), { fullscreen: true });
+  t.after(() => escapeState.overlay.dispose());
+  escapeState.overlay.render(3);
+  escapeState.overlay.handleInput(ESCAPE);
+  assert.deepEqual(closed, [{ type: "close" }], "Escape closes the panel while below the interactive width");
+
+  const restoreState = harness([workflow("restore-nav")], 30, () => {}, { fullscreen: true });
+  t.after(() => restoreState.overlay.dispose());
+  restoreState.overlay.render(2);
+  restoreState.overlay.handleInput(ENTER);
+  restoreState.overlay.render(52);
+  assert.ok(restoreState.overlay.render(52).some((line) => line.includes("Enter open")), "the panel regains its normal narrow-list hint once interactive again");
+  restoreState.overlay.handleInput(ENTER);
+  assert.ok(restoreState.overlay.render(52).some((line) => line.includes("workflow · phase")), "Enter opens the overview once the panel is interactive again");
+});
+
+test("focusRunId selects the requested run on the first render", (t) => {
+  const first = workflow("focus-first");
+  const second = workflow("focus-second");
+  const state = harness([first, second], 30, () => {}, { focusRunId: "focus-second" });
+  t.after(() => state.overlay.dispose());
+  assert.match(state.overlay.render(120).join("\n"), /Release focus-second/);
+});
+
+test("invalidate() clears the cached detail body so a manual refresh recomputes Markdown", (t) => {
+  const current = workflow("cache", "completed");
+  current.agents[0]!.transcript = [{ kind: "assistant", text: "# Verdict\n\n**PASS**" }];
+  let calls = 0;
+  const state = harness([current], 30, () => {}, {
+    renderMarkdown: (text) => { calls++; return text.split("\n"); },
+  });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(72);
+  state.overlay.handleInput(ENTER);
+  state.overlay.render(72);
+  const callsAfterOpen = calls;
+  assert.ok(callsAfterOpen > 0, "opening the agent pane renders the transcript once");
+  state.overlay.render(72);
+  assert.equal(calls, callsAfterOpen, "an unchanged render reuses the cached detail body");
+
+  state.overlay.invalidate();
+  state.overlay.render(72);
+  assert.ok(calls > callsAfterOpen, "invalidate() forces the next render to recompute the cached detail body");
+});
+
+test("resizing wide, medium, narrow, and back to wide preserves run, phase, and agent identity with layered Escape", (t) => {
+  const closed: WorkflowsDashboardAction[] = [];
+  const first = workflow("resize-first");
+  const second = workflow("resize-second");
+  const phaseTemplate = second.phases[0]!;
+  second.phases = [
+    { ...phaseTemplate, index: 10, name: "First phase", agents: [0] },
+    { ...phaseTemplate, index: 20, name: "Second phase", agents: [1] },
+  ];
+  second.currentPhase = 20;
+  second.agents[0]!.phase = 10;
+  second.agents[1]!.phase = 20;
+  const { overlay } = harness([first, second], 30, (action) => closed.push(action), { fullscreen: true });
+  t.after(() => overlay.dispose());
+
+  overlay.render(120);
+  overlay.handleInput("j");
+  overlay.handleInput(ENTER);
+  const wide = overlay.render(120).join("\n");
+  assert.match(wide, /agent · tests/, "wide selects the tests agent in the current phase");
+
+  const medium = overlay.render(72).join("\n");
+  assert.match(medium, /agent · tests/, "resizing to medium keeps the same agent identity");
+
+  const narrow = overlay.render(52).join("\n");
+  assert.match(narrow, /agent ·/, "resizing to narrow keeps the agent pane instead of resetting to the run list");
+  assert.match(narrow, /tests/);
+
+  overlay.handleInput(ESCAPE);
+  assert.match(overlay.render(52).join("\n"), /workflow · phase/, "the first Escape returns to the workflow overview");
+  overlay.handleInput(ESCAPE);
+  assert.match(overlay.render(52).join("\n"), /runs ·/, "the second Escape returns to the narrow run list");
+
+  const wideAgain = overlay.render(120).join("\n");
+  assert.match(wideAgain, /Release resize-second/, "re-widening keeps the previously selected run identity");
+
+  overlay.handleInput(ESCAPE);
+  assert.deepEqual(closed, [{ type: "close" }], "the final Escape closes the dashboard");
+});
+
 test("/workflows keeps the host overlay geometry and non-TUI summary contract", async () => {
   const runs = [workflow("integration", "completed")];
   let captured: unknown;

@@ -188,10 +188,12 @@ test("rejects workflows that return before all agent calls are awaited", async (
     }
   `, {
     onAgent: async (_prompt, _options, signal) => new Promise((resolve) => {
-      signal.addEventListener("abort", () => {
+      const onAbort = () => {
         aborted = true;
         resolve({ ok: false, output: "", error: "aborted" });
-      }, { once: true });
+      };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
     }),
   });
   try {

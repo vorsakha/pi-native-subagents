@@ -1,7 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { aggregateWorkflowUsage } from "../../src/workflows/manager.ts";
-import { formatWorkflowBudget, workflowBudgetMetrics } from "../../src/workflows/budget.ts";
+import { formatWorkflowBudget, workflowBudgetHealth } from "../../src/workflows/budget.ts";
 import type {
   WorkflowAgentRecord,
   WorkflowPhase,
@@ -271,19 +271,6 @@ function headerLine(snapshot: WorkflowSnapshot, theme: Theme, now: number): stri
   return `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(snapshot.name) || "Workflow"))} ${theme.fg(status.color, `· ${snapshot.status}${taskOutcomeLabel(snapshot)}`)}${abnormalText}${tail}`;
 }
 
-/** Rolls the workflow's budget metrics into a short health phrase for the collapsed `Usage` group. */
-function budgetHealth(
-  snapshot: Pick<WorkflowSnapshot, "budget" | "agents">,
-  usage: Parameters<typeof workflowBudgetMetrics>[1],
-): { text: string; abnormal: boolean } {
-  const metrics = workflowBudgetMetrics(snapshot, usage);
-  if (!metrics.length) return { text: "budget open", abnormal: false };
-  const reached = metrics.filter((metric) => metric.supported && metric.reached).map((metric) => metric.key);
-  return reached.length
-    ? { text: `budget reached (${reached.join(", ")})`, abnormal: true }
-    : { text: "budget ok", abnormal: false };
-}
-
 export function buildWorkflowCardLines(
   snapshot: WorkflowSnapshot,
   theme: Theme,
@@ -332,10 +319,10 @@ export function buildWorkflowCardLines(
 
   const usageSnapshot = aggregateWorkflowUsage(snapshot);
   const usageText = formatUsage(usageSnapshot);
-  const health = budgetHealth(snapshot, usageSnapshot);
+  const health = workflowBudgetHealth(snapshot, usageSnapshot);
   if (options.expanded) {
     if (usageText) lines.push(group(theme, "Usage", theme.fg("dim", usageText)));
-    lines.push(group(theme, "Budget", theme.fg(health.abnormal ? "warning" : "dim", formatWorkflowBudget(snapshot, usageSnapshot)!)));
+    lines.push(group(theme, "Budget", theme.fg(health.abnormal ? "warning" : "dim", formatWorkflowBudget(snapshot, usageSnapshot))));
   } else {
     const value = [usageText, theme.fg(health.abnormal ? "warning" : "dim", health.text)].filter(Boolean).join(theme.fg("dim", " · "));
     lines.push(group(theme, "Usage", value));

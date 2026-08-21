@@ -29,7 +29,10 @@ export function workflowBudgetMetrics(
   if (!budget) return [];
   const activeAgents = snapshot.agents.filter((agent) => agent.state === "queued" || agent.state === "running").length;
   const tokens = usage.input + usage.output;
-  const agentTokens = snapshot.agents.reduce((maximum, agent) => Math.max(maximum, agent.usage?.input + agent.usage?.output || 0), 0);
+  // Legacy or partially persisted agent records may omit usage or individual
+  // usage fields; fold each missing field to 0 instead of collapsing the
+  // whole agent's contribution to 0 when only one field is present.
+  const agentTokens = snapshot.agents.reduce((maximum, agent) => Math.max(maximum, (agent.usage?.input ?? 0) + (agent.usage?.output ?? 0)), 0);
   return [
     metric("agents", snapshot.agents.length, budget.maxAgents),
     metric("concurrency", activeAgents, budget.maxConcurrency),
@@ -56,7 +59,39 @@ function metricText(value: WorkflowBudgetMetric): string {
 export function formatWorkflowBudget(
   snapshot: Pick<WorkflowSnapshot, "budget" | "agents">,
   usage: Pick<WorkflowUsage, "input" | "output" | "cost" | "turns">,
-): string | undefined {
+): string {
   const metrics = workflowBudgetMetrics(snapshot, usage);
   return metrics.length ? metrics.map(metricText).join(" · ") : "open";
+}
+
+export interface WorkflowBudgetHealth {
+  text: string;
+  abnormal: boolean;
+}
+
+/**
+ * Reaching maxConcurrency is temporary scheduling saturation, not spend or
+ * call exhaustion: queued agents resume as soon as a slot frees up, so it
+ * never counts toward the "reached" set that marks a card abnormal.
+ */
+const SATURATION_METRIC_KEYS: ReadonlySet<WorkflowBudgetMetric["key"]> = new Set(["concurrency"]);
+
+/**
+ * Single semantic summary shared by the collapsed and expanded workflow
+ * cards, so both surfaces agree on what counts as reached, unsupported, or
+ * merely saturated. An unsupported explicit metric (e.g. Codex maxCost) is
+ * always named and marked abnormal rather than silently reported "ok".
+ */
+export function workflowBudgetHealth(
+  snapshot: Pick<WorkflowSnapshot, "budget" | "agents">,
+  usage: Pick<WorkflowUsage, "input" | "output" | "cost" | "turns">,
+): WorkflowBudgetHealth {
+  const metrics = workflowBudgetMetrics(snapshot, usage);
+  if (!metrics.length) return { text: "budget open", abnormal: false };
+  const exhausted = metrics.filter((metric) => metric.supported && metric.reached && !SATURATION_METRIC_KEYS.has(metric.key)).map((metric) => metric.key);
+  const unsupported = metrics.filter((metric) => !metric.supported).map((metric) => metric.key);
+  const parts: string[] = [];
+  if (exhausted.length) parts.push(`reached (${exhausted.join(", ")})`);
+  if (unsupported.length) parts.push(unsupported.map((key) => `${key} unsupported`).join(", "));
+  return parts.length ? { text: `budget ${parts.join(" · ")}`, abnormal: true } : { text: "budget ok", abnormal: false };
 }
