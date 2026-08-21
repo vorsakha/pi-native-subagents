@@ -3,12 +3,12 @@ import assert from "node:assert/strict";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { registerParentThreadChildTool } from "../extensions/parent-thread/index.ts";
-import { configuredHarnessFromEnv, parseHumanSubagentCommand, permittedHumanPiToolNames, registerNativeSubagents } from "../extensions/subagents/index.ts";
+import { configuredHarnessFromEnv, parseHumanSubagentCommand, permittedHumanPiToolNames, registerNativeSubagents, summarizeSubagentActivity } from "../extensions/subagents/index.ts";
 import { PI_CHILD_MARKER } from "../src/backends/pi-rpc.ts";
 import { PI_PARENT_THREAD_FILE } from "../src/parent-thread-context.ts";
 import { buildCatalog } from "../src/capabilities.ts";
 import { claudeStatus, codexStatus, parseClaudeAuthStatus, parseCodexAccount, piStatusFromCatalog } from "../src/provider-status.ts";
-import { HoldingBackend, ImmediateBackend, context, fakePi, tempDir, theme } from "./helpers.ts";
+import { HoldingBackend, ImmediateBackend, context, fakePi, jobSnapshot, tempDir, theme } from "./helpers.ts";
 
 /** The parent session's tool inventory, including surfaces children must never inherit. */
 const PARENT_TOOLS = [
@@ -363,4 +363,61 @@ test("thread and human cards follow live job state without periodic rerenders", 
   assert.match(humanLiveCard.render(100).join("\n"), /cancelled/, "the existing component settles in place");
   const humanUpdate = blinkPi.entries[humanEntryCount + 1];
   assert.deepEqual(blinkPi.entryRenderers.get("native-human-subagent")(humanUpdate, { expanded: false }, theme).render(100), []);
+});
+
+test("summarizeSubagentActivity distinguishes direct and workflow-owned jobs", () => {
+  const workflowRef = { runId: "wf-1", agentIndex: 0, label: "build" };
+
+  const inactive = summarizeSubagentActivity([
+    jobSnapshot({ status: "completed" }),
+    jobSnapshot({ status: "failed" }),
+    jobSnapshot({ status: "cancelled" }),
+  ]);
+  assert.deepEqual(inactive.segments, []);
+  assert.deepEqual(inactive.pointers, []);
+
+  const directRunning = summarizeSubagentActivity([jobSnapshot({ status: "running" })]);
+  assert.equal(directRunning.segments[0].summary, "1 subagent running");
+  assert.equal(directRunning.segments[0].breakdown, "");
+  assert.deepEqual(directRunning.pointers, ["/subagents"]);
+
+  const directQueued = summarizeSubagentActivity([
+    jobSnapshot({ status: "queued" }),
+    jobSnapshot({ status: "queued" }),
+  ]);
+  assert.equal(directQueued.segments[0].summary, "2 subagents queued");
+  assert.deepEqual(directQueued.pointers, ["/subagents"]);
+
+  const directMixed = summarizeSubagentActivity([
+    jobSnapshot({ status: "running" }),
+    jobSnapshot({ status: "running" }),
+    jobSnapshot({ status: "queued" }),
+  ]);
+  assert.equal(directMixed.segments[0].summary, "3 subagents active");
+  assert.equal(directMixed.segments[0].breakdown, " · 2 running · 1 queued");
+  assert.deepEqual(directMixed.pointers, ["/subagents"]);
+
+  const workflowOnly = summarizeSubagentActivity([
+    jobSnapshot({ status: "running", workflow: workflowRef }),
+  ]);
+  assert.equal(workflowOnly.segments[0].summary, "1 workflow agent running");
+  assert.deepEqual(workflowOnly.pointers, ["/workflows"]);
+  assert.doesNotMatch(workflowOnly.text, /\/subagents/);
+
+  const mixed = summarizeSubagentActivity([
+    jobSnapshot({ status: "running" }),
+    jobSnapshot({ status: "running", workflow: workflowRef }),
+    jobSnapshot({ status: "queued", workflow: workflowRef }),
+  ]);
+  assert.equal(mixed.segments.length, 2);
+  assert.equal(mixed.segments[0].owner, "direct");
+  assert.equal(mixed.segments[0].summary, "1 subagent running");
+  assert.equal(mixed.segments[1].owner, "workflow");
+  assert.equal(mixed.segments[1].summary, "2 workflow agents active");
+  assert.equal(mixed.segments[1].breakdown, " (1 running · 1 queued)");
+  assert.deepEqual(mixed.pointers, ["/subagents", "/workflows"]);
+
+  const directKey = summarizeSubagentActivity([jobSnapshot({ status: "running" })]).key;
+  const workflowKey = summarizeSubagentActivity([jobSnapshot({ status: "running", workflow: workflowRef })]).key;
+  assert.notEqual(directKey, workflowKey, "ownership must be part of the widget dedup key");
 });

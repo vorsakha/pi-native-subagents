@@ -127,6 +127,8 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
   // deltas are the hot path and must not duplicate a bounded 256 KiB transcript per token.
   const next: JobSnapshot = { ...job };
   switch (event.type) {
+    case "queued":
+      break;
     case "started":
       if (next.status === "queued") next.status = "running";
       next.startedAt ??= event.at ?? now;

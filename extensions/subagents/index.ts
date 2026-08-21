@@ -109,6 +109,66 @@ const HUMAN_SUBAGENT_ENTRY = "native-human-subagent";
 const SUBAGENT_ACTIVITY_WIDGET = "native-subagents-active";
 const HUMAN_SUBAGENT_USAGE = "/subagent [--harness pi|claude|codex] [--model ID] [--name NAME] [--effort LEVEL] [--access readOnly|full] [--max-tokens N] [--max-cost USD] [--max-turns N] [--cwd PATH] [--profile NAME] [--independent] <task>";
 
+export interface ActivitySegment {
+  owner: "direct" | "workflow";
+  running: number;
+  queued: number;
+  summary: string;
+  breakdown: string;
+  pointer: string;
+}
+
+export interface SubagentActivity {
+  segments: ActivitySegment[];
+  pointers: string[];
+  key: string;
+  text: string;
+}
+
+/** Buckets active jobs by ownership so the activity widget can point to the right dashboard(s) without conflating counts. */
+export function summarizeSubagentActivity(
+  jobs: ReadonlyArray<Pick<JobSnapshot, "status" | "workflow">>,
+): SubagentActivity {
+  const counts = {
+    direct: { running: 0, queued: 0 },
+    workflow: { running: 0, queued: 0 },
+  };
+  for (const job of jobs) {
+    if (job.status !== "running" && job.status !== "queued") continue;
+    counts[job.workflow ? "workflow" : "direct"][job.status]++;
+  }
+
+  const owners: Array<{ owner: "direct" | "workflow"; noun: string; pointer: string }> = [
+    { owner: "direct", noun: "subagent", pointer: "/subagents" },
+    { owner: "workflow", noun: "workflow agent", pointer: "/workflows" },
+  ];
+  const active = owners.filter(({ owner }) => counts[owner].running + counts[owner].queued > 0);
+  const segments: ActivitySegment[] = active.map(({ owner, noun, pointer }) => {
+    const { running, queued } = counts[owner];
+    const total = running + queued;
+    const plural = (n: number) => `${noun}${n === 1 ? "" : "s"}`;
+    const summary = queued === 0
+      ? `${running} ${plural(running)} running`
+      : running === 0
+        ? `${queued} ${plural(queued)} queued`
+        : `${total} ${plural(total)} active`;
+    const breakdown = running && queued
+      ? active.length > 1
+        ? ` (${running} running · ${queued} queued)`
+        : ` · ${running} running · ${queued} queued`
+      : "";
+    return { owner, running, queued, summary, breakdown, pointer };
+  });
+
+  const pointers = segments.map((segment) => segment.pointer);
+  const key = `${counts.direct.running}:${counts.direct.queued}:${counts.workflow.running}:${counts.workflow.queued}`;
+  const text = segments.length
+    ? `◆ ${segments.map((segment) => `${segment.summary}${segment.breakdown}`).join(" · ")} • ${pointers.join(" · ")}${pointers.length === 1 ? " to view" : ""}`
+    : "";
+
+  return { segments, pointers, key, text };
+}
+
 interface HumanSubagentEntryData {
   job: JobSnapshot;
   /** Anchors are visible cards; updates are durable state deltas rendered through their anchor. */
@@ -205,36 +265,26 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       ui.setStatus("native-subagents", `subagents:${harness}`);
     }
 
-    const jobs = sessionManager.list();
-    const running = jobs.filter((job) => job.status === "running").length;
-    const queued = jobs.filter((job) => job.status === "queued").length;
-    const activity = `${running}:${queued}`;
-    if (displayedActivity === activity) return;
-    displayedActivity = activity;
+    const activity = summarizeSubagentActivity(sessionManager.list());
+    if (displayedActivity === activity.key) return;
+    displayedActivity = activity.key;
 
-    const active = running + queued;
-    if (!active) {
+    if (!activity.segments.length) {
       ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, undefined);
       return;
     }
 
-    const summary = queued === 0
-      ? `${running} subagent${running === 1 ? "" : "s"} running`
-      : running === 0
-        ? `${queued} subagent${queued === 1 ? "" : "s"} queued`
-        : `${active} subagents active`;
-    const breakdown = running && queued
-      ? ` · ${running} running · ${queued} queued`
-      : "";
-
     ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, (_tui, theme) => {
+      const summaries = activity.segments
+        .map((segment) => theme.fg("text", segment.summary) + theme.fg("dim", segment.breakdown))
+        .join(theme.fg("dim", " · "));
+      const pointers = activity.pointers.map((pointer) => theme.fg("accent", pointer)).join(theme.fg("dim", " · "));
       const line =
         theme.fg("accent", "◆ ") +
-        theme.fg("text", summary) +
-        theme.fg("dim", breakdown) +
+        summaries +
         theme.fg("dim", " • ") +
-        theme.fg("accent", "/subagents") +
-        theme.fg("dim", " to view");
+        pointers +
+        (activity.pointers.length === 1 ? theme.fg("dim", " to view") : "");
       return {
         render: (width: number) => [truncateToWidth(line, Math.max(0, width), "")],
         invalidate() {},

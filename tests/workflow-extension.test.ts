@@ -4,7 +4,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
 import type { Backend } from "../src/types.ts";
-import { HoldingBackend, ImmediateBackend, context, fakePi, tempDir, theme } from "./helpers.ts";
+import { ControlledBackend, HoldingBackend, ImmediateBackend, context, fakePi, tempDir, theme, waitFor } from "./helpers.ts";
 
 /** Workflow agents echo `<name>:<task>` and report usage so cards have content to render. */
 const WORKFLOW_BACKENDS = ["pi", "claude", "codex"] as const;
@@ -261,4 +261,73 @@ test("workflow tool rejects invalid JSON args and untrusted projects", async () 
   await denied.pi.commands.get("workflows").handler("", untrusted.ctx);
   assert.match(untrusted.notifications.at(-1)?.message ?? "", /unavailable for untrusted projects/);
   await denied.pi.handlers.get("session_shutdown")?.();
+});
+
+test("the activity widget distinguishes direct and workflow-owned jobs and points at both dashboards", async () => {
+  const directBackend = new HoldingBackend("codex");
+  const workflowAgentBackend = new HoldingBackend("pi");
+  const { pi } = await setup({ backends: [directBackend, workflowAgentBackend] });
+  const session = context({ hasUI: true });
+  pi.handlers.get("session_start")?.({}, session.ctx);
+  assert.equal(session.widgets.get("native-subagents-active"), undefined);
+
+  await pi.tools.get("subagent_spawn").execute("direct", { name: "direct", task: "direct work", harness: "codex" }, undefined, undefined, session.ctx);
+  await waitFor(() => directBackend.starts >= 1, "direct job dispatched");
+  const started = await pi.tools.get("workflow").execute("wf-live", {
+    name: "Background hold",
+    script: `export default async () => agent("hold", { name: "held", access: "readOnly" })`,
+    background: true,
+  }, new AbortController().signal, undefined, session.ctx);
+  assert.match(started.content[0].text, /Workflow started/);
+  await waitFor(() => workflowAgentBackend.starts >= 1, "workflow agent dispatched");
+
+  const widgetFactory = session.widgets.get("native-subagents-active") as (tui: unknown, theme: unknown) => { render(width: number): string[] };
+  assert.ok(widgetFactory, "widget is set while both direct and workflow-owned jobs are active");
+  const line = widgetFactory(undefined, theme).render(120).join("\n");
+  assert.match(line, /1 subagent running/);
+  assert.match(line, /1 workflow agent running/);
+  assert.match(line, /\/subagents/);
+  assert.match(line, /\/workflows/);
+
+  await pi.handlers.get("session_shutdown")?.();
+  assert.equal(session.widgets.get("native-subagents-active"), undefined);
+});
+
+test("the activity widget reflects a workflow agent still queued behind a full four-job scheduler budget", async () => {
+  const backend = new ControlledBackend("codex");
+  const { pi } = await setup({ backends: [backend] });
+  const session = context({ hasUI: true });
+  pi.handlers.get("session_start")?.({}, session.ctx);
+
+  for (let index = 0; index < 4; index++) {
+    await pi.tools.get("subagent_spawn").execute(`hold-${index}`, { name: `hold-${index}`, task: `hold ${index}`, harness: "codex" }, undefined, undefined, session.ctx);
+  }
+  await waitFor(() => backend.starts.length === 4, "four direct jobs occupy the entire scheduler budget");
+
+  const started = await pi.tools.get("workflow").execute("wf-queued", {
+    name: "Queued behind direct jobs",
+    script: `export default async () => agent("queued", { name: "queued", access: "readOnly", harness: "codex" })`,
+    background: true,
+  }, new AbortController().signal, undefined, session.ctx);
+  assert.match(started.content[0].text, /Workflow started/);
+
+  // The queued workflow agent never dispatches (no `started` event), so the widget
+  // must pick it up from the spawn-time notification rather than a scheduler event.
+  let line = "";
+  await waitFor(() => {
+    const widgetFactory = session.widgets.get("native-subagents-active") as
+      ((tui: unknown, theme: unknown) => { render(width: number): string[] }) | undefined;
+    if (!widgetFactory) return false;
+    line = widgetFactory(undefined, theme).render(120).join("\n");
+    return /workflow agent/.test(line);
+  }, "widget reflects the newly queued workflow agent without waiting for another scheduler event");
+
+  assert.equal(backend.starts.length, 4, "the fifth job stays queued rather than dispatching");
+  assert.match(line, /4 subagents running/);
+  assert.match(line, /1 workflow agent queued/);
+  assert.match(line, /\/subagents/);
+  assert.match(line, /\/workflows/);
+
+  for (const jobId of backend.starts) backend.complete(jobId, "done");
+  await pi.handlers.get("session_shutdown")?.();
 });

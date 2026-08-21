@@ -169,6 +169,7 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 - `/subagents providers` reports each native provider as installed, authenticated, or ready, with the masked account email, plan, auth method, and Pi's selected model. `/subagents providers refresh` re-probes. It reads account and auth state only: no model request is made, credentials are never displayed, and Pi exposes no account email.
 - `/workflows` uses the same width breakpoints: wide terminals keep a run rail beside the inspector, medium terminals stack the run list above it, and narrow or short terminals show one pane at a time. In narrow mode, `Enter` drills from the run list to the workflow overview and then to the selected agent; Escape or Pi's configured cancel binding returns one level at a time before closing.
 - Workflow inspection preserves run IDs, phase indexes, and agent indexes through refreshed snapshots, sorting, filtering, and reordering. Use phase arrows, `Tab` for the visible agent roster, `p` to pause/resume, `r` to restart a replayable agent, `x`/`X` for confirmed agent/run cancellation, and `Shift+↑↓`, Page Up/Down, `Ctrl+U/D`, and `g/G` for bounded result scrolling.
+- The editor activity widget counts direct and workflow-owned agents separately and points at `/subagents`, `/workflows`, or both; workflow-owned jobs stay listed and tagged in `/subagents`.
 
 ## Runtime limits and lifecycle
 

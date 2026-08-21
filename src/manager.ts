@@ -175,8 +175,12 @@ export class JobManager {
       requires: policy.requires ? [...policy.requires] : undefined,
       capabilities: request.capabilityRoute ? { ...request.capabilityRoute } : undefined,
     };
-    this.#jobs.set(id, { snapshot, profile, request, policy });
+    const job: InternalJob = { snapshot, profile, request, policy };
+    this.#jobs.set(id, job);
     this.#queue.push(id);
+    // Notify listeners before dispatch attempts: a job that stays queued behind a
+    // full scheduler budget otherwise reaches no `#emit`/`#publish` call at all.
+    this.#publish(job, { type: "queued" });
     this.#pump();
     return clone(snapshot);
   }

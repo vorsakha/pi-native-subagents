@@ -44,6 +44,8 @@ export interface ToolResultSnapshot {
 }
 
 export type BackendEvent =
+  /** Manager-only notification that a newly spawned job is queued and awaiting a scheduler slot; never emitted by a backend adapter. */
+  | { type: "queued"; at?: number }
   | { type: "started"; backendSessionId?: string; sessionFile?: string; at?: number }
   | { type: "user_message"; text: string; at?: number }
   | { type: "text_delta"; text: string; at?: number }
