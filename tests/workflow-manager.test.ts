@@ -706,6 +706,290 @@ test("records phases, results, and final workflow artifacts", async () => {
   }
 });
 
+test("declared phase metadata prepopulates pending phases before dispatch and keeps the planned total", async () => {
+  const f = await fixture();
+  const prompts = ["inspect", "verify", "summarize", "publish", "archive", "done"];
+  const script = `
+    export const meta = { phases: ["Inspect", "Verify", "Summarize", "Publish", "Archive", "Done"] };
+    export default async () => {
+      ${prompts.map((prompt, index) => `phase(${JSON.stringify([" Inspect ", "Verify", "Summarize", "Publish", "Archive", "Done"][index])}); await agent(${JSON.stringify(prompt)}, { access: "readOnly" });`).join("\n      ")}
+      return "complete";
+    }
+  `;
+  try {
+    const started = await f.workflows.start(f.request(script));
+    await waitFor(() => f.backend.requests.length === 1, "declared first phase agent");
+
+    const beforeSettlement = f.workflows.check(started.snapshot.runId);
+    assert.equal(beforeSettlement.plannedPhaseCount, 6);
+    assert.equal(beforeSettlement.currentPhase, 0);
+    assert.deepEqual(beforeSettlement.phases.map((phase) => [phase.name, phase.status]), [
+      ["Inspect", "running"], ["Verify", "pending"], ["Summarize", "pending"],
+      ["Publish", "pending"], ["Archive", "pending"], ["Done", "pending"],
+    ]);
+
+    for (const [index, prompt] of prompts.entries()) {
+      if (index > 0) await waitFor(() => f.backend.requests.length === index + 1, `declared phase ${index + 1} agent`);
+      const live = f.workflows.check(started.snapshot.runId);
+      assert.equal(live.phases.length, 6, "future declared phases remain in the snapshot");
+      assert.equal(live.plannedPhaseCount, 6, "activation never changes the planned total");
+      f.backend.completeTask(prompt, prompt);
+    }
+
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.plannedPhaseCount, 6);
+    assert.ok(final.phases.every((phase) => phase.status === "completed"));
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("declared early success settles only activated phases and persists future phases as pending", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export const meta = { phases: ["One", "Two", "Three"] };
+      export default async () => {
+        phase("One");
+        return "early";
+      };
+    `));
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.currentPhase, 0);
+    assert.deepEqual(final.phases.map((phase) => [phase.name, phase.status]), [
+      ["One", "completed"], ["Two", "pending"], ["Three", "pending"],
+    ]);
+    assert.equal(f.backend.requests.length, 0);
+
+    const persisted = JSON.parse(await readFile(join(final.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
+    assert.deepEqual(persisted.phases.map((phase) => phase.status), ["completed", "pending", "pending"]);
+    const report = await readFile(join(final.artifactDir, "report.md"), "utf8");
+    assert.match(report, /- One: completed/);
+    assert.match(report, /- Two: pending/);
+    assert.match(report, /- Three: pending/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("declared failure settles the active phase and leaves future phases pending", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export const meta = { phases: ["One", "Two", "Three"] };
+      export default async () => {
+        phase("One");
+        throw new Error("expected failure");
+      };
+    `));
+    const final = await started.completion;
+    assert.equal(final.status, "failed");
+    assert.deepEqual(final.phases.map((phase) => [phase.name, phase.status]), [
+      ["One", "failed"], ["Two", "pending"], ["Three", "pending"],
+    ]);
+    assert.equal(f.backend.requests.length, 0);
+
+    const persisted = JSON.parse(await readFile(join(final.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
+    assert.deepEqual(persisted.phases.map((phase) => phase.status), ["failed", "pending", "pending"]);
+    const report = await readFile(join(final.artifactDir, "report.md"), "utf8");
+    assert.match(report, /- One: failed/);
+    assert.match(report, /- Two: pending/);
+    assert.match(report, /- Three: pending/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("declared workflows with no activation keep every planned phase pending", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export const meta = { phases: ["One", "Two"] };
+      export default async () => "no phase";
+    `));
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.currentPhase, null);
+    assert.deepEqual(final.phases.map((phase) => phase.status), ["pending", "pending"]);
+    assert.equal(f.backend.requests.length, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("declared phases allow idempotent repeats and skipped forward phases, but reject backward activation", async () => {
+  const f = await fixture();
+  const script = `
+    export const meta = { phases: ["One", "Two", "Three"] };
+    export default async () => {
+      phase("One");
+      await agent("first", { access: "readOnly" });
+      phase("  One  ");
+      await agent("repeat", { access: "readOnly" });
+      phase("Three");
+      await agent("third", { access: "readOnly" });
+      phase("Two");
+      return "unreachable";
+    }
+  `;
+  try {
+    const started = await f.workflows.start(f.request(script));
+    await waitFor(() => f.backend.requests.length === 1, "first declared agent");
+    f.backend.completeTask("first", "first output");
+    await waitFor(() => f.backend.requests.length === 2, "repeated declared phase agent");
+    const repeated = f.workflows.check(started.snapshot.runId);
+    assert.equal(repeated.currentPhase, 0, "repeating a phase does not move the active pointer");
+    assert.equal(repeated.phases.length, 3);
+    assert.deepEqual(repeated.phases.map((phase) => phase.status), ["running", "pending", "pending"]);
+    f.backend.completeTask("repeat", "repeat output");
+    await waitFor(() => f.backend.requests.length === 3, "skipped forward phase agent");
+    const skipped = f.workflows.check(started.snapshot.runId);
+    assert.equal(skipped.currentPhase, 2);
+    assert.deepEqual(skipped.phases.map((phase) => phase.status), ["completed", "completed", "running"]);
+    f.backend.completeTask("third", "third output");
+
+    const final = await started.completion;
+    assert.equal(final.status, "failed");
+    assert.match(final.error ?? "", /backward/i);
+    assert.equal(f.backend.requests.length, 3, "backward activation dispatches no provider call");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("undeclared phase titles fail before another child dispatch", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export const meta = { phases: ["One", "Two"] };
+      export default async () => {
+        phase("One");
+        await agent("first", { access: "readOnly" });
+        phase("Missing");
+        return "unreachable";
+      }
+    `));
+    await waitFor(() => f.backend.requests.length === 1, "undeclared phase first agent");
+    f.backend.completeTask("first", "first output");
+    const final = await started.completion;
+    assert.equal(final.status, "failed");
+    assert.match(final.error ?? "", /not declared/i);
+    assert.equal(f.backend.requests.length, 1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("agent phase labels cannot silently advance a declared plan", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export const meta = { phases: ["One", "Two"] };
+      export default async () => agent("must not dispatch", { phase: "Two", access: "readOnly" });
+    `));
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(f.backend.requests.length, 0);
+    assert.equal(final.currentPhase, null);
+    assert.match((final.result as { error?: string }).error ?? "", /cannot advance|active/i);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("dynamic agent phase labels retain discovery behavior", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => agent("dynamic phase", { phase: "Explicit", access: "readOnly" });
+    `));
+    await waitFor(() => f.backend.requests.length === 1, "dynamic explicit phase agent");
+    const live = f.workflows.check(started.snapshot.runId);
+    assert.equal(live.plannedPhaseCount, undefined);
+    assert.deepEqual(live.phases.map((phase) => [phase.name, phase.status]), [["Explicit", "running"]]);
+    f.backend.completeTask("dynamic phase", "done");
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.deepEqual(final.phases.map((phase) => [phase.name, phase.status]), [["Explicit", "completed"]]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("final metadata reapplication can refresh labels without rewriting the initial phase plan", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export const meta = { name: "initial", description: "initial", phases: ["One", "Two"] };
+      export default async () => {
+        phase("One");
+        const result = await agent("metadata", { access: "readOnly" });
+        meta.name = "final";
+        meta.description = "final description";
+        meta.phases = ["rewritten", "plan"];
+        return result;
+      }
+    `));
+    await waitFor(() => f.backend.requests.length === 1, "metadata plan agent");
+    f.backend.completeTask("metadata", "done");
+    const final = await started.completion;
+    assert.equal(final.name, "final");
+    assert.equal(final.description, "final description");
+    assert.deepEqual(final.phases.map((phase) => phase.name), ["One", "Two"]);
+    assert.equal(final.plannedPhaseCount, 2);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("invalid declared phase plans fail before child provider dispatch", async () => {
+  const cases: Array<{ phases: unknown; pattern: RegExp }> = [
+    { phases: "not an array", pattern: /array with 1 to 64/i },
+    { phases: [], pattern: /array with 1 to 64/i },
+    { phases: ["   "], pattern: /non-empty/i },
+    { phases: ["one", 2], pattern: /must be a string/i },
+    { phases: ["x".repeat(161)], pattern: /160 characters/i },
+    { phases: Array.from({ length: 65 }, (_, index) => `phase-${index}`), pattern: /1 to 64/i },
+    { phases: ["one", " one "], pattern: /unique/i },
+  ];
+  const f = await fixture();
+  try {
+    for (const item of cases) {
+      const started = await f.workflows.start(f.request(`
+        export const meta = { phases: ${JSON.stringify(item.phases)} };
+        export default async () => agent("must not dispatch", { access: "readOnly" });
+      `));
+      const final = await started.completion;
+      assert.equal(final.status, "failed");
+      assert.match(final.error ?? "", item.pattern);
+    }
+    assert.equal(f.backend.requests.length, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("accepts the maximum declared phase plan size", async () => {
+  const f = await fixture();
+  const phases = Array.from({ length: 64 }, (_, index) => `phase-${index}`);
+  try {
+    const started = await f.workflows.start(f.request(`
+      export const meta = { phases: ${JSON.stringify(phases)} };
+      export default async () => "complete";
+    `));
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.plannedPhaseCount, 64);
+    assert.deepEqual(final.phases.map((phase) => phase.name), phases);
+    assert.ok(final.phases.every((phase) => phase.status === "pending"));
+    assert.equal(f.backend.requests.length, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("completed sandbox runs report task outcome without changing lifecycle", async () => {
   const f = await fixture();
   try {
@@ -772,8 +1056,11 @@ test("pauses before dispatch, resumes in place, and completes normally", async (
 test("restarts a selected agent by replaying its prefix and invalidating its suffix", async () => {
   const f = await fixture();
   const script = `
+    export const meta = { phases: ["First", "Second"] };
     export default async () => {
+      phase("First");
       const first = await agent("restart:first", { name: "first" });
+      phase("Second");
       return agent("restart:second:" + first.output, { name: "second" });
     }
   `;
@@ -795,6 +1082,7 @@ test("restarts a selected agent by replaying its prefix and invalidating its suf
 
     const final = await restarted.completion;
     assert.equal(final.status, "completed");
+    assert.equal(final.plannedPhaseCount, 2, "declared totals survive replayed execution");
     assert.deepEqual(final.replay, { sourceRunId: sourceFinal.runId, matchedCalls: 1, invalidatedAt: 1 });
     assert.equal(final.agents[0]?.replayedFrom?.runId, sourceFinal.runId);
     assert.equal(final.agents[0]?.outputProvenance, "replay");

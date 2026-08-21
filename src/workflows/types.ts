@@ -178,6 +178,8 @@ export interface WorkflowSnapshot {
   timestamps: WorkflowTimestamps;
   currentPhase: number | null;
   phases: WorkflowPhase[];
+  /** Present when the workflow declared its complete phase plan in metadata. */
+  plannedPhaseCount?: number;
   agents: WorkflowAgentRecord[];
   /** Bounded narrator-style progress emitted by workflow log(). */
   logs?: WorkflowLogRecord[];

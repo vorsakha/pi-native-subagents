@@ -9,6 +9,7 @@ import {
   buildWorkflowCardLines,
   renderWorkflowCall,
   renderWorkflowCard,
+  workflowPhaseProgress,
 } from "../extensions/workflows/render.ts";
 import { shortId } from "../extensions/subagents/render.ts";
 import type { WorkflowAgentRecord, WorkflowPhase, WorkflowSnapshot } from "../src/workflows/types.ts";
@@ -180,6 +181,7 @@ test("collapsed and expanded cards share one budget-health verdict: unsupported 
 test("the phase spine stays bounded for many phases while the current/total fraction stays authoritative", () => {
   const many = workflow({
     currentPhase: 6,
+    plannedPhaseCount: 12,
     phases: Array.from({ length: 12 }, (_, index) => phase({
       index, name: `phase ${index}`, status: index < 6 ? "completed" as const : index === 6 ? "running" as const : "pending" as const,
     })),
@@ -195,6 +197,47 @@ test("the phase spine stays bounded for many phases while the current/total frac
   assert.ok(expanded.length <= MAX_EXPANDED_LINES);
   assert.ok(expanded.some((line) => line.includes("phase 6")), "the roster window is centered on the current phase");
   assert.ok(expanded.some((line) => line.includes("earlier phase")), "hidden earlier phases are called out by count");
+});
+
+test("shared phase progress distinguishes declared, dynamic, terminal, and no-phase states", () => {
+  const declared = workflow({
+    currentPhase: null,
+    plannedPhaseCount: 6,
+    phases: Array.from({ length: 6 }, (_, index) => phase({ index, name: `declared ${index}` })),
+  });
+  assert.equal(workflowPhaseProgress(declared).label, "0/6");
+  declared.currentPhase = 0;
+  assert.equal(workflowPhaseProgress(declared).label, "1/6");
+
+  const dynamic = workflow({ currentPhase: 1 });
+  assert.equal(workflowPhaseProgress(dynamic).label, "2/?");
+  for (const status of ["completed", "failed", "aborted"] as const) {
+    const terminal = workflow({ status, currentPhase: 1 });
+    assert.equal(workflowPhaseProgress(terminal).label, "2/2");
+    assert.equal(workflowPhaseProgress(terminal, 0).label, "1/2");
+    assert.equal(workflowPhaseProgress(terminal, 1).label, "2/2");
+  }
+
+  const declaredTerminal = workflow({
+    status: "completed",
+    currentPhase: null,
+    plannedPhaseCount: 6,
+    phases: Array.from({ length: 6 }, (_, index) => phase({ index, name: `declared ${index}` })),
+  });
+  const declaredTerminalProgress = workflowPhaseProgress(declaredTerminal);
+  assert.equal(declaredTerminalProgress.label, "0/6");
+  assert.equal(declaredTerminalProgress.phase, undefined);
+  assert.equal(declaredTerminalProgress.phaseIndex, -1);
+  const declaredTerminalCard = buildWorkflowCardLines(declaredTerminal, theme, { expanded: true, now: 4_000 }).join("\n");
+  assert.match(declaredTerminalCard, /0\/6.*not started/);
+  assert.doesNotMatch(declaredTerminalCard, /›/);
+
+  const activeWithoutPhases = workflow({ currentPhase: null, phases: [] });
+  assert.equal(workflowPhaseProgress(activeWithoutPhases).label, "waiting");
+  assert.match(buildWorkflowCardLines(activeWithoutPhases, theme, { expanded: true, now: 4_000 }).join("\n"), /waiting for the first phase/);
+  const terminalWithoutPhases = workflow({ status: "completed", currentPhase: null, phases: [] });
+  assert.equal(workflowPhaseProgress(terminalWithoutPhases).label, "no phases");
+  assert.doesNotMatch(buildWorkflowCardLines(terminalWithoutPhases, theme, { expanded: true, now: 4_000 }).join("\n"), /waiting for the first phase/);
 });
 
 test("abnormal warning and failure counts sit before elapsed time in the header, ahead of mode and run id", () => {

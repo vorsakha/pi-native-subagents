@@ -24,7 +24,7 @@ import type {
   WorkflowSnapshot,
 } from "../../src/workflows/types.ts";
 import { formatContext, formatUsage, sanitizeInline, sanitizeText, shortId, traceStatusMeta } from "../subagents/render.ts";
-import { workflowStatusMeta } from "./render.ts";
+import { workflowPhaseProgress, workflowStatusMeta } from "./render.ts";
 import {
   appendBoundedSection,
   boundedHeadTailText,
@@ -851,8 +851,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
       return agent ? `agent · ${sanitizeInline(agent.name)} · ${agent.state}` : "agent";
     }
     const phase = this.phaseFor(run);
-    const phasePosition = phase ? run.phases.findIndex((item) => item.index === phase.index) + 1 : 0;
-    return phase ? `workflow · phase ${phasePosition}/${run.phases.length} · filter ${this.#agentFilter}` : "workflow";
+    const progress = phase ? workflowPhaseProgress(run, phase.index) : undefined;
+    return phase ? `workflow · phase ${progress?.label ?? "waiting"} · filter ${this.#agentFilter}` : "workflow";
   }
 
   private renderRunRail(runs: WorkflowSnapshot[], view: ListViewport<WorkflowSnapshot>, chosen: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
@@ -870,8 +870,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const marker = selected ? this.theme.fg("accent", "❯") : " ";
     const name = selected ? this.theme.fg("accent", sanitizeInline(run.name)) : this.theme.fg("text", sanitizeInline(run.name));
     const left = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name} ${this.theme.fg("dim", shortId(sanitizeText(run.runId)))}`;
-    const phasePosition = run.currentPhase === null ? 0 : run.phases.findIndex((phase) => phase.index === run.currentPhase) + 1;
-    const phase = phasePosition > 0 ? `${phasePosition}/${run.phases.length}` : "waiting";
+    const phase = workflowPhaseProgress(run).label;
     const outcome = run.status === "completed" && run.taskOutcome ? ` · ${run.taskOutcome}` : "";
     const right = `${this.theme.fg("muted", `phase ${phase} · ${formatElapsed(run, this.#now())}`)} · ${this.theme.fg(status.color, `${run.status}${outcome}`)} `;
     return alignDashboardRow(left, right, width);
@@ -896,10 +895,13 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const usage = formatUsage(usageSnapshot);
     const budget = formatWorkflowBudget(run, usageSnapshot);
     const status = workflowStatusMeta(run);
+    const progress = workflowPhaseProgress(run);
     const lines: string[] = [
       `${this.theme.fg("accent", this.theme.bold(sanitizeInline(run.name) || "Workflow"))} ${this.theme.fg(status.color, `· ${shortId(sanitizeText(run.runId))} · ${status.glyph} ${run.status}${run.status === "completed" ? ` · task ${run.taskOutcome ?? "unspecified"}` : ""}`)} ${this.theme.fg("dim", `· ${formatElapsed(run, this.#now())}`)}`,
       this.theme.fg("dim", boundedInline(run.description, 2_000) || "(no workflow description)"),
-      phase ? this.renderPhase(phase, run.phases) : this.theme.fg("dim", "Phase · waiting for the first phase"),
+      phase
+        ? this.renderPhase(run, phase)
+        : this.theme.fg("dim", progress.waiting ? "Phase · waiting for the first phase" : "Phase · no phases recorded"),
     ];
     if (phase?.description) lines.push(this.theme.fg("muted", `Phase context · ${boundedInline(phase.description, 2_000)}`));
     if (usage) lines.push(this.theme.fg("dim", `Usage · ${usage}`));
@@ -1058,10 +1060,13 @@ export class WorkflowsDashboardOverlay implements Focusable {
     return bounded;
   }
 
-  private renderPhase(phase: WorkflowPhase, phases: WorkflowPhase[]): string {
+  private renderPhase(run: WorkflowSnapshot, phase: WorkflowPhase): string {
+    const progress = workflowPhaseProgress(run, phase.index);
+    if (run.plannedPhaseCount !== undefined && run.currentPhase === null) {
+      return `${this.theme.fg("accent", `Phase ${progress.label}`)} ${this.theme.fg("dim", "no current phase · ←→")}`;
+    }
     const status = traceStatusMeta(phase.status, this.#now());
-    const position = phases.findIndex((item) => item.index === phase.index);
-    return `${this.theme.fg("accent", `Phase ${position + 1}/${phases.length}`)} ${this.theme.fg(status.color, `${status.glyph} ${boundedInline(phase.name, 1_000)}`)} ${this.theme.fg("dim", `· ${phase.status} · ←→`)}`;
+    return `${this.theme.fg("accent", `Phase ${progress.label}`)} ${this.theme.fg(status.color, `${status.glyph} ${boundedInline(phase.name, 1_000)}`)} ${this.theme.fg("dim", `· ${phase.status} · ←→`)}`;
   }
 
   private renderAgentRow(agent: WorkflowAgentRecord, selected: boolean): string {

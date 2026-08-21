@@ -107,6 +107,8 @@ export default async function () {
 }
 ```
 
+For a workflow with a known plan, add `phases` to the exported metadata, for example `export const meta = { name: "release review", phases: ["review", "verify", "summarize"] };`. The plan accepts 1–64 unique names; names are trimmed and internal whitespace is collapsed, matching is case-sensitive, and each normalized name is limited to 160 characters. Declared phases appear as pending before the first `phase(title)` call, and `phase(title)` must activate them forward in plan order (conditional phases may be skipped). Repeating the active phase is harmless; use `phase(title)` to advance rather than `agent({ phase })`. Omit `meta.phases` when phases are discovered dynamically.
+
 ## Deferred parallel tasks are mandatory
 
 `parallel` receives functions, not already-started promises.

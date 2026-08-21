@@ -156,6 +156,7 @@ test("no-resume loading aborts paused future checkpoints plus queued agents and 
   const { root } = await fixture();
   const future = 99_999_999;
   const input = snapshot("future-session", future);
+  input.plannedPhaseCount = 1;
   input.status = "paused";
   input.timestamps.pausedAt = future;
   input.phases[0]!.status = "pending";
@@ -174,6 +175,122 @@ test("no-resume loading aborts paused future checkpoints plus queued agents and 
   assert.equal(loaded[0]?.status, "aborted");
   assert.equal(loaded[0]?.phases[0]?.status, "aborted");
   assert.equal(loaded[0]?.agents[0]?.state, "aborted");
+  assert.equal(loaded[0]?.plannedPhaseCount, 1, "the declared total survives stale restoration");
+});
+
+test("stale declared restoration aborts the active phase and preserves future phases across reload and report", async () => {
+  const { root } = await fixture();
+  const old = 1_000;
+  const input = snapshot("declared-stale", old);
+  const template = input.phases[0]!;
+  input.plannedPhaseCount = 4;
+  input.currentPhase = 20;
+  input.phases = [
+    { ...template, index: 10, name: "Prepare", status: "completed", agents: [] },
+    { ...template, index: 20, name: "Active", status: "running", agents: [0] },
+    { ...template, index: 30, name: "Verify", status: "pending", agents: [] },
+    { ...template, index: 40, name: "Publish", status: "pending", agents: [] },
+  ];
+  input.agents[0]!.phase = 20;
+  const created = await createWorkflowArtifacts(root, {
+    script: "export default async () => null;\n",
+    args: {},
+    snapshot: input,
+  });
+
+  const [restored] = await loadWorkflowSummaries(root, {
+    sessionId: "declared-stale",
+    now: 10_000,
+    staleAfterMs: 5_000,
+  });
+  assert.ok(restored);
+  assert.equal(restored.status, "aborted");
+  assert.equal(restored.plannedPhaseCount, 4);
+  assert.equal(restored.currentPhase, 20);
+  assert.deepEqual(restored.phases.map((phase) => [phase.name, phase.status]), [
+    ["Prepare", "completed"], ["Active", "aborted"], ["Verify", "pending"], ["Publish", "pending"],
+  ]);
+
+  const saved = JSON.parse(await readFile(join(created.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
+  assert.equal(saved.plannedPhaseCount, 4);
+  assert.equal(saved.currentPhase, 20);
+  assert.deepEqual(saved.phases.map((phase) => phase.status), ["completed", "aborted", "pending", "pending"]);
+
+  await writeWorkflowReport(root, restored);
+  const report = await readFile(join(created.artifactDir, "report.md"), "utf8");
+  assert.match(report, /- Active: aborted/);
+  assert.match(report, /- Verify: pending/);
+  assert.match(report, /- Publish: pending/);
+
+  const [reloaded] = await loadWorkflowSummaries(root, { sessionId: "declared-stale", now: 11_000, staleAfterMs: 5_000 });
+  assert.ok(reloaded);
+  assert.equal(reloaded.plannedPhaseCount, 4);
+  assert.equal(reloaded.currentPhase, 20);
+  assert.deepEqual(reloaded.phases.map((phase) => phase.status), ["completed", "aborted", "pending", "pending"]);
+});
+
+test("stale declared restoration with no activation keeps every planned phase pending", async () => {
+  const { root } = await fixture();
+  const old = 1_000;
+  const input = snapshot("declared-no-activation", old);
+  const template = input.phases[0]!;
+  input.plannedPhaseCount = 3;
+  input.currentPhase = null;
+  input.phases = [
+    { ...template, index: 10, name: "Prepare", status: "pending", agents: [] },
+    { ...template, index: 20, name: "Verify", status: "pending", agents: [] },
+    { ...template, index: 30, name: "Publish", status: "pending", agents: [] },
+  ];
+  input.agents = [];
+  const created = await createWorkflowArtifacts(root, {
+    script: "export default async () => null;\n",
+    args: {},
+    snapshot: input,
+  });
+
+  const [restored] = await loadWorkflowSummaries(root, {
+    sessionId: "declared-no-activation",
+    now: 10_000,
+    staleAfterMs: 5_000,
+  });
+  assert.ok(restored);
+  assert.equal(restored.status, "aborted");
+  assert.equal(restored.plannedPhaseCount, 3);
+  assert.equal(restored.currentPhase, null);
+  assert.deepEqual(restored.phases.map((phase) => phase.status), ["pending", "pending", "pending"]);
+
+  const saved = JSON.parse(await readFile(join(created.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
+  assert.equal(saved.plannedPhaseCount, 3);
+  assert.equal(saved.currentPhase, null);
+  assert.deepEqual(saved.phases.map((phase) => phase.status), ["pending", "pending", "pending"]);
+
+  await writeWorkflowReport(root, restored);
+  const report = await readFile(join(created.artifactDir, "report.md"), "utf8");
+  assert.match(report, /- Prepare: pending/);
+  assert.match(report, /- Verify: pending/);
+  assert.match(report, /- Publish: pending/);
+
+  const [reloaded] = await loadWorkflowSummaries(root, { sessionId: "declared-no-activation", now: 11_000, staleAfterMs: 5_000 });
+  assert.ok(reloaded);
+  assert.equal(reloaded.plannedPhaseCount, 3);
+  assert.equal(reloaded.currentPhase, null);
+  assert.deepEqual(reloaded.phases.map((phase) => phase.status), ["pending", "pending", "pending"]);
+});
+
+test("persists declared phase totals and rejects inconsistent declared snapshots", async () => {
+  const { root } = await fixture();
+  const created = await createWorkflowArtifacts(root, {
+    script: "export default async () => null;\n",
+    args: {},
+    snapshot: { ...snapshot("planned-session"), plannedPhaseCount: 1 },
+  });
+  const loaded = await loadWorkflowSummaries(root, { sessionId: "planned-session" });
+  assert.equal(loaded[0]?.plannedPhaseCount, 1);
+
+  const persisted = JSON.parse(await readFile(join(created.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
+  persisted.plannedPhaseCount = 2;
+  await writeFile(join(created.artifactDir, "workflow.json"), JSON.stringify(persisted), { mode: 0o600 });
+  assert.deepEqual(await loadWorkflowSummaries(root, { sessionId: "planned-session" }), [], "a count/phase mismatch is not restored");
 });
 
 test("loads old completed snapshots and derives task outcome from the authoritative result artifact", async () => {

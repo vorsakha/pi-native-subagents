@@ -365,19 +365,74 @@ test("narrow workflow overview keeps h and Left available for previous-phase nav
 
   overlay.render(52);
   overlay.handleInput(ENTER);
-  assert.match(overlay.render(52).join("\n"), /workflow · phase 1\/2/);
+  assert.match(overlay.render(52).join("\n"), /workflow · phase 1\/\?/);
   assert.match(overlay.render(52).join("\n"), /First phase/);
 
   overlay.handleInput("l");
   const second = overlay.render(52).join("\n");
-  assert.match(second, /workflow · phase 2\/2/);
+  assert.match(second, /workflow · phase 2\/\?/);
   assert.match(second, /Second phase/);
 
   overlay.handleInput("h");
   const first = overlay.render(52).join("\n");
-  assert.match(first, /workflow · phase 1\/2/);
+  assert.match(first, /workflow · phase 1\/\?/);
   assert.match(first, /First phase/);
   assert.doesNotMatch(first, /Enter open/, "h navigates phases instead of returning to the hidden run list");
+});
+
+test("workflow dashboard shares declared totals and terminal no-phase wording with inline cards", (t) => {
+  const declared = workflow("declared-dashboard");
+  const template = declared.phases[0]!;
+  declared.plannedPhaseCount = 6;
+  declared.currentPhase = null;
+  declared.phases = Array.from({ length: 6 }, (_, index) => ({
+    ...template,
+    index,
+    name: ["One", "Two", "Three", "Four", "Five", "Six"][index]!,
+    status: "pending" as const,
+    agents: [],
+  }));
+  const declaredState = harness([declared], 30);
+  t.after(() => declaredState.overlay.dispose());
+  declaredState.overlay.render(52);
+  declaredState.overlay.handleInput(ENTER);
+  const declaredText = declaredState.overlay.render(52).join("\n");
+  assert.match(declaredText, /workflow · phase 0\/6/);
+  assert.match(declaredText, /Phase 0\/6.*no current phase/);
+
+  const terminal = workflow("terminal-no-phase", "completed");
+  terminal.currentPhase = null;
+  terminal.phases = [];
+  terminal.agents = [];
+  const terminalState = harness([terminal], 30);
+  t.after(() => terminalState.overlay.dispose());
+  const terminalRun = terminalState.overlay.render(52).join("\n");
+  assert.match(terminalRun, /phase no phases/);
+  terminalState.overlay.handleInput(ENTER);
+  const terminalText = terminalState.overlay.render(52).join("\n");
+  assert.match(terminalText, /no phases recorded/);
+  assert.doesNotMatch(terminalText, /waiting for the first phase/);
+});
+
+test("terminal dynamic dashboard selection reports selected phase positions", (t) => {
+  for (const status of ["completed", "failed", "aborted"] as const) {
+    const run = workflow(`terminal-${status}`, status);
+    const template = run.phases[0]!;
+    run.currentPhase = 1;
+    run.phases = [
+      { ...template, index: 0, name: "First", status },
+      { ...template, index: 1, name: "Second", status },
+    ];
+    const state = harness([run], 30);
+    t.after(() => state.overlay.dispose());
+    state.overlay.render(52);
+    state.overlay.handleInput(ENTER);
+    assert.match(state.overlay.render(52).join("\n"), /workflow · phase 2\/2/);
+    state.overlay.handleInput("h");
+    assert.match(state.overlay.render(52).join("\n"), /workflow · phase 1\/2/);
+    state.overlay.handleInput("l");
+    assert.match(state.overlay.render(52).join("\n"), /workflow · phase 2\/2/);
+  }
 });
 
 test("agent actions and hints require the selected agent to survive the final overview viewport", (t) => {

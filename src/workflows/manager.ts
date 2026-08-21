@@ -44,6 +44,7 @@ const CHECKPOINT_DELAY_MS = 150;
 const MAX_RETAINED_RUNS = 64;
 const MAX_WORKFLOW_LOGS = 128;
 export const MAX_WORKFLOW_PHASES = 64;
+export const MAX_WORKFLOW_PHASE_NAME_LENGTH = 160;
 
 export interface StartWorkflowRequest {
   sessionId: string;
@@ -95,6 +96,7 @@ interface RunEntry {
   activeDispatches: number;
   dispatchWaiters: Set<() => void>;
   reachedBudgetWarnings: Set<string>;
+  metadataReceived: boolean;
 }
 
 function workflowUsage(usage?: Partial<Usage>): WorkflowUsage {
@@ -119,6 +121,30 @@ function boundedText(value: unknown, max = 16_384): string {
 function label(value: unknown, fallback: string): string {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
   return (text || fallback).slice(0, 160);
+}
+
+function normalizePhaseName(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function validateDeclaredPhasePlan(value: unknown): string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_WORKFLOW_PHASES) {
+    throw new Error(`Workflow meta phases must be an array with 1 to ${MAX_WORKFLOW_PHASES} entries`);
+  }
+  const names: string[] = [];
+  const seen = new Set<string>();
+  for (const [index, item] of value.entries()) {
+    if (typeof item !== "string") throw new Error(`Workflow meta phase ${index + 1} must be a string`);
+    const name = normalizePhaseName(item);
+    if (!name) throw new Error(`Workflow meta phase ${index + 1} must be non-empty after whitespace normalization`);
+    if (name.length > MAX_WORKFLOW_PHASE_NAME_LENGTH) {
+      throw new Error(`Workflow meta phase ${index + 1} exceeds ${MAX_WORKFLOW_PHASE_NAME_LENGTH} characters after whitespace normalization`);
+    }
+    if (seen.has(name)) throw new Error(`Workflow meta phase names must be unique after whitespace normalization: ${JSON.stringify(name)}`);
+    seen.add(name);
+    names.push(name);
+  }
+  return names;
 }
 
 function looksInstructionShaped(value: unknown): boolean {
@@ -228,6 +254,7 @@ export class WorkflowManager {
           activeDispatches: 0,
           dispatchWaiters: new Set(),
           reachedBudgetWarnings: new Set(),
+          metadataReceived: true,
         });
       }
     })();
@@ -352,6 +379,7 @@ export class WorkflowManager {
       activeDispatches: 0,
       dispatchWaiters: new Set(),
       reachedBudgetWarnings: new Set(),
+      metadataReceived: false,
     };
     this.#runs.set(snapshot.runId, entry);
     entry.completion = this.#execute(entry, request);
@@ -468,12 +496,12 @@ export class WorkflowManager {
         args: request.args ?? null,
         cwd: request.cwd,
         signal: entry.controller.signal,
-        onMeta: (meta) => this.#applyMeta(entry, meta),
+        onMeta: (meta) => this.#applyMeta(entry, meta, true),
         onPhase: (title) => this.#activatePhase(entry, title),
         onLog: (message) => this.#recordLog(entry, message),
         onAgent: (prompt, options, signal, callIndex) => this.#runAgent(entry, request, prompt, options, signal, callIndex),
       });
-      this.#applyMeta(entry, sandbox.meta);
+      this.#applyMeta(entry, sandbox.meta, false);
       entry.snapshot.result = sandbox.result;
       entry.snapshot.status = "completed";
       entry.snapshot.taskOutcome = workflowTaskOutcome(sandbox.result);
@@ -631,9 +659,7 @@ export class WorkflowManager {
     }
     await this.#waitUntilResumed(entry, signal);
 
-    const phase = typeof options.phase === "string"
-      ? this.#ensurePhase(entry, options.phase)
-      : entry.snapshot.currentPhase ?? this.#ensurePhase(entry, "Agents");
+    const phase = this.#resolveAgentPhase(entry, options.phase);
     this.#markPhaseRunning(entry, phase);
     const index = entry.snapshot.agents.length;
     const name = label(options.name ?? options.label, `agent-${index + 1}`);
@@ -846,9 +872,7 @@ export class WorkflowManager {
     fingerprint: string,
     replay: WorkflowReplayCall,
   ): WorkflowAgentRecord {
-    const phase = typeof options.phase === "string"
-      ? this.#ensurePhase(entry, options.phase)
-      : entry.snapshot.currentPhase ?? this.#ensurePhase(entry, "Agents");
+    const phase = this.#resolveAgentPhase(entry, options.phase);
     this.#markPhaseRunning(entry, phase);
     const index = entry.snapshot.agents.length;
     const now = Date.now();
@@ -1128,6 +1152,27 @@ export class WorkflowManager {
     return phase.index;
   }
 
+  #resolveAgentPhase(entry: RunEntry, rawPhase: unknown): number {
+    if (entry.snapshot.plannedPhaseCount !== undefined) {
+      const current = entry.snapshot.currentPhase === null
+        ? undefined
+        : entry.snapshot.phases[entry.snapshot.currentPhase];
+      if (!current) {
+        throw new Error("No declared workflow phase is active; call phase(title) before agent()");
+      }
+      if (rawPhase === undefined) return current.index;
+      if (typeof rawPhase !== "string") throw new Error("agent phase must be a declared phase title");
+      const requested = this.#declaredPhaseIndex(entry, rawPhase);
+      if (requested !== current.index) {
+        throw new Error(`agent({ phase: ${JSON.stringify(entry.snapshot.phases[requested]!.name)} }) cannot advance the declared plan; call phase(title) first`);
+      }
+      return requested;
+    }
+    return typeof rawPhase === "string"
+      ? this.#ensurePhase(entry, rawPhase)
+      : entry.snapshot.currentPhase ?? this.#ensurePhase(entry, "Agents");
+  }
+
   #markPhaseRunning(entry: RunEntry, index: number): void {
     const phase = entry.snapshot.phases[index];
     if (!phase || phase.status !== "pending") return;
@@ -1139,12 +1184,29 @@ export class WorkflowManager {
     this.#touch(entry);
   }
 
-  #applyMeta(entry: RunEntry, value: unknown): void {
+  #applyMeta(entry: RunEntry, value: unknown, initial: boolean): void {
     if (!value || typeof value !== "object" || Array.isArray(value)) return;
     const meta = value as Record<string, unknown>;
+    const plan = initial && !entry.metadataReceived && Object.hasOwn(meta, "phases")
+      ? validateDeclaredPhasePlan(meta.phases)
+      : undefined;
+    if (initial && !entry.metadataReceived) {
+      entry.metadataReceived = true;
+      if (plan) {
+        const now = Date.now();
+        entry.snapshot.plannedPhaseCount = plan.length;
+        entry.snapshot.phases = plan.map((name, index) => ({
+          index,
+          name,
+          status: "pending",
+          timestamps: { createdAt: now, updatedAt: now },
+          agents: [],
+        }));
+      }
+    }
     const name = meta.name === undefined ? entry.snapshot.name : label(meta.name, entry.snapshot.name);
     const description = meta.description === undefined ? entry.snapshot.description : label(meta.description, entry.snapshot.description);
-    if (name === entry.snapshot.name && description === entry.snapshot.description) return;
+    if (name === entry.snapshot.name && description === entry.snapshot.description && !plan) return;
     entry.snapshot.name = name;
     entry.snapshot.description = description;
     this.#touch(entry);
@@ -1162,13 +1224,36 @@ export class WorkflowManager {
   }
 
   #activatePhase(entry: RunEntry, title: string): void {
-    const index = this.#ensurePhase(entry, title);
+    const index = entry.snapshot.plannedPhaseCount === undefined
+      ? this.#ensurePhase(entry, title)
+      : this.#declaredPhaseIndex(entry, title);
     const now = Date.now();
     const current = entry.snapshot.currentPhase === null ? undefined : entry.snapshot.phases[entry.snapshot.currentPhase];
+    if (current && current.index === index) return;
+    if (current && index < current.index) {
+      throw new Error(`Workflow phase cannot move backward from ${JSON.stringify(current.name)} to ${JSON.stringify(entry.snapshot.phases[index]!.name)}`);
+    }
     if (current && current.index !== index && current.status === "running") {
       current.status = "completed";
       current.timestamps.updatedAt = now;
       current.timestamps.endedAt = now;
+    }
+    if (entry.snapshot.plannedPhaseCount !== undefined && current) {
+      for (let skipped = current.index + 1; skipped < index; skipped++) {
+        const phase = entry.snapshot.phases[skipped]!;
+        if (phase.status !== "pending") continue;
+        phase.status = "completed";
+        phase.timestamps.updatedAt = now;
+        phase.timestamps.endedAt = now;
+      }
+    } else if (entry.snapshot.plannedPhaseCount !== undefined) {
+      for (let skipped = 0; skipped < index; skipped++) {
+        const phase = entry.snapshot.phases[skipped]!;
+        if (phase.status !== "pending") continue;
+        phase.status = "completed";
+        phase.timestamps.updatedAt = now;
+        phase.timestamps.endedAt = now;
+      }
     }
     const phase = entry.snapshot.phases[index]!;
     phase.status = "running";
@@ -1178,11 +1263,23 @@ export class WorkflowManager {
     this.#touch(entry);
   }
 
+  #declaredPhaseIndex(entry: RunEntry, rawTitle: string): number {
+    const name = normalizePhaseName(rawTitle);
+    const index = entry.snapshot.phases.findIndex((phase) => phase.name === name);
+    if (index >= 0) return index;
+    const shown = name || "<blank>";
+    throw new Error(`Workflow phase ${JSON.stringify(shown)} is not declared in the workflow phase plan`);
+  }
+
   #finishPhases(entry: RunEntry, status: "completed" | "failed" | "aborted"): void {
     const now = Date.now();
     for (const phase of entry.snapshot.phases) {
-      if (phase.status === "completed") continue;
-      phase.status = phase.status === "pending" && status === "completed" ? "completed" : status;
+      // A declared plan is a view of the workflow's possible phases, not a
+      // promise that every conditional phase will run. Only phases reached
+      // by phase() (including explicitly skipped phases, which are already
+      // completed) receive the workflow's terminal state.
+      if (phase.status === "completed" || (entry.snapshot.plannedPhaseCount !== undefined && phase.status === "pending")) continue;
+      phase.status = status;
       phase.timestamps.updatedAt = now;
       phase.timestamps.endedAt = now;
       if (status !== "completed") phase.error ??= entry.snapshot.error;

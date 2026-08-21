@@ -606,6 +606,13 @@ function validReplacementReference(value: unknown): boolean {
 function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<WorkflowSnapshot>;
+  const plannedPhaseCount = candidate.plannedPhaseCount;
+  const validPlannedPhaseCount = plannedPhaseCount === undefined
+    || Number.isSafeInteger(plannedPhaseCount)
+      && plannedPhaseCount >= 1
+      && plannedPhaseCount <= 64
+      && Array.isArray(candidate.phases)
+      && candidate.phases.length === plannedPhaseCount;
   return typeof candidate.runId === "string"
     && RUN_ID_PATTERN.test(candidate.runId)
     && typeof candidate.sessionId === "string"
@@ -623,6 +630,7 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
     && (candidate.budget === undefined || !!candidate.budget && typeof candidate.budget === "object" && !Array.isArray(candidate.budget)
       && Object.keys(candidate.budget).every((key) => ["maxAgents", "maxConcurrency", "maxTokens", "maxTokensPerAgent", "maxCost", "maxTurns"].includes(key))
       && Object.values(candidate.budget).every((item) => item === undefined || typeof item === "number" && Number.isFinite(item) && item > 0))
+    && validPlannedPhaseCount
     && Array.isArray(candidate.phases)
     && Array.isArray(candidate.agents)
     && candidate.agents.every((agent) => !!agent && typeof agent === "object"
@@ -631,23 +639,41 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
       && typeof agent.independent === "boolean");
 }
 
+function currentPhasePosition(snapshot: WorkflowSnapshot): number | undefined {
+  const currentPhase = snapshot.currentPhase;
+  if (typeof currentPhase !== "number" || !Number.isSafeInteger(currentPhase) || currentPhase < 0) return undefined;
+  // Phase indexes are the durable identity. Older snapshots may only have
+  // recorded the array position, so fall back only when no index matches.
+  const indexedPosition = snapshot.phases.findIndex((phase) => phase.index === currentPhase);
+  if (indexedPosition >= 0) return indexedPosition;
+  return currentPhase < snapshot.phases.length ? currentPhase : undefined;
+}
+
 function abortStaleWorkflow(snapshot: WorkflowSnapshot, now: number, staleAfterMs: number): WorkflowSnapshot {
   if (snapshot.status !== "running" && snapshot.status !== "paused") return snapshot;
   // staleAfterMs=0 is the explicit no-resume mode: every restored running
   // checkpoint is from a previous manager, even with equal/future timestamps.
   if (staleAfterMs > 0 && now - snapshot.timestamps.updatedAt <= staleAfterMs) return snapshot;
   const error = snapshot.error ?? "Workflow was aborted because its running checkpoint became stale.";
+  const declared = snapshot.plannedPhaseCount !== undefined;
+  const currentPosition = declared ? currentPhasePosition(snapshot) : undefined;
   return {
     ...snapshot,
     status: "aborted",
     error,
     timestamps: { ...snapshot.timestamps, updatedAt: now, pausedAt: undefined, endedAt: now },
-    phases: snapshot.phases.map((phase) => phase.status === "running" || phase.status === "pending" ? {
-      ...phase,
-      status: "aborted",
-      error: phase.error ?? error,
-      timestamps: { ...phase.timestamps, updatedAt: now, endedAt: now },
-    } : phase),
+    phases: snapshot.phases.map((phase, position) => {
+      const stale = declared
+        ? phase.status === "running" || phase.status === "paused"
+          || (position === currentPosition && phase.status === "pending")
+        : phase.status === "running" || phase.status === "pending";
+      return stale ? {
+        ...phase,
+        status: "aborted",
+        error: phase.error ?? error,
+        timestamps: { ...phase.timestamps, updatedAt: now, endedAt: now },
+      } : phase;
+    }),
     agents: snapshot.agents.map((agent) => agent.state === "running" || agent.state === "queued" ? {
       ...agent,
       state: "aborted",

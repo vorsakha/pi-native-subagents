@@ -145,11 +145,61 @@ function latestValue(snapshot: WorkflowSnapshot, theme: Theme, now: number): str
   return `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", "—")} ${theme.fg("muted", agentActivity(agent))}`;
 }
 
-/** Position of the current phase within the phases array, defaulting to the most recent phase. */
-function currentPhaseIndex(snapshot: WorkflowSnapshot): number {
-  if (!snapshot.phases.length) return -1;
-  const found = snapshot.phases.findIndex((phase) => phase.index === snapshot.currentPhase);
-  return found >= 0 ? found : snapshot.phases.length - 1;
+export interface WorkflowPhaseProgress {
+  currentIndex: number;
+  phaseIndex: number;
+  phase?: WorkflowPhase;
+  position: number;
+  total?: number;
+  label: string;
+  waiting: boolean;
+  noPhases: boolean;
+}
+
+function terminalStatus(status: WorkflowSnapshot["status"]): boolean {
+  return status === "completed" || status === "failed" || status === "aborted";
+}
+
+/** Shared phase position and denominator semantics for cards and the workflow dashboard. */
+export function workflowPhaseProgress(snapshot: WorkflowSnapshot, selectedPhaseIndex?: number): WorkflowPhaseProgress {
+  const currentIndex = snapshot.currentPhase === null
+    ? -1
+    : snapshot.phases.findIndex((phase) => phase.index === snapshot.currentPhase);
+  const selectedIndex = selectedPhaseIndex === undefined
+    ? -1
+    : snapshot.phases.findIndex((phase) => phase.index === selectedPhaseIndex);
+  const terminal = terminalStatus(snapshot.status);
+  const declared = snapshot.plannedPhaseCount !== undefined;
+  const noPhases = snapshot.phases.length === 0;
+  const phaseIndex = selectedIndex >= 0
+    ? selectedIndex
+    : currentIndex >= 0
+      ? currentIndex
+      : !declared && terminal && snapshot.phases.length
+        ? snapshot.phases.length - 1
+        : -1;
+  const phase = phaseIndex >= 0 ? snapshot.phases[phaseIndex] : undefined;
+  const position = declared
+    ? currentIndex < 0
+      ? 0
+      : selectedIndex >= 0
+        ? selectedIndex + 1
+        : currentIndex + 1
+    : terminal && snapshot.phases.length
+      ? selectedIndex >= 0 ? selectedIndex + 1 : snapshot.phases.length
+      : phaseIndex >= 0 ? phaseIndex + 1 : 0;
+  const total = declared
+    ? snapshot.plannedPhaseCount
+    : terminal && snapshot.phases.length
+      ? snapshot.phases.length
+      : undefined;
+  const waiting = !terminal && position === 0 && !declared;
+  const label = noPhases
+    ? terminal ? "no phases" : "waiting"
+    : waiting
+      ? "waiting"
+      : `${position}/${total ?? "?"}`;
+  return { currentIndex, phaseIndex, phase, position, total, label, waiting, noPhases };
 }
 
 /** Bounded phase spine: a window of glyphs centered on the current phase, with `⋯` markers when phases are hidden. */
@@ -173,13 +223,16 @@ function phaseSpine(phases: WorkflowPhase[], currentIndex: number, theme: Theme,
 }
 
 function phaseGroupValue(snapshot: WorkflowSnapshot, theme: Theme, now: number): string {
-  if (!snapshot.phases.length) return theme.fg("dim", "waiting for the first phase");
-  const currentIndex = currentPhaseIndex(snapshot);
-  const phase = snapshot.phases[currentIndex]!;
-  const spine = phaseSpine(snapshot.phases, currentIndex, theme, now);
-  const fraction = theme.fg("dim", `${currentIndex + 1}/${snapshot.phases.length}`);
-  const name = theme.fg("toolTitle", sanitizeInline(phase.name));
-  return `${spine}  ${fraction} ${name} ${theme.fg("dim", `· ${phase.status}`)}`;
+  const progress = workflowPhaseProgress(snapshot);
+  if (progress.noPhases) {
+    return theme.fg("dim", progress.waiting ? "waiting for the first phase" : "no phases recorded");
+  }
+  const spineIndex = progress.phaseIndex >= 0 ? progress.phaseIndex : 0;
+  const spine = phaseSpine(snapshot.phases, spineIndex, theme, now);
+  const fraction = theme.fg("dim", progress.label);
+  if (!progress.phase) return `${spine}  ${fraction} ${theme.fg("dim", "not started")}`;
+  const name = theme.fg("toolTitle", sanitizeInline(progress.phase.name));
+  return `${spine}  ${fraction} ${name} ${theme.fg("dim", `· ${progress.phase.status}`)}`;
 }
 
 function phaseRow(phase: WorkflowPhase, isCurrent: boolean, theme: Theme, now: number): string {
@@ -192,9 +245,14 @@ function phaseRow(phase: WorkflowPhase, isCurrent: boolean, theme: Theme, now: n
 function phaseRosterLines(snapshot: WorkflowSnapshot, theme: Theme, now: number): string[] {
   const total = snapshot.phases.length;
   if (total <= 1) return [];
-  const currentIndex = currentPhaseIndex(snapshot);
+  const progress = workflowPhaseProgress(snapshot);
+  const currentIndex = progress.currentIndex >= 0
+    ? progress.currentIndex
+    : snapshot.plannedPhaseCount === undefined
+      ? progress.phaseIndex
+      : -1;
   const radius = Math.floor((MAX_PHASES_EXPANDED - 1) / 2);
-  let start = Math.max(0, currentIndex - radius);
+  let start = Math.max(0, (currentIndex >= 0 ? currentIndex : 0) - radius);
   const end = Math.min(total - 1, start + MAX_PHASES_EXPANDED - 1);
   start = Math.max(0, end - MAX_PHASES_EXPANDED + 1);
   const lines: string[] = [];

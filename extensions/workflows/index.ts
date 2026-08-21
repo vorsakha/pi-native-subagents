@@ -238,6 +238,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     promptGuidelines: [
       "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls; use direct spawning for a small simple fan-out.",
       "Workflow scripts export a default async function; helpers are globals: use phase(), log(), agent(), parallel(), and pipeline(). Do not destructure a callback context object.",
+      "When phases are known up front, declare meta.phases and call phase(title) to activate them in order; omit it for dynamic discovery.",
       "Use parallel only with deferred functions such as () => agent(...); never pass already-started agent promises.",
       "Use exactly one source (script, workflowName, or scriptPath) and exactly one input form (input or legacy args).",
       "agent(prompt) is generic and defaults to full access after project trust; set access=readOnly for inspection.",
