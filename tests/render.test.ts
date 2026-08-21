@@ -89,6 +89,44 @@ test("renderer sanitizes output and enforces collapsed/expanded line budgets", (
   assert.ok(expandedLines.length <= MAX_EXPANDED_LINES, `expanded produced ${expandedLines.length} lines`);
   assert.ok(expandedLines.every((line) => !CONTROL_CHARS.test(line)));
   assert.ok(expandedLines.some((line) => line.includes("/subagents")));
+  assert.ok(expandedLines.every((line) => !line.includes("tool-")), "expanded card no longer lists recent tool calls as primary activity");
+});
+
+test("expanded activity prioritizes semantic progress over the tool list", () => {
+  const manyTools = Array.from({ length: 6 }, (_, i) => tool(String(i)));
+
+  const withTools = buildJobCardLines(job({ status: "running", tools: manyTools }), theme, { expanded: true, now: 5_000 });
+  assert.ok(withTools.length <= MAX_EXPANDED_LINES, `expanded produced ${withTools.length} lines`);
+  assert.ok(withTools.every((line) => !line.includes("tool-")), "no multi-row recent-tool list even when tools exist");
+  assert.equal(withTools.filter((line) => line.includes("Activity")).length <= 1, true, "at most one Activity line");
+
+  const liveThinking = "Reviewing the diff for edge cases before running the suite";
+  const thinkingLines = buildJobCardLines(job({ status: "running", liveThinking, tools: manyTools }), theme, { expanded: true, now: 5_000 });
+  const activityLines = thinkingLines.filter((line) => line.includes("Activity"));
+  assert.equal(activityLines.length, 1, "exactly one Activity line carries live semantic progress");
+  assert.ok(activityLines[0]!.includes(liveThinking), "live thinking preview is shown");
+  assert.ok(thinkingLines.every((line) => !line.includes("tool-")), "tool detail stays out of the card even with live thinking present");
+  assert.ok(thinkingLines.every((line) => !CONTROL_CHARS.test(line)));
+
+  const narrow = renderJobCard(job({ status: "running", liveThinking, tools: manyTools }), theme, { expanded: true, now: 5_000 }).render(48);
+  assert.ok(narrow.length <= MAX_EXPANDED_LINES);
+  assert.ok(narrow.some((line) => line.includes("Activity")), "activity survives narrow-width rendering");
+
+  const hugeThinking = "x".repeat(5_000) + "TAIL_MARKER";
+  const boundedLines = buildJobCardLines(job({ status: "running", liveThinking: hugeThinking }), theme, { expanded: true, now: 5_000 });
+  const boundedActivity = boundedLines.find((line) => line.includes("Activity"));
+  assert.ok(boundedActivity, "activity line present for a large live-thinking buffer");
+  assert.ok(boundedActivity!.length < 400, "activity preview is tightly bounded, not the full buffer");
+
+  const runningToolOnly = buildJobCardLines(job({ status: "running", tools: [tool("build", "running")] }), theme, { expanded: true, now: 5_000 });
+  assert.ok(runningToolOnly.some((line) => line.includes("Activity") && line.includes("running tool-build")), "no output/liveThinking falls back to the running tool as a minimal operational indicator");
+
+  const queuedLines = buildJobCardLines(job({ status: "queued" }), theme, { expanded: true, now: 5_000 });
+  assert.ok(queuedLines.some((line) => line.includes("waiting for an agent slot")), "queued job with nothing else falls back to a minimal waiting indicator");
+
+  const completedNoOutput = buildJobCardLines(job({ status: "completed", output: "", endedAt: 5_000 }), theme, { expanded: true, now: 5_000 });
+  assert.ok(completedNoOutput.some((line) => line.includes("Result") && line.includes("(no assistant text)")));
+  assert.ok(completedNoOutput.every((line) => !line.includes("Activity")), "completed cards foreground Result, not Activity");
 });
 
 test("every direct tool registers width-safe, sanitized trace renderers", () => {

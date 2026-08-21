@@ -324,6 +324,31 @@ test("workflow results use native Markdown while transcript roles and workflow m
   assert.match(compactDetail, /FINAL_SUFFIX/);
 });
 
+test("agent detail activity does not duplicate tool detail already shown in the transcript", (t) => {
+  const run = workflow("no-duplication", "completed");
+  const agent = run.agents[0]!;
+  agent.liveThinking = "narrowing down the failing assertion";
+  agent.tools = [{ id: "bash-1", name: "bash", summary: "DISTINCT_TOOL_SUMMARY_MARKER", status: "completed" }];
+  agent.transcript = [
+    { kind: "assistant", text: "investigating" },
+    { kind: "tool", toolId: "bash-1", name: "bash", text: "DISTINCT_TOOL_SUMMARY_MARKER" },
+  ];
+
+  const { overlay } = harness([run], 30, () => {}, { renderMarkdown: (text) => text.split("\n") });
+  t.after(() => overlay.dispose());
+
+  overlay.render(72);
+  overlay.handleInput(ENTER);
+  const lines = overlay.render(72);
+  assert.ok(lines.some((line) => line.includes("→ bash · DISTINCT_TOOL_SUMMARY_MARKER")), "the tool lifecycle row still appears in the Transcript section");
+  assert.ok(lines.some((line) => line.includes("Activity") && line.includes("narrowing down the failing assertion")), "the Activity section still surfaces live semantic progress");
+
+  const activityLine = lines.find((line) => line.includes("Activity"));
+  assert.ok(activityLine && !activityLine.includes("DISTINCT_TOOL_SUMMARY_MARKER"), "the Activity section does not repeat the tool detail already in the transcript");
+  const toolMentions = lines.filter((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER"));
+  assert.equal(toolMentions.length, 1, "tool detail is rendered exactly once, in the transcript, not duplicated in Activity");
+});
+
 test("narrow workflows drill from runs to overview to agent, with layered Escape and Pi cancel backtracking", (t) => {
   const closed: WorkflowsDashboardAction[] = [];
   const { overlay, actions } = harness([workflow("narrow")], 30, (action) => closed.push(action));

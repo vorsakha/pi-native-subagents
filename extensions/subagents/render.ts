@@ -4,7 +4,7 @@ import { truncateToWidth } from "@earendil-works/pi-tui";
 import { isTerminal } from "../../src/manager.ts";
 import { formatSpendBudget } from "../../src/budget.ts";
 import type { PeerSessionSummary } from "../../src/session-peers.ts";
-import type { ContextSnapshot, JobSnapshot, JobStatus, SendBehavior, ToolTrace, Usage } from "../../src/types.ts";
+import type { ContextSnapshot, JobSnapshot, JobStatus, SendBehavior, Usage } from "../../src/types.ts";
 
 /*
  * Trace grammar shared by every direct tool and by the workflow renderers:
@@ -25,7 +25,6 @@ import type { ContextSnapshot, JobSnapshot, JobStatus, SendBehavior, ToolTrace, 
 export const MAX_COLLAPSED_LINES = 10;
 export const MAX_EXPANDED_LINES = 36;
 
-const MAX_TOOLS_EXPANDED = 8;
 const MAX_TAIL_COLLAPSED = 3;
 const MAX_TAIL_EXPANDED = 16;
 const MAX_LIST_JOBS_COLLAPSED = 8;
@@ -91,6 +90,16 @@ export function sanitizeInline(value: string): string {
   return sanitizeText(value).replace(/\s+/g, " ").trim();
 }
 
+/** Chars kept from the tail of a live activity preview before sanitizing, so a large
+ *  in-flight `liveThinking` buffer never costs a full sanitize pass every render frame. */
+const ACTIVITY_PREVIEW_CHARS = 160;
+
+/** Bound-then-sanitize tail preview of live semantic progress for a single card line. */
+function activityPreview(value: string): string {
+  const trimmed = value.length > ACTIVITY_PREVIEW_CHARS ? `…${value.slice(-ACTIVITY_PREVIEW_CHARS)}` : value;
+  return sanitizeInline(trimmed);
+}
+
 export function shortId(id: string): string {
   return id.slice(0, 8);
 }
@@ -146,12 +155,6 @@ export function traceStatusMeta(status: string, now?: number): { glyph: string; 
 
 export function statusMeta(status: JobStatus, now?: number): { glyph: string; color: TraceStatusColor } {
   return traceStatusMeta(status, now);
-}
-
-function toolLine(theme: Theme, tool: ToolTrace, indent = ""): string {
-  const glyph = tool.status === "running" ? "…" : tool.status === "failed" ? "×" : "✓";
-  const summary = tool.summary ? `: ${sanitizeInline(tool.summary)}` : "";
-  return theme.fg("muted", `${indent}${glyph} ${sanitizeInline(tool.name)}${summary}`);
 }
 
 function sectionLine(theme: Theme, label: string, value: string, color: "text" | "toolOutput" | "dim" | "muted" | "error" = "dim"): string {
@@ -257,19 +260,24 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
     }
   }
 
-  // Keep collapsed live activity human-readable: tool calls are implementation detail.
-  // They remain available in the expanded card and the /subagents dashboard.
-  if (expanded && job.tools.length) {
-    const shown = job.tools.slice(-MAX_TOOLS_EXPANDED);
-    lines.push(theme.fg("muted", "Activity"));
-    for (const tool of shown) lines.push(toolLine(theme, tool, "  "));
-    const omitted = job.tools.length - shown.length;
-    if (omitted > 0) lines.push(theme.fg("muted", `  +${omitted} earlier tool call${omitted === 1 ? "" : "s"}`));
-  } else if (!job.output && job.status === "queued") {
-    lines.push(sectionLine(theme, "Activity", "waiting for an agent slot", "dim"));
-  } else if (!job.output && job.status === "running") {
-    lines.push(sectionLine(theme, "Activity", "waiting for the first response", "dim"));
-  } else if (!job.output && isTerminal(job.status)) {
+  // Activity prioritizes current semantic progress over tool mechanics: live thinking beats
+  // the latest assistant output (already shown above) beats a minimal operational indicator.
+  // Full tool lifecycle detail lives only in the transcript/dashboard, never duplicated here.
+  if (!isTerminal(job.status)) {
+    const thinking = activityPreview(job.liveThinking);
+    if (thinking) {
+      lines.push(sectionLine(theme, "Activity", thinking, "dim"));
+    } else if (!job.output) {
+      const runningTool = [...job.tools].reverse().find((tool) => tool.status === "running");
+      if (runningTool) {
+        lines.push(sectionLine(theme, "Activity", `running ${sanitizeInline(runningTool.name)}`, "dim"));
+      } else if (job.status === "queued") {
+        lines.push(sectionLine(theme, "Activity", "waiting for an agent slot", "dim"));
+      } else if (job.status === "running") {
+        lines.push(sectionLine(theme, "Activity", "waiting for the first response", "dim"));
+      }
+    }
+  } else if (!job.output) {
     lines.push(sectionLine(theme, "Result", "(no assistant text)", "dim"));
   }
 

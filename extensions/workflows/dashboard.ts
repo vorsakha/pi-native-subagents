@@ -1027,18 +1027,11 @@ export class WorkflowsDashboardOverlay implements Focusable {
       const prompt = boundedHeadTailText(sanitizeText(agent.prompt), MAX_PROMPT_CHARS, "prompt");
       appendBoundedSection(body, this.theme, "Prompt", renderPrefixedRows(this.theme, this.theme.fg("accent", "> "), prompt, "userMessageText", width), 48);
     }
-    if (agent.liveThinking?.trim() || agent.tools?.length) {
-      const activity: string[] = [];
-      if (agent.liveThinking?.trim()) {
-        const thinking = boundedHeadTailText(sanitizeText(agent.liveThinking), MAX_ACTIVITY_CHARS, "activity");
-        activity.push(...renderPrefixedRows(this.theme, this.theme.fg("dim", "~ "), thinking, "muted", width));
-      }
-      for (const tool of agent.tools?.slice(-3) ?? []) {
-        const glyph = tool.status === "running" ? "…" : tool.status === "failed" ? "×" : "✓";
-        const color = tool.status === "failed" ? "error" : "muted";
-        const summary = tool.summary ? ` · ${boundedInline(tool.summary, 1_000)}` : "";
-        activity.push(this.theme.fg(color, `${glyph} ${boundedInline(tool.name, 500)}${summary}`));
-      }
+    if (agent.liveThinking?.trim()) {
+      // Tool lifecycle detail already lives in the Transcript section below; keep this
+      // section to semantic live-thinking progress so it isn't duplicated here.
+      const thinking = boundedHeadTailText(sanitizeText(agent.liveThinking), MAX_ACTIVITY_CHARS, "activity");
+      const activity = renderPrefixedRows(this.theme, this.theme.fg("dim", "~ "), thinking, "muted", width);
       appendBoundedSection(body, this.theme, "Activity", activity, 16);
     }
     if (agent.structured !== undefined) {
