@@ -105,6 +105,60 @@ test("background workflows return immediately and deliver one follow-up result f
   await failed.pi.handlers.get("session_shutdown")?.();
 });
 
+test("terminal delivery includes budget warnings and status retains unsuccessful completions", async () => {
+  const piBackend = workflowBackend("pi");
+  const { pi } = await setup({ backends: [piBackend] });
+  const session = context({ hasUI: true });
+  pi.handlers.get("session_start")?.({}, session.ctx);
+
+  const direct = await pi.tools.get("subagent").execute("direct-budget", {
+    task: "direct warning",
+    maxTokens: 5,
+  }, undefined, undefined, session.ctx);
+  assert.match(direct.content[0].text, /Warnings:\n- Subagent budget tokens limit reached/);
+
+  await pi.tools.get("subagent_spawn").execute("direct-background-budget", {
+    task: "direct background warning",
+    maxTokens: 5,
+  }, undefined, undefined, session.ctx);
+  await pi.handlers.get("agent_settled")?.();
+  assert.match(pi.messages[0]?.message.content ?? "", /Warnings:\n- Subagent budget tokens limit reached/);
+  pi.messages.length = 0;
+
+  const workflowForeground = await pi.tools.get("workflow").execute("workflow-foreground-budget", {
+    name: "Foreground budget warning",
+    script: `export default async () => agent("workflow foreground warning", { access: "readOnly" })`,
+    budget: { maxTokens: 5, maxCost: 0.005, maxTurns: 1, maxTokensPerAgent: 5 },
+  }, undefined, undefined, session.ctx);
+  const terminalText = workflowForeground.content[0].text;
+  for (const warning of [
+    "Workflow budget tokens limit reached",
+    "Workflow budget cost limit reached",
+    "Workflow budget turns limit reached",
+    "Workflow budget agent tokens limit reached",
+  ]) assert.match(terminalText, new RegExp(warning));
+
+  await pi.tools.get("workflow").execute("workflow-budget", {
+    name: "Budget warning",
+    script: `export default async () => agent("workflow warning", { access: "readOnly" })`,
+    budget: { maxTokens: 5 },
+    background: true,
+  }, new AbortController().signal, undefined, session.ctx);
+  for (let index = 0; index < 500 && pi.messages.length === 0; index++) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.match(pi.messages[0]?.message.content ?? "", /Warnings:\n- Workflow budget tokens limit reached/);
+
+  const unsuccessful = await pi.tools.get("workflow").execute("unsuccessful", {
+    name: "Rejected review",
+    script: `export default async () => ({ ok: false })`,
+  }, undefined, undefined, session.ctx);
+  assert.equal(unsuccessful.details.workflow.status, "completed");
+  assert.equal(unsuccessful.details.workflow.taskOutcome, "unsuccessful");
+  assert.match(session.statuses.get("native-workflows") ?? "", /1!/);
+  await pi.handlers.get("session_shutdown")?.();
+});
+
 test("background workflow cards follow live state without periodic rerenders", async () => {
   const backend = new HoldingBackend();
   const timers = new Map<object, () => void>();

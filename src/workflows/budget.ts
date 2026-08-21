@@ -5,15 +5,19 @@ export interface WorkflowBudgetMetric {
   used: number;
   limit: number;
   remaining: number;
+  reached: boolean;
+  supported: boolean;
 }
 
-function metric(key: WorkflowBudgetMetric["key"], used: number, limit: number | undefined): WorkflowBudgetMetric | undefined {
+function metric(key: WorkflowBudgetMetric["key"], used: number, limit: number | undefined, supported = true): WorkflowBudgetMetric | undefined {
   if (limit === undefined) return undefined;
   return {
     key,
     used: Math.max(0, used),
     limit,
     remaining: Math.max(0, limit - used),
+    reached: used >= limit,
+    supported,
   };
 }
 
@@ -32,7 +36,7 @@ export function workflowBudgetMetrics(
     metric("tokens", tokens, budget.maxTokens),
     metric("agentTokens", agentTokens, budget.maxTokensPerAgent),
     metric("turns", usage.turns, budget.maxTurns),
-    metric("cost", usage.cost, budget.maxCost),
+    metric("cost", usage.cost, budget.maxCost, !snapshot.agents.some((agent) => agent.harness === "codex")),
   ].filter((value): value is WorkflowBudgetMetric => value !== undefined);
 }
 
@@ -41,11 +45,12 @@ function numberText(value: number): string {
 }
 
 function metricText(value: WorkflowBudgetMetric): string {
+  if (!value.supported) return `${value.key} unsupported`;
   if (value.key === "cost") {
-    return `cost $${value.used.toFixed(4)}/$${value.limit.toFixed(4)} (${value.remaining > 0 ? `$${value.remaining.toFixed(4)} remaining` : "0 remaining"})`;
+    return `cost $${value.used.toFixed(4)}/$${value.limit.toFixed(4)} (${value.reached ? "reached" : `$${value.remaining.toFixed(4)} remaining`})`;
   }
   const label = value.key === "agentTokens" ? "agent tokens" : value.key;
-  return `${label} ${numberText(value.used)}/${numberText(value.limit)} (${numberText(value.remaining)} remaining)`;
+  return `${label} ${numberText(value.used)}/${numberText(value.limit)} (${value.reached ? "reached" : `${numberText(value.remaining)} remaining`})`;
 }
 
 export function formatWorkflowBudget(
@@ -53,5 +58,5 @@ export function formatWorkflowBudget(
   usage: Pick<WorkflowUsage, "input" | "output" | "cost" | "turns">,
 ): string | undefined {
   const metrics = workflowBudgetMetrics(snapshot, usage);
-  return metrics.length ? metrics.map(metricText).join(" · ") : undefined;
+  return metrics.length ? metrics.map(metricText).join(" · ") : "open";
 }

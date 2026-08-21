@@ -28,6 +28,7 @@ import type {
   WorkflowSnapshot,
 } from "../../src/workflows/types.ts";
 import { formatContext, formatUsage, sanitizeInline, sanitizeText, shortId, traceStatusMeta } from "../subagents/render.ts";
+import { workflowStatusMeta } from "./render.ts";
 
 const MAX_RESULT_CHARS = 16_384;
 const MAX_RESULT_ROWS = 400;
@@ -845,13 +846,14 @@ export class WorkflowsDashboardOverlay implements Focusable {
   }
 
   private renderRun(run: WorkflowSnapshot, selected: boolean, width: number): string {
-    const status = traceStatusMeta(run.status, this.#now());
+    const status = workflowStatusMeta(run);
     const marker = selected ? this.theme.fg("accent", "❯") : " ";
     const name = selected ? this.theme.fg("accent", sanitizeInline(run.name)) : this.theme.fg("text", sanitizeInline(run.name));
     const left = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name} ${this.theme.fg("dim", shortId(sanitizeText(run.runId)))}`;
     const phasePosition = run.currentPhase === null ? 0 : run.phases.findIndex((phase) => phase.index === run.currentPhase) + 1;
     const phase = phasePosition > 0 ? `${phasePosition}/${run.phases.length}` : "waiting";
-    const right = `${this.theme.fg("muted", `phase ${phase} · ${formatElapsed(run, this.#now())}`)} · ${this.theme.fg(status.color, run.status)} `;
+    const outcome = run.status === "completed" && run.taskOutcome ? ` · ${run.taskOutcome}` : "";
+    const right = `${this.theme.fg("muted", `phase ${phase} · ${formatElapsed(run, this.#now())}`)} · ${this.theme.fg(status.color, `${run.status}${outcome}`)} `;
     return alignDashboardRow(left, right, width);
   }
 
@@ -873,9 +875,9 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const usageSnapshot = aggregateWorkflowUsage(run);
     const usage = formatUsage(usageSnapshot);
     const budget = formatWorkflowBudget(run, usageSnapshot);
-    const status = traceStatusMeta(run.status, this.#now());
+    const status = workflowStatusMeta(run);
     const lines: string[] = [
-      `${this.theme.fg("accent", this.theme.bold(sanitizeInline(run.name) || "Workflow"))} ${this.theme.fg("dim", `· ${shortId(sanitizeText(run.runId))} · ${status.glyph} ${run.status} · ${formatElapsed(run, this.#now())}`)}`,
+      `${this.theme.fg("accent", this.theme.bold(sanitizeInline(run.name) || "Workflow"))} ${this.theme.fg(status.color, `· ${shortId(sanitizeText(run.runId))} · ${status.glyph} ${run.status}${run.status === "completed" ? ` · task ${run.taskOutcome ?? "unspecified"}` : ""}`)} ${this.theme.fg("dim", `· ${formatElapsed(run, this.#now())}`)}`,
       this.theme.fg("dim", boundedInline(run.description, 2_000) || "(no workflow description)"),
       phase ? this.renderPhase(phase, run.phases) : this.theme.fg("dim", "Phase · waiting for the first phase"),
     ];

@@ -13,6 +13,7 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import type { ToolResultSnapshot, TranscriptEntry } from "../types.ts";
 import { formatWorkflowBudget } from "./budget.ts";
+import { workflowTaskOutcome } from "./outcome.ts";
 import type { WorkflowJournalRecord, WorkflowSnapshot } from "./types.ts";
 
 const RUN_ID_PATTERN = /^wf_[a-f0-9]+$/;
@@ -512,6 +513,7 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
     "",
     `- Run: \`${snapshot.runId}\``,
     `- Status: **${snapshot.status}**`,
+    ...(snapshot.status === "completed" ? [`- Task outcome: **${snapshot.taskOutcome ?? workflowTaskOutcome(snapshot.result)}**`] : []),
     `- Agents: ${snapshot.agents.length}`,
     `- Usage: ${usage.input} fresh input / ${usage.output} output / ${usage.cacheRead} cache-read / ${usage.cacheWrite} cache-write tokens · ${usage.turns} turns · $${usage.cost.toFixed(4)}`,
     ...(budget ? [`- Budget: ${budget}`] : []),
@@ -611,6 +613,7 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
     && typeof candidate.description === "string"
     && typeof candidate.background === "boolean"
     && typeof candidate.status === "string"
+    && (candidate.taskOutcome === undefined || candidate.taskOutcome === "successful" || candidate.taskOutcome === "unsuccessful" || candidate.taskOutcome === "unspecified")
     && !!candidate.timestamps
     && typeof candidate.timestamps === "object"
     && typeof candidate.timestamps.createdAt === "number"
@@ -672,7 +675,16 @@ export async function loadWorkflowSummaries(
       const parsed: unknown = JSON.parse(await readFile(join(directory, "workflow.json"), "utf8"));
       if (!isWorkflowSnapshot(parsed) || parsed.runId !== entry.name) continue;
       if (options.sessionId !== undefined && parsed.sessionId !== options.sessionId) continue;
-      let snapshot: WorkflowSnapshot = { ...parsed, artifactDir: directory };
+      let authoritativeResult: unknown = parsed.result;
+      if (parsed.status === "completed" && parsed.taskOutcome === undefined) {
+        try { authoritativeResult = JSON.parse(await readFile(join(directory, "result.json"), "utf8")) as unknown; }
+        catch { /* older or partial runs may only retain the bounded summary result */ }
+      }
+      let snapshot: WorkflowSnapshot = {
+        ...parsed,
+        artifactDir: directory,
+        taskOutcome: parsed.taskOutcome ?? (parsed.status === "completed" ? workflowTaskOutcome(authoritativeResult) : undefined),
+      };
       if (snapshot.transcriptArtifact) {
         try {
           const rawTranscripts = JSON.parse(await readFile(join(directory, snapshot.transcriptArtifact), "utf8")) as Record<string, unknown>;

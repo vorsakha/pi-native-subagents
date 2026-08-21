@@ -4,6 +4,7 @@ import type {
   DiscoveredCapability,
 } from "./capabilities.ts";
 import type { ParentThreadSnapshot } from "./parent-thread-context.ts";
+import type { SpendBudget } from "./budget.ts";
 
 export type HarnessName = "pi" | "claude" | "codex";
 export type ProviderFamily = "claude" | "codex" | "other";
@@ -233,6 +234,8 @@ export interface SpawnRequest {
   /** Internal durable-replay hint used only when independentOf names a prior-session job no longer retained by JobManager. */
   independentOfProvider?: ProviderFamily;
   profile?: string;
+  /** Optional cumulative spend boundary for this retained native session. */
+  budget?: SpendBudget;
   /** Internal configured fallback; not exposed as a model-facing tool field. */
   defaultHarness?: HarnessName;
   parentProvider?: ProviderFamily;
@@ -244,6 +247,8 @@ export interface SpawnRequest {
   parentThread?: ParentThreadSnapshot;
   /** Internal ownership metadata supplied by the workflow runtime, never by a harness adapter. */
   workflow?: WorkflowJobReference;
+  /** Internal synchronous gate checked immediately before a queued job starts. */
+  dispatchGate?: () => string | undefined;
   /** Internal session-peer fork data (source provenance plus the already-forked session file to resume). Pi-only; never set by a harness adapter. */
   peer?: PeerSessionReference & { sessionFile: string };
 }
@@ -283,6 +288,8 @@ export interface JobSnapshot {
   error?: string;
   truncated: boolean;
   usage: Usage;
+  /** Omitted means open spend budget. Usage is cumulative across retained follow-ups. */
+  budget?: SpendBudget;
   /** Latest native request occupancy, when the harness exposes it. */
   context?: ContextSnapshot;
   tools: ToolTrace[];

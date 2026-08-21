@@ -28,6 +28,7 @@ export {
   isFullscreenTui,
 } from "../dashboard-style.ts";
 import { isTerminal } from "../../src/manager.ts";
+import { formatSpendBudget } from "../../src/budget.ts";
 import {
   formatContext,
   formatEffort,
@@ -762,7 +763,7 @@ class DashboardOverlay implements Focusable {
       job.capabilities?.auto ? "auto-routed" : "",
     ].filter(Boolean).join(" · ");
     optional.push(truncate(this.theme.fg("muted", `route ${route}`), width));
-    const meter = [formatUsage(job.usage), formatContext(job.context), job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""]
+    const meter = [formatUsage(job.usage), `budget ${formatSpendBudget(job.budget, job.usage, job.harness)}`, formatContext(job.context), job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""]
       .filter(Boolean).join(" · ");
     if (meter) optional.push(truncate(this.theme.fg("dim", `usage ${meter}`), width));
     if (job.workflow) {
@@ -980,7 +981,7 @@ function truncate(value: string, width: number, ellipsis = "…"): string {
 }
 
 function statusLine(job: JobSnapshot): string {
-  return `${job.id} ${job.status} ${job.name} [${job.access}${job.independent ? "; independent" : ""}; ${job.harness}/${job.model}; effort ${formatEffort(job.effort)}]`;
+  return `${job.id} ${job.status} ${job.name} [${job.access}${job.independent ? "; independent" : ""}; ${job.harness}/${job.model}; effort ${formatEffort(job.effort)}; budget ${formatSpendBudget(job.budget, job.usage, job.harness)}]`;
 }
 
 export { DashboardOverlay };

@@ -61,6 +61,8 @@ import {
   type SessionPeerSource,
 } from "../../src/session-peers.ts";
 import type { AccessMode, Backend, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SendBehavior } from "../../src/types.ts";
+import type { SpendBudget } from "../../src/budget.ts";
+import { formatSpendBudget } from "../../src/budget.ts";
 import { registerWorkflows } from "../workflows/index.ts";
 
 /** Production session-peer source backed by Pi's real SessionManager. Never mutates the source session. */
@@ -105,7 +107,7 @@ const ACCESS = ["readOnly", "full"] as const;
 const MAX_CAPABILITY_LINES = 40;
 const HUMAN_SUBAGENT_ENTRY = "native-human-subagent";
 const SUBAGENT_ACTIVITY_WIDGET = "native-subagents-active";
-const HUMAN_SUBAGENT_USAGE = "/subagent [--harness pi|claude|codex] [--model ID] [--name NAME] [--effort LEVEL] [--access readOnly|full] [--cwd PATH] [--profile NAME] [--independent] <task>";
+const HUMAN_SUBAGENT_USAGE = "/subagent [--harness pi|claude|codex] [--model ID] [--name NAME] [--effort LEVEL] [--access readOnly|full] [--max-tokens N] [--max-cost USD] [--max-turns N] [--cwd PATH] [--profile NAME] [--independent] <task>";
 
 interface HumanSubagentEntryData {
   job: JobSnapshot;
@@ -630,7 +632,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 
   pi.registerCommand("subagent", {
     description: "Spawn a background subagent for the human without notifying the orchestrator.",
-    getArgumentCompletions: (prefix) => ["--harness", "--model", "--name", "--effort", "--access", "--cwd", "--profile", "--independent", "--independent-of"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    getArgumentCompletions: (prefix) => ["--harness", "--model", "--name", "--effort", "--access", "--max-tokens", "--max-cost", "--max-turns", "--cwd", "--profile", "--independent", "--independent-of"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (!args.trim() || args.trim() === "--help" || args.trim() === "-h") {
         ctx.ui.notify(`Usage: ${HUMAN_SUBAGENT_USAGE}`, "info");
@@ -640,8 +642,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         const params = parseHumanSubagentCommand(args);
         const messages = ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
         const parentThread = captureParentThread(messages);
-        const initial = await spawnJob(params, ctx, undefined, true, parentThread);
-        appendHumanAnchor(initial);
+        const spawned = await spawnJob(params, ctx, undefined, true, parentThread);
+        await getManager().wait(spawned.id, { timeoutMs: 0 });
+        appendHumanAnchor(spawned);
       } catch (error) {
         ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
       }
@@ -669,6 +672,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     independent: Type.Optional(Type.Boolean({ description: "Require a native provider different from the parent" })),
     independentOf: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Route on a native provider different from this existing job ID" })),
     profile: Type.Optional(Type.String({ minLength: 1, maxLength: 160, description: "Human-authored profile name; omit unless the human explicitly requested one" })),
+    maxTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000_000, description: "Optional cumulative fresh input plus output token boundary for the retained session" })),
+    maxCost: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 10_000, description: "Optional cumulative reported-cost boundary for the retained session" })),
+    maxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000, description: "Optional cumulative native-turn boundary for the retained session" })),
   });
 
   pi.registerTool({
@@ -740,7 +746,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     parameters: spawnParameters,
     async execute(_id, params, signal, _onUpdate, ctx) {
       rejectSchemaMismatch(params);
-      const snapshot = await spawnJob(params, ctx, signal);
+      const spawned = await spawnJob(params, ctx, signal);
+      const snapshot = await getManager().wait(spawned.id, { timeoutMs: 0, signal });
       return result(snapshot, `Spawned ${snapshot.id} (${snapshot.name}, ${snapshot.access}, ${snapshot.harness}/${snapshot.model}, effort ${formatEffort(snapshot.effort)}${capabilityText(snapshot)})`);
     },
     renderCall(args, theme) {
@@ -1153,6 +1160,24 @@ export function parseHumanSubagentCommand(input: string): SpawnToolParams {
         index = taken.nextIndex;
         break;
       }
+      case "--max-tokens":
+      case "--max-turns": {
+        const taken = takeValue(flag, inlineValue, index);
+        const value = Number(taken.value);
+        if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${flag} requires a positive integer.`);
+        if (flag === "--max-tokens") params.maxTokens = value;
+        else params.maxTurns = value;
+        index = taken.nextIndex;
+        break;
+      }
+      case "--max-cost": {
+        const taken = takeValue(flag, inlineValue, index);
+        const value = Number(taken.value);
+        if (!Number.isFinite(value) || value <= 0) throw new Error(`${flag} requires a positive number.`);
+        params.maxCost = value;
+        index = taken.nextIndex;
+        break;
+      }
       case "--cwd": {
         const taken = takeValue(flag, inlineValue, index);
         params.cwd = taken.value;
@@ -1237,6 +1262,9 @@ export interface SpawnToolParams {
   independent?: boolean;
   independentOf?: string;
   profile?: string;
+  maxTokens?: number;
+  maxCost?: number;
+  maxTurns?: number;
 }
 
 /**
@@ -1278,6 +1306,7 @@ async function spawn(
     humanVisible: context.humanVisible,
     humanPiTools: context.humanPiTools,
     parentThread: context.parentThread,
+    budget: directBudget(params),
   };
   const routing = await routeCapabilities(router, {
     request: { ...request, harness: params.harness, requires: params.requires },
@@ -1332,7 +1361,12 @@ export function normalizeHarness(value: unknown): HarnessName | undefined {
 
 function statusLine(job: JobSnapshot): string {
   const profile = job.profile ? `; profile ${job.profile}` : "";
-  return `${job.id} ${job.status} ${job.name} [${job.access}; ${job.harness}/${job.model}; effort ${formatEffort(job.effort)}${profile}]`;
+  return `${job.id} ${job.status} ${job.name} [${job.access}; ${job.harness}/${job.model}; effort ${formatEffort(job.effort)}${profile}; budget ${formatSpendBudget(job.budget, job.usage, job.harness)}]`;
+}
+
+function directBudget(params: Pick<SpawnToolParams, "maxTokens" | "maxCost" | "maxTurns">): SpendBudget | undefined {
+  const budget = { maxTokens: params.maxTokens, maxCost: params.maxCost, maxTurns: params.maxTurns };
+  return Object.values(budget).some((value) => value !== undefined) ? budget : undefined;
 }
 /** Route provenance for tool text: what was required, and which live inventory satisfied it. */
 function capabilityText(job: JobSnapshot): string {
@@ -1341,9 +1375,14 @@ function capabilityText(job: JobSnapshot): string {
   return `, capabilities ${route.matched.join(", ") || "none"}${route.auto ? " (auto-routed)" : ""} @ ${route.revision.slice(7, 15)}`;
 }
 function terminalText(job: JobSnapshot): string {
-  if (job.status === "completed") return job.output || "(completed with no text output)";
-  if (job.status === "failed" || job.status === "cancelled") return `${statusLine(job)}\n${job.error ?? ""}`.trim();
+  const warnings = terminalWarnings(job.warnings);
+  if (job.status === "completed") return `${job.output || "(completed with no text output)"}${warnings}`;
+  if (job.status === "failed" || job.status === "cancelled") return `${statusLine(job)}\n${job.error ?? ""}${warnings}`.trim();
   return statusLine(job);
+}
+function terminalWarnings(warnings: string[] | undefined): string {
+  const shown = warnings?.slice(-3) ?? [];
+  return shown.length ? `\nWarnings:\n${shown.map((warning) => `- ${warning}`).join("\n")}` : "";
 }
 function compactJob(job: JobSnapshot): JobSnapshot {
   return { ...job, transcript: [], liveThinking: "", queuedMessages: [] };

@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { JobManager } from "../src/manager.ts";
 import type { Backend, BackendRun, JobSnapshot, ProfileDefinition } from "../src/types.ts";
-import { ControlledBackend, tick } from "./helpers.ts";
+import { ControlledBackend, ImmediateBackend, tick } from "./helpers.ts";
 
 function setup(concurrency = 4) {
   const backend = new ControlledBackend();
@@ -116,6 +116,139 @@ test("manager forwards caller models and labels omitted models as native default
   backend.complete(selected.id);
   backend.complete(nativeDefault.id);
   await manager.shutdown();
+});
+
+test("spawn, check, and list snapshots cannot mutate the enforced budget", async () => {
+  const { backend, manager } = setup(1);
+  const spawned = manager.spawn({ ...request(1), budget: { maxTokens: 10, maxTurns: 3 } });
+  spawned.budget!.maxTokens = 1;
+  assert.equal(manager.check(spawned.id).budget?.maxTokens, 10, "spawn returns a cloned budget");
+
+  const checked = manager.check(spawned.id);
+  checked.budget!.maxTokens = 2;
+  assert.equal(manager.check(spawned.id).budget?.maxTokens, 10, "check returns a cloned budget");
+
+  const listed = manager.list().find((job) => job.id === spawned.id)!;
+  listed.budget!.maxTokens = 3;
+  assert.equal(manager.check(spawned.id).budget?.maxTokens, 10, "list returns cloned budgets");
+
+  await tick();
+  backend.complete(spawned.id, "within original budget", { input: 5, output: 1 });
+  await manager.wait(spawned.id);
+  const followUp = await manager.send(spawned.id, "allowed by enforced budget", "followUp");
+  assert.equal(followUp.generation, 1);
+  await tick();
+  backend.complete(spawned.id, "done", { input: 1, output: 1 });
+  await manager.shutdown();
+});
+
+test("a synchronous completion subscriber can queue the next generation without cleanup clobbering it", async () => {
+  const backend = new ImmediateBackend("codex", { echoSend: true });
+  const manager = new JobManager({ backends: [backend], concurrency: 1 });
+  const completedGenerations: number[] = [];
+  let subscriberFollowUp: Promise<JobSnapshot> | undefined;
+  manager.subscribe((snapshot, event) => {
+    if (event.type !== "completed") return;
+    completedGenerations.push(snapshot.generation);
+    if (snapshot.generation === 0) subscriberFollowUp = manager.send(snapshot.id, "subscriber follow-up", "followUp");
+  });
+
+  const initial = manager.spawn(request(1));
+  for (let index = 0; index < 20 && !subscriberFollowUp; index++) await tick();
+  assert.ok(subscriberFollowUp, "subscriber observed the initial completion synchronously");
+  const queued = await subscriberFollowUp;
+  assert.equal(queued.generation, 1);
+  for (let index = 0; index < 20 && manager.check(initial.id).status !== "completed"; index++) await tick();
+  const final = manager.check(initial.id);
+  assert.equal(final.generation, 1);
+  assert.equal(final.status, "completed");
+  assert.equal(final.output, "codex-subscriber follow-up");
+  assert.deepEqual(completedGenerations, [0, 1], "generation zero cleanup emits no terminal event over generation one");
+  assert.equal(backend.requests.length, 1, "the retained native session is reused");
+  await manager.shutdown();
+});
+
+test("direct spend budgets are optional, cumulative, soft for active work, and block retained follow-ups", async () => {
+  const { backend, manager } = setup(1);
+  const open = manager.spawn(request(1));
+  assert.equal(open.budget, undefined);
+  await tick();
+  backend.complete(open.id, "open", { input: 100, output: 100, cacheRead: 10_000, turns: 3 });
+  await manager.wait(open.id);
+  await manager.send(open.id, "still open");
+  await tick();
+  backend.complete(open.id, "open again", { input: 1, output: 1, turns: 1 });
+  await manager.wait(open.id);
+
+  const budgeted = manager.spawn({ ...request(2), budget: { maxTokens: 5, maxTurns: 1 } });
+  await tick();
+  backend.complete(budgeted.id, "natural success", { input: 5, output: 2, cacheRead: 1_000, turns: 1 });
+  const final = await manager.wait(budgeted.id);
+  assert.equal(final.status, "completed");
+  assert.equal(final.output, "natural success");
+  assert.match(final.warnings?.join("\n") ?? "", /tokens limit reached/);
+  assert.match(final.warnings?.join("\n") ?? "", /turns limit reached/);
+  await assert.rejects(manager.send(budgeted.id, "blocked"), /later dispatches are blocked/);
+  assert.equal(backend.cancels.length, 0);
+  await manager.shutdown();
+});
+
+test("running-generation follow-ups wait for settlement and recheck cumulative spend", async () => {
+  const { backend, manager } = setup(2);
+
+  const beforeObservation = manager.spawn({ ...request(1), budget: { maxTokens: 5 } });
+  await tick();
+  const heldBefore = manager.send(beforeObservation.id, "submitted before usage", "followUp");
+  await tick();
+  assert.equal(backend.sends.length, 0, "follow-up is held outside the active generation");
+  backend.complete(beforeObservation.id, "done", { input: 5, output: 1 });
+  await assert.rejects(heldBefore, /later dispatches are blocked/);
+
+  const afterObservation = manager.spawn({ ...request(2), budget: { maxTurns: 1 } });
+  await tick();
+  backend.runs.get(afterObservation.id)!.emit({ type: "usage", usage: { turns: 1 } });
+  await manager.send(afterObservation.id, "active steering stays allowed", "steer");
+  const heldAfter = manager.send(afterObservation.id, "submitted after usage", "followUp");
+  await tick();
+  assert.deepEqual(backend.sends.map((send) => send.message), ["active steering stays allowed"]);
+  backend.complete(afterObservation.id, "done");
+  await assert.rejects(heldAfter, /later dispatches are blocked/);
+
+  const underBudget = manager.spawn({ ...request(3), budget: { maxTokens: 10 } });
+  await tick();
+  const accepted = manager.send(underBudget.id, "next generation", "followUp");
+  backend.complete(underBudget.id, "first", { input: 2, output: 1 });
+  const queued = await accepted;
+  assert.equal(queued.generation, 1);
+  assert.ok(queued.status === "queued" || queued.status === "running");
+  await tick();
+  assert.ok(backend.sends.some((send) => send.message === "next generation" && send.behavior === "followUp"));
+  backend.complete(underBudget.id, "second", { input: 2, output: 1 });
+  await manager.wait(underBudget.id);
+  await manager.shutdown();
+});
+
+test("direct reached warnings are keyed per metric and emitted once as usage changes", async () => {
+  const backend = new ControlledBackend("claude");
+  const manager = new JobManager({ backends: [backend] });
+  const job = manager.spawn({ ...request(1), harness: "claude", budget: { maxTokens: 5, maxTurns: 2, maxCost: 1 } });
+  await tick();
+  const run = backend.runs.get(job.id)!;
+  run.emit({ type: "usage", usage: { input: 5 } });
+  run.emit({ type: "usage", usage: { input: 4, turns: 2 } });
+  run.emit({ type: "usage", usage: { output: 10, turns: 3, cost: 1.5 } });
+  backend.complete(job.id, "done", { output: 1, cost: 1 });
+  const warnings = (await manager.wait(job.id)).warnings ?? [];
+  for (const metric of ["tokens", "turns", "cost"]) {
+    assert.equal(warnings.filter((warning) => warning.includes(`${metric} limit reached`)).length, 1);
+  }
+  await manager.shutdown();
+});
+
+test("rejects maxCost before dispatch when the selected route does not report cost", () => {
+  const { backend, manager } = setup();
+  assert.throws(() => manager.spawn({ ...request(1), budget: { maxCost: 1 } }), /maxCost is unsupported by the codex route/);
+  assert.equal(backend.requests.length, 0);
 });
 
 test("independentOf routes against the producer job rather than the parent provider", async () => {

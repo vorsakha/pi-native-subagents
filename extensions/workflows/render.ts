@@ -16,6 +16,7 @@ import {
   traceResultLine,
   traceResultLines,
   traceStatusMeta,
+  type TraceStatusColor,
 } from "../subagents/render.ts";
 
 /** Hard budgets for workflow tool results, including their footer. */
@@ -26,6 +27,16 @@ export const WORKFLOWS_POINTER = "/workflows";
 const MAX_RESULT_CHARS = 16_384;
 const MAX_PHASES_EXPANDED = 6;
 const MAX_AGENTS_EXPANDED = 8;
+
+export function workflowStatusMeta(snapshot: Pick<WorkflowSnapshot, "status" | "taskOutcome">): { glyph: string; color: TraceStatusColor } {
+  return snapshot.status === "completed" && snapshot.taskOutcome === "unsuccessful"
+    ? { glyph: "!", color: "warning" }
+    : traceStatusMeta(snapshot.status);
+}
+
+function taskOutcomeLabel(snapshot: Pick<WorkflowSnapshot, "status" | "taskOutcome">): string {
+  return snapshot.status === "completed" ? ` · task ${snapshot.taskOutcome ?? "unspecified"}` : "";
+}
 
 export interface WorkflowCardOptions {
   expanded: boolean;
@@ -150,10 +161,10 @@ export function buildWorkflowCardLines(
   options: WorkflowCardOptions,
 ): string[] {
   const budget = options.expanded ? MAX_EXPANDED_LINES : MAX_COLLAPSED_LINES;
-  const status = traceStatusMeta(snapshot.status, options.now);
+  const status = workflowStatusMeta(snapshot);
   const mode = snapshot.background ? "background" : "foreground";
   const lines: string[] = [
-    `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(snapshot.name) || "Workflow"))} ${theme.fg("dim", shortId(sanitizeText(snapshot.runId)))} ${theme.fg("dim", `· ${snapshot.status} · ${mode} · ${formatElapsed(snapshot, options.now)}`)}`,
+    `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(snapshot.name) || "Workflow"))} ${theme.fg("dim", shortId(sanitizeText(snapshot.runId)))} ${theme.fg(status.color, `· ${snapshot.status}${taskOutcomeLabel(snapshot)}`)} ${theme.fg("dim", `· ${mode} · ${formatElapsed(snapshot, options.now)}`)}`,
   ];
 
   const description = sanitizeInline(snapshot.description);

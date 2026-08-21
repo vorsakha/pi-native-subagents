@@ -55,6 +55,9 @@ test("renderer sanitizes output and enforces collapsed/expanded line budgets", (
   assert.ok(renderJobCard(job(), theme, { expanded: false, now: 5_000 }).render(48).some((line) => line.includes("effort adaptive")), "adaptive effort survives bounded-width rendering");
   const independentLines = buildJobCardLines(job({ independent: true }), theme, { expanded: false, now: 5_000 });
   assert.ok(independentLines.some((line) => line.includes("independent")), "cross-provider independence is visible in the main thread card");
+  assert.ok(buildJobCardLines(job(), theme, { expanded: true, now: 5_000 }).some((line) => line.includes("Budget") && line.includes("open")));
+  assert.ok(buildJobCardLines(job({ budget: { maxTokens: 5 }, usage: usage({ input: 5 }) }), theme, { expanded: true, now: 5_000 })
+    .some((line) => line.includes("tokens 5/5 reached")));
 
   const outcomeLines = buildJobCardLines(job({
     status: "completed",

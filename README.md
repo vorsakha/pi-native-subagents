@@ -51,6 +51,7 @@ export default async function () {
 ```text
 /subagent [--harness pi|claude|codex] [--model ID] [--effort LEVEL]
           [--access readOnly|full] [--cwd DIR] [--profile NAME]
+          [--max-tokens N] [--max-cost USD] [--max-turns N]
           [--independent] [--independent-of JOB] <task>
 /subagents [status|profiles|providers|capabilities|pi|claude|codex]
 /subagents-config [pi|claude|codex]
@@ -71,10 +72,13 @@ export default async function () {
 | `independent` | Forces a different native provider from the parent. |
 | `independentOf` | Forces a different provider from an existing producer job. |
 | `profile` | Applied only when named explicitly; may impose access/harness ceilings. |
+| `maxTokens`, `maxCost`, `maxTurns` | Optional cumulative spend boundaries. Omit them for an open spend budget. Reached limits block retained follow-ups after active work finishes. |
 
 Manage running jobs with `subagent_wait`, `subagent_check`, `subagent_send`, `subagent_cancel`, and `subagent_list`. Completed ordinary jobs keep their native session for follow-ups, bounded at 100 retained jobs.
 
 `workflow` takes exactly one source — inline `script`, saved `workflowName`, or a trusted project-local `scriptPath`. Inside a workflow the globals are `args`, `phase()`, `log()`, `agent()`, `parallel()`, and `pipeline()`. Await every `agent()` call before returning.
+
+Workflow spend budgets are also optional. Explicit token, cost, turn, and per-agent token limits stop later dispatches once observed usage reaches the boundary; they do not cancel active agents or change successful child results. A completed workflow reports its task outcome separately: `{ ok: true }` is successful, `{ ok: false }` is unsuccessful, and other results are unspecified.
 
 `subagent_capabilities` lists each harness's native tools, skills, commands, plugins, MCP servers, and hooks, filtered by `query`, `harness`, `kind`, `effect`, and `access`.
 

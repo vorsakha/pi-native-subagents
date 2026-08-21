@@ -14,6 +14,7 @@ import {
   type StartWorkflowRequest,
 } from "../../src/workflows/manager.ts";
 import type { WorkflowSnapshot } from "../../src/workflows/types.ts";
+import { workflowTaskOutcome } from "../../src/workflows/outcome.ts";
 import { openWorkflowsDashboard } from "./dashboard.ts";
 import { sanitizeInline, shortId } from "../subagents/render.ts";
 import { renderWorkflowCall, renderWorkflowCard, renderWorkflowFailure } from "./render.ts";
@@ -59,6 +60,7 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
   const result = serializedResult === undefined ? undefined : JSON.parse(JSON.stringify(serializedResult));
   return {
     ...structuredClone(snapshot),
+    taskOutcome: snapshot.taskOutcome ?? (snapshot.status === "completed" ? workflowTaskOutcome(snapshot.result) : undefined),
     result,
     agents: snapshot.agents.map((agent) => ({
       index: agent.index,
@@ -104,14 +106,20 @@ function failedCallText(snapshot: WorkflowSnapshot): string {
 }
 
 function resultText(snapshot: WorkflowSnapshot): string {
-  const heading = `Workflow ${snapshot.runId} ${snapshot.status}: ${snapshot.name}`;
+  const outcome = snapshot.taskOutcome ? ` · task ${snapshot.taskOutcome}` : "";
+  const heading = `Workflow ${snapshot.runId} ${snapshot.status}${outcome}: ${snapshot.name}`;
   const error = snapshot.error ? `\nError: ${sanitizeInline(snapshot.error)}` : "";
   let result = "";
   if (snapshot.result !== undefined) {
     try { result = JSON.stringify(serializeWorkflowValue(snapshot.result, { maxTotalBytes: MAX_RESULT_TEXT_BYTES - 512 }), null, 2); }
     catch { result = String(snapshot.result); }
   }
-  const body = `${heading}${error}${failedCallText(snapshot)}${result ? `\n\nResult:\n${result}` : ""}\nInspect private artifacts with /workflows.`;
+  const warnings = snapshot.warnings ?? [];
+  const reached = warnings.filter((warning) => warning.startsWith("Workflow budget ") && warning.includes(" limit reached"));
+  const advisory = warnings.filter((warning) => !reached.includes(warning)).slice(-3);
+  const shownWarnings = [...reached, ...advisory];
+  const warningText = shownWarnings.length ? `\nWarnings:\n${shownWarnings.map((warning) => `- ${sanitizeInline(warning)}`).join("\n")}` : "";
+  const body = `${heading}${error}${warningText}${failedCallText(snapshot)}${result ? `\n\nResult:\n${result}` : ""}\nInspect private artifacts with /workflows.`;
   const buffer = Buffer.from(body);
   if (buffer.byteLength <= MAX_RESULT_TEXT_BYTES) return body;
   return `${buffer.subarray(0, MAX_RESULT_TEXT_BYTES - 64).toString("utf8")}\n[workflow result truncated — inspect /workflows]`;
@@ -197,12 +205,14 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     const runs = manager?.list() ?? [];
     const active = runs.filter((run) => !workflowIsTerminal(run.status)).length;
     const failed = runs.filter((run) => run.status === "failed" || run.status === "aborted").length;
-    const completed = runs.filter((run) => run.status === "completed").length;
+    const successful = runs.filter((run) => run.status === "completed" && run.taskOutcome === "successful").length;
+    const unsuccessful = runs.filter((run) => run.status === "completed" && run.taskOutcome === "unsuccessful").length;
+    const completed = runs.filter((run) => run.status === "completed" && run.taskOutcome !== "successful" && run.taskOutcome !== "unsuccessful").length;
     const phase = snapshot?.currentPhase === null || snapshot?.currentPhase === undefined
       ? undefined
       : snapshot.phases[snapshot.currentPhase]?.name;
-    if (!active && !completed && !failed) ctx.ui.setStatus("native-workflows", undefined);
-    else ctx.ui.setStatus("native-workflows", `workflows${active ? ` ${active}↻` : ""}${completed ? ` ${completed}✓` : ""}${failed ? ` ${failed}×` : ""}${active === 1 && phase ? ` · ${phase}` : ""}`);
+    if (!active && !successful && !unsuccessful && !completed && !failed) ctx.ui.setStatus("native-workflows", undefined);
+    else ctx.ui.setStatus("native-workflows", `workflows${active ? ` ${active}↻` : ""}${successful ? ` ${successful}✓` : ""}${unsuccessful ? ` ${unsuccessful}!` : ""}${completed ? ` ${completed}○` : ""}${failed ? ` ${failed}×` : ""}${active === 1 && phase ? ` · ${phase}` : ""}`);
   };
 
   const deliverBackgroundResult = (snapshot: WorkflowSnapshot, runGeneration: number) => {

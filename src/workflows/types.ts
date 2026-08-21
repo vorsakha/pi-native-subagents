@@ -1,5 +1,6 @@
 import type { AccessMode, ContextSnapshot, EffortLevel, HarnessName, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
 import type { WorkflowWorktreeResult } from "./worktree.ts";
+import type { SpendBudget } from "../budget.ts";
 
 export type WorkflowStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
 
@@ -148,16 +149,16 @@ export interface WorkflowReplayCall {
 
 export type WorkflowApprovalMode = "auto" | "plan" | "onMutate";
 
-export interface WorkflowBudgetPolicy {
+export interface WorkflowBudgetPolicy extends SpendBudget {
   maxAgents?: number;
   maxConcurrency?: number;
   /** Aggregate fresh input plus output tokens. */
   maxTokens?: number;
   /** Fresh input plus output ceiling for any single agent. */
   maxTokensPerAgent?: number;
-  maxCost?: number;
-  maxTurns?: number;
 }
+
+export type WorkflowTaskOutcome = "successful" | "unsuccessful" | "unspecified";
 
 export interface WorkflowReplayState {
   sourceRunId: string;
@@ -172,6 +173,8 @@ export interface WorkflowSnapshot {
   description: string;
   background: boolean;
   status: WorkflowStatus;
+  /** Script result semantics, separate from sandbox lifecycle. */
+  taskOutcome?: WorkflowTaskOutcome;
   timestamps: WorkflowTimestamps;
   currentPhase: number | null;
   phases: WorkflowPhase[];

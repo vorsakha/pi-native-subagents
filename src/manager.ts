@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { compilePolicy } from "./policy.ts";
+import { assertSupportedSpendBudget, firstReachedSpendWarning, reachedSpendWarning, spendBudgetMetrics, validateSpendBudget, type SpendBudget, type SpendMetric } from "./budget.ts";
 import { emptyUsage, reduceJob } from "./reducer.ts";
-import type { Backend, BackendEvent, BackendRun, JobSnapshot, ProfileDefinition, SendBehavior, SpawnRequest } from "./types.ts";
+import type { Backend, BackendEvent, BackendRun, HarnessName, JobSnapshot, ProfileDefinition, ProviderFamily, SendBehavior, SpawnRequest } from "./types.ts";
 
 const GENERIC_SYSTEM_PROMPT = `You are an isolated, task-driven subagent. Work only on the supplied task and return a concise, evidence-based result. You do not have access to parent conversation context beyond the task. Before recommending structural changes, inspect applicable repository instructions, scripts, CI, and nearby conventions. Distinguish acceptance failures, convention violations, verification gaps, and optional improvements; do not prescribe an implementation mechanism that the acceptance wording does not require. Treat absent tests as a defect only when repository convention or concrete regression risk justifies it. Do not spawn subagents or workflows.`;
 
@@ -22,6 +23,14 @@ interface InternalJob {
   runWaiters?: Set<(run?: BackendRun) => void>;
   startupController?: AbortController;
   pendingRestart?: { message: string; behavior: SendBehavior };
+  reachedBudgetWarnings?: Set<SpendMetric>;
+  inFlight?: boolean;
+  lastSettledGeneration?: number;
+  generationWaiters?: Map<number, Set<() => void>>;
+  deferredStartupTerminal?: {
+    event: Extract<BackendEvent, { type: "completed" | "failed" | "cancelled" }>;
+    generation: number;
+  };
   /** Last observer-safe projection, used to reuse unchanged bounded collections on streaming events. */
   publishedSource?: JobSnapshot;
   publishedSnapshot?: JobSnapshot;
@@ -31,6 +40,7 @@ function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: J
   return {
     ...snapshot,
     usage: previous?.source.usage === snapshot.usage ? previous.value.usage : { ...snapshot.usage },
+    budget: snapshot.budget ? { ...snapshot.budget } : undefined,
     context: snapshot.context ? { ...snapshot.context } : undefined,
     tools: previous?.source.tools === snapshot.tools ? previous.value.tools : snapshot.tools.map((tool) => ({ ...tool })),
     transcript: previous?.source.transcript === snapshot.transcript
@@ -113,24 +123,11 @@ export class JobManager {
     }
     const profile = profileName ? this.#profiles.get(profileName) : undefined;
     if (profileName && !profile) throw new Error(`Unknown subagent profile: ${profileName}`);
-    const independenceTarget = independentOf ? this.#jobs.get(independentOf) : undefined;
-    const replayProvider = request.independentOfProvider;
-    if (replayProvider !== undefined && replayProvider !== "claude" && replayProvider !== "codex") {
-      throw new Error("independentOfProvider must identify native Claude or Codex");
-    }
-    if (replayProvider !== undefined && !independentOf) throw new Error("independentOfProvider requires independentOf");
-    if (independentOf && !independenceTarget && !replayProvider) throw new Error(`Unknown independence target job: ${independentOf}`);
-    const targetHarness = independenceTarget?.snapshot.harness;
-    if (targetHarness === "pi") {
-      throw new Error("independentOf requires a target job using the native Claude or Codex harness");
-    }
-    const retainedProvider = targetHarness === "claude" || targetHarness === "codex" ? targetHarness : undefined;
-    if (retainedProvider && replayProvider && retainedProvider !== replayProvider) {
-      throw new Error("independentOfProvider does not match the retained independence target");
-    }
-    const independentOfProvider = retainedProvider ?? replayProvider;
+    const independentOfProvider = this.#independenceProvider(request, independentOf);
     const compiled = compilePolicy(request, profile, independentOfProvider);
     if (!this.#backends.has(compiled.policy.harness)) throw new Error(`Harness is unavailable: ${compiled.policy.harness}`);
+    const budget = validateSpendBudget(request.budget, "Subagent budget");
+    assertSupportedSpendBudget(budget, compiled.policy.harness);
     // A recorded route is only evidence for the harness it was validated against.
     if (request.capabilityRoute && request.capabilityRoute.harness !== compiled.policy.harness) {
       throw new Error(`Capability route was validated for ${request.capabilityRoute.harness} but this job routes to ${compiled.policy.harness}`);
@@ -165,6 +162,7 @@ export class JobManager {
       output: "",
       truncated: false,
       usage: emptyUsage(),
+      budget,
       tools: [],
       transcript: [],
       liveThinking: "",
@@ -181,6 +179,20 @@ export class JobManager {
     this.#queue.push(id);
     this.#pump();
     return clone(snapshot);
+  }
+
+  /** Resolve the exact route JobManager would use without dispatching the request. */
+  resolveHarness(request: SpawnRequest): HarnessName {
+    const profileName = request.profile?.trim();
+    const profile = profileName ? this.#profiles.get(profileName) : undefined;
+    if (profileName && !profile) throw new Error(`Unknown subagent profile: ${profileName}`);
+    const independentOf = request.independentOf?.trim();
+    const independentOfProvider = this.#independenceProvider(request, independentOf);
+    return compilePolicy(request, profile, independentOfProvider).policy.harness;
+  }
+
+  assertSpendBudgetSupported(request: SpawnRequest, budget: SpendBudget | undefined): void {
+    assertSupportedSpendBudget(budget, this.resolveHarness(request));
   }
 
   check(id: string): JobSnapshot {
@@ -211,7 +223,13 @@ export class JobManager {
     if (job.snapshot.status === "queued" && job.pendingRestart) {
       throw new Error(`Cannot send to ${id}: a follow-up is waiting for an available slot`);
     }
+    if (behavior === "followUp" && !isTerminal(job.snapshot.status)) {
+      await this.wait(id);
+      return this.send(id, message, "followUp");
+    }
     if (job.snapshot.status === "completed") {
+      const boundary = firstReachedSpendWarning(job.snapshot.budget, job.snapshot.usage, job.snapshot.harness, "Subagent budget");
+      if (boundary) throw new Error(`Cannot reuse ${id}: ${boundary}`);
       if (!job.run) throw new Error(`Cannot reuse ${id}: native session is no longer available`);
       if (job.pendingRestart) throw new Error(`Cannot reuse ${id}: a follow-up is already queued`);
       job.pendingRestart = { message, behavior: "followUp" };
@@ -249,8 +267,9 @@ export class JobManager {
   }
 
   async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<JobSnapshot> {
-    const current = this.check(id);
-    if (isTerminal(current.status)) return current;
+    const job = this.#jobs.get(id);
+    if (!job) throw new Error(`Unknown job: ${id}`);
+    if (isTerminal(job.snapshot.status) && !job.deferredStartupTerminal) return clone(job.snapshot);
     return new Promise<JobSnapshot>((resolve, reject) => {
       let timer: NodeJS.Timeout | undefined;
       const finish = () => {
@@ -377,11 +396,22 @@ export class JobManager {
       // idle slot when no direct job is waiting.
       const directIndex = this.#queue.findIndex((id) => {
         const candidate = this.#jobs.get(id);
-        return candidate?.snapshot.status === "queued" && !candidate.snapshot.workflow;
+        return candidate?.snapshot.status === "queued" && !candidate.inFlight && !candidate.snapshot.workflow;
       });
-      const [id] = this.#queue.splice(directIndex >= 0 ? directIndex : 0, 1);
+      const nextIndex = directIndex >= 0 ? directIndex : this.#queue.findIndex((id) => {
+        const candidate = this.#jobs.get(id);
+        return candidate?.snapshot.status === "queued" && !candidate.inFlight;
+      });
+      if (nextIndex < 0) break;
+      const [id] = this.#queue.splice(nextIndex, 1);
       const job = id ? this.#jobs.get(id) : undefined;
-      if (!job || job.snapshot.status !== "queued") continue;
+      if (!job || job.snapshot.status !== "queued" || job.inFlight) continue;
+      const dispatchError = job.request.dispatchGate?.();
+      if (dispatchError) {
+        this.#emit(job, { type: "failed", error: dispatchError });
+        continue;
+      }
+      job.inFlight = true;
       this.#active++;
       const launch = job.run && job.pendingRestart ? this.#restart(job) : this.#launch(job);
       this.#launches.add(launch);
@@ -390,6 +420,7 @@ export class JobManager {
   }
 
   async #launch(job: InternalJob): Promise<void> {
+    const generation = job.snapshot.generation;
     const backend = this.#backends.get(job.policy.harness)!;
     const startupController = new AbortController();
     job.startupController = startupController;
@@ -432,15 +463,20 @@ export class JobManager {
       job.run = startedRun;
       job.startupController = undefined;
       this.#resolveRunWaiters(job, job.run);
+      const deferredTerminal = job.deferredStartupTerminal;
+      job.deferredStartupTerminal = undefined;
+      if (deferredTerminal) this.#publishSettlement(job, deferredTerminal.event, deferredTerminal.generation);
       if (job.cancelRequested && isTerminal(job.snapshot.status)) {
         await (job.run.forceClose?.() ?? job.run.close());
         return;
       }
       if (job.cancelRequested) await this.#cancelRun(job, job.run, job.cancelRequested);
       await job.run.completed;
-      if (!isTerminal(job.snapshot.status) && !job.cancelRequested) this.#emit(job, { type: "completed" });
+      if (job.snapshot.generation === generation && !isTerminal(job.snapshot.status) && !job.cancelRequested) {
+        this.#emit(job, { type: "completed" });
+      }
     } catch (error) {
-      if (!isTerminal(job.snapshot.status)) {
+      if (job.snapshot.generation === generation && !isTerminal(job.snapshot.status)) {
         const startupTimedOut = startupController.signal.reason instanceof OperationDeadlineError;
         if (job.cancelRequested || startupController.signal.aborted && !startupTimedOut) {
           this.#emit(job, { type: "cancelled", reason: job.cancelRequested ?? "Harness startup aborted" });
@@ -448,23 +484,28 @@ export class JobManager {
       }
     } finally {
       job.startupController = undefined;
+      job.deferredStartupTerminal = undefined;
       this.#resolveRunWaiters(job);
       const run = job.run;
-      if (job.snapshot.status !== "completed" || !run || job.cancelRequested || job.snapshot.workflow) {
+      const advanced = job.snapshot.generation !== generation;
+      if (!advanced && (job.snapshot.status !== "completed" || !run || job.cancelRequested || job.snapshot.workflow)) {
         if (run) await this.#serialize(job, () => run.close()).catch(() => undefined);
         job.run = undefined;
       }
+      job.inFlight = false;
       this.#active--;
       this.#pump();
     }
   }
 
   async #restart(job: InternalJob): Promise<void> {
+    const generation = job.snapshot.generation;
     const run = job.run;
     const pending = job.pendingRestart;
     job.pendingRestart = undefined;
     if (!run || !pending) {
       this.#emit(job, { type: "failed", error: "Native session is no longer available" });
+      job.inFlight = false;
       this.#active--;
       this.#pump();
       return;
@@ -472,26 +513,30 @@ export class JobManager {
     try {
       this.#emit(job, { type: "started" });
       await this.#serialize(job, () => run.send(pending.message, pending.behavior));
-      await this.#waitForTerminal(job);
+      await this.#waitForGenerationTerminal(job, generation);
     } catch (error) {
-      if (!isTerminal(job.snapshot.status)) this.#emit(job, { type: "failed", error: error instanceof Error ? error.message : String(error) });
+      if (job.snapshot.generation === generation && !isTerminal(job.snapshot.status)) {
+        this.#emit(job, { type: "failed", error: error instanceof Error ? error.message : String(error) });
+      }
     } finally {
-      if (job.snapshot.status !== "completed" || job.run !== run || job.snapshot.workflow) {
+      const advanced = job.snapshot.generation !== generation;
+      if (!advanced && (job.snapshot.status !== "completed" || job.run !== run || job.snapshot.workflow)) {
         await this.#serialize(job, () => run.close()).catch(() => undefined);
         if (job.run === run) job.run = undefined;
       }
+      job.inFlight = false;
       this.#active--;
       this.#pump();
     }
   }
 
-  #waitForTerminal(job: InternalJob): Promise<void> {
-    if (isTerminal(job.snapshot.status)) return Promise.resolve();
+  #waitForGenerationTerminal(job: InternalJob, generation: number): Promise<void> {
+    if ((job.lastSettledGeneration ?? -1) >= generation) return Promise.resolve();
     return new Promise((resolve) => {
-      const waiter = () => resolve();
-      const set = this.#waiters.get(job.snapshot.id) ?? new Set<() => void>();
-      set.add(waiter);
-      this.#waiters.set(job.snapshot.id, set);
+      const waiters = job.generationWaiters ??= new Map();
+      const set = waiters.get(generation) ?? new Set<() => void>();
+      set.add(resolve);
+      waiters.set(generation, set);
     });
   }
 
@@ -501,7 +546,43 @@ export class JobManager {
       job.deferredCancellation = event;
       return;
     }
+    if (job.startupController && !job.run && (event.type === "completed" || event.type === "failed" || event.type === "cancelled")) {
+      const generation = job.snapshot.generation;
+      job.snapshot = reduceJob(job.snapshot, event);
+      job.deferredStartupTerminal = { event, generation };
+      return;
+    }
     this.#emit(job, event);
+    if (event.type === "usage") this.#recordBudgetWarnings(job);
+  }
+
+  #recordBudgetWarnings(job: InternalJob): void {
+    const reached = job.reachedBudgetWarnings ??= new Set();
+    for (const metric of spendBudgetMetrics(job.snapshot.budget, job.snapshot.usage, job.snapshot.harness)) {
+      if (!metric.reached || !metric.supported || reached.has(metric.key)) continue;
+      const warning = reachedSpendWarning(metric, "Subagent budget");
+      if (!warning) continue;
+      reached.add(metric.key);
+      job.snapshot = { ...job.snapshot, warnings: [...(job.snapshot.warnings ?? []), warning].slice(-8) };
+      this.#publish(job, { type: "degraded", source: "budget", detail: warning });
+    }
+  }
+
+  #independenceProvider(request: SpawnRequest, independentOf: string | undefined): ProviderFamily | undefined {
+    const independenceTarget = independentOf ? this.#jobs.get(independentOf) : undefined;
+    const replayProvider = request.independentOfProvider;
+    if (replayProvider !== undefined && replayProvider !== "claude" && replayProvider !== "codex") {
+      throw new Error("independentOfProvider must identify native Claude or Codex");
+    }
+    if (replayProvider !== undefined && !independentOf) throw new Error("independentOfProvider requires independentOf");
+    if (independentOf && !independenceTarget && !replayProvider) throw new Error(`Unknown independence target job: ${independentOf}`);
+    const targetHarness = independenceTarget?.snapshot.harness;
+    if (targetHarness === "pi") throw new Error("independentOf requires a target job using the native Claude or Codex harness");
+    const retainedProvider = targetHarness === "claude" || targetHarness === "codex" ? targetHarness : undefined;
+    if (retainedProvider && replayProvider && retainedProvider !== replayProvider) {
+      throw new Error("independentOfProvider does not match the retained independence target");
+    }
+    return retainedProvider ?? replayProvider;
   }
 
   async #cancelRun(job: InternalJob, run: BackendRun, reason: string): Promise<void> {
@@ -530,13 +611,22 @@ export class JobManager {
 
   #emit(job: InternalJob, event: BackendEvent): void {
     if (isTerminal(job.snapshot.status)) return;
+    const generation = job.snapshot.generation;
     job.snapshot = reduceJob(job.snapshot, event);
+    const settled = isTerminal(job.snapshot.status);
+    if (settled) this.#publishSettlement(job, event, generation);
+    else this.#publish(job, event);
+  }
+
+  #publishSettlement(job: InternalJob, event: BackendEvent, generation: number): void {
     this.#publish(job, event);
-    if (isTerminal(job.snapshot.status)) {
-      this.#resolveRunWaiters(job);
-      for (const waiter of this.#waiters.get(job.snapshot.id) ?? []) waiter();
-      this.#waiters.delete(job.snapshot.id);
-    }
+    job.lastSettledGeneration = Math.max(job.lastSettledGeneration ?? -1, generation);
+    for (const waiter of job.generationWaiters?.get(generation) ?? []) waiter();
+    job.generationWaiters?.delete(generation);
+    if (!isTerminal(job.snapshot.status)) return;
+    this.#resolveRunWaiters(job);
+    for (const waiter of this.#waiters.get(job.snapshot.id) ?? []) waiter();
+    this.#waiters.delete(job.snapshot.id);
   }
 
   #publish(job: InternalJob, event: BackendEvent): void {

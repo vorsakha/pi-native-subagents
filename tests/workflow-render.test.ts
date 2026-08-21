@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import { theme } from "./helpers.ts";
 import {
   MAX_COLLAPSED_LINES,
@@ -105,4 +106,27 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
   assert.ok(lines.at(-1)?.includes("/workflows"));
   assert.ok(lines.every((line) => !line.includes("updating")), "active state is conveyed by the blink, not redundant copy");
   assert.ok(lines.every((line) => !CONTROL_CHARS.test(line)));
+});
+
+test("workflow cards show lifecycle, task outcome, and open or unsupported budget state", () => {
+  const completed = workflow({
+    status: "completed",
+    taskOutcome: "unsuccessful",
+    result: { ok: false },
+    timestamps: { createdAt: 1_000, updatedAt: 3_000, startedAt: 2_000, endedAt: 3_000 },
+  });
+  const open = buildWorkflowCardLines(completed, theme, { expanded: true, now: 4_000 });
+  assert.ok(open.some((line) => line.includes("completed") && line.includes("task unsuccessful")));
+  assert.ok(open.some((line) => line.includes("!")));
+  assert.ok(open.some((line) => line.includes("Budget · open")));
+
+  const coloredTheme = { ...theme, fg: (color: string, text: string) => `[${color}]${text}` } as unknown as Theme;
+  const colored = buildWorkflowCardLines(completed, coloredTheme, { expanded: true, now: 4_000 });
+  assert.ok(colored.some((line) => line.includes("[warning]!") && line.includes("[warning]· completed · task unsuccessful")));
+
+  const active = buildWorkflowCardLines(workflow({ taskOutcome: undefined }), theme, { expanded: true, now: 4_000 });
+  assert.ok(active.every((line) => !line.includes("task unspecified")), "active task outcome stays pending by omission");
+
+  const unsupported = buildWorkflowCardLines(workflow({ budget: { maxCost: 1 } }), theme, { expanded: true, now: 4_000 });
+  assert.ok(unsupported.some((line) => line.includes("cost unsupported")));
 });

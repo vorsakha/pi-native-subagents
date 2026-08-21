@@ -7,6 +7,7 @@ import {
   checkpointWorkflow,
   createWorkflowArtifacts,
   loadWorkflowSummaries,
+  writeWorkflowReport,
   writeWorkflowResult,
 } from "../src/workflows/artifacts.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
@@ -173,4 +174,44 @@ test("no-resume loading aborts paused future checkpoints plus queued agents and 
   assert.equal(loaded[0]?.status, "aborted");
   assert.equal(loaded[0]?.phases[0]?.status, "aborted");
   assert.equal(loaded[0]?.agents[0]?.state, "aborted");
+});
+
+test("loads old completed snapshots and derives task outcome from the authoritative result artifact", async () => {
+  const { root } = await fixture();
+  const created = await createWorkflowArtifacts(root, {
+    script: "export default async () => ({ ok: false });\n",
+    args: {},
+    snapshot: snapshot("legacy-outcome"),
+  });
+  const legacy: WorkflowSnapshot = {
+    ...created,
+    status: "completed",
+    result: { truncated: true, preview: "top-level ok field omitted from bounded summary" },
+    timestamps: { ...created.timestamps, endedAt: Date.now() },
+  };
+  delete legacy.taskOutcome;
+  await checkpointWorkflow(root, legacy);
+  await writeWorkflowResult(root, created.runId, { ok: false, detail: "authoritative" });
+
+  const [loaded] = await loadWorkflowSummaries(root, { sessionId: "legacy-outcome" });
+  assert.equal(loaded?.status, "completed");
+  assert.equal(loaded?.taskOutcome, "unsuccessful");
+});
+
+test("durable reports include task outcome only for completed workflows", async () => {
+  const { root } = await fixture();
+  const created = await createWorkflowArtifacts(root, {
+    script: "export default async () => ({ ok: false });\n",
+    args: {},
+    snapshot: snapshot("report-outcome"),
+  });
+
+  await writeWorkflowReport(root, { ...created, status: "completed", taskOutcome: "unsuccessful", result: { ok: false } });
+  assert.match(await readFile(join(created.artifactDir, "report.md"), "utf8"), /Task outcome: \*\*unsuccessful\*\*/);
+
+  for (const status of ["failed", "aborted"] as const) {
+    await writeWorkflowReport(root, { ...created, status, taskOutcome: "unsuccessful", result: { ok: false } });
+    const report = await readFile(join(created.artifactDir, "report.md"), "utf8");
+    assert.doesNotMatch(report, /Task outcome:/, `${status} report omits task outcome`);
+  }
 });

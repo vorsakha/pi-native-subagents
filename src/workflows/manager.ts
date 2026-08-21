@@ -7,7 +7,8 @@ import type { CapabilityRouter } from "../capability-service.ts";
 import type { JobManager } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
 import { normalizeModel } from "../policy.ts";
-import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, Usage } from "../types.ts";
+import { reachedSpendWarning, spendBudgetMetrics, validateSpendBudget } from "../budget.ts";
+import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SpawnRequest, Usage } from "../types.ts";
 import {
   appendWorkflowJournal,
   checkpointWorkflow,
@@ -19,6 +20,7 @@ import {
 } from "./artifacts.ts";
 import { replayableJournalCalls, workflowCallFingerprint, workflowDefinitionFingerprint } from "./journal.ts";
 import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
+import { workflowTaskOutcome } from "./outcome.ts";
 import { finishWorkflowWorktree, prepareWorkflowWorktree, type WorkflowWorktreeHandle } from "./worktree.ts";
 import type {
   WorkflowAgentRecord,
@@ -92,6 +94,7 @@ interface RunEntry {
   approvalPromise?: Promise<boolean>;
   activeDispatches: number;
   dispatchWaiters: Set<() => void>;
+  reachedBudgetWarnings: Set<string>;
 }
 
 function workflowUsage(usage?: Partial<Usage>): WorkflowUsage {
@@ -224,6 +227,7 @@ export class WorkflowManager {
           mutationApproved: false,
           activeDispatches: 0,
           dispatchWaiters: new Set(),
+          reachedBudgetWarnings: new Set(),
         });
       }
     })();
@@ -347,6 +351,7 @@ export class WorkflowManager {
       mutationApproved: approval === "auto",
       activeDispatches: 0,
       dispatchWaiters: new Set(),
+      reachedBudgetWarnings: new Set(),
     };
     this.#runs.set(snapshot.runId, entry);
     entry.completion = this.#execute(entry, request);
@@ -471,6 +476,7 @@ export class WorkflowManager {
       this.#applyMeta(entry, sandbox.meta);
       entry.snapshot.result = sandbox.result;
       entry.snapshot.status = "completed";
+      entry.snapshot.taskOutcome = workflowTaskOutcome(sandbox.result);
       this.#finishPhases(entry, "completed");
       await writeWorkflowResult(this.#artifactRoot, entry.snapshot.runId, sandbox.result);
     } catch (error) {
@@ -572,17 +578,6 @@ export class WorkflowManager {
       throw error;
     }
     const record = entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
-    const budgetError = this.#budgetViolation(entry);
-    if (budgetError) {
-      result = { ...result, ok: false, error: budgetError };
-      if (record) {
-        record.state = "failed";
-        record.error = budgetError;
-        record.timestamps.updatedAt = Date.now();
-        record.timestamps.endedAt ??= record.timestamps.updatedAt;
-      }
-      entry.snapshot.error = budgetError;
-    }
     await this.#appendJournal(entry, {
       callIndex,
       fingerprint,
@@ -593,7 +588,6 @@ export class WorkflowManager {
       route: journalRoute(record),
       replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
     });
-    if (budgetError) entry.controller.abort(new Error(budgetError));
     return result;
   }
 
@@ -748,7 +742,7 @@ export class WorkflowManager {
         preference: request.defaultHarness ? [request.defaultHarness] : undefined,
         signal,
       });
-      job = this.#jobs.spawn({
+      const spawnRequest = {
         name,
         task,
         cwd: agentCwd,
@@ -771,7 +765,10 @@ export class WorkflowManager {
           label: record.name,
           phase: entry.snapshot.phases[phase]?.name,
         },
-      });
+        dispatchGate: () => this.#budgetPreflight(entry),
+      } satisfies SpawnRequest;
+      this.#jobs.assertSpendBudgetSupported(spawnRequest, entry.snapshot.budget);
+      job = this.#jobs.spawn(spawnRequest);
     } catch (error) {
       await finishIsolation().catch(() => undefined);
       record.state = "failed";
@@ -943,19 +940,8 @@ export class WorkflowManager {
     if (budget.maxTokens !== undefined && tokens >= budget.maxTokens) return `Workflow token budget exhausted (${tokens}/${budget.maxTokens})`;
     if (budget.maxCost !== undefined && usage.cost >= budget.maxCost) return `Workflow cost budget exhausted ($${usage.cost.toFixed(4)}/$${budget.maxCost})`;
     if (budget.maxTurns !== undefined && usage.turns >= budget.maxTurns) return `Workflow turn budget exhausted (${usage.turns}/${budget.maxTurns})`;
-    return undefined;
-  }
-
-  #budgetViolation(entry: RunEntry): string | undefined {
-    const budget = entry.snapshot.budget;
-    if (!budget) return undefined;
-    const usage = aggregateWorkflowUsage(entry.snapshot);
-    const tokens = usage.input + usage.output;
-    if (budget.maxTokens !== undefined && tokens > budget.maxTokens) return `Workflow token budget exceeded (${tokens}/${budget.maxTokens})`;
-    const agent = budget.maxTokensPerAgent === undefined ? undefined : entry.snapshot.agents.find((candidate) => candidate.usage.input + candidate.usage.output > budget.maxTokensPerAgent!);
-    if (agent) return `Workflow per-agent token budget exceeded for ${agent.name} (${agent.usage.input + agent.usage.output}/${budget.maxTokensPerAgent})`;
-    if (budget.maxCost !== undefined && usage.cost > budget.maxCost) return `Workflow cost budget exceeded ($${usage.cost.toFixed(4)}/$${budget.maxCost})`;
-    if (budget.maxTurns !== undefined && usage.turns > budget.maxTurns) return `Workflow turn budget exceeded (${usage.turns}/${budget.maxTurns})`;
+    const agent = budget.maxTokensPerAgent === undefined ? undefined : entry.snapshot.agents.find((candidate) => candidate.usage.input + candidate.usage.output >= budget.maxTokensPerAgent!);
+    if (agent) return `Workflow per-agent token budget exhausted for ${agent.name} (${agent.usage.input + agent.usage.output}/${budget.maxTokensPerAgent})`;
     return undefined;
   }
 
@@ -1094,14 +1080,33 @@ export class WorkflowManager {
       agent.instructionShaped = looksInstructionShaped(job.output);
     }
     this.#touch(entry);
-    if (event.type === "usage" || event.type === "context") {
-      const violation = this.#budgetViolation(entry);
-      if (violation && !entry.controller.signal.aborted) {
-        entry.snapshot.error = violation;
-        entry.controller.abort(new Error(violation));
-        void this.#cancelMemberJobs(entry, violation);
+    this.#recordBudgetWarnings(entry);
+  }
+
+  #recordBudgetWarnings(entry: RunEntry): void {
+    const usage = aggregateWorkflowUsage(entry.snapshot);
+    let changed = false;
+    const harnesses = new Set(entry.snapshot.agents.map((agent) => agent.harness).filter((value): value is HarnessName => value === "pi" || value === "claude" || value === "codex"));
+    for (const harness of harnesses) {
+      for (const metric of spendBudgetMetrics(entry.snapshot.budget, usage, harness)) {
+        const key = `aggregate:${metric.key}`;
+        if (!metric.reached || !metric.supported || entry.reachedBudgetWarnings.has(key)) continue;
+        const warning = reachedSpendWarning(metric, "Workflow budget");
+        if (!warning) continue;
+        entry.reachedBudgetWarnings.add(key);
+        entry.snapshot.warnings = [...(entry.snapshot.warnings ?? []), warning].slice(-16);
+        changed = true;
       }
     }
+    const limit = entry.snapshot.budget?.maxTokensPerAgent;
+    const agent = limit === undefined ? undefined : entry.snapshot.agents.find((candidate) => candidate.usage.input + candidate.usage.output >= limit);
+    if (agent && !entry.reachedBudgetWarnings.has("agentTokens")) {
+      const warning = `Workflow budget agent tokens limit reached for ${agent.name} (${agent.usage.input + agent.usage.output}/${limit}); later dispatches are blocked`;
+      entry.reachedBudgetWarnings.add("agentTokens");
+      entry.snapshot.warnings = [...(entry.snapshot.warnings ?? []), warning].slice(-16);
+      changed = true;
+    }
+    if (changed) this.#touch(entry);
   }
 
   #ensurePhase(entry: RunEntry, rawTitle: string): number {
@@ -1255,19 +1260,16 @@ function normalizeWorkflowBudget(value: WorkflowBudgetPolicy | undefined): Workf
     if (typeof item !== "number" || !Number.isSafeInteger(item) || item < 1 || item > maximum) throw new Error(`Workflow budget ${name} must be an integer from 1 to ${maximum}`);
     return item;
   };
-  const maxCost = value.maxCost;
-  if (maxCost !== undefined && (typeof maxCost !== "number" || !Number.isFinite(maxCost) || maxCost <= 0 || maxCost > 10_000)) {
-    throw new Error("Workflow budget maxCost must be a positive number no greater than 10000");
-  }
-  return {
+  const spend = validateSpendBudget(value, "Workflow budget");
+  const normalized = {
     maxAgents: integer("maxAgents", 32),
     maxConcurrency: integer("maxConcurrency", 4),
-    maxTokens: integer("maxTokens", 100_000_000),
     maxTokensPerAgent: integer("maxTokensPerAgent", 100_000_000),
-    maxCost,
-    maxTurns: integer("maxTurns", 10_000),
+    ...spend,
   };
+  return Object.values(normalized).some((item) => item !== undefined) ? normalized : undefined;
 }
+
 
 function workflowBudgetWarnings(budget: WorkflowBudgetPolicy | undefined): string[] {
   if (!budget) return [];

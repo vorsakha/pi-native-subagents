@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import { type KeybindingsManager, visibleWidth } from "@earendil-works/pi-tui";
 import { theme } from "./helpers.ts";
 import {
@@ -55,6 +56,7 @@ interface HarnessOptions {
   focusRunId?: string;
   cancelBinding?: string;
   renderMarkdown?: (text: string, width: number) => string[];
+  theme?: Theme;
 }
 
 function harness(
@@ -115,7 +117,7 @@ function harness(
   } as never;
   const overlay = createWorkflowsDashboardOverlay(
     tui,
-    theme,
+    options.theme ?? theme,
     {
       matches: (data: string, binding: string) => binding === "tui.select.cancel" && data === (options.cancelBinding ?? "\u0003"),
     } as unknown as KeybindingsManager,
@@ -173,6 +175,18 @@ test("workflow dashboard uses adaptive geometry and exact fullscreen or regular 
   t.after(() => short.dispose());
   assertPanel(short.render(120), 120, 8);
   assert.equal(dashboardLayout(120, 8).kind, "narrow", "short screens use one predictable pane");
+});
+
+test("workflow dashboard marks completed unsuccessful runs with warning color", (t) => {
+  const run = workflow("unsuccessful", "completed");
+  run.taskOutcome = "unsuccessful";
+  run.result = { ok: false };
+  const coloredTheme = { ...theme, fg: (color: string, text: string) => `[${color}]${text}` } as unknown as Theme;
+  const state = harness([run], 30, () => {}, { theme: coloredTheme });
+  t.after(() => state.overlay.dispose());
+  const rendered = state.overlay.render(200).join("\n");
+  assert.match(rendered, /\[warning[^\n]*! completed/);
+  assert.match(rendered, /! completed · task unsuccessful/);
 });
 
 test("minimum-width live run and agent cancellation keep Unicode controls visible through confirmation", (t) => {

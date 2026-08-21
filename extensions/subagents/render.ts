@@ -2,6 +2,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { isTerminal } from "../../src/manager.ts";
+import { formatSpendBudget } from "../../src/budget.ts";
 import type { PeerSessionSummary } from "../../src/session-peers.ts";
 import type { ContextSnapshot, JobSnapshot, JobStatus, SendBehavior, ToolTrace, Usage } from "../../src/types.ts";
 
@@ -274,6 +275,7 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
 
   const usage = formatUsage(job.usage);
   if (usage) lines.push(sectionLine(theme, "Usage", usage, "dim"));
+  lines.push(sectionLine(theme, "Budget", formatSpendBudget(job.budget, job.usage, job.harness), "dim"));
   const context = formatContext(job.context);
   if (context) lines.push(sectionLine(theme, "Context", context, "dim"));
 

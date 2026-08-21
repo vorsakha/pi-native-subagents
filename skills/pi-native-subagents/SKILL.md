@@ -34,6 +34,9 @@ Usage rules:
 - Use `independentOf: "<producer-job-id>"` when a reviewer must differ from the provider that produced the reviewed work. The target must be an existing job.
 - Omit `profile` unless the human explicitly names one. Profiles may impose access, harness, or routing ceilings.
 - At most four jobs run concurrently. Prefer direct spawning over manually recreating workflow scheduling.
+- Direct `maxTokens`, `maxCost`, and `maxTurns` are optional. Omit all three for an open spend budget. They apply cumulatively to the retained native session and every follow-up, not only the current turn.
+- Reaching a direct spend boundary never cancels the active turn or changes its result. The active turn finishes, usage may overshoot, and later retained follow-ups are rejected. A follow-up submitted during an active generation waits for settlement and a cumulative-budget recheck; steering the active generation remains immediate.
+- Fresh input plus output consumes `maxTokens`; cache reads do not. Pi and Claude report token, turn, and cost metrics. Codex reports tokens and turns but not cost, so a Codex route with `maxCost` is rejected before dispatch. Never infer a spend limit from a profile, route, model, or environment.
 
 Example:
 
@@ -151,6 +154,11 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 - `approval: "plan"` is for read-only planning. Use `approval: "onMutate"` when a workflow may mutate and host approval is required.
 - Mutating agents sharing one checkout are serialized. Use `isolation: "worktree"` for explicit clean-worktree concurrency and preserve the resulting patch metadata.
 - `maxAgents` and `maxConcurrency` limit work shape. `maxTokens` limits aggregate fresh input plus output; cached reads remain visible but do not consume that budget. `maxTokensPerAgent` applies the same ceiling to one child. `maxCost` and `maxTurns` remain aggregate, and `maxTurns` is not a per-agent allowance. Native context occupancy is displayed separately when exposed by the harness.
+- Workflow budgets are optional. An omitted or empty budget leaves spend open while the hard ceilings of 32 calls, four workers, global concurrency four, watchdogs, provider/context limits, bounded persistence, cancellation, and shutdown remain in force.
+- Spend limits are soft dispatch boundaries. The runtime warns once per reached metric, lets already-running calls finish, accepts asynchronous overshoot, preserves natural child success, and blocks only later fresh dispatches. Workflow-owned jobs recheck the boundary when a global JobManager slot opens, so queued children cannot slip through after another child settles. A replayable completed journal call is replayed before fresh-dispatch budget checks. `maxTokensPerAgent` follows the same rule.
+- Use `>=` semantics: observed usage at the exact limit counts as reached. Workflow aggregate usage is cumulative across children; replayed calls do not spend again.
+- `maxCost` requires every selected fresh route to report cost. Pi and Claude do; Codex does not. The runtime validates the final live route, including the provider opposite an `independentOf` producer, before starting its child instead of comparing the limit with a synthetic zero.
+- Workflow lifecycle and task outcome are separate. Sandbox completion sets lifecycle `completed`. A top-level plain object with `ok: true` has outcome `successful`; `ok: false` has outcome `unsuccessful`; every other result is `unspecified`. Script/runtime errors still fail, while cancellation, shutdown, and stale restoration abort. Completed child journal calls remain replayable even when the containing workflow outcome is unsuccessful.
 
 ## Common failures and corrections
 
@@ -158,8 +166,8 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 - `Cannot destructure ... of null`: use the default async function with the injected globals; do not assume a callback context object.
 - `parallel tasks must be functions`: wrap every agent call in `() => agent(...)`.
 - `Workflow returned before N agent call(s) settled`: await all calls, including calls started in loops or branches.
-- `Workflow token budget exceeded`: narrow the offending lane before raising the aggregate fresh-input/output allowance; use `maxTokensPerAgent` to contain one runaway child.
-- `Workflow turn budget exceeded`: the budget covers aggregate child turns. Increase it with realistic orchestration overhead, or use direct `subagent_spawn` for a small fan-out.
+- `Workflow ... budget exhausted`: active calls have already finished. Narrow the offending lane, raise the explicit boundary, or replay with a compatible larger budget so completed calls can be reused.
+- `Budget maxCost is unsupported`: remove the cost boundary or select Pi/Claude. Do not treat Codex's absent cost metric as zero.
 - `independent` rejected for the same provider: independence means provider diversity, not model escalation. Omit it for same-provider escalation or route to the opposite provider.
 - Requirement rejected: rediscover capabilities with `subagent_capabilities`, use the returned ID, and keep the access ceiling consistent.
 - A harness rejected for login or readiness: check `/subagents providers` to see which provider is authenticated and ready before retrying, and switch routes rather than guessing at the account state.

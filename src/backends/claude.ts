@@ -330,7 +330,6 @@ export class ClaudeBackend implements Backend {
         extraArgs: { "safe-mode": null },
         persistSession: true,
         includePartialMessages: true,
-        maxTurns: 80,
       },
     });
     watchdog.arm();

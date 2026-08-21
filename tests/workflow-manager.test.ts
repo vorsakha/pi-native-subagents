@@ -326,7 +326,7 @@ test("workflow budgets bound calls, concurrency, aggregate and per-agent tokens,
         const second = await agent("budget second", { access: "readOnly" });
         return [first, second];
       }
-    `, { budget: { maxAgents: 1, maxConcurrency: 1, maxTokens: 100, maxTurns: 2, maxCost: 1 } }));
+    `, { budget: { maxAgents: 1, maxConcurrency: 1, maxTokens: 100, maxTurns: 2 } }));
     await waitFor(() => f.backend.requests.length === 1, "budget first agent");
     f.backend.completeTask("budget first", "one", { input: 10, output: 5, turns: 1, cost: 0.1 });
     const callFinal = await calls.completion;
@@ -338,7 +338,7 @@ test("workflow budgets bound calls, concurrency, aggregate and per-agent tokens,
     const concurrent = await f.workflows.start(f.request(`export default async () => parallel([
       () => agent("slot one", { access: "readOnly" }),
       () => agent("slot two", { access: "readOnly" })
-    ], 2);`, { budget: { maxConcurrency: 1, maxAgents: 20, maxTokens: 600000, maxCost: 25 } }));
+    ], 2);`, { budget: { maxConcurrency: 1, maxAgents: 20, maxTokens: 600000 } }));
     await waitFor(() => f.backend.requests.length === 2, "first budgeted concurrency slot");
     assert.equal(f.backend.active, 1);
     f.backend.completeTask("slot one", "one");
@@ -347,19 +347,117 @@ test("workflow budgets bound calls, concurrency, aggregate and per-agent tokens,
     const concurrentFinal = await concurrent.completion;
     assert.ok((concurrentFinal.warnings?.length ?? 0) >= 2, "large-run allowances produce advisory warnings");
 
-    const exceeded = await f.workflows.start(f.request(`export default async () => agent("expensive", { access: "readOnly" });`, { budget: { maxTokens: 5 } }));
+    const exceeded = await f.workflows.start(f.request(`export default async () => {
+      const first = await agent("expensive", { access: "readOnly" });
+      const second = await agent("blocked after spend", { access: "readOnly" });
+      return [first, second];
+    };`, { budget: { maxTokens: 5 } }));
     await waitFor(() => f.backend.requests.length === 4, "budget overage agent");
     f.backend.completeTask("expensive", "spent", { input: 10, output: 1, turns: 1 });
     const exceededFinal = await exceeded.completion;
-    assert.equal(exceededFinal.status, "aborted");
-    assert.match(exceededFinal.error ?? "", /token budget exceeded/);
+    assert.equal(exceededFinal.status, "completed");
+    assert.equal((exceededFinal.result as Array<{ ok: boolean }>)[0]?.ok, true, "natural child success is preserved");
+    assert.match((exceededFinal.result as Array<{ error?: string }>)[1]?.error ?? "", /token budget exhausted/);
+    assert.equal(f.backend.cancels.length, 0, "spend boundaries never cancel active work");
 
-    const perAgent = await f.workflows.start(f.request(`export default async () => agent("runaway", { access: "readOnly" });`, { budget: { maxTokens: 100, maxTokensPerAgent: 5 } }));
+    const perAgent = await f.workflows.start(f.request(`export default async () => {
+      const first = await agent("runaway", { access: "readOnly" });
+      const second = await agent("blocked per-agent", { access: "readOnly" });
+      return [first, second];
+    };`, { budget: { maxTokens: 100, maxTokensPerAgent: 5 } }));
     await waitFor(() => f.backend.requests.length === 5, "per-agent budget overage agent");
     f.backend.completeTask("runaway", "spent", { input: 6, output: 1, turns: 1 });
     const perAgentFinal = await perAgent.completion;
-    assert.equal(perAgentFinal.status, "aborted");
-    assert.match(perAgentFinal.error ?? "", /per-agent token budget exceeded/);
+    assert.equal(perAgentFinal.status, "completed");
+    assert.equal((perAgentFinal.result as Array<{ ok: boolean }>)[0]?.ok, true);
+    assert.match((perAgentFinal.result as Array<{ error?: string }>)[1]?.error ?? "", /per-agent token budget exhausted/);
+  } finally { await f.cleanup(); }
+});
+
+test("workflow maxCost rejects unsupported routes before child dispatch", async () => {
+  const f = await fixture();
+  try {
+    const unsupported = await f.workflows.start(f.request(`export default async () => agent("codex cost", { access: "readOnly" });`, {
+      budget: { maxCost: 1 },
+    }));
+    const final = await unsupported.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.taskOutcome, "unsuccessful");
+    assert.match((final.result as { error?: string }).error ?? "", /maxCost is unsupported by the codex route/);
+    assert.equal(f.backend.requests.length, 0);
+
+    const supported = await f.workflows.start(f.request(`export default async () => agent("claude cost", { harness: "claude", access: "readOnly" });`, {
+      budget: { maxCost: 1 },
+    }));
+    await waitFor(() => f.claude.requests.length === 1, "cost-reporting Claude route");
+    f.claude.completeTask("claude cost", "ok", { cost: 1.2, turns: 1 });
+    assert.equal((await supported.completion).status, "completed");
+  } finally { await f.cleanup(); }
+});
+
+test("workflow maxCost resolves live independentOf routes in both directions", async () => {
+  const f = await fixture();
+  try {
+    const codexProducer = f.jobs.spawn({ name: "codex producer", task: "produce codex", cwd: f.cwd, trusted: true, harness: "codex" });
+    const claudeProducer = f.jobs.spawn({ name: "claude producer", task: "produce claude", cwd: f.cwd, trusted: true, harness: "claude" });
+    await waitFor(() => f.backend.requests.length === 1 && f.claude.requests.length === 1, "both producers");
+    f.backend.complete(codexProducer.id, "codex output");
+    f.claude.complete(claudeProducer.id, "claude output");
+    await Promise.all([f.jobs.wait(codexProducer.id), f.jobs.wait(claudeProducer.id)]);
+
+    const supported = await f.workflows.start(f.request(`export default async () => agent("review codex", { access: "readOnly", independentOf: "${codexProducer.id}" });`, {
+      budget: { maxCost: 1 },
+    }));
+    await waitFor(() => f.claude.requests.some((request) => request.task === "review codex"), "Claude opposite Codex producer");
+    assert.equal(f.jobs.list().find((job) => job.task === "review codex")?.budget, undefined, "aggregate workflow budget is not attached to the direct child session");
+    f.claude.completeTask("review codex", "ok", { cost: 0.2 });
+    assert.equal(((await supported.completion).result as { ok: boolean }).ok, true);
+
+    const unsupported = await f.workflows.start(f.request(`export default async () => agent("review claude", { access: "readOnly", independentOf: "${claudeProducer.id}" });`, {
+      budget: { maxCost: 1 },
+    }));
+    const final = await unsupported.completion;
+    assert.match((final.result as { error?: string }).error ?? "", /maxCost is unsupported by the codex route/);
+    assert.equal(f.backend.requests.filter((request) => request.task === "review claude").length, 0);
+  } finally { await f.cleanup(); }
+});
+
+test("workflow-owned jobs recheck spend at the global pre-launch boundary", async () => {
+  const f = await fixture(1);
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => parallel([
+      () => agent("global first", { access: "readOnly" }),
+      () => agent("global queued", { access: "readOnly" })
+    ], 2);`, { budget: { maxConcurrency: 2, maxTokens: 5 } }));
+    await waitFor(() => f.jobs.list().length === 2, "one active and one globally queued workflow child");
+    assert.equal(f.backend.requests.length, 1);
+    f.backend.completeTask("global first", "done", { input: 5, output: 1 });
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(f.backend.requests.filter((request) => request.task === "global queued").length, 0);
+    const results = final.result as Array<{ ok: boolean; error?: string }>;
+    assert.equal(results[0]?.ok, true);
+    assert.match(results[1]?.error ?? "", /token budget exhausted/);
+    assert.equal(f.backend.cancels.length, 0);
+  } finally { await f.cleanup(); }
+});
+
+test("workflow reached warnings enumerate supported metrics once", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => agent("all metrics", { harness: "claude", access: "readOnly" });`, {
+      budget: { maxTokens: 5, maxTurns: 2, maxCost: 1 },
+    }));
+    await waitFor(() => f.claude.requests.length === 1, "Claude metrics child");
+    const run = f.claude.activeRuns()[0]!;
+    run.emit({ type: "usage", usage: { input: 5 } });
+    run.emit({ type: "usage", usage: { input: 5, turns: 2 } });
+    run.emit({ type: "usage", usage: { output: 2, turns: 1, cost: 1.2 } });
+    f.claude.completeTask("all metrics", "ok", { output: 1, cost: 0.1 });
+    const warnings = (await started.completion).warnings ?? [];
+    for (const metric of ["tokens", "turns", "cost"]) {
+      assert.equal(warnings.filter((warning) => warning.includes(`${metric} limit reached`)).length, 1);
+    }
   } finally { await f.cleanup(); }
 });
 
@@ -491,7 +589,7 @@ test("records phases, results, and final workflow artifacts", async () => {
     const started = await f.workflows.start(f.request(script, {
       args: { subject: "change" },
       parentProvider: "claude",
-      budget: { maxAgents: 2, maxConcurrency: 1, maxTokens: 1_000, maxTurns: 4, maxCost: 1 },
+      budget: { maxAgents: 2, maxConcurrency: 1, maxTokens: 1_000, maxTurns: 4 },
     }));
     await waitFor(() => f.backend.requests.length === 1, "phase agent");
     const live = f.workflows.check(started.snapshot.runId);
@@ -534,6 +632,22 @@ test("records phases, results, and final workflow artifacts", async () => {
   } finally {
     await f.cleanup();
   }
+});
+
+test("completed sandbox runs report task outcome without changing lifecycle", async () => {
+  const f = await fixture();
+  try {
+    const unsuccessful = await f.workflows.start(f.request(`export default async () => ({ ok: false, reason: "review rejected" });`));
+    const final = await unsuccessful.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.taskOutcome, "unsuccessful");
+
+    const successful = await f.workflows.start(f.request(`export default async () => ({ ok: true });`));
+    assert.equal((await successful.completion).taskOutcome, "successful");
+
+    const unspecified = await f.workflows.start(f.request(`export default async () => "done";`));
+    assert.equal((await unspecified.completion).taskOutcome, "unspecified");
+  } finally { await f.cleanup(); }
 });
 
 test("returns an immediate background-style start snapshot and a separate completion handle", async () => {
@@ -889,17 +1003,16 @@ test("replay permits a monotonic budget increase and preserves the completed pre
   try {
     const source = await f.workflows.start(f.request(script, { budget: { maxTokens: 5 } }));
     await waitFor(() => f.backend.requests.length === 1, "budget prefix agent");
-    f.backend.completeTask("budget:first", "one", { input: 2, output: 1, turns: 1 });
-    await waitFor(() => f.backend.requests.length === 2, "budget exhausted suffix agent");
-    f.backend.completeTask("budget:second:one", "old suffix", { input: 10, output: 1, turns: 1 });
+    f.backend.completeTask("budget:first", "one", { input: 5, output: 1, turns: 1 });
     const sourceFinal = await source.completion;
-    assert.equal(sourceFinal.status, "aborted");
+    assert.equal(sourceFinal.status, "completed");
+    assert.match((sourceFinal.result as { error?: string }).error ?? "", /token budget exhausted/);
 
     const resumed = await f.workflows.start(f.request(script, {
       budget: { maxTokens: 100 },
       resumeFromRunId: sourceFinal.runId,
     }));
-    await waitFor(() => f.backend.requests.length === 3, "replayed budget suffix agent");
+    await waitFor(() => f.backend.requests.length === 2, "replayed budget suffix agent");
     assert.equal(f.backend.requests.filter((request) => request.task === "budget:first").length, 1, "completed prefix is not rerun");
     f.backend.completeTask("budget:second:one", "new suffix", { input: 10, output: 1, turns: 1 });
     const final = await resumed.completion;
