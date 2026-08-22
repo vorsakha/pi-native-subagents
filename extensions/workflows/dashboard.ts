@@ -17,6 +17,7 @@ import {
 } from "../dashboard-style.ts";
 import type { DashboardLayout } from "../dashboard-style.ts";
 import { aggregateWorkflowUsage, workflowIsTerminal } from "../../src/workflows/manager.ts";
+import { isTranscriptTruncationEntry } from "../../src/workflows/artifacts.ts";
 import { formatWorkflowBudget } from "../../src/workflows/budget.ts";
 import type {
   WorkflowAgentRecord,
@@ -37,6 +38,17 @@ import {
   serializeResult,
   truncateWorkflowDashboardLine,
 } from "./dashboard-detail.ts";
+import {
+  DEFAULT_TOOL_DISPLAY,
+  pairToolEntries,
+  renderToolGroupRow,
+  resolveToolRenderSnapshot,
+  summarizeToolCalls,
+  toolCallState,
+  type ToolDisplayMode,
+  type ToolEntry,
+} from "../tool-summary.ts";
+import { renderPiTool } from "../subagents/transcript.ts";
 
 export { renderWorkflowMarkdown, truncateWorkflowDashboardLine } from "./dashboard-detail.ts";
 
@@ -120,6 +132,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
   #scroll = 0;
   #scrollKey: string | undefined;
   #followTail = true;
+  /** One display preference per overlay instance; survives run/agent changes, not resets. */
+  #toolDisplay: ToolDisplayMode = DEFAULT_TOOL_DISPLAY;
   #resultRows = 0;
   #resultTotal = 0;
   #confirmCancel: CancelTarget | undefined;
@@ -332,6 +346,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     else if (matchesKey(data, "r")) this.restartAgent(run);
     else if (matchesKey(data, "x")) this.requestAgentCancel(run);
     else if (data === "X" || matchesKey(data, Key.shift("x"))) this.requestRunCancel(run);
+    else if (agentPane && (matchesKey(data, "t") || matchesKey(data, Key.ctrl("t")))) this.toggleToolDisplay();
 
     this.tui.requestRender();
   }
@@ -400,6 +415,11 @@ export class WorkflowsDashboardOverlay implements Focusable {
     this.#renderedConfirmationTarget = undefined;
     this.#notice = "";
     this.resetScroll();
+  }
+
+  private toggleToolDisplay(): void {
+    this.#toolDisplay = this.#toolDisplay === "compact" ? "full" : "compact";
+    this.invalidate();
   }
 
   /* ── selection and actions ───────────────────────────────────────────── */
@@ -1013,7 +1033,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
 
   private agentDetailBody(run: WorkflowSnapshot, phase: WorkflowPhase | undefined, agent: WorkflowAgentRecord, width: number): string[] {
     const signature = detailSignature(run, phase, agent);
-    const key = `agent:${run.runId}:${phase?.index ?? "none"}:${agent.index}:${width}:${signature}`;
+    const key = `agent:${run.runId}:${phase?.index ?? "none"}:${agent.index}:${width}:${this.#toolDisplay}:${signature}`;
     const cached = this.#detailCache.get(key);
     if (cached) return cached;
 
@@ -1095,7 +1115,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
   private renderBoundedResult(run: WorkflowSnapshot, phase: WorkflowPhase | undefined, agent: WorkflowAgentRecord | undefined, width: number): string[] {
     const safeWidth = Math.max(1, width);
     const signature = detailSignature(run, phase, agent);
-    const key = `result:${run.runId}:${phase?.index ?? "none"}:${agent?.index ?? "workflow"}:${safeWidth}:${signature}`;
+    const key = `result:${run.runId}:${phase?.index ?? "none"}:${agent?.index ?? "workflow"}:${safeWidth}:${this.#toolDisplay}:${signature}`;
     const cached = this.#detailCache.get(key);
     if (cached) return cached;
 
@@ -1103,20 +1123,63 @@ export class WorkflowsDashboardOverlay implements Focusable {
     let rows: string[] = [];
     let truncated = false;
     if (transcript) {
-      for (const { entry, text } of boundedTranscriptParts(transcript, MAX_RESULT_CHARS)) {
+      const traces = new Map((agent?.tools ?? []).map((tool) => [tool.id, tool]));
+      const parts = boundedTranscriptParts(transcript, MAX_RESULT_CHARS);
+      // Pair every tool event by id across the whole bounded window up front, not
+      // just within one adjacent run, so a call interrupted by an assistant/user/
+      // thinking entry still resolves to exactly one call instead of a running
+      // group plus a separate completed group for the same id.
+      const { pairs } = pairToolEntries(
+        parts.map((part) => part.entry).filter((entry): entry is ToolEntry => entry?.kind === "tool"),
+      );
+      const emitted = new Set<string>();
+      let runIds: string[] = [];
+      const flushToolRun = () => {
+        if (!runIds.length) return;
+        const calls = runIds.map((id) => pairs.get(id)!);
+        if (this.#toolDisplay === "compact") {
+          const states = calls.map(({ call, result }) => toolCallState(call, result, traces.get(call.toolId)));
+          rows.push(renderToolGroupRow(summarizeToolCalls(states), this.theme, safeWidth));
+        } else {
+          for (const { call, result } of calls) {
+            const snapshot = resolveToolRenderSnapshot(
+              `${run.runId}:${agent?.index ?? "workflow"}:${call.toolId}`,
+              "",
+              call,
+              result,
+              traces.get(call.toolId),
+            );
+            rows.push(...renderPiTool(snapshot, safeWidth));
+          }
+        }
+        runIds = [];
+      };
+      for (const part of parts) {
+        const { entry, text } = part;
         if (!entry) {
+          flushToolRun();
           rows.push(this.theme.fg("muted", text));
           continue;
         }
+        if (entry.kind === "tool") {
+          if (isTranscriptTruncationEntry(entry)) {
+            flushToolRun();
+            rows.push(this.theme.fg("muted", entry.text ?? text));
+            continue;
+          }
+          if (!emitted.has(entry.toolId)) {
+            emitted.add(entry.toolId);
+            runIds.push(entry.toolId);
+          }
+          continue;
+        }
+        flushToolRun();
         if (!text.trim()) continue;
         if (entry.kind === "assistant") rows.push(...this.renderMarkdownLines(text, safeWidth));
         else if (entry.kind === "user") rows.push(...renderPrefixedRows(this.theme, this.theme.fg("accent", "> "), text, "userMessageText", safeWidth));
-        else if (entry.kind === "thinking") rows.push(...renderPrefixedRows(this.theme, this.theme.fg("dim", "~ "), text, "muted", safeWidth));
-        else {
-          const prefix = entry.error ? this.theme.fg("error", "× ") : this.theme.fg("muted", "→ ");
-          rows.push(...renderPrefixedRows(this.theme, prefix, text, entry.error ? "error" : "muted", safeWidth));
-        }
+        else rows.push(...renderPrefixedRows(this.theme, this.theme.fg("dim", "~ "), text, "muted", safeWidth));
       }
+      flushToolRun();
     } else {
       const value = [agent?.output, agent?.preview, phase?.result, run.result].find((candidate) => candidate !== undefined && candidate !== null && candidate !== "");
       if (value === undefined) {
@@ -1191,6 +1254,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
         agentActionable ? agentCancelLabel : "",
         live ? runCancelLabel : "",
         agentVisible && agent?.callIndex !== undefined ? "r restart agent" : "",
+        `t ${this.#toolDisplay === "compact" ? "full" : "compact"}`,
         "h/← overview",
         "Shift+↑↓/Pg scroll · Ctrl+U/D · g/G",
       ]

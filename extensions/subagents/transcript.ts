@@ -12,13 +12,22 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import { isTerminal } from "../../src/manager.ts";
-import type {
-  JobSnapshot,
-  SendBehavior,
-  ToolResultSnapshot,
-  TranscriptEntry,
-} from "../../src/types.ts";
-import { sanitizeInline, sanitizeText } from "./render.ts";
+import type { JobSnapshot, SendBehavior, ToolTrace } from "../../src/types.ts";
+import { sanitizeText } from "./render.ts";
+import {
+  DEFAULT_TOOL_DISPLAY,
+  groupToolBlocks,
+  renderToolGroupRow,
+  resolveToolRenderSnapshot,
+  summarizeToolCalls,
+  toolCallState,
+  transcriptBlocks,
+  type ToolDisplayMode,
+  type ToolLifecycleBlock,
+  type ToolRenderSnapshot,
+} from "../tool-summary.ts";
+
+export type { ToolRenderSnapshot } from "../tool-summary.ts";
 
 /*
  * One normalized transcript for every supervision surface. Assistant and user
@@ -28,20 +37,13 @@ import { sanitizeInline, sanitizeText } from "./render.ts";
  * renderer; unknown native tools use Pi's generic fallback shell.
  */
 
-export interface ToolRenderSnapshot {
-  key: string;
-  name: string;
-  args: Record<string, unknown>;
-  result?: ToolResultSnapshot;
-  status: "running" | "completed" | "failed";
-  cwd: string;
-}
-
 export interface TranscriptOptions {
   /** Overrides Pi's regular assistant Markdown renderer. */
   renderMarkdown?: (text: string, width: number) => string[];
   /** Overrides Pi's regular tool execution renderer. */
   renderTool?: (tool: ToolRenderSnapshot, width: number) => string[];
+  /** Compact groups consecutive tool calls into one bounded indicator; full uses Pi's tool shell. */
+  toolDisplay?: ToolDisplayMode;
 }
 
 /** Render assistant prose with regular Pi message padding, theme, and wrapping. */
@@ -76,123 +78,12 @@ function renderThinking(text: string, width: number, theme: Theme): string[] {
   return ["", ...rows.map((line) => truncateToWidth(line, safeWidth, ""))];
 }
 
-type ToolEntry = Extract<TranscriptEntry, { kind: "tool" }>;
-type ToolTrace = JobSnapshot["tools"][number];
-type TranscriptBlock =
-  | { kind: "entry"; entry: Exclude<TranscriptEntry, ToolEntry> }
-  | { kind: "tool"; call: ToolEntry; result?: ToolEntry };
-
-/** Pair native start/result events by id, even when parallel calls interleave. */
-function transcriptBlocks(entries: TranscriptEntry[]): TranscriptBlock[] {
-  const blocks: TranscriptBlock[] = [];
-  const openTools = new Map<string, Extract<TranscriptBlock, { kind: "tool" }>>();
-  for (const entry of entries) {
-    if (entry.kind !== "tool") {
-      blocks.push({ kind: "entry", entry });
-      continue;
-    }
-
-    const open = openTools.get(entry.toolId);
-    const isResult = entry.phase === "end" || entry.phase === undefined && open !== undefined;
-    if (isResult && open) {
-      open.result = entry;
-      openTools.delete(entry.toolId);
-      continue;
-    }
-    if (isResult) {
-      blocks.push({ kind: "tool", call: entry, result: entry });
-      continue;
-    }
-
-    const block: Extract<TranscriptBlock, { kind: "tool" }> = { kind: "tool", call: entry };
-    blocks.push(block);
-    openTools.set(entry.toolId, block);
-  }
-  return blocks;
-}
-
-function jsonRecord(value: string | undefined): Record<string, unknown> | undefined {
-  if (!value?.trim().startsWith("{")) return undefined;
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-const BUILT_IN_TOOL_NAMES = new Set(["bash", "edit", "find", "grep", "ls", "read", "write"]);
-
-function piToolName(value: string): string {
-  const clean = sanitizeInline(value) || "tool";
-  const lower = clean.toLowerCase();
-  return BUILT_IN_TOOL_NAMES.has(lower) ? lower : clean;
-}
-
-function legacyArgs(name: string, text: string | undefined): Record<string, unknown> {
-  const parsed = jsonRecord(text);
-  if (parsed) return parsed;
-  const value = sanitizeText(text ?? "").trim();
-  if (!value) return {};
-  const lower = name.toLowerCase();
-  if (lower === "bash") return { command: value };
-  if (["edit", "read", "write"].includes(lower)) return { path: value };
-  return { input: value };
-}
-
-/** Claude sometimes JSON-encodes textual tool output; expose the actual text. */
-function normalizeToolOutput(value: string | undefined): string {
-  const clean = sanitizeText(value ?? "").trimEnd();
-  if (!clean) return "";
-  try {
-    const parsed = JSON.parse(clean) as unknown;
-    if (typeof parsed === "string") return sanitizeText(parsed).trimEnd();
-    if (Array.isArray(parsed)) {
-      const text = parsed
-        .map((part) => part !== null && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string"
-          ? String((part as Record<string, unknown>).text)
-          : "")
-        .filter(Boolean)
-        .join("\n");
-      if (text) return sanitizeText(text).trimEnd();
-    }
-  } catch { /* Truncated previews are intentionally rendered as received. */ }
-  return clean;
-}
-
 function resolvedTool(
   job: JobSnapshot,
-  block: Extract<TranscriptBlock, { kind: "tool" }>,
+  block: ToolLifecycleBlock,
   trace: ToolTrace | undefined,
 ): ToolRenderSnapshot {
-  const callName = block.call.name === "tool" ? "" : block.call.name;
-  const resultName = block.result?.name === "tool" ? "" : block.result?.name;
-  const name = piToolName(callName || resultName || trace?.name || "tool");
-  const args = block.call.args ?? trace?.args ?? legacyArgs(name, block.call.phase === "end" ? trace?.summary : block.call.text);
-  const status = block.result?.error === true || block.result?.result?.isError === true || trace?.status === "failed"
-    ? "failed"
-    : block.result || trace?.status === "completed"
-      ? "completed"
-      : "running";
-  const legacyOutput = normalizeToolOutput(block.result?.text ?? (
-    block.call.phase === "end" ? block.call.text : undefined
-  ));
-  const result = block.result?.result ?? trace?.result ?? (status === "running"
-    ? undefined
-    : {
-        content: legacyOutput ? [{ type: "text", text: legacyOutput }] : [],
-        isError: status === "failed",
-      });
-  return {
-    key: `${job.id}:${block.call.toolId}`,
-    name,
-    args,
-    result,
-    status,
-    cwd: job.cwd,
-  };
+  return resolveToolRenderSnapshot(`${job.id}:${block.call.toolId}`, job.cwd, block.call, block.result, trace);
 }
 
 const transcriptTui = {
@@ -252,8 +143,15 @@ export function buildTranscript(
     lines.push(...renderMarkdown(clean, safeWidth));
   };
   const toolTraces = new Map(job.tools.map((tool) => [tool.id, tool]));
+  const toolDisplay = options.toolDisplay ?? DEFAULT_TOOL_DISPLAY;
+  const blocks = transcriptBlocks(job.transcript);
 
-  for (const block of transcriptBlocks(job.transcript)) {
+  for (const block of toolDisplay === "full" ? blocks : groupToolBlocks(blocks)) {
+    if (block.kind === "toolGroup") {
+      const states = block.calls.map((call) => toolCallState(call.call, call.result, toolTraces.get(call.call.toolId)));
+      lines.push(renderToolGroupRow(summarizeToolCalls(states), theme, safeWidth));
+      continue;
+    }
     if (block.kind === "tool") {
       const tool = resolvedTool(job, block, toolTraces.get(block.call.toolId));
       lines.push(...renderTool(tool, safeWidth));

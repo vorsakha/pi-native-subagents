@@ -53,7 +53,7 @@ export function emptyComponent(): Component {
   return new Lines([]);
 }
 
-const TRACE_GROUP = "⌁";
+export const TRACE_GROUP = "⌁";
 const TRACE_RAIL = "│";
 const TRACE_INDENT = "     ";
 

@@ -18,6 +18,7 @@ initTheme("dark", false);
 const ENTER = "\r";
 const ESCAPE = "\u001b";
 const PAGE_UP = "\u001b[5~";
+const CTRL_T = String.fromCharCode(20);
 const PAGE_DOWN = "\u001b[6~";
 
 test("dashboard truncation respects terminal display width for Unicode and ANSI", () => {
@@ -395,7 +396,7 @@ test("transcript delegates structured tool events to Pi execution components", (
       { kind: "tool" as const, phase: "end" as const, toolId: "read-1", name: "Read", result: { content: [{ type: "text", text: "File not found" }], isError: true }, error: true },
     ],
   };
-  const lines = buildTranscript(current, 48, ansiTheme);
+  const lines = buildTranscript(current, 48, ansiTheme, { toolDisplay: "full" });
   const plain = lines.join("\n").replace(/\u001b\[[0-9;]*m/g, "");
   const backgrounds = new Set(lines.flatMap((line) => line.match(/\u001b\[48;[^m]+m/g) ?? []));
 
@@ -406,6 +407,127 @@ test("transcript delegates structured tool events to Pi execution components", (
   assert.doesNotMatch(plain, /[✓×]/, "Pi's native tool shell does not add custom status glyphs");
   assert.ok(backgrounds.size >= 2, "success and error use Pi's distinct semantic tool backgrounds");
   assert.ok(lines.every((line) => visibleWidth(line) <= 48));
+
+  const compactLines = buildTranscript(current, 48, ansiTheme);
+  assert.ok(!compactLines.some((line) => line.includes("missing.ts")), "compact mode is the default and omits Pi's native tool shell");
+  assert.match(compactLines.join("\n"), /2 tool calls/);
+});
+
+test("compact tool groups fold consecutive calls between assistant turns and stay chronological", () => {
+  const current = {
+    ...job("grouping"),
+    output: "",
+    transcript: [
+      { kind: "assistant" as const, text: "starting work" },
+      { kind: "tool" as const, phase: "start" as const, toolId: "r1", name: "read", args: { path: "a.ts" } },
+      { kind: "tool" as const, phase: "start" as const, toolId: "r2", name: "read", args: { path: "b.ts" } },
+      { kind: "tool" as const, phase: "start" as const, toolId: "r3", name: "read", args: { path: "c.ts" } },
+      { kind: "tool" as const, phase: "start" as const, toolId: "e1", name: "edit", args: { path: "a.ts" } },
+      { kind: "tool" as const, phase: "start" as const, toolId: "e2", name: "edit", args: { path: "b.ts" } },
+      { kind: "tool" as const, phase: "start" as const, toolId: "b1", name: "bash", args: { command: "npm test" } },
+      { kind: "tool" as const, phase: "start" as const, toolId: "b2", name: "bash", args: { command: "npm run lint" } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "r1", name: "read", result: { content: [], isError: false } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "r2", name: "read", result: { content: [], isError: false } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "r3", name: "read", result: { content: [], isError: false } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "e1", name: "edit", result: { content: [], isError: false } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "e2", name: "edit", result: { content: [], isError: false } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "b1", name: "bash", result: { content: [], isError: true }, error: true },
+      { kind: "tool" as const, phase: "end" as const, toolId: "b2", name: "bash", result: { content: [], isError: false } },
+      { kind: "assistant" as const, text: "concluding work" },
+    ],
+  };
+  const lines = buildTranscript(current, 70, theme);
+  const groupLines = lines.filter((line) => line.includes("tool calls"));
+  assert.equal(groupLines.length, 1, "consecutive tool calls fold into exactly one group row");
+  const groupIndex = lines.indexOf(groupLines[0]!);
+  const startIndex = lines.findIndex((line) => line.includes("starting work"));
+  const endIndex = lines.findIndex((line) => line.includes("concluding work"));
+  assert.ok(startIndex >= 0 && groupIndex > startIndex && endIndex > groupIndex, "the group sits between the surrounding assistant turns");
+  assert.match(groupLines[0]!, /7 tool calls/);
+  assert.match(groupLines[0]!, /✓6/);
+  assert.match(groupLines[0]!, /×1/);
+  assert.match(groupLines[0]!, /read ×3, edit ×2, bash ×2/);
+});
+
+test("dashboard toggles between compact groups and full Pi tool rendering with t and Ctrl+T", (t) => {
+  const current = {
+    ...job("toggle-tools"),
+    output: "",
+    transcript: [
+      { kind: "tool" as const, phase: "start" as const, toolId: "r1", name: "read", args: { path: "a.ts" } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "r1", name: "read", result: { content: [{ type: "text", text: "contents" }], isError: false } },
+    ],
+  };
+  const { overlay } = dashboard([current], 24, () => {}, undefined, { focusJobId: current.id });
+  t.after(() => overlay.dispose());
+
+  const compact = overlay.render(90);
+  assert.ok(compact.some((line) => line.includes("1 tool call")), "compact mode is the default");
+  assert.ok(compact.some((line) => line.includes("t full")), "hint offers the toggle to full mode");
+
+  overlay.handleInput("t");
+  const full = overlay.render(90);
+  assert.ok(full.some((line) => line.includes("a.ts")), "full mode restores Pi's native tool rendering");
+  assert.ok(full.some((line) => line.includes("t compact")), "hint offers the toggle back to compact mode");
+
+  overlay.handleInput("t");
+  const backToCompact = overlay.render(90);
+  assert.deepEqual(backToCompact, compact, "toggling twice reproduces the original compact output, including the cache key");
+});
+
+test("in-panel takeover toggles tool rendering with Ctrl+T and treats a bare t as composer input", (t) => {
+  const current = {
+    ...job("takeover-toggle-tools"),
+    output: "",
+    transcript: [
+      { kind: "tool" as const, phase: "start" as const, toolId: "r1", name: "read", args: { path: "a.ts" } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "r1", name: "read", result: { content: [{ type: "text", text: "contents" }], isError: false } },
+    ],
+  };
+  const { overlay } = dashboard([current], 24, () => {}, undefined, { focusJobId: current.id });
+  t.after(() => overlay.dispose());
+  overlay.focused = true;
+
+  overlay.render(90);
+  overlay.handleInput("\r"); // Enter takeover for a live, reusable job.
+  const compact = overlay.render(90);
+  assert.ok(compact.some((line) => line.includes("1 tool call")), "takeover compact mode is the default");
+  assert.ok(compact.some((line) => line.includes("Ctrl+T full")), "takeover hint offers the toggle to full mode");
+
+  overlay.handleInput("t");
+  const stillCompact = overlay.render(90);
+  assert.ok(stillCompact.some((line) => line.includes("1 tool call")), "a bare t while composing types into the draft instead of toggling out of compact mode");
+  assert.ok(stillCompact.some((line) => line.includes("> t")), "the composer echoes the typed t");
+
+  overlay.handleInput(CTRL_T);
+  const full = overlay.render(90);
+  assert.ok(full.some((line) => line.includes("a.ts")), "Ctrl+T restores Pi's native tool rendering during takeover");
+  assert.ok(full.some((line) => line.includes("Ctrl+T compact")), "takeover hint offers the toggle back to compact mode");
+
+  overlay.handleInput(CTRL_T);
+  const backToCompact = overlay.render(90);
+  assert.ok(backToCompact.some((line) => line.includes("1 tool call")), "a second Ctrl+T toggles back to compact mode");
+});
+
+test("compact tool group rows keep failures visible and stay within every width", () => {
+  const current = {
+    ...job("width-bounds"),
+    output: "",
+    transcript: [
+      { kind: "tool" as const, phase: "start" as const, toolId: "r1", name: "read", args: { path: "a.ts" } },
+      { kind: "tool" as const, phase: "start" as const, toolId: "r2", name: "read", args: { path: "b.ts" } },
+      { kind: "tool" as const, phase: "start" as const, toolId: "b1", name: "bash", args: { command: "npm test" } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "r1", name: "read", result: { content: [], isError: false } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "r2", name: "read", result: { content: [], isError: false } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "b1", name: "bash", result: { content: [], isError: true }, error: true },
+    ],
+  };
+  for (const width of [80, 60, 40, 24, 12]) {
+    const lines = buildTranscript(current, width, theme);
+    assert.ok(lines.every((line) => visibleWidth(line) <= width), `every line fits within ${width} columns`);
+    const groupLine = lines.find((line) => line.includes("⌁"));
+    assert.ok(groupLine?.includes("×1"), `the failed-call count survives at width ${width}`);
+  }
 });
 
 test("takeover restores a rejected draft without overwriting newer input", async (t) => {
@@ -476,9 +598,20 @@ test("takeover renders normalized thinking, tools, queued messages, and closes r
   const lines = view.render(72);
   assert.equal(lines.length, 24, "takeover stays within the fullscreen overlay height");
   assert.ok(lines.some((line) => line.includes("considering options")));
-  assert.ok(lines.some((line) => line.includes("read") && line.includes("file.ts")));
+  assert.ok(lines.some((line) => line.includes("1 tool call") && line.includes("read")), "compact mode is the default in takeover");
+  assert.ok(!lines.some((line) => line.includes("file.ts")), "compact mode omits Pi's native tool shell");
   assert.ok(lines.some((line) => line.includes("also verify tests")));
   assert.ok(lines.some((line) => line.includes("effort high")), "takeover metadata shows request effort");
+  assert.ok(lines.some((line) => line.includes("Ctrl+T full")), "footer hint offers the toggle to full mode");
+
+  view.handleInput("");
+  const fullLines = view.render(72);
+  assert.ok(fullLines.some((line) => line.includes("read") && line.includes("file.ts")), "Ctrl+T restores Pi's native tool rendering");
+  assert.ok(fullLines.some((line) => line.includes("Ctrl+T compact")), "footer hint offers the toggle back to compact mode");
+
+  view.handleInput("t");
+  const afterLiteralT = view.render(72);
+  assert.ok(afterLiteralT.some((line) => line.includes("read") && line.includes("file.ts")), "a bare t types into the composer instead of toggling");
   const compactTakeover = view.render(48);
   assert.equal(compactTakeover.length, 24, "takeover height remains exact after resize");
   assert.ok(compactTakeover.some((line) => line.includes("effort high")), "effort survives bounded takeover rendering");

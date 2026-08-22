@@ -1,21 +1,27 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
+import { initTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import { type KeybindingsManager, visibleWidth } from "@earendil-works/pi-tui";
-import { theme } from "./helpers.ts";
+import { tempDir, theme } from "./helpers.ts";
 import {
   createWorkflowsDashboardOverlay,
   openWorkflowsDashboard,
   type WorkflowsDashboardAction,
 } from "../extensions/workflows/dashboard.ts";
 import { dashboardLayout } from "../extensions/dashboard-style.ts";
+import { checkpointWorkflow, createWorkflowArtifacts, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
+import type { TranscriptEntry } from "../src/types.ts";
+
+initTheme("dark", false);
 
 const ENTER = "\r";
 const ESCAPE = "\u001b";
 const PAGE_UP = "\u001b[5~";
 const PAGE_DOWN = "\u001b[6~";
 const CTRL_D = "\u0004";
+const CTRL_T = String.fromCharCode(20);
 const SHIFT_UP = "\u001b[1;2A";
 
 function workflow(id: string, status: WorkflowSnapshot["status"] = "running"): WorkflowSnapshot {
@@ -227,7 +233,9 @@ test("workflow results use native Markdown while transcript roles and workflow m
     { kind: "tool", toolId: "t1", name: "read", text: "file.ts" },
   ];
   const sources: string[] = [];
-  const { overlay } = harness([markdown], 30, () => {}, {
+  // Tall enough that the full-mode Pi tool render and every surrounding row
+  // fit without scrolling, so tail-following after the toggle can't hide any of them.
+  const { overlay } = harness([markdown], 55, () => {}, {
     renderMarkdown: (text) => {
       sources.push(text);
       return ["\u001b[1mVerdict\u001b[0m", "\u001b[32mPASS\u001b[0m"];
@@ -237,12 +245,18 @@ test("workflow results use native Markdown while transcript roles and workflow m
 
   overlay.render(72);
   overlay.handleInput("\r");
+  const compactLines = overlay.render(72);
+  assert.ok(compactLines.some((line) => line.includes("1 tool call") && line.includes("read")), "compact mode is the default in the agent pane");
+  assert.ok(!compactLines.some((line) => line.includes("file.ts")), "compact mode omits the per-tool detail row");
+
+  sources.length = 0;
+  overlay.handleInput("t");
   const lines = overlay.render(72);
   assert.deepEqual(sources, ["# Verdict\n\n**PASS**", "review result"], "assistant transcript and distinct final result use Markdown");
   assert.ok(lines.some((line) => line.includes("\u001b[1mVerdict\u001b[0m")));
   assert.ok(lines.some((line) => line.includes("> **inspect this literally**")));
   assert.ok(lines.some((line) => line.includes("~ considering options")));
-  assert.ok(lines.some((line) => line.includes("→ read · file.ts")));
+  assert.ok(lines.some((line) => line.includes("read") && line.includes("file.ts")), "full mode renders the tool through Pi's native execution component");
   assert.ok(lines.some((line) => line.includes("Prompt · Review the implementation")));
   assert.ok(lines.some((line) => line.includes("effort high")));
 
@@ -334,13 +348,20 @@ test("agent detail activity does not duplicate tool detail already shown in the 
     { kind: "tool", toolId: "bash-1", name: "bash", text: "DISTINCT_TOOL_SUMMARY_MARKER" },
   ];
 
-  const { overlay } = harness([run], 30, () => {}, { renderMarkdown: (text) => text.split("\n") });
+  // Tall enough that the full-mode Pi tool render and every surrounding row fit
+  // without scrolling, so tail-following after the toggle can't hide any of them.
+  const { overlay } = harness([run], 40, () => {}, { renderMarkdown: (text) => text.split("\n") });
   t.after(() => overlay.dispose());
 
   overlay.render(72);
   overlay.handleInput(ENTER);
+  const compactLines = overlay.render(72);
+  assert.ok(!compactLines.some((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER")), "compact mode is the default and does not surface per-tool detail anywhere, including Activity");
+  assert.ok(compactLines.some((line) => line.includes("Activity") && line.includes("narrowing down the failing assertion")), "the Activity section still surfaces live semantic progress in compact mode");
+
+  overlay.handleInput("t");
   const lines = overlay.render(72);
-  assert.ok(lines.some((line) => line.includes("→ bash · DISTINCT_TOOL_SUMMARY_MARKER")), "the tool lifecycle row still appears in the Transcript section");
+  assert.ok(lines.some((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER")), "the tool lifecycle row still appears in the Transcript section in full mode, via Pi's native execution component");
   assert.ok(lines.some((line) => line.includes("Activity") && line.includes("narrowing down the failing assertion")), "the Activity section still surfaces live semantic progress");
 
   const activityLine = lines.find((line) => line.includes("Activity"));
@@ -829,6 +850,149 @@ test("focusRunId selects the requested run on the first render", (t) => {
   const state = harness([first, second], 30, () => {}, { focusRunId: "focus-second" });
   t.after(() => state.overlay.dispose());
   assert.match(state.overlay.render(120).join("\n"), /Release focus-second/);
+});
+
+test("workflow agent pane toggles between compact groups and full tool rendering with t", (t) => {
+  const current = workflow("toggle-tools", "completed");
+  current.agents[0]!.transcript = [
+    { kind: "tool", phase: "start", toolId: "r1", name: "read", args: { path: "a.ts" } },
+    { kind: "tool", phase: "end", toolId: "r1", name: "read", result: { content: [{ type: "text", text: "contents" }], isError: false } },
+  ];
+  const { overlay } = harness([current], 32, () => {}, { renderMarkdown: (text) => text.split("\n") });
+  t.after(() => overlay.dispose());
+
+  overlay.render(60);
+  overlay.handleInput(ENTER);
+  overlay.handleInput(ENTER);
+  const compact = overlay.render(60);
+  assertPanel(compact, 60, 25);
+  assert.ok(compact.some((line) => line.includes("1 tool call") && line.includes("read")), "agent pane defaults to compact grouping");
+  assert.ok(compact.some((line) => line.includes("t full")), "hint offers the toggle to full mode");
+
+  overlay.handleInput("t");
+  const full = overlay.render(60);
+  assertPanel(full, 60, 25);
+  assert.ok(full.some((line) => line.includes("read") && line.includes("a.ts")), "toggling to full mode renders the call through Pi's native execution component");
+  assert.equal(full.filter((line) => line.includes("read") && line.includes("a.ts")).length, 1, "the paired start/end lifecycle events resolve to exactly one rendered call, not one per event");
+  assert.ok(!full.some((line) => line.includes("1 tool call")), "full mode does not show the compact group row");
+  assert.ok(full.some((line) => line.includes("t compact")), "hint offers the toggle back to compact mode");
+
+  overlay.handleInput("t");
+  const backToCompact = overlay.render(60);
+  assertPanel(backToCompact, 60, 25);
+  assert.deepEqual(backToCompact, compact, "toggling twice reproduces identical compact output across both detail cache keys");
+});
+
+test("workflow agent pane also toggles tool rendering with the primary Ctrl+T binding", (t) => {
+  const current = workflow("toggle-tools-ctrl", "completed");
+  current.agents[0]!.transcript = [
+    { kind: "tool", phase: "start", toolId: "r1", name: "read", args: { path: "a.ts" } },
+    { kind: "tool", phase: "end", toolId: "r1", name: "read", result: { content: [{ type: "text", text: "contents" }], isError: false } },
+  ];
+  const { overlay } = harness([current], 32, () => {}, { renderMarkdown: (text) => text.split("\n") });
+  t.after(() => overlay.dispose());
+
+  overlay.render(60);
+  overlay.handleInput(ENTER);
+  overlay.handleInput(ENTER);
+  const compact = overlay.render(60);
+  assert.ok(compact.some((line) => line.includes("1 tool call")), "agent pane defaults to compact grouping");
+
+  overlay.handleInput(CTRL_T);
+  const full = overlay.render(60);
+  assert.ok(full.some((line) => line.includes("read") && line.includes("a.ts")), "Ctrl+T toggles to full mode, same as t");
+  assert.ok(!full.some((line) => line.includes("1 tool call")), "full mode does not show the compact group row");
+
+  overlay.handleInput(CTRL_T);
+  const backToCompact = overlay.render(60);
+  assert.deepEqual(backToCompact, compact, "a second Ctrl+T reproduces identical compact output");
+});
+
+test("a workflow tool call interrupted by an assistant entry resolves to one failed call, not a running and a completed group", () => {
+  const current = workflow("split-lifecycle", "completed");
+  current.agents[0]!.transcript = [
+    { kind: "tool", phase: "start", toolId: "b1", name: "bash", args: { command: "npm test" } },
+    { kind: "assistant", text: "still running" },
+    { kind: "tool", phase: "end", toolId: "b1", name: "bash", result: { content: [], isError: true }, error: true },
+  ];
+  const { overlay } = harness([current], 40, () => {}, { renderMarkdown: (text) => text.split("\n") });
+  overlay.render(72);
+  overlay.handleInput(ENTER);
+  overlay.handleInput(ENTER);
+  const lines = overlay.render(72);
+  overlay.dispose();
+
+  const groupLines = lines.filter((line) => line.includes("tool call"));
+  assert.equal(groupLines.length, 1, "the interrupted call folds into exactly one group, not a running group plus a separate completed/failed one");
+  assert.match(groupLines[0]!, /1 tool call/);
+  assert.match(groupLines[0]!, /×1/);
+  assert.doesNotMatch(groupLines[0]!, /●1/, "the call is not still reported as running once its result has arrived");
+});
+
+test("a persisted transcript truncation sentinel survives reload and presents as omitted metadata, not a running tool", async (t) => {
+  const root = join(await tempDir("workflow-dashboard-artifacts"), "workflows");
+  const now = Date.now();
+  // Large enough (by raw JSON size) that boundedTranscript() splices in the
+  // "[older transcript entries omitted]" sentinel when this agent's
+  // transcript is persisted, while each entry's *display* text (the only
+  // thing the dashboard's own MAX_RESULT_CHARS bounding measures) stays
+  // tiny, so that separate, unrelated bound never re-truncates the sentinel
+  // back out before it reaches presentation.
+  const bigTranscript: TranscriptEntry[] = [
+    { kind: "user", text: "start" },
+    ...Array.from({ length: 40 }, (_, index): TranscriptEntry => ({
+      kind: "tool",
+      toolId: `bash-${index}`,
+      name: "bash",
+      result: { content: [{ type: "text", text: "x".repeat(800) }], isError: false },
+    })),
+  ];
+  const created = await createWorkflowArtifacts(root, {
+    script: "export default async () => 'ok';\n",
+    args: {},
+    snapshot: {
+      sessionId: "sentinel-session",
+      name: "Sentinel run",
+      description: "Persist a transcript large enough to be truncated",
+      background: true,
+      status: "completed",
+      timestamps: { createdAt: now, startedAt: now, updatedAt: now, endedAt: now },
+      currentPhase: 0,
+      phases: [{ index: 0, name: "review", status: "completed", timestamps: { createdAt: now, updatedAt: now }, agents: [0] }],
+      agents: [{
+        index: 0, name: "review", access: "readOnly", independent: false, phase: 0, state: "completed",
+        timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now }, harness: "codex", model: "review-model",
+        preview: "output chunk 39", transcript: bigTranscript, usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+      }],
+      result: "ok",
+    },
+  });
+  // checkpointWorkflow is what marks the snapshot as backed by a separate
+  // transcripts.json artifact, matching how a real run reaches disk.
+  await checkpointWorkflow(root, created);
+
+  const [loaded] = await loadWorkflowSummaries(root, { sessionId: "sentinel-session" });
+  assert.ok(loaded, "the persisted run reloads");
+  const reloadedTranscript = loaded!.agents[0]!.transcript!;
+  assert.ok(
+    reloadedTranscript.some((entry) => entry.kind === "tool" && entry.toolId === "transcript" && entry.text === "[older transcript entries omitted]"),
+    "the fixture transcript is large enough to trigger the persisted truncation sentinel",
+  );
+
+  const { overlay } = harness([loaded!], 40, () => {}, { renderMarkdown: (text) => text.split("\n") });
+  t.after(() => overlay.dispose());
+  overlay.render(100);
+  overlay.handleInput(ENTER);
+  overlay.handleInput(ENTER);
+  const lines = overlay.render(100);
+
+  assert.ok(
+    lines.some((line) => line.includes("[older transcript entries omitted]")),
+    "the sentinel renders as its own readable omission line",
+  );
+  const groupLine = lines.find((line) => line.includes("tool call"));
+  assert.ok(groupLine, "the surviving real tool calls still render as a compact group");
+  assert.doesNotMatch(groupLine!, /●/, "the phase-less sentinel is not folded into the group and counted as a running tool");
 });
 
 test("invalidate() clears the cached detail body so a manual refresh recomputes Markdown", (t) => {

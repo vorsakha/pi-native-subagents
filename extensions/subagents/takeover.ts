@@ -13,6 +13,7 @@ import type { JobSnapshot } from "../../src/types.ts";
 import { formatContext, formatEffort, formatUsage, sanitizeInline, shortId, statusMeta } from "./render.ts";
 import { openSubagentsDashboard, type SubagentsDashboardManager } from "./dashboard.ts";
 import { buildTranscript } from "./transcript.ts";
+import { DEFAULT_TOOL_DISPLAY, type ToolDisplayMode } from "../tool-summary.ts";
 
 interface TakeoverManager extends Pick<JobManager, "check" | "send" | "cancel" | "subscribe"> {}
 
@@ -29,6 +30,7 @@ class TakeoverView implements Focusable {
   #viewportRows = 1;
   #transcriptRows = 0;
   #notice = "";
+  #toolDisplay: ToolDisplayMode = DEFAULT_TOOL_DISPLAY;
   #renderTimer?: NodeJS.Timeout;
   #ticker: NodeJS.Timeout;
   #unsubscribe: () => void;
@@ -101,7 +103,7 @@ class TakeoverView implements Focusable {
     const owner = job.workflow ? ` · workflow ${sanitizeInline(job.workflow.label)}` : "";
     const header = `${this.#theme.fg(status.color, status.glyph)} ${this.#theme.fg("accent", this.#theme.bold(`${sanitizeInline(job.name)} · ${shortId(job.id)}`))}${this.#theme.fg("dim", ` · ${job.status} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}${owner}`)}`;
     const meta = [job.access, job.profile ? `profile ${job.profile}` : "", job.independent ? "independent" : "", `effort ${formatEffort(job.effort)}`, usage, formatContext(job.context), job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""].filter(Boolean).join(" · ");
-    const transcript = buildTranscript(job, width, this.#theme);
+    const transcript = buildTranscript(job, width, this.#theme, { toolDisplay: this.#toolDisplay });
     const terminalRows = Math.max(1, this.#tui.terminal.rows || 24);
     const reusable = !job.workflow && job.status !== "failed" && job.status !== "cancelled";
     const inputRows = reusable ? Math.max(1, this.#input.render(width).length) : 1;
@@ -130,7 +132,7 @@ class TakeoverView implements Focusable {
       : "Session unavailable — read-only transcript"));
     else lines.push(...this.#input.render(width));
     if (this.#notice) lines.push(truncateToWidth(this.#theme.fg("warning", this.#notice), width, "…"));
-    else lines.push(truncateToWidth(this.#theme.fg("dim", `${job.status === "completed" ? "Enter follow-up" : "Enter steer"} · Shift+↑↓/Pg scroll · Esc close`), width, "…"));
+    else lines.push(truncateToWidth(this.#theme.fg("dim", `${job.status === "completed" ? "Enter follow-up" : "Enter steer"} · Ctrl+T ${this.#toolDisplay === "compact" ? "full" : "compact"} · Shift+↑↓/Pg scroll · Esc close`), width, "…"));
     lines.push(border);
     return lines.slice(0, terminalRows);
   }
@@ -150,6 +152,9 @@ class TakeoverView implements Focusable {
     else if (matchesKey(data, Key.shift(Key.down))) this.scroll(-4);
     else if (matchesKey(data, Key.pageUp)) this.scroll(this.#viewportRows - 1);
     else if (matchesKey(data, Key.pageDown)) this.scroll(-(this.#viewportRows - 1));
+    else if (matchesKey(data, Key.ctrl("t"))) {
+      this.#toolDisplay = this.#toolDisplay === "compact" ? "full" : "compact";
+    }
     else if (this.#keybindings.matches(data, "tui.input.submit") || matchesKey(data, Key.enter)) this.#input.onSubmit?.(this.#input.getValue());
     else {
       const job = this.#manager.check(this.#jobId);

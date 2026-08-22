@@ -45,6 +45,7 @@ import {
   takeoverPolicy,
   transcriptSignature,
 } from "./transcript.ts";
+import { DEFAULT_TOOL_DISPLAY, type ToolDisplayMode } from "../tool-summary.ts";
 import type { JobSnapshot, SendBehavior } from "../../src/types.ts";
 
 /*
@@ -108,6 +109,8 @@ class DashboardOverlay implements Focusable {
   #scrollJobId: string | undefined;
   /** Live jobs are most useful pinned to their latest output; any upward scroll unpins. */
   #followTail = true;
+  /** One display preference per overlay instance; survives job/pane changes, not resets. */
+  #toolDisplay: ToolDisplayMode = DEFAULT_TOOL_DISPLAY;
   #transcriptRows = 0;
   #transcriptTotal = 0;
   /** Job id armed for cancellation; a second `x` confirms, any other key disarms. */
@@ -294,6 +297,7 @@ class DashboardOverlay implements Focusable {
       // singleton. Printable navigation keys must remain ordinary text here.
       if (matchesKey(data, Key.shift(Key.up))) this.scroll(-1);
       else if (matchesKey(data, Key.shift(Key.down))) this.scroll(1);
+      else if (matchesKey(data, Key.ctrl("t"))) this.toggleToolDisplay();
       else if (this.keybindings.matches(data, "tui.input.submit") || matchesKey(data, Key.enter)) this.submit(this.#input.getValue());
       else {
         this.#inputRevision++;
@@ -327,6 +331,7 @@ class DashboardOverlay implements Focusable {
     else if (matchesKey(data, "s") && this.steerControlVisible(job)) this.enterTakeover(job, "steer");
     else if (matchesKey(data, "f") && this.followUpControlVisible(job)) this.enterTakeover(job, "followUp");
     else if (matchesKey(data, "x") && this.cancelControlVisible(job)) this.requestCancel(job, undefined);
+    else if (matchesKey(data, "t") || matchesKey(data, Key.ctrl("t"))) this.toggleToolDisplay();
     this.tui.requestRender();
   }
 
@@ -431,6 +436,11 @@ class DashboardOverlay implements Focusable {
     if (!next || next.id === this.#selectedId) return;
     this.#selectedId = next.id;
     this.resetScroll();
+  }
+
+  private toggleToolDisplay(): void {
+    this.#toolDisplay = this.#toolDisplay === "compact" ? "full" : "compact";
+    this.invalidate();
   }
 
   private enterTakeover(job: JobSnapshot | undefined, behavior?: SendBehavior): void {
@@ -819,9 +829,9 @@ class DashboardOverlay implements Focusable {
 
   /** Wrapping and Markdown are the expensive part; they only rerun when the job or width moves. */
   private transcript(job: JobSnapshot, width: number): string[] {
-    const key = `${transcriptSignature(job)}@${width}`;
+    const key = `${transcriptSignature(job)}@${width}@${this.#toolDisplay}`;
     if (this.#transcriptCache?.key === key) return this.#transcriptCache.lines;
-    const lines = buildTranscript(job, width, this.theme, { renderMarkdown: this.#renderMarkdown });
+    const lines = buildTranscript(job, width, this.theme, { renderMarkdown: this.#renderMarkdown, toolDisplay: this.#toolDisplay });
     this.#transcriptCache = { key, lines };
     return lines;
   }
@@ -855,9 +865,10 @@ class DashboardOverlay implements Focusable {
 
   private controls(frame: DashboardFrame, job: JobSnapshot | undefined): string {
     const scroll = "Shift+↑↓ scroll";
+    const toolToggle = `t ${this.#toolDisplay === "compact" ? "full" : "compact"}`;
     if (this.#mode === "takeover") {
       const behavior = job ? (this.#behavior ?? takeoverPolicy(job).behavior) : "steer";
-      return `Enter ${behavior === "followUp" ? "queue follow-up" : "steer"} · ${scroll}`;
+      return `Enter ${behavior === "followUp" ? "queue follow-up" : "steer"} · Ctrl+T ${this.#toolDisplay === "compact" ? "full" : "compact"} · ${scroll}`;
     }
     const live = job && !isTerminal(job.status);
     const sendable = job && takeoverPolicy(job).reusable;
@@ -871,6 +882,7 @@ class DashboardOverlay implements Focusable {
       sendable ? "Enter takeover" : "",
       sendable && live ? "s steer" : "",
       sendable && !live ? "f follow-up" : "",
+      toolToggle,
       `${scroll} · Ctrl+U/D · g/G`,
     ].filter(Boolean).join(" · ");
   }

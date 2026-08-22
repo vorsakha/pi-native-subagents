@@ -20,6 +20,18 @@ const RUN_ID_PATTERN = /^wf_[a-f0-9]+$/;
 const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 const TRANSCRIPT_ENTRY_BYTES = 4 * 1_024;
 const TRANSCRIPT_AGENT_BYTES = 32 * 1_024;
+const TRANSCRIPT_TRUNCATION_TOOL_ID = "transcript";
+const TRANSCRIPT_TRUNCATION_TEXT = "[older transcript entries omitted]";
+
+/** Phase-less sentinel `boundedTranscript` splices in for omitted entries; carries no
+ * result of its own, so dashboard presentation must not mistake it for a running tool call. */
+function transcriptTruncationEntry(): TranscriptEntry {
+  return { kind: "tool", toolId: TRANSCRIPT_TRUNCATION_TOOL_ID, name: "transcript", text: TRANSCRIPT_TRUNCATION_TEXT };
+}
+
+export function isTranscriptTruncationEntry(entry: TranscriptEntry): boolean {
+  return entry.kind === "tool" && entry.toolId === TRANSCRIPT_TRUNCATION_TOOL_ID && entry.text === TRANSCRIPT_TRUNCATION_TEXT;
+}
 const JOURNAL_RECORD_BYTES = 1 * 1_024 * 1_024;
 const JOURNAL_FILE_BYTES = 72 * 1_024 * 1_024;
 const MAX_JOURNAL_RECORDS = 256;
@@ -252,7 +264,7 @@ function boundedTranscript(entries: TranscriptEntry[] = []): TranscriptEntry[] {
   for (let index = bounded.length - 1; index > 0; index--) {
     const candidate = [
       ...(first ? [first] : []),
-      { kind: "tool", toolId: "transcript", name: "transcript", text: "[older transcript entries omitted]" } as TranscriptEntry,
+      transcriptTruncationEntry(),
       ...[...tail].reverse(),
       bounded[index]!,
     ];
@@ -261,7 +273,7 @@ function boundedTranscript(entries: TranscriptEntry[] = []): TranscriptEntry[] {
   }
   return [
     ...(first ? [first] : []),
-    { kind: "tool", toolId: "transcript", name: "transcript", text: "[older transcript entries omitted]" },
+    transcriptTruncationEntry(),
     ...tail.reverse(),
   ];
 }
