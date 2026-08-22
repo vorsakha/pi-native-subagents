@@ -406,6 +406,15 @@ export class PiRpcBackend implements Backend {
             input: number(usage.input), output: number(usage.output), cacheRead: number(usage.cacheRead),
             cacheWrite: number(usage.cacheWrite), cost: number(asObject(usage.cost).total), turns: 1,
           } });
+          // responseModel, when present, is the concrete model that served the request; message.model is only the requested/configured model and is never a substitute.
+          const servingModel = typeof message.responseModel === "string" && message.responseModel ? message.responseModel : undefined;
+          const contextTokens = typeof usage.totalTokens === "number" && Number.isFinite(usage.totalTokens) ? usage.totalTokens : undefined;
+          if (servingModel !== undefined || contextTokens !== undefined) {
+            emit({ type: "context", context: {
+              ...(servingModel !== undefined ? { servingModel } : {}),
+              ...(contextTokens !== undefined ? { tokens: contextTokens } : {}),
+            } });
+          }
         } else if (message.role === "user") {
           const text = textContent(message.content);
           if (text) emit({ type: "user_message", text });

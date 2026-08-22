@@ -298,6 +298,10 @@ export class JobManager {
       truncated: false,
       tools: [],
       liveThinking: "",
+      // The new generation's occupancy gauge is unread until its own telemetry arrives; the prior
+      // generation's reading must not keep displaying as current, possibly forever if this generation
+      // never reports one. Cumulative usage is untouched: it is not a generation-scoped gauge.
+      context: undefined,
       queuedMessages: [{ text: message, behavior: "followUp" }],
     };
     this.#queue.push(id);

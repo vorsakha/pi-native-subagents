@@ -516,17 +516,23 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
   assert.equal(streamedSnapshots[2]!.tools, streamedSnapshots[1]!.tools, "observer projections reuse unchanged tool clones across deltas");
   await manager.send(job.id, "change course", "steer");
   assert.deepEqual(backend.sends, [{ id: job.id, message: "change course", behavior: "steer" }]);
-  backend.complete(job.id, "done");
+  backend.runs.get(job.id)!.emit({ type: "context", context: { tokens: 1_000, servingModel: "gen-0-model" } });
+  backend.complete(job.id, "done", { input: 3 });
   await manager.wait(job.id);
   assert.ok(observed.includes("completed:completed"));
   const queued = await manager.send(job.id, "review the fixes", "followUp");
   assert.ok(queued.status === "queued" || queued.status === "running");
+  assert.equal(queued.context, undefined, "the retained generation boundary clears the prior generation's context before any new telemetry arrives, even if this generation never reports one");
   await tick();
   assert.deepEqual(backend.sends.at(-1), { id: job.id, message: "review the fixes", behavior: "followUp" });
-  backend.complete(job.id, "second result");
+  backend.runs.get(job.id)!.emit({ type: "context", context: { tokens: 2_000, servingModel: "gen-1-model" } });
+  backend.complete(job.id, "second result", { input: 2 });
   const continued = await manager.wait(job.id);
   assert.equal(continued.status, "completed");
   assert.equal(continued.output, "second result");
+  assert.deepEqual(continued.context, { tokens: 2_000, servingModel: "gen-1-model" }, "a retained follow-up's context replaces the prior generation's gauge");
+  assert.equal(continued.usage.input, 5, "usage accumulates across retained generations");
+  assert.equal(continued.model, "default", "the configured job model is unaffected by runtime-reported serving models");
 
   const workflowOwned = manager.spawn({
     ...request(2),

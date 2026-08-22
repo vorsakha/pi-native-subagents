@@ -5,6 +5,7 @@ import {
   MAX_COLLAPSED_LINES,
   MAX_EXPANDED_LINES,
   buildJobCardLines,
+  formatContext,
   renderJobCard,
   renderJobReceipt,
   sanitizeInline,
@@ -90,6 +91,22 @@ test("renderer sanitizes output and enforces collapsed/expanded line budgets", (
   assert.ok(expandedLines.every((line) => !CONTROL_CHARS.test(line)));
   assert.ok(expandedLines.some((line) => line.includes("/subagents")));
   assert.ok(expandedLines.every((line) => !line.includes("tool-")), "expanded card no longer lists recent tool calls as primary activity");
+});
+
+test("formatContext distinguishes the configured model from the effective serving model and never renders a zero gauge", () => {
+  assert.equal(formatContext(undefined), "");
+  assert.equal(formatContext({ tokens: 12_000, window: 100_000, servingModel: "served-model" }), "context 12k/100k · serving served-model");
+  assert.equal(formatContext({ tokens: 500 }), "context 500");
+  assert.equal(formatContext({ servingModel: "served-model" }), "context unknown · serving served-model", "an unreported gauge never renders as zero");
+  assert.equal(formatContext({ window: 200_000 }), "context unknown/200k", "a known window with unknown tokens still surfaces the reading instead of vanishing");
+  assert.equal(formatContext({}), "", "no known field renders nothing");
+
+  const lines = buildJobCardLines(job({
+    harness: "codex", model: "configured-model",
+    context: { tokens: 12_000, window: 100_000, servingModel: "runtime-model" },
+  }), theme, { expanded: true, now: 5_000 });
+  assert.ok(lines.some((line) => line.includes("codex/configured-model")), "the configured job model keeps its own policy slot");
+  assert.ok(lines.some((line) => line.includes("serving runtime-model")), "the effective serving model is shown separately from the configured model");
 });
 
 test("expanded activity prioritizes semantic progress over the tool list", () => {

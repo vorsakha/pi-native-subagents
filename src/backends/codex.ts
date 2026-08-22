@@ -276,7 +276,16 @@ export class CodexAppServerBackend implements Backend {
     let cancellingReason: string | undefined;
     let stderr = "";
     let previousTokenTotals: CodexTokenTotals | undefined;
-    let servingModel = request.policy.model;
+    /** Model identity reported by the runtime; never seeded from configured policy. */
+    let servingModel: string | undefined;
+    /** Latest occupancy gauge; carried over (not recomputed) by events that are not a new reading, e.g. a reroute. */
+    let lastOccupancy: { tokens?: number; window?: number } = {};
+    const emitContext = () => {
+      const context: ContextSnapshot = { ...lastOccupancy, ...(servingModel ? { servingModel } : {}) };
+      if (context.tokens !== undefined || context.window !== undefined || context.servingModel !== undefined) {
+        emit({ type: "context", context });
+      }
+    };
     const followUps: string[] = [];
     let resolveCompleted!: () => void;
     const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
@@ -368,6 +377,8 @@ export class CodexAppServerBackend implements Backend {
             });
           }
         } else if (method === "thread/tokenUsage/updated") {
+          // ThreadTokenUsageUpdatedNotification carries required threadId/turnId; a mismatch is another turn's telemetry, never this job's current gauge.
+          if (params.threadId !== threadId || params.turnId !== turnId) return;
           const tokenUsage = asObject(params.tokenUsage ?? params.usage);
           const total = asObject(tokenUsage.total);
           const last = asObject(tokenUsage.last ?? tokenUsage);
@@ -380,15 +391,23 @@ export class CodexAppServerBackend implements Backend {
             const usage = codexUsageDelta(codexTokenTotals(last));
             if (hasUsage(usage)) emit({ type: "usage", usage });
           }
-          const contextTokens = num(last.totalTokens) || num(last.inputTokens) + num(last.outputTokens);
-          const contextWindow = num(tokenUsage.modelContextWindow ?? params.modelContextWindow);
-          if (contextTokens || contextWindow || servingModel) {
-            const context: ContextSnapshot = {
-              tokens: contextTokens,
-              ...(contextWindow ? { window: contextWindow } : {}),
-              ...(servingModel ? { servingModel } : {}),
-            };
-            emit({ type: "context", context });
+          const contextTokens = typeof last.totalTokens === "number"
+            ? last.totalTokens
+            : typeof last.inputTokens === "number" || typeof last.outputTokens === "number"
+              ? num(last.inputTokens) + num(last.outputTokens)
+              : undefined;
+          const contextWindow = numOrUndefined(tokenUsage.modelContextWindow ?? params.modelContextWindow);
+          lastOccupancy = {
+            ...(contextTokens !== undefined ? { tokens: contextTokens } : {}),
+            ...(contextWindow !== undefined ? { window: contextWindow } : {}),
+          };
+          emitContext();
+        } else if (method === "model/rerouted") {
+          // ModelReroutedNotification carries required threadId/turnId; only this job's current turn may update its serving model.
+          const toModel = params.toModel;
+          if (params.threadId === threadId && params.turnId === turnId && typeof toModel === "string" && toModel) {
+            servingModel = toModel;
+            emitContext();
           }
         } else if (method === "turn/completed") {
           const turn = asObject(params.turn);
@@ -474,8 +493,9 @@ export class CodexAppServerBackend implements Backend {
           threadResult = await startThread({ ...(baseConfig ?? {}), mcp_servers: {}, hooks: {} });
         }
         const thread = asObject(threadResult.thread);
-        servingModel = [threadResult.model, thread.model]
-          .find((value): value is string => typeof value === "string" && value.length > 0) ?? servingModel;
+        // ThreadStartResponse.model echoes the model this backend itself requested (configured routing
+        // intent, resolved but not yet observed serving); only a later model/rerouted notification is
+        // authoritative telemetry about the model that actually served a turn.
         const returnedProviders = [threadResult.modelProvider, thread.modelProvider]
           .filter((value): value is string => typeof value === "string" && value.length > 0);
         if (returnedProviders.length === 0 || returnedProviders.some((provider) => provider !== "openai")) {
@@ -484,6 +504,7 @@ export class CodexAppServerBackend implements Backend {
         threadId = String(thread.id ?? "");
         if (!threadId) throw new Error("Codex thread/start returned no thread id");
         emit({ type: "started", backendSessionId: threadId, sessionFile: typeof thread.path === "string" ? thread.path : undefined });
+        emitContext();
         await startTurn(`Task: ${request.task}`);
       } catch (error) {
         if (!closing) finish({ type: "failed", error: error instanceof Error ? error.message : String(error) });
@@ -505,6 +526,9 @@ export class CodexAppServerBackend implements Backend {
       if (settled) {
         settled = false;
         output = "";
+        // A new generation's occupancy is unread until this turn's own thread/tokenUsage/updated notification
+        // reports it; the prior generation's gauge must not be re-emitted labeled as current.
+        lastOccupancy = {};
         watchdog.arm();
         emit({ type: "started" });
         await startTurn(message);
@@ -562,6 +586,7 @@ function appendTurn(current: string, next: string): string {
   return boundedOutput(current, `${current ? "\n\n" : ""}${next}`);
 }
 function num(value: unknown): number { return typeof value === "number" && Number.isFinite(value) ? value : 0; }
+function numOrUndefined(value: unknown): number | undefined { return typeof value === "number" && Number.isFinite(value) ? value : undefined; }
 function arrayOf(value: unknown): unknown[] { return Array.isArray(value) ? value : []; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function itemSummary(item: Record<string, unknown>): string {

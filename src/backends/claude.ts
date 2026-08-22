@@ -18,6 +18,7 @@ import type {
   BackendPolicy,
   BackendRequest,
   BackendRun,
+  ContextSnapshot,
   DiscoveryRequest,
   DiscoveryResult,
   SendBehavior,
@@ -75,6 +76,38 @@ interface ClaudeBackendOptions {
   inactivityTimeoutMs?: number;
   queryFn?: ClaudeQuery;
   verifyAuth?: ClaudeAuthVerifier;
+}
+
+/** Accumulated per-session runtime telemetry, mutated in place as authoritative frames arrive. */
+interface ClaudeTelemetry {
+  servingModel?: string;
+  tokens?: number;
+  window?: number;
+}
+
+function emitClaudeContext(telemetry: ClaudeTelemetry, emit: (event: BackendEvent) => void): void {
+  if (telemetry.servingModel === undefined && telemetry.tokens === undefined && telemetry.window === undefined) return;
+  const context: ContextSnapshot = {
+    ...(telemetry.servingModel !== undefined ? { servingModel: telemetry.servingModel } : {}),
+    ...(telemetry.tokens !== undefined ? { tokens: telemetry.tokens } : {}),
+    ...(telemetry.window !== undefined ? { window: telemetry.window } : {}),
+  };
+  emit({ type: "context", context });
+}
+
+/** A prior occupancy reading belonged to the outgoing model; it must not be shown as if it were current for the new one. */
+function setClaudeServingModel(telemetry: ClaudeTelemetry, model: string): void {
+  if (telemetry.servingModel === model) return;
+  telemetry.servingModel = model;
+  telemetry.tokens = undefined;
+  telemetry.window = undefined;
+}
+
+/** The last `iterations` entry is the authoritative current-turn reading; earlier entries and the top-level totals can be cumulative across server-side iterations. */
+function lastClaudeIteration(usage: Record<string, unknown>): Record<string, unknown> | undefined {
+  const iterations = usage.iterations;
+  if (!Array.isArray(iterations) || iterations.length === 0) return undefined;
+  return record(iterations[iterations.length - 1]);
 }
 
 export class ClaudeBackend implements Backend {
@@ -254,6 +287,7 @@ export class ClaudeBackend implements Backend {
     let expectedResults = 1;
     let resultCount = 0;
     let output = "";
+    const telemetry: ClaudeTelemetry = {};
     const queuedMessages: Array<{ text: string; behavior: SendBehavior }> = [];
     let resolveCompleted!: () => void;
     const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
@@ -338,7 +372,7 @@ export class ClaudeBackend implements Backend {
       try {
         for await (const message of stream) {
           watchdog.touch();
-          const result = handleMessage(message, emit, controller, request.policy.access === "readOnly", !!request.parentThread);
+          const result = handleMessage(message, emit, controller, request.policy.access === "readOnly", !!request.parentThread, telemetry);
           if (!result) continue;
           resultCount++;
           if (queuedMessages.length) {
@@ -379,6 +413,9 @@ export class ClaudeBackend implements Backend {
         if (restarting) {
           terminal = false;
           output = "";
+          // A new turn's occupancy is unread until this generation's own frames report it; a prior generation's gauge must not carry forward as if current.
+          telemetry.tokens = undefined;
+          telemetry.window = undefined;
           expectedResults = resultCount + 1;
           behavior = "followUp";
           emit({ type: "started" });
@@ -464,7 +501,14 @@ function userMessage(text: string, priority: "now" | "next" | "later"): SDKUserM
 
 interface ClaudeResult { success: boolean; output: string; error: string }
 
-function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void, controller: AbortController, readOnly: boolean, allowParentThread = false): ClaudeResult | undefined {
+function handleMessage(
+  message: SDKMessage,
+  emit: (event: BackendEvent) => void,
+  controller: AbortController,
+  readOnly: boolean,
+  allowParentThread: boolean,
+  telemetry: ClaudeTelemetry,
+): ClaudeResult | undefined {
   if (message.type === "system" && message.subtype === "init") {
     const source = message.apiKeySource as string;
     if (source !== "oauth" && source !== "none") {
@@ -478,12 +522,22 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
       controller.abort();
       return { success: false, output: "", error };
     }
+    if (typeof message.model === "string" && message.model) {
+      setClaudeServingModel(telemetry, message.model);
+      emitClaudeContext(telemetry, emit);
+    }
     emit({ type: "started", backendSessionId: message.session_id });
     return;
   }
   if (message.type === "system" && message.subtype === "permission_denied") {
     emit({ type: "tool_start", id: message.tool_use_id, name: message.tool_name, args: {}, summary: "Denied by read-only policy" });
     emit({ type: "tool_end", id: message.tool_use_id, name: message.tool_name, error: true });
+    return;
+  }
+  if (message.type === "system" && message.subtype === "model_refusal_fallback") {
+    // Retry ran on a fallback model; the refused attempt's occupancy reading does not belong to it.
+    setClaudeServingModel(telemetry, message.fallback_model);
+    emitClaudeContext(telemetry, emit);
     return;
   }
   if (message.type === "stream_event") {
@@ -496,6 +550,23 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
     return;
   }
   if (message.type === "assistant") {
+    // Sidechain frames (subagent/Task output) never represent this job's own turn.
+    if (!message.parent_tool_use_id) {
+      const usage = record(message.message.usage);
+      // usage.iterations, when present, is the authoritative per-iteration breakdown: the last entry is the true
+      // current context size and, for a server-side fallback hop, the model that actually served the response.
+      // The top-level usage fields can be cumulative across those iterations.
+      const iteration = lastClaudeIteration(usage);
+      const model = iteration && typeof iteration.model === "string" && iteration.model
+        ? iteration.model
+        : typeof message.message.model === "string" && message.message.model ? message.message.model : undefined;
+      if (model) setClaudeServingModel(telemetry, model);
+      const tokenSource = iteration ?? usage;
+      if (typeof tokenSource.input_tokens === "number" || typeof tokenSource.cache_read_input_tokens === "number" || typeof tokenSource.cache_creation_input_tokens === "number") {
+        telemetry.tokens = num(tokenSource.input_tokens) + num(tokenSource.cache_read_input_tokens) + num(tokenSource.cache_creation_input_tokens);
+      }
+      emitClaudeContext(telemetry, emit);
+    }
     let text = "";
     for (const block of message.message.content) {
       if (block.type === "text") text += block.text;
@@ -534,6 +605,12 @@ function handleMessage(message: SDKMessage, emit: (event: BackendEvent) => void,
       cacheRead: num(usage.cache_read_input_tokens), cacheWrite: num(usage.cache_creation_input_tokens),
       cost: message.total_cost_usd, turns: message.num_turns,
     } });
+    // Must emit before this function returns a terminal result: the manager drops context events once the job settles.
+    const contextWindow = telemetry.servingModel ? message.modelUsage[telemetry.servingModel]?.contextWindow : undefined;
+    if (typeof contextWindow === "number" && Number.isFinite(contextWindow)) {
+      telemetry.window = contextWindow;
+      emitClaudeContext(telemetry, emit);
+    }
     if (message.subtype === "success" && message.result) emit({ type: "message", text: boundedAppend("", message.result).text });
     return message.subtype === "success"
       ? { success: true, output: message.result, error: "" }

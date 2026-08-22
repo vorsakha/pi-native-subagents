@@ -134,8 +134,14 @@ export function formatUsage(usage: Usage): string {
 
 export function formatContext(context?: ContextSnapshot): string {
   if (!context) return "";
+  const serving = context.servingModel ? ` · serving ${sanitizeInline(context.servingModel)}` : "";
+  if (context.tokens === undefined) {
+    if (context.window === undefined && !serving) return "";
+    const occupancy = context.window ? `unknown/${formatTokens(context.window)}` : "unknown";
+    return `context ${occupancy}${serving}`;
+  }
   const occupancy = context.window ? `${formatTokens(context.tokens)}/${formatTokens(context.window)}` : formatTokens(context.tokens);
-  return `context ${occupancy}${context.servingModel ? ` · serving ${sanitizeInline(context.servingModel)}` : ""}`;
+  return `context ${occupancy}${serving}`;
 }
 
 export type TraceStatusColor = "accent" | "success" | "warning" | "error" | "muted" | "dim";

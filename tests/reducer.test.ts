@@ -22,13 +22,15 @@ test("reducer tracks lifecycle, tools, usage, and authoritative final message", 
   });
   state = reduceJob(state, { type: "usage", usage: { input: 10, output: 2, turns: 1 } });
   state = reduceJob(state, { type: "context", context: { tokens: 12_000, window: 100_000, servingModel: "served-model" } });
+  state = reduceJob(state, { type: "usage", usage: { input: 5, output: 1 } });
+  state = reduceJob(state, { type: "context", context: { tokens: 5_000 } });
   state = reduceJob(state, { type: "message", text: "final" });
   state = reduceJob(state, { type: "completed", at: 3 });
   assert.equal(state.status, "completed");
   assert.equal(state.output, "final");
   assert.equal(state.tools[0]?.status, "completed");
-  assert.equal(state.usage.input, 10);
-  assert.deepEqual(state.context, { tokens: 12_000, window: 100_000, servingModel: "served-model" });
+  assert.equal(state.usage.input, 15, "usage accumulates across context events instead of resetting");
+  assert.deepEqual(state.context, { tokens: 5_000 }, "a later context event fully replaces the gauge instead of merging with the prior reading");
   assert.deepEqual(state.transcript.map((entry) => entry.kind), ["user", "thinking", "tool", "tool", "assistant"]);
   assert.deepEqual(state.transcript.filter((entry) => entry.kind === "tool").map((entry) => entry.phase), ["start", "end"]);
   assert.deepEqual(state.tools[0]?.args, { path: "src/index.ts" });

@@ -59,6 +59,14 @@ process.stdin.on("data", chunk => {
       process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
     }
     if (value.type === "prompt" && process.env.MODE === "malformed") process.stdout.write("{not-json}\\n");
+    if (value.type === "prompt" && process.env.MODE === "serving-model") {
+      process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "MODEL_OK" }], usage: { totalTokens: 4242 }, stopReason: "stop", model: "pi-requested-alias", responseModel: "pi-served-model" } }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+    }
+    if (value.type === "prompt" && process.env.MODE === "alias-only") {
+      process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "ALIAS_OK" }], usage: { totalTokens: 4242 }, stopReason: "stop", model: "pi-requested-alias" } }) + "\\n");
+      process.stdout.write(JSON.stringify({ type: "agent_settled" }) + "\\n");
+    }
     if (value.type === "steer" || value.type === "follow_up") complete(value.message);
   }
 });
@@ -99,20 +107,68 @@ process.stdin.on("data", chunk => {
     else if (value.method === "account/read") reply(value.id, { account: { type: "chatgpt" } });
     else if (value.method === "thread/start") {
       if (process.env.THREAD_PARAM_FILE) fs.writeFileSync(process.env.THREAD_PARAM_FILE, JSON.stringify(value.params));
-      reply(value.id, { modelProvider: "openai", thread: { id: "thread-1", modelProvider: process.env.THREAD_PROVIDER || "openai" } });
+      reply(value.id, { modelProvider: "openai", ...(process.env.THREAD_MODEL ? { model: process.env.THREAD_MODEL } : {}), thread: { id: "thread-1", modelProvider: process.env.THREAD_PROVIDER || "openai" } });
     }
     else if (value.method === "turn/start") {
       if (process.env.PARAM_FILE) fs.appendFileSync(process.env.PARAM_FILE, JSON.stringify(value.params) + "\\n");
       const number = ++turns; const id = "turn-" + number;
       reply(value.id, { turn: { id } });
       if (process.env.MODE === "usage") {
-        const params = { tokenUsage: {
+        const params = { threadId: "thread-1", turnId: id, tokenUsage: {
           total: { inputTokens: 104685, outputTokens: 106, cachedInputTokens: 102144, cacheWriteInputTokens: 0 },
           last: { inputTokens: 104685, outputTokens: 106, cachedInputTokens: 102144, totalTokens: 104791 },
           modelContextWindow: 258400,
         } };
         process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params }) + "\\n");
         process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params }) + "\\n");
+      }
+      if (process.env.MODE === "latest-turn") {
+        process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: id, tokenUsage: {
+          total: { inputTokens: 900000, outputTokens: 50000, cachedInputTokens: 800000 },
+          last: { totalTokens: 12345 },
+          modelContextWindow: 200000,
+        } } }) + "\\n");
+        process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: id, tokenUsage: {
+          total: { inputTokens: 950000, outputTokens: 51000 },
+          modelContextWindow: 200000,
+        } } }) + "\\n");
+      }
+      if (process.env.MODE === "reroute") {
+        process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: id, tokenUsage: {
+          total: { inputTokens: 1000, outputTokens: 10 },
+          last: { totalTokens: 1010 },
+          modelContextWindow: 200000,
+        } } }) + "\\n");
+        process.stdout.write(JSON.stringify({ method: "model/rerouted", params: { threadId: "thread-1", turnId: id, fromModel: process.env.THREAD_MODEL, toModel: "gpt-5.6-codex-mini", reason: "fixture" } }) + "\\n");
+      }
+      if (process.env.MODE === "stale-scope") {
+        process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: "turn-other", tokenUsage: {
+          total: { inputTokens: 1, outputTokens: 1 },
+          last: { totalTokens: 999999 },
+          modelContextWindow: 999999,
+        } } }) + "\\n");
+        process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-other", turnId: id, tokenUsage: {
+          total: { inputTokens: 1, outputTokens: 1 },
+          last: { totalTokens: 888888 },
+          modelContextWindow: 888888,
+        } } }) + "\\n");
+        process.stdout.write(JSON.stringify({ method: "model/rerouted", params: { threadId: "thread-1", turnId: "turn-other", fromModel: "a", toModel: "stale-model", reason: "fixture" } }) + "\\n");
+        process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: id, tokenUsage: {
+          total: { inputTokens: 10, outputTokens: 5 },
+          last: { totalTokens: 4242 },
+          modelContextWindow: 100000,
+        } } }) + "\\n");
+      }
+      if (process.env.MODE === "retained-generation") {
+        if (number === 1) {
+          process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: id, tokenUsage: {
+            total: { inputTokens: 1000, outputTokens: 10 },
+            last: { totalTokens: 1010 },
+            modelContextWindow: 200000,
+          } } }) + "\\n");
+        } else {
+          process.stdout.write(JSON.stringify({ method: "model/rerouted", params: { threadId: "thread-1", turnId: id, fromModel: "a", toModel: "gen-2-model", reason: "fixture" } }) + "\\n");
+        }
       }
       if (process.env.MODE === "dynamic-tool") {
         process.stdout.write(JSON.stringify({ id: "server-tool-1", method: "item/tool/call", params: { threadId: "thread-1", turnId: id, callId: "call-1", tool: "parent_thread_context", arguments: { query: "decision" } } }) + "\\n");
@@ -164,12 +220,18 @@ function terminal(events: BackendEvent[]): BackendEvent | undefined {
   return undefined;
 }
 
-test("Codex usage separates cached input, ignores duplicate totals, and reports current context", async () => {
+function contextEvents(events: BackendEvent[]): Array<Extract<BackendEvent, { type: "context" }>> {
+  return events.filter((event): event is Extract<BackendEvent, { type: "context" }> => event.type === "context");
+}
+
+test("Codex usage separates cached input and never substitutes the configured model for an unreported serving model", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
   try {
+    const codexRequest = request("codex", fake.dir, { ...process.env, MODE: "usage" });
+    assert.equal(codexRequest.policy.model, "fixture-model");
     const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
-      .start(request("codex", fake.dir, { ...process.env, MODE: "usage" }), (event) => events.push(event));
+      .start(codexRequest, (event) => events.push(event));
     await run.completed;
     const usage = events.filter((event): event is Extract<BackendEvent, { type: "usage" }> => event.type === "usage")
       .reduce((total, event) => ({
@@ -178,9 +240,84 @@ test("Codex usage separates cached input, ignores duplicate totals, and reports 
         cacheRead: total.cacheRead + (event.usage.cacheRead ?? 0),
       }), { input: 0, output: 0, cacheRead: 0 });
     assert.deepEqual(usage, { input: 2_541, output: 106, cacheRead: 102_144 });
-    assert.deepEqual(events.filter((event): event is Extract<BackendEvent, { type: "context" }> => event.type === "context").at(-1)?.context, {
-      tokens: 104_791, window: 258_400, servingModel: "fixture-model",
-    });
+    assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 104_791, window: 258_400 });
+    assert.equal(codexRequest.policy.model, "fixture-model", "the configured job model is never rewritten");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex leaves the effective serving model unknown when thread/start reports a model but no reroute ever arrives", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+      .start(request("codex", fake.dir, { ...process.env, MODE: "usage", THREAD_MODEL: "gpt-5.6-codex" }), (event) => events.push(event));
+    await run.completed;
+    assert.deepEqual(
+      contextEvents(events).at(-1)?.context,
+      { tokens: 104_791, window: 258_400 },
+      "thread/start's model field is configured/resolved routing state, not authoritative serving telemetry, and must never populate servingModel",
+    );
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex context occupancy uses the latest-turn gauge, never thread-cumulative totals, and stays unknown without a last reading", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+      .start(request("codex", fake.dir, { ...process.env, MODE: "latest-turn" }), (event) => events.push(event));
+    await run.completed;
+    const contexts = contextEvents(events);
+    assert.deepEqual(contexts[0]?.context, { tokens: 12_345, window: 200_000 }, "occupancy reads the latest-turn gauge, not the thread-cumulative total");
+    assert.deepEqual(contexts[1]?.context, { window: 200_000 }, "tokens stay unknown, not zero, when a reading omits the latest-turn gauge");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex model/rerouted updates the effective serving model and preserves the last occupancy reading", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+      .start(request("codex", fake.dir, { ...process.env, MODE: "reroute", THREAD_MODEL: "gpt-5.6-codex" }), (event) => events.push(event));
+    await run.completed;
+    assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 1_010, window: 200_000, servingModel: "gpt-5.6-codex-mini" });
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex clears its private occupancy cache at a retained follow-up's generation boundary instead of re-emitting the prior generation's gauge", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 2_000 })
+      .start(request("codex", fake.dir, { ...process.env, MODE: "retained-generation" }), (event) => events.push(event));
+    await run.completed;
+    assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 1_010, window: 200_000 }, "generation one's own telemetry reports occupancy");
+    await run.send("FOLLOW", "followUp");
+    const deadline = Date.now() + 1_000;
+    while (events.filter((event) => event.type === "completed").length < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.deepEqual(
+      contextEvents(events).at(-1)?.context,
+      { servingModel: "gen-2-model" },
+      "the retained generation's own turn only reports a reroute, never a fresh occupancy reading; the prior generation's lastOccupancy cache must not be re-emitted alongside it",
+    );
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex ignores thread-scoped telemetry whose threadId or turnId does not match the current turn", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+      .start(request("codex", fake.dir, { ...process.env, MODE: "stale-scope" }), (event) => events.push(event));
+    await run.completed;
+    assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 4_242, window: 100_000 }, "only telemetry scoped to this job's current threadId/turnId is accepted");
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
@@ -534,6 +671,186 @@ test("Claude fails closed if a read-only CLI init exposes mutating tools", async
   assert.equal(event.type, "failed");
   assert.match(event.error, /read-only initialization exposed (?:mutating|forbidden) tools: Write/);
   await run.close();
+});
+
+test("Claude reports the effective serving model and per-turn occupancy from init, assistant, and result frames", async () => {
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [], model: "claude-init-model" };
+    yield {
+      type: "assistant",
+      parent_tool_use_id: null,
+      message: {
+        model: "claude-turn-model",
+        content: [{ type: "text", text: "hi" }],
+        usage: { input_tokens: 500, cache_read_input_tokens: 200, cache_creation_input_tokens: 50 },
+      },
+    };
+    yield {
+      type: "result", subtype: "success", result: "done", usage: {}, total_cost_usd: 0, num_turns: 1,
+      modelUsage: { "claude-turn-model": { contextWindow: 200_000 } },
+    };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const claudeRequest = request("claude", process.cwd(), process.env);
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(claudeRequest, (event) => events.push(event));
+  await run.completed;
+  const contexts = contextEvents(events);
+  assert.deepEqual(contexts[0]?.context, { servingModel: "claude-init-model" }, "init reports the effective model before any turn");
+  assert.deepEqual(contexts.at(-1)?.context, { servingModel: "claude-turn-model", tokens: 750, window: 200_000 });
+  assert.equal(claudeRequest.policy.model, "fixture-model", "the configured job model is never rewritten");
+  await run.close();
+});
+
+test("Claude prefers the last usage.iterations entry over cumulative top-level usage and the requested model", async () => {
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield {
+      type: "assistant", parent_tool_use_id: null,
+      message: {
+        model: "claude-requested",
+        content: [{ type: "text", text: "hi" }],
+        usage: {
+          input_tokens: 905_000, cache_read_input_tokens: 800_100, cache_creation_input_tokens: 0,
+          iterations: [
+            { type: "message", model: "claude-requested", input_tokens: 900_000, cache_read_input_tokens: 800_000, cache_creation_input_tokens: 0, output_tokens: 1_000 },
+            { type: "fallback_message", model: "claude-fallback-hop", input_tokens: 5_000, cache_read_input_tokens: 100, cache_creation_input_tokens: 0, output_tokens: 50 },
+          ],
+        },
+      },
+    };
+    yield { type: "result", subtype: "success", result: "done", usage: {}, total_cost_usd: 0, num_turns: 1, modelUsage: {} };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
+  await run.completed;
+  const contexts = contextEvents(events);
+  assert.deepEqual(contexts.at(-1)?.context, { servingModel: "claude-fallback-hop", tokens: 5_100 }, "the last iteration is the true context size and identifies the model that actually served the response");
+  await run.close();
+});
+
+test("Claude clears the prior generation's occupancy gauge at the start of a retained follow-up instead of carrying it forward as current", async () => {
+  let releaseSecond!: () => void;
+  const secondTurn = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [], model: "claude-g1" };
+    yield { type: "assistant", parent_tool_use_id: null, message: { model: "claude-g1", content: [{ type: "text", text: "first" }], usage: { input_tokens: 500, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } };
+    yield { type: "result", subtype: "success", result: "first", usage: {}, total_cost_usd: 0, num_turns: 1, modelUsage: { "claude-g1": { contextWindow: 100_000 } } };
+    await secondTurn;
+    // The second generation's own turn never reports a fresh usage reading.
+    yield { type: "assistant", parent_tool_use_id: null, message: { model: "claude-g1", content: [{ type: "text", text: "second" }] } };
+    yield { type: "result", subtype: "success", result: "second", usage: {}, total_cost_usd: 0, num_turns: 1, modelUsage: {} };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
+  await run.completed;
+  assert.deepEqual(contextEvents(events).at(-1)?.context, { servingModel: "claude-g1", tokens: 500, window: 100_000 });
+  await run.send("follow up", "followUp");
+  releaseSecond();
+  const deadline = Date.now() + 1_000;
+  while (events.filter((event) => event.type === "completed").length < 2 && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  assert.deepEqual(contextEvents(events).at(-1)?.context, { servingModel: "claude-g1" }, "the retained follow-up's unreported occupancy is unknown, not generation one's stale reading");
+  await run.close();
+});
+
+test("Claude system/model_refusal_fallback updates the effective serving model and clears the refused model's stale occupancy", async () => {
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [], model: "claude-primary" };
+    yield {
+      type: "assistant", parent_tool_use_id: null,
+      message: { model: "claude-primary", content: [{ type: "text", text: "partial" }], usage: { input_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } },
+    };
+    yield {
+      type: "system", subtype: "model_refusal_fallback", trigger: "refusal", direction: "retry",
+      original_model: "claude-primary", fallback_model: "claude-fallback", request_id: null, content: "",
+    };
+    yield { type: "result", subtype: "success", result: "done", usage: {}, total_cost_usd: 0, num_turns: 1, modelUsage: {} };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
+  await run.completed;
+  const contexts = contextEvents(events);
+  assert.deepEqual(contexts.at(-1)?.context, { servingModel: "claude-fallback" }, "the refused model's occupancy reading never carries over labeled as the fallback model's own");
+  await run.close();
+});
+
+test("Claude emits no context event when the stream omits model and usage fields", async () => {
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: "hi" }] } };
+    yield { type: "result", subtype: "success", result: "done", usage: {}, total_cost_usd: 0, num_turns: 1, modelUsage: {} };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
+  await run.completed;
+  assert.deepEqual(contextEvents(events), []);
+  await run.close();
+});
+
+test("Pi reports the concrete responseModel over the requested alias and totalTokens as occupancy", async () => {
+  const fake = await fixture(PI_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 2_000 })
+      .start(request("pi", fake.dir, { ...process.env, MODE: "serving-model" }), (event) => events.push(event));
+    await run.completed;
+    assert.deepEqual(terminal(events), { type: "completed", output: "MODEL_OK" });
+    const contexts = contextEvents(events);
+    assert.deepEqual(contexts, [{ type: "context", context: { servingModel: "pi-served-model", tokens: 4_242 } }], "responseModel is preferred over the requested alias in model, and usage.totalTokens is the occupancy gauge");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Pi keeps servingModel unknown when only the requested alias is present and responseModel is absent", async () => {
+  const fake = await fixture(PI_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 2_000 })
+      .start(request("pi", fake.dir, { ...process.env, MODE: "alias-only" }), (event) => events.push(event));
+    await run.completed;
+    assert.deepEqual(terminal(events), { type: "completed", output: "ALIAS_OK" });
+    const contexts = contextEvents(events);
+    assert.deepEqual(contexts, [{ type: "context", context: { tokens: 4_242 } }], "message.model is only the requested alias and must never substitute for an absent responseModel");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Pi emits no context event for an unsupported runtime version that omits model, responseModel, and totalTokens", async () => {
+  const fake = await fixture(PI_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new PiRpcBackend(fake.command, { requestTimeoutMs: 2_000 })
+      .start(request("pi", fake.dir, { ...process.env, MODE: "complete" }), (event) => events.push(event));
+    await run.completed;
+    assert.deepEqual(contextEvents(events), []);
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
 
 test("Codex reuses its native thread for queued and post-settlement follow-ups", async () => {

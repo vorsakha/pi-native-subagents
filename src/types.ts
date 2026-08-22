@@ -23,10 +23,14 @@ export interface Usage {
   turns: number;
 }
 
-/** Latest native request occupancy. This is a gauge, not cumulative usage. */
+/**
+ * Latest native request occupancy. This is a gauge, not cumulative usage.
+ * A field is omitted, never zero, when the runtime did not report it.
+ */
 export interface ContextSnapshot {
-  tokens: number;
+  tokens?: number;
   window?: number;
+  /** Model identity reported by the native runtime for the current turn; never the configured policy model. */
   servingModel?: string;
 }
 
