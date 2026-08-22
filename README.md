@@ -13,8 +13,7 @@ Every child runs under an explicit access policy inside a trusted project, and c
 Requires Node.js 22.19.0 or newer. Pi extensions execute with your user permissions, so review the package before installing it.
 
 ```bash
-npm install
-pi install /absolute/path/to/pi-native-subagents
+pi install git:github.com/vorsakha/pi-native-subagents@main
 ```
 
 ## Try it

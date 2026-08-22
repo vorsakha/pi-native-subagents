@@ -201,6 +201,7 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 - Requirement rejected: rediscover capabilities with `subagent_capabilities`, use the returned ID, and keep the access ceiling consistent.
 - A harness rejected for login or readiness: check `/subagents providers` to see which provider is authenticated and ready before retrying, and switch routes rather than guessing at the account state.
 - A workflow or child fails: inspect the returned `ok`, `error`, route, and job ID; use `/workflows` for durable workflow state. Do not hide a failed route behind a success-only summary.
+- Pi reports that this package loaded more than once: keep exactly one package source. To update an installed Git package, install the same Git source at the new commit instead of installing a local checkout alongside it.
 
 ## Safe routing defaults
 
