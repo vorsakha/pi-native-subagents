@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { theme } from "./helpers.ts";
+import { ansiTheme, theme } from "./helpers.ts";
 import {
   MAX_COLLAPSED_LINES,
   MAX_EXPANDED_LINES,
@@ -155,6 +155,20 @@ test("workflow cards show lifecycle, task outcome, and open or unsupported budge
   assert.ok(settled.some((line) => line.startsWith("Result")), "settled collapsed cards report Result, not Latest");
 });
 
+test("header marker follows the attention branch: quiet for a successful completion, full color for paused", () => {
+  const coloredTheme = { ...theme, fg: (color: string, text: string) => `[${color}]${text}` } as unknown as Theme;
+
+  const completed = workflow({ status: "completed", taskOutcome: "successful" });
+  const completedHeader = buildWorkflowCardLines(completed, coloredTheme, { expanded: false, now: 6_000 })[0]!;
+  assert.ok(completedHeader.includes("[muted]◆"), "a successful completion uses the neutral marker rather than its own success glyph");
+  assert.ok(completedHeader.includes("[dim]· completed"), "the status text stays dim once nothing needs attention");
+
+  const paused = workflow({ status: "paused" });
+  const pausedHeader = buildWorkflowCardLines(paused, coloredTheme, { expanded: false, now: 6_000 })[0]!;
+  assert.ok(pausedHeader.includes("[warning]Ⅱ"), "a paused workflow keeps its own full-color glyph since it needs attention");
+  assert.ok(pausedHeader.includes("[warning]· paused"), "the status text stays full color when attention is warranted");
+});
+
 test("collapsed and expanded cards share one budget-health verdict: unsupported metrics are named and abnormal, concurrency saturation is not", () => {
   const coloredTheme = { ...theme, fg: (color: string, text: string) => `[${color}]${text}` } as unknown as Theme;
 
@@ -238,6 +252,12 @@ test("shared phase progress distinguishes declared, dynamic, terminal, and no-ph
   const terminalWithoutPhases = workflow({ status: "completed", currentPhase: null, phases: [] });
   assert.equal(workflowPhaseProgress(terminalWithoutPhases).label, "no phases");
   assert.doesNotMatch(buildWorkflowCardLines(terminalWithoutPhases, theme, { expanded: true, now: 4_000 }).join("\n"), /waiting for the first phase/);
+
+  const coloredTheme = { ...theme, fg: (color: string, text: string) => `[${color}]${text}` } as unknown as Theme;
+  const activePhasesLine = buildWorkflowCardLines(activeWithoutPhases, coloredTheme, { expanded: true, now: 4_000 }).find((line) => line.startsWith("[dim]Phases"))!;
+  assert.ok(activePhasesLine.includes("[accent]●"), "before any phase exists, the phase slot still carries the workflow's own live status glyph");
+  const terminalPhasesLine = buildWorkflowCardLines(terminalWithoutPhases, coloredTheme, { expanded: true, now: 4_000 }).find((line) => line.startsWith("[dim]Phases"))!;
+  assert.ok(terminalPhasesLine.includes("[success]✓"), "a workflow that finishes with no phases recorded still shows its terminal status glyph in the phase slot");
 });
 
 test("abnormal warning and failure counts sit before elapsed time in the header, ahead of mode and run id", () => {
@@ -296,4 +316,129 @@ test("narrow widths keep the left-loaded header and drop mode/run id before the 
   assert.ok(narrowHeader.includes("Release"), "the name survives truncation at a narrow width");
   assert.ok(!narrowHeader.includes(shortId("run-0123456789abcdef")), "the run id truncates away before the name at a narrow width");
   assert.ok(!narrowHeader.includes("bg"), "the mode truncates away before the name at a narrow width");
+});
+
+test("styled header and phase spine truncate cleanly at narrow widths with a real ANSI theme", () => {
+  const snapshot = workflow();
+  const narrow = renderWorkflowCard(snapshot, ansiTheme, { expanded: false, now: 6_000 }).render(20);
+  assert.ok(narrow.every((line) => visibleWidth(line) <= 20), "escape sequences never count toward the visible width budget");
+  const narrowHeader = narrow[0]!;
+  assert.ok(narrowHeader.includes(ESC), "the header still applies theme styling at a narrow width");
+  assert.ok(narrowHeader.includes("Release"), "the name survives truncation alongside real escape sequences");
+  const phasesLine = narrow.find((line) => line.includes("Phases"))!;
+  assert.ok(phasesLine.includes(ESC), "the phase spine still applies theme styling at a narrow width");
+});
+
+test("collapsed cards keep only the phase spine loud for routine running state; the header and agent rollup stay quiet", () => {
+  const allRunning = workflow({
+    status: "running",
+    agents: [
+      agent({ index: 0, name: "reviewer", state: "running" }),
+      agent({ index: 1, name: "tests", state: "running" }),
+      agent({ index: 2, name: "docs", state: "running" }),
+    ],
+  });
+  const lines = buildWorkflowCardLines(allRunning, theme, { expanded: false, now: 6_000 });
+  const [header] = lines;
+  const phasesLine = lines.find((line) => line.startsWith("Phases"))!;
+  const agentsLine = lines.find((line) => line.startsWith("Agents"))!;
+
+  assert.ok(!header!.includes("●"), "the header no longer duplicates the phase spine's running dot");
+  assert.ok(header!.includes("◆"), "the header uses a neutral marker for a routine (non-attention) status");
+  assert.ok(header!.includes("running"), "the overall status is still stated once, as text, in the header");
+  assert.ok(phasesLine.includes("●"), "the phase spine still carries the current phase's running dot");
+  assert.match(agentsLine, /\b3 active\b/, "a uniformly running roster collapses to a compact readable count, not glyph-heavy per-state tallies");
+  assert.doesNotMatch(agentsLine, /[●○✓×]/, "the compact count carries no per-state status glyphs");
+});
+
+test("mixed-state agent rollups stay textual and readable, and failures/queued remain distinguishable without glyphs or color alone", () => {
+  const mixed = workflow({
+    agents: [
+      agent({ index: 0, name: "reviewer", state: "completed" }),
+      agent({ index: 1, name: "tests", state: "running" }),
+      agent({ index: 2, name: "lint", state: "queued" }),
+      agent({ index: 3, name: "security", state: "failed" }),
+    ],
+  });
+  const agentsLine = buildWorkflowCardLines(mixed, theme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("Agents"))!;
+
+  assert.doesNotMatch(agentsLine, /[●○✓×]/, "the collapsed rollup no longer carries per-state status glyphs");
+  assert.match(agentsLine, /\bqueued\b/);
+  assert.match(agentsLine, /\brunning\b/);
+  assert.match(agentsLine, /\bdone\b/);
+  assert.match(agentsLine, /\bfailed\b/);
+
+  const coloredTheme = { ...theme, fg: (color: string, text: string) => `[${color}]${text}` } as unknown as Theme;
+  const coloredAgentsLine = buildWorkflowCardLines(mixed, coloredTheme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("[dim]Agents"))!;
+  assert.ok(coloredAgentsLine.includes("[error]1 failed"), "the failed count keeps its attention color as reinforcement, on top of its own word");
+});
+
+test("Latest identifies the focused agent by name plus its activity, without a status glyph, and never just repeats the word running", () => {
+  const withPreview = workflow({
+    agents: [
+      agent({ index: 0, name: "reviewer", state: "completed" }),
+      agent({ index: 1, name: "reliability-security", state: "running", preview: "scanning dependency advisories" }),
+    ],
+  });
+  const previewLine = buildWorkflowCardLines(withPreview, theme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("Latest"))!;
+  assert.match(previewLine, /reliability-security · scanning dependency advisories/);
+
+  const runningNoPreview = workflow({ agents: [agent({ index: 0, name: "tests", state: "running" })] });
+  const runningLine = buildWorkflowCardLines(runningNoPreview, theme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("Latest"))!;
+  assert.doesNotMatch(runningLine, /[●○✓×]/, "the Latest row carries no status glyph");
+  assert.doesNotMatch(runningLine, /\brunning\b/, "quiet fallback copy avoids repeating the header's already-stated running status");
+  assert.match(runningLine, /in progress/);
+
+  const queuedNoPreview = workflow({ agents: [agent({ index: 0, name: "tests", state: "queued" })] });
+  const queuedLine = buildWorkflowCardLines(queuedNoPreview, theme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("Latest"))!;
+  assert.match(queuedLine, /waiting to start/);
+});
+
+test("expanded phase and agent rosters demote routine glyphs, keeping only current selection and failure/warning states attention-worthy", () => {
+  const coloredTheme = { ...theme, fg: (color: string, text: string) => `[${color}]${text}` } as unknown as Theme;
+  const snapshot = workflow({
+    currentPhase: 1,
+    phases: [
+      phase({ index: 0, name: "inspect", status: "completed", agents: [0] }),
+      phase({ index: 1, name: "verify", status: "running", agents: [1] }),
+      phase({ index: 2, name: "ship", status: "failed", agents: [2] }),
+    ],
+    agents: [
+      agent({ index: 0, name: "reviewer", state: "completed" }),
+      agent({ index: 1, name: "tests", state: "running" }),
+      agent({ index: 2, name: "release", state: "failed" }),
+    ],
+  });
+  const lines = buildWorkflowCardLines(snapshot, coloredTheme, { expanded: true, now: 6_000 });
+  // Roster rows (phases and agents) are the only lines indented under the shared label gutter.
+  const rosterLines = lines.filter((line) => line.startsWith(" ".repeat(9)));
+
+  const inspectRow = rosterLines.find((line) => line.includes("inspect"))!;
+  assert.ok(inspectRow.includes("[dim]✓"), "a completed, non-current phase is demoted to dim");
+  assert.ok(!inspectRow.includes("[success]✓"), "the completed phase no longer competes with attention states for the eye");
+
+  const verifyRow = rosterLines.find((line) => line.includes("verify"))!;
+  assert.ok(verifyRow.includes("[accent]›"), "the current phase keeps its selection marker at full color");
+  assert.ok(verifyRow.includes("[accent]●"), "the current phase's own status glyph stays undemoted alongside the selection marker");
+
+  const shipRow = rosterLines.find((line) => line.includes("ship"))!;
+  assert.ok(shipRow.includes("[error]×"), "a failed phase keeps its full attention color regardless of position");
+
+  const reviewerRow = rosterLines.find((line) => line.includes("reviewer"))!;
+  assert.ok(reviewerRow.includes("[dim]✓"), "a completed agent row is demoted to dim");
+
+  const releaseRow = rosterLines.find((line) => line.includes("release"))!;
+  assert.ok(releaseRow.includes("[error]×"), "a failed agent row keeps its full attention color");
+});
+
+test("the neutral header marker and quiet rollups stay inside hard width budgets, even at narrow widths", () => {
+  const snapshot = workflow({
+    agents: [agent({ index: 0, name: "reliability-security-and-compliance-review", state: "running" })],
+  });
+  const wide = renderWorkflowCard(snapshot, theme, { expanded: false, now: 6_000 }).render(200);
+  assert.ok(wide.every((line) => visibleWidth(line) <= 200));
+  assert.ok(wide[0]!.includes("◆"), "the neutral workflow marker renders at ample width");
+
+  const narrow = renderWorkflowCard(snapshot, theme, { expanded: false, now: 6_000 }).render(24);
+  assert.ok(narrow.every((line) => visibleWidth(line) <= 24), "no line overflows a narrow terminal width even with a long agent name");
 });

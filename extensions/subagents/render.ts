@@ -18,7 +18,7 @@ import type { ContextSnapshot, JobSnapshot, JobStatus, SendBehavior, Usage } fro
  * never duplicated. Output is sanitized before Pi renders it as Markdown, and
  * cards are pinned to job id + generation so retained-session follow-ups do not
  * rewrite historical rows. Colors come from the active theme; status is always
- * carried by a glyph as well, never by color alone.
+ * carried by a glyph or word as well, never by color alone.
  */
 
 /** Hard rendered-line budgets so no tool call/result can spam the transcript. */
@@ -155,6 +155,18 @@ export function traceStatusMeta(status: string, now?: number): { glyph: string; 
 
 export function statusMeta(status: JobStatus, now?: number): { glyph: string; color: TraceStatusColor } {
   return traceStatusMeta(status, now);
+}
+
+/**
+ * Whether a status needs to stand out against the rest of a card — holds and failures, not
+ * routine progress. Used by workflow cards, where several statuses (header, phase rows, agent
+ * rows) sit on one card and would otherwise compete for the eye: routine glyphs (running,
+ * completed, queued) get demoted to quiet, and only genuinely abnormal states keep their full
+ * accent color. Direct subagent cards render a single job's status via `statusMeta` and don't
+ * need this demotion.
+ */
+export function isAttentionStatus(color: TraceStatusColor): boolean {
+  return color === "warning" || color === "error";
 }
 
 function sectionLine(theme: Theme, label: string, value: string, color: "text" | "toolOutput" | "dim" | "muted" | "error" = "dim"): string {

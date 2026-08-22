@@ -9,6 +9,7 @@ import type {
 } from "../../src/workflows/types.ts";
 import {
   formatUsage,
+  isAttentionStatus,
   linesComponent,
   renderToolCallLine,
   sanitizeInline,
@@ -46,6 +47,12 @@ function taskOutcomeLabel(snapshot: Pick<WorkflowSnapshot, "status" | "taskOutco
 
 function isRunningState(status: WorkflowSnapshot["status"]): boolean {
   return status === "running" || status === "paused" || status === "pending";
+}
+
+/** Quiets a routine status glyph's color so it doesn't compete with the phase spine or a
+ *  selected row; failure/warning states keep their full color so they still stand out. */
+function demoteUnlessAttention(meta: { glyph: string; color: TraceStatusColor }): { glyph: string; color: TraceStatusColor } {
+  return isAttentionStatus(meta.color) ? meta : { glyph: meta.glyph, color: "dim" };
 }
 
 export interface WorkflowCardOptions {
@@ -128,21 +135,24 @@ function focusedAgent(snapshot: WorkflowSnapshot): WorkflowAgentRecord | undefin
     ?? snapshot.agents.at(-1);
 }
 
+/** Quiet fallback copy for an agent with no semantic preview yet — avoids restating "running",
+ *  which the header and phase spine already convey. */
 function agentActivity(agent: WorkflowAgentRecord): string {
   if (typeof agent.preview === "string" && agent.preview) return sanitizeInline(agent.preview);
   switch (agent.state) {
-    case "queued": return "queued";
-    case "running": return "running";
+    case "queued": return "waiting to start";
+    case "running": return "in progress";
     case "completed": return "done";
     default: return agent.state;
   }
 }
 
-function latestValue(snapshot: WorkflowSnapshot, theme: Theme, now: number): string | undefined {
+/** The focused agent's name plus its activity — no status glyph, since the header and phase
+ *  spine already carry the workflow's running state. */
+function latestValue(snapshot: WorkflowSnapshot, theme: Theme): string | undefined {
   const agent = focusedAgent(snapshot);
   if (!agent) return undefined;
-  const status = traceStatusMeta(agent.state, now);
-  return `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", "—")} ${theme.fg("muted", agentActivity(agent))}`;
+  return `${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", "·")} ${theme.fg("muted", agentActivity(agent))}`;
 }
 
 export interface WorkflowPhaseProgress {
@@ -225,7 +235,12 @@ function phaseSpine(phases: WorkflowPhase[], currentIndex: number, theme: Theme,
 function phaseGroupValue(snapshot: WorkflowSnapshot, theme: Theme, now: number): string {
   const progress = workflowPhaseProgress(snapshot);
   if (progress.noPhases) {
-    return theme.fg("dim", progress.waiting ? "waiting for the first phase" : "no phases recorded");
+    // Before the real phase spine exists, the workflow's own status glyph is the one
+    // meaningful live indicator in this slot rather than a bare neutral placeholder.
+    const status = traceStatusMeta(snapshot.status, now);
+    const glyph = theme.fg(status.color, status.glyph);
+    const text = theme.fg("dim", progress.waiting ? "waiting for the first phase" : "no phases recorded");
+    return `${glyph} ${text}`;
   }
   const spineIndex = progress.phaseIndex >= 0 ? progress.phaseIndex : 0;
   const spine = phaseSpine(snapshot.phases, spineIndex, theme, now);
@@ -237,8 +252,11 @@ function phaseGroupValue(snapshot: WorkflowSnapshot, theme: Theme, now: number):
 
 function phaseRow(phase: WorkflowPhase, isCurrent: boolean, theme: Theme, now: number): string {
   const status = traceStatusMeta(phase.status, now);
+  // Current selection is its own attention signal (the `›` marker), so a routine glyph there
+  // stays undemoted too — only failure/warning states and the current row keep full color.
+  const shown = isCurrent ? status : demoteUnlessAttention(status);
   const marker = isCurrent ? theme.fg("accent", "›") : " ";
-  return `${GROUP_INDENT}${marker} ${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(phase.name))} ${theme.fg("dim", `· ${phase.status} · ${countLabel(phase.agents.length, "agent")}`)}`;
+  return `${GROUP_INDENT}${marker} ${theme.fg(shown.color, shown.glyph)} ${theme.fg("toolTitle", sanitizeInline(phase.name))} ${theme.fg("dim", `· ${phase.status} · ${countLabel(phase.agents.length, "agent")}`)}`;
 }
 
 /** Bounded roster of individual phase rows, windowed around the current phase. */
@@ -276,20 +294,33 @@ function agentCounts(agents: WorkflowAgentRecord[]): AgentCounts {
   }, { total: 0, queued: 0, running: 0, done: 0, failed: 0 });
 }
 
-/** Rollup of total/running/done/failed agent counts — no policy or model noise. */
+/** Compact wording for a roster that's entirely in one state, so it doesn't repeat the
+ *  total plus that same total's count (e.g. "3 total, 3 running"). */
+function singleStateSummary(counts: AgentCounts, theme: Theme): string | undefined {
+  if (counts.running === counts.total) return theme.fg("text", `${counts.total} active`);
+  if (counts.done === counts.total) return theme.fg("muted", `${counts.total} done`);
+  if (counts.queued === counts.total) return theme.fg("muted", `${counts.total} queued`);
+  if (counts.failed === counts.total) return theme.fg("error", `${counts.total} failed`);
+  return undefined;
+}
+
+/** Rollup of total/running/done/failed agent counts — no policy or model noise, and no
+ *  per-state glyphs (the counts and words already carry the state, without color-only cues). */
 function agentRollupValue(snapshot: WorkflowSnapshot, theme: Theme): string {
   if (!snapshot.agents.length) return theme.fg("dim", "none started");
   const counts = agentCounts(snapshot.agents);
+  const single = singleStateSummary(counts, theme);
+  if (single) return single;
   const parts = [theme.fg("text", String(counts.total))];
-  if (counts.queued) parts.push(theme.fg("muted", `○${counts.queued} queued`));
-  if (counts.running) parts.push(theme.fg("accent", `●${counts.running} running`));
-  if (counts.done) parts.push(theme.fg("success", `✓${counts.done} done`));
-  if (counts.failed) parts.push(theme.fg("error", `×${counts.failed} failed`));
+  if (counts.queued) parts.push(theme.fg("muted", `${counts.queued} queued`));
+  if (counts.running) parts.push(theme.fg("muted", `${counts.running} running`));
+  if (counts.done) parts.push(theme.fg("dim", `${counts.done} done`));
+  if (counts.failed) parts.push(theme.fg("error", `${counts.failed} failed`));
   return parts.join(theme.fg("dim", " · "));
 }
 
 function agentRow(agent: WorkflowAgentRecord, theme: Theme, now: number): string {
-  const status = traceStatusMeta(agent.state, now);
+  const status = demoteUnlessAttention(traceStatusMeta(agent.state, now));
   const route = agent.harness || agent.model
     ? ` · ${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}`
     : "";
@@ -316,8 +347,18 @@ function clampContent(theme: Theme, lines: string[], budget: number): string[] {
   return kept;
 }
 
+/** Same neutral marker as the `⌁ workflow` call row, used for the header's routine states so
+ *  it doesn't add a second bright accent dot next to the phase spine below it. */
+const WORKFLOW_MARKER = "◆";
+
 function headerLine(snapshot: WorkflowSnapshot, theme: Theme, now: number): string {
   const status = workflowStatusMeta(snapshot);
+  // The header carries the one explicit overall status: a full-color glyph and label when the
+  // run needs attention (paused, failed, aborted, unsuccessful), and a quiet neutral marker
+  // with dim status text otherwise — routine progress belongs to the phase spine, not here.
+  const attention = isAttentionStatus(status.color);
+  const marker = attention ? theme.fg(status.color, status.glyph) : theme.fg("muted", WORKFLOW_MARKER);
+  const statusColor: TraceStatusColor = attention ? status.color : "dim";
   const mode = snapshot.background ? "bg" : "fg";
   const failed = snapshot.agents.filter((agent) => agent.state === "failed" || agent.state === "cancelled" || agent.state === "aborted").length;
   const warnings = snapshot.warnings?.length ?? 0;
@@ -326,7 +367,7 @@ function headerLine(snapshot: WorkflowSnapshot, theme: Theme, now: number): stri
   if (failed) abnormal.push(theme.fg("error", `×${failed}`));
   const abnormalText = abnormal.length ? ` ${abnormal.join(" ")}` : "";
   const tail = theme.fg("dim", ` · ${formatElapsed(snapshot, now)} · ${mode} · ${shortId(sanitizeText(snapshot.runId))}`);
-  return `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(snapshot.name) || "Workflow"))} ${theme.fg(status.color, `· ${snapshot.status}${taskOutcomeLabel(snapshot)}`)}${abnormalText}${tail}`;
+  return `${marker} ${theme.fg("toolTitle", theme.bold(sanitizeInline(snapshot.name) || "Workflow"))} ${theme.fg(statusColor, `· ${snapshot.status}${taskOutcomeLabel(snapshot)}`)}${abnormalText}${tail}`;
 }
 
 export function buildWorkflowCardLines(
@@ -372,7 +413,7 @@ export function buildWorkflowCardLines(
       lines.push(group(theme, "Result", theme.fg("dim", "(no result)")));
     }
   } else {
-    lines.push(group(theme, "Latest", latestValue(snapshot, theme, options.now) ?? theme.fg("dim", "waiting for the first agent")));
+    lines.push(group(theme, "Latest", latestValue(snapshot, theme) ?? theme.fg("dim", "waiting for the first agent")));
   }
 
   const usageSnapshot = aggregateWorkflowUsage(snapshot);
