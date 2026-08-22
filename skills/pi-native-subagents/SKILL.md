@@ -130,7 +130,7 @@ Rules:
 
 - The target job must be a job this run's own `agent()` call started, and it must still be `completed` with a retained session; cross-workflow, direct (non-workflow) `subagent_spawn` jobs, expired, failed, cancelled, and not-yet-settled jobs are all rejected.
 - `options` accepts only `phase` and `schema` — the same non-policy presentation/validation fields `agent()` accepts for those concerns. Harness, model, effort, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original `agent()` call and cannot be changed by a follow-up.
-- A follow-up run in `isolation: "worktree"` can only be continued while its worktree is still `preserved` on disk; once `removed`, `followUp()` fails rather than guessing at a now-missing cwd.
+- An `agent()` call that used `isolation: "worktree"` can never be targeted by `followUp()`. Its worktree is finalized when the call returns, so the follow-up is rejected whether the recorded isolation state is `preserved`, `removed`, or `orphaned`.
 - Each `followUp()` call consumes its own agent-call ordinal (it counts toward the 32-call budget) and appears in `/workflows` as another bounded generation under the same agent, not a new agent card. Cumulative usage and per-agent token budgets already include every generation.
 - Await every `followUp()` call, exactly like `agent()`.
 
