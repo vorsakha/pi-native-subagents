@@ -15,13 +15,25 @@ import {
   createWorkflowArtifacts,
   loadWorkflowJournal,
   loadWorkflowSummaries,
+  readWorkflowRunSummary,
+  updateWorkflowRunIsolation,
   writeWorkflowReport,
   writeWorkflowResult,
 } from "./artifacts.ts";
 import { replayableJournalCalls, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint } from "./journal.ts";
 import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
 import { workflowTaskOutcome } from "./outcome.ts";
-import { finishWorkflowWorktree, prepareWorkflowWorktree, type WorkflowWorktreeHandle } from "./worktree.ts";
+import { finishWorkflowWorktree, prepareWorkflowWorktree, reclaimWorkflowWorktree, type WorkflowWorktreeHandle, type WorkflowWorktreeReclamation } from "./worktree.ts";
+import {
+  applyWorkflowRetention,
+  DEFAULT_WORKFLOW_RETAINED_RUNS,
+  listWorkflowProtectedWorktrees,
+  listWorkflowRunProtectedWorktrees,
+  openWorkflowSessionLease,
+  withWorkflowRetentionLock,
+  type WorkflowProtectedWorktree,
+  type WorkflowSessionLease,
+} from "./retention.ts";
 import type {
   WorkflowAgentGeneration,
   WorkflowAgentRecord,
@@ -42,7 +54,6 @@ import type {
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
 const ACCESS = new Set<AccessMode>(["readOnly", "full"]);
 const CHECKPOINT_DELAY_MS = 150;
-const MAX_RETAINED_RUNS = 64;
 const MAX_WORKFLOW_LOGS = 128;
 export const MAX_WORKFLOW_PHASES = 64;
 export const MAX_WORKFLOW_PHASE_NAME_LENGTH = 160;
@@ -102,6 +113,11 @@ interface RunEntry {
   dispatchWaiters: Set<() => void>;
   reachedBudgetWarnings: Set<string>;
   metadataReceived: boolean;
+}
+
+interface ReplaySource {
+  snapshot: WorkflowSnapshot;
+  calls: WorkflowReplayCall[];
 }
 
 function workflowUsage(usage?: Partial<Usage>): WorkflowUsage {
@@ -220,6 +236,10 @@ export class WorkflowManager {
   readonly #resolveProfile?: (name: string) => ProfileDefinition | undefined;
   #initializing?: Promise<void>;
   #closed = false;
+  #retentionChain: Promise<void> = Promise.resolve();
+  #retentionLease?: WorkflowSessionLease;
+  readonly #replaySourceRunIds = new Set<string>();
+  readonly #maxRetainedRuns: number;
 
   constructor(options: {
     jobs: JobManager;
@@ -229,6 +249,8 @@ export class WorkflowManager {
     /** Live capability routing for `requires`/`harness: "auto"`; absent means requirements fail closed. */
     router?: CapabilityRouter;
     resolveProfile?: (name: string) => ProfileDefinition | undefined;
+    /** Overrides the retained-run window (default {@link DEFAULT_WORKFLOW_RETAINED_RUNS}); test-only knob, in-memory and on-disk retention always share this one bound. */
+    retainedRuns?: number;
   }) {
     this.#jobs = options.jobs;
     this.#artifactRoot = resolve(options.artifactRoot);
@@ -236,32 +258,30 @@ export class WorkflowManager {
     this.#approveMutation = options.approveMutation;
     this.#router = options.router;
     this.#resolveProfile = options.resolveProfile;
+    this.#maxRetainedRuns = Number.isSafeInteger(options.retainedRuns) && options.retainedRuns! > 0
+      ? options.retainedRuns!
+      : DEFAULT_WORKFLOW_RETAINED_RUNS;
     this.#unsubscribeJobs = this.#jobs.subscribe((job, event) => this.#updateAgentFromJob(job, event));
   }
 
   async initialize(): Promise<void> {
     this.#initializing ??= (async () => {
-      const restored = await loadWorkflowSummaries(this.#artifactRoot, { staleAfterMs: 0, sessionId: this.#sessionId });
-      for (const snapshot of restored.slice(0, MAX_RETAINED_RUNS)) {
-        if (this.#runs.has(snapshot.runId)) continue;
-        const controller = new AbortController();
-        const completion = Promise.resolve(clone(snapshot));
-        this.#runs.set(snapshot.runId, {
-          snapshot,
-          controller,
-          completion,
-          persistChain: Promise.resolve(),
-          journalChain: Promise.resolve(),
-          journalSequence: 0,
-          nextCallIndex: 0,
-          pauseWaiters: new Set(),
-          mutationApproved: false,
-          activeDispatches: 0,
-          dispatchWaiters: new Set(),
-          reachedBudgetWarnings: new Set(),
-          metadataReceived: true,
+      const lease = await openWorkflowSessionLease(this.#artifactRoot, this.#sessionId);
+      this.#retentionLease = lease;
+      try {
+        const restored = await withWorkflowRetentionLock(this.#artifactRoot, async () => {
+          const loaded = await loadWorkflowSummaries(this.#artifactRoot, { staleAfterMs: 0, sessionId: this.#sessionId });
+          const retained = loaded.slice(0, this.#maxRetainedRuns);
+          await lease.claimWhileLocked(retained.map((snapshot) => snapshot.runId));
+          return retained;
         });
+        for (const snapshot of restored) this.#restoreRun(snapshot);
+      } catch (error) {
+        await lease.close().catch(() => undefined);
+        this.#retentionLease = undefined;
+        throw error;
       }
+      await this.#applyRetention();
     })();
     return this.#initializing;
   }
@@ -309,7 +329,7 @@ export class WorkflowManager {
     });
     let replay: ReplayRuntime | undefined;
     if (request.resumeFromRunId) {
-      const source = this.#runs.get(request.resumeFromRunId);
+      const source = await this.#loadReplaySource(request.resumeFromRunId);
       if (!source) throw new Error(`Unknown workflow replay source: ${request.resumeFromRunId}`);
       if (!terminalWorkflow(source.snapshot.status)) throw new Error("Cannot resume from an active workflow");
       if (!source.snapshot.definitionFingerprint) throw new Error("Workflow predates durable replay and cannot be resumed");
@@ -323,8 +343,7 @@ export class WorkflowManager {
       if (restartAt !== undefined && (!Number.isSafeInteger(restartAt) || restartAt < 0 || restartAt >= 32)) {
         throw new Error("restartFromCallIndex must be an agent call ordinal from 0 to 31");
       }
-      const replayable = replayableJournalCalls(await loadWorkflowJournal(this.#artifactRoot, source.snapshot.runId));
-      const calls = restartAt === undefined ? replayable : replayable.filter((call) => call.callIndex < restartAt);
+      const calls = restartAt === undefined ? source.calls : source.calls.filter((call) => call.callIndex < restartAt);
       replay = {
         sourceRunId: source.snapshot.runId,
         calls,
@@ -362,12 +381,18 @@ export class WorkflowManager {
         invalidatedAt: request.restartFromCallIndex,
       } : undefined,
     };
-    const snapshot = await createWorkflowArtifacts(this.#artifactRoot, {
-      script: request.script,
-      args: request.args ?? null,
-      snapshot: base,
+    await this.#evictOldRuns();
+    const lease = this.#retentionLease;
+    if (!lease) throw new Error("Workflow session lease is unavailable");
+    const snapshot = await withWorkflowRetentionLock(this.#artifactRoot, async () => {
+      const created = await createWorkflowArtifacts(this.#artifactRoot, {
+        script: request.script,
+        args: request.args ?? null,
+        snapshot: base,
+      });
+      await lease.claimWhileLocked([created.runId]);
+      return created;
     });
-    this.#evictOldRuns();
     const controller = new AbortController();
     const entry: RunEntry = {
       snapshot,
@@ -389,7 +414,137 @@ export class WorkflowManager {
     this.#runs.set(snapshot.runId, entry);
     entry.completion = this.#execute(entry, request);
     this.#publish(entry);
+    void this.#applyRetention();
     return { snapshot: clone(snapshot), completion: entry.completion };
+  }
+
+  /**
+   * Bounds on-disk artifacts to the retained-run window. Every run held in
+   * `#runs` is protected by this manager's durable session lease, and the
+   * retention pass also reads leases written by other open managers.
+   */
+  #applyRetention(): Promise<void> {
+    const next = this.#retentionChain
+      .catch(() => undefined)
+      .then(() => applyWorkflowRetention(this.#artifactRoot, {
+        maxRuns: this.#maxRetainedRuns,
+        protectRunIds: [...this.#runs.keys(), ...this.#replaySourceRunIds],
+      }))
+      .then(() => undefined)
+      .catch(() => undefined);
+    this.#retentionChain = next;
+    return next;
+  }
+
+  #restoreRun(snapshot: WorkflowSnapshot): RunEntry {
+    const existing = this.#runs.get(snapshot.runId);
+    if (existing) return existing;
+    const controller = new AbortController();
+    const completion = Promise.resolve(clone(snapshot));
+    const entry: RunEntry = {
+      snapshot,
+      controller,
+      completion,
+      persistChain: Promise.resolve(),
+      journalChain: Promise.resolve(),
+      journalSequence: 0,
+      nextCallIndex: 0,
+      pauseWaiters: new Set(),
+      mutationApproved: false,
+      activeDispatches: 0,
+      dispatchWaiters: new Set(),
+      reachedBudgetWarnings: new Set(),
+      metadataReceived: true,
+    };
+    this.#runs.set(snapshot.runId, entry);
+    return entry;
+  }
+
+  /** Loads a replay source from the shared artifact root when it was not
+   * restored into this session's history. The retention lock covers the
+   * summary and journal read, so a concurrent retention pass cannot delete a
+   * source between those reads. Terminal sources remain claimed by this
+   * manager while an explicit replay references them. */
+  async #loadReplaySource(runId: string): Promise<ReplaySource | undefined> {
+    const inMemory = this.#runs.get(runId);
+    if (inMemory) {
+      return {
+        snapshot: inMemory.snapshot,
+        calls: replayableJournalCalls(await loadWorkflowJournal(this.#artifactRoot, runId)),
+      };
+    }
+    const lease = this.#retentionLease;
+    if (!lease) throw new Error("Workflow session lease is unavailable");
+    return withWorkflowRetentionLock(this.#artifactRoot, async () => {
+      const snapshot = await readWorkflowRunSummary(this.#artifactRoot, runId);
+      if (!snapshot) return undefined;
+      if (!terminalWorkflow(snapshot.status)) return { snapshot, calls: [] };
+      await lease.claimWhileLocked([runId]);
+      this.#replaySourceRunIds.add(runId);
+      const calls = replayableJournalCalls(await loadWorkflowJournal(this.#artifactRoot, runId));
+      return { snapshot, calls };
+    });
+  }
+
+  /** Enumerates every preserved/orphaned worktree across this manager's artifact root. */
+  async listProtectedWorktrees(options: { cwd?: string } = {}): Promise<WorkflowProtectedWorktree[]> {
+    return listWorkflowProtectedWorktrees(this.#artifactRoot, options);
+  }
+
+  /**
+   * Explicit, confirmation-gated reclamation of one preserved or orphaned
+   * isolated worktree: removes the Git worktree registration and branch, and
+   * persists the resulting `removed` isolation state. Refuses a non-terminal
+   * run so reclamation can never race a live checkpointer.
+   */
+  async reclaimWorktree(input: {
+    runId: string;
+    agentIndex: number;
+    cwd: string;
+    /** Literal-typed confirmation gate: this method cannot be called without an explicit caller decision. */
+    confirmed: true;
+    force?: boolean;
+  }): Promise<{ reclamation: WorkflowWorktreeReclamation; worktree: WorkflowProtectedWorktree }> {
+    const entry = this.#runs.get(input.runId);
+    const snapshot = entry?.snapshot ?? await readWorkflowRunSummary(this.#artifactRoot, input.runId);
+    if (!snapshot) throw new Error(`Unknown workflow run: ${input.runId}`);
+    if (!terminalWorkflow(snapshot.status)) throw new Error("Cannot reclaim a worktree from an active workflow run");
+    const worktrees = await listWorkflowRunProtectedWorktrees(this.#artifactRoot, input.runId);
+    const worktree = worktrees.find((candidate) => candidate.agentIndex === input.agentIndex);
+    if (!worktree) throw new Error(`No protected worktree for agent ${input.agentIndex} in workflow ${input.runId}`);
+    if (worktree.state === "active") throw new Error("Cannot reclaim a live worktree from an active checkpoint");
+    const reclamation = await reclaimWorkflowWorktree({
+      cwd: input.cwd,
+      artifactDir: snapshot.artifactDir,
+      runId: input.runId,
+      agentIndex: input.agentIndex,
+      branch: worktree.branch,
+      state: worktree.state,
+      patchArtifact: worktree.patchArtifact,
+      force: input.force,
+    });
+    const isolation = {
+      type: "worktree" as const,
+      state: "removed" as const,
+      branch: worktree.branch,
+      changed: true,
+      patchArtifact: worktree.patchArtifact,
+      error: worktree.error,
+      reclaimedAt: Date.now(),
+    };
+    const agent = entry?.snapshot.agents[input.agentIndex];
+    if (entry && agent) {
+      agent.isolation = isolation;
+      this.#touch(entry);
+      await this.#flushCheckpoint(entry);
+    } else {
+      try { await updateWorkflowRunIsolation(this.#artifactRoot, input.runId, input.agentIndex, isolation); }
+      catch (error) {
+        reclamation.warnings.push(`Reclaimed the Git worktree, but could not update the run record: ${boundedText(error)}`);
+      }
+    }
+    void this.#applyRetention();
+    return { reclamation, worktree };
   }
 
   async cancel(runId: string, reason = "Cancelled by parent"): Promise<WorkflowSnapshot> {
@@ -481,8 +636,12 @@ export class WorkflowManager {
       this.#releasePause(entry);
     }
     let timer: NodeJS.Timeout | undefined;
+    let activeSettled = active.length === 0;
+    const activeCompletion = Promise.allSettled(active.map((entry) => entry.completion)).then(() => {
+      activeSettled = true;
+    });
     await Promise.race([
-      Promise.allSettled(active.map((entry) => entry.completion)).then(() => undefined),
+      activeCompletion,
       new Promise<void>((resolveDeadline) => { timer = setTimeout(resolveDeadline, Math.max(0, timeoutMs)); }),
     ]);
     if (timer) clearTimeout(timer);
@@ -492,6 +651,12 @@ export class WorkflowManager {
       entry.checkpointTimer = undefined;
     }
     this.#listeners.clear();
+    const lease = this.#retentionLease;
+    if (lease) {
+      this.#retentionLease = undefined;
+      if (activeSettled) await lease.close().catch(() => undefined);
+      else void activeCompletion.then(() => lease.close()).catch(() => undefined);
+    }
   }
 
   async #execute(entry: RunEntry, request: StartWorkflowRequest): Promise<WorkflowSnapshot> {
@@ -1647,15 +1812,17 @@ export class WorkflowManager {
     }
   }
 
-  #evictOldRuns(): void {
-    if (this.#runs.size < MAX_RETAINED_RUNS) return;
+  async #evictOldRuns(): Promise<void> {
+    if (this.#runs.size < this.#maxRetainedRuns) return;
     const terminal = [...this.#runs.values()]
       .filter((entry) => terminalWorkflow(entry.snapshot.status))
       .sort((left, right) => left.snapshot.timestamps.updatedAt - right.snapshot.timestamps.updatedAt);
-    while (this.#runs.size >= MAX_RETAINED_RUNS && terminal.length) {
-      this.#runs.delete(terminal.shift()!.snapshot.runId);
+    while (this.#runs.size >= this.#maxRetainedRuns && terminal.length) {
+      const victim = terminal.shift()!;
+      this.#runs.delete(victim.snapshot.runId);
+      await this.#retentionLease?.release(victim.snapshot.runId);
     }
-    if (this.#runs.size >= MAX_RETAINED_RUNS) throw new Error(`Workflow retention limit reached (${MAX_RETAINED_RUNS})`);
+    if (this.#runs.size >= this.#maxRetainedRuns) throw new Error(`Workflow retention limit reached (${this.#maxRetainedRuns})`);
   }
 }
 

@@ -331,3 +331,26 @@ test("the activity widget reflects a workflow agent still queued behind a full f
   for (const jobId of backend.starts) backend.complete(jobId, "done");
   await pi.handlers.get("session_shutdown")?.();
 });
+
+test("/workflows worktrees reports an empty inventory and reclaim refuses without host confirmation", async () => {
+  const { pi } = await setup();
+  const plain = context({ hasUI: true });
+  pi.handlers.get("session_start")?.({}, plain.ctx);
+
+  await pi.commands.get("workflows").handler("worktrees", plain.ctx);
+  assert.match(plain.notifications.at(-1)?.message ?? "", /No protected worktrees/);
+
+  await pi.commands.get("workflows").handler("reclaim wf_deadbeef 0", plain.ctx);
+  assert.match(plain.notifications.at(-1)?.message ?? "", /requires host confirmation/);
+  await pi.handlers.get("session_shutdown")?.();
+
+  const confirmable = context({ hasUI: true, confirm: async () => true });
+  pi.handlers.get("session_start")?.({}, confirmable.ctx);
+  await pi.commands.get("workflows").handler("reclaim wf_deadbeef 0", confirmable.ctx);
+  assert.match(confirmable.notifications.at(-1)?.message ?? "", /No protected worktree for/);
+
+  await pi.commands.get("workflows").handler("reclaim not-a-run-id", confirmable.ctx);
+  assert.match(confirmable.notifications.at(-1)?.message ?? "", /Usage: \/workflows reclaim/);
+
+  await pi.handlers.get("session_shutdown")?.();
+});

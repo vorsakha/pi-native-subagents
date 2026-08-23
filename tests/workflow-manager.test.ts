@@ -6,7 +6,7 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promise
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
-import { ControlledBackend, tempDir, tick, waitFor } from "./helpers.ts";
+import { ControlledBackend, delay, tempDir, tick, waitFor } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import { workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint } from "../src/workflows/journal.ts";
 import {
@@ -14,6 +14,7 @@ import {
   WorkflowManager,
 } from "../src/workflows/manager.ts";
 import { formatWorkflowBudget, workflowBudgetHealth } from "../src/workflows/budget.ts";
+import { applyWorkflowRetention } from "../src/workflows/retention.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 
 const reviewer: ProfileDefinition = {
@@ -32,6 +33,7 @@ const execFileAsync = promisify(execFile);
 async function fixture(
   concurrency = 4,
   approveMutation?: ConstructorParameters<typeof WorkflowManager>[0]["approveMutation"],
+  retainedRuns?: number,
 ) {
   const parent = await tempDir("workflow-manager");
   const cwd = join(parent, "cwd");
@@ -44,7 +46,7 @@ async function fixture(
     profiles: new Map([[reviewer.name, reviewer]]),
     concurrency,
   });
-  const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1", approveMutation });
+  const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1", approveMutation, retainedRuns });
   return {
     parent,
     cwd,
@@ -1866,6 +1868,155 @@ test("a workflow that ultimately fails still releases every retained session it 
     const final = await started.completion;
     assert.equal(final.status, "failed");
     assert.ok(f.backend.closes.includes(firstJobId), "the successful first agent's session is still released after the workflow fails");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("retention bounds the artifact root to the retained-run window and resumeFromRunId works for every retained run", async () => {
+  const f = await fixture(4, undefined, 3);
+  try {
+    const script = "export default async () => ({ ok: true });";
+    const runIds: string[] = [];
+    for (let index = 0; index < 6; index++) {
+      const started = await f.workflows.start(f.request(script));
+      const final = await started.completion;
+      assert.equal(final.status, "completed");
+      runIds.push(final.runId);
+      await delay(2);
+    }
+    const expectedRetained = runIds.slice(-3);
+    assert.deepEqual(f.workflows.list().map((run) => run.runId).sort(), [...expectedRetained].sort());
+
+    const deadline = Date.now() + 5_000;
+    let onDisk: string[] = [];
+    for (;;) {
+      onDisk = await readdir(f.artifactRoot);
+      if (onDisk.length <= 3 || Date.now() > deadline) break;
+      await delay(20);
+    }
+    assert.deepEqual(onDisk.sort(), [...expectedRetained].sort(), "the artifact root never grows past the retained-run window");
+
+    for (const runId of expectedRetained) {
+      const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: runId }));
+      const final = await resumed.completion;
+      assert.equal(final.status, "completed", `resumeFromRunId works for retained run ${runId}`);
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("resumeFromRunId loads a retained terminal run created by another session", async () => {
+  const f = await fixture(4, undefined, 1);
+  let other: WorkflowManager | undefined;
+  const script = `export default async () => agent("cross-session replay", { access: "readOnly" });`;
+  try {
+    const source = await f.workflows.start(f.request(script));
+    await waitFor(() => f.backend.requests.length === 1, "cross-session source agent");
+    f.backend.completeTask("cross-session replay", "cached across sessions");
+    const sourceFinal = await source.completion;
+    assert.equal(sourceFinal.status, "completed");
+
+    other = new WorkflowManager({
+      jobs: f.jobs,
+      artifactRoot: f.artifactRoot,
+      sessionId: "session-2",
+      retainedRuns: 1,
+    });
+    const resumed = await other.start(f.request(script, {
+      sessionId: "session-2",
+      resumeFromRunId: sourceFinal.runId,
+    }));
+    const final = await resumed.completion;
+
+    assert.equal(final.status, "completed");
+    assert.equal(final.replay?.sourceRunId, sourceFinal.runId);
+    assert.equal(final.agents[0]?.output, "cached across sessions");
+    assert.equal(f.backend.requests.length, 1, "the foreign session's completed call is replayed without dispatch");
+  } finally {
+    await other?.shutdown(200).catch(() => undefined);
+    await f.cleanup();
+  }
+});
+
+test("a second manager cannot reclaim terminal artifacts still held by an open manager session", async () => {
+  const f = await fixture(4, undefined, 1);
+  let other: WorkflowManager | undefined;
+  try {
+    const held = await f.workflows.start(f.request("export default async () => 'held';"));
+    const heldFinal = await held.completion;
+
+    other = new WorkflowManager({
+      jobs: f.jobs,
+      artifactRoot: f.artifactRoot,
+      sessionId: "session-2",
+      retainedRuns: 1,
+    });
+    for (let index = 0; index < 3; index++) {
+      const started = await other.start(f.request(`export default async () => 'new-${index}';`, { sessionId: "session-2" }));
+      await started.completion;
+      await delay(2);
+    }
+
+    const whileOpen = await applyWorkflowRetention(f.artifactRoot, { maxRuns: 0 });
+    assert.ok(!whileOpen.removed.includes(heldFinal.runId), "the first manager's durable session claim protects its held run");
+    assert.ok((await readdir(f.artifactRoot)).includes(heldFinal.runId));
+
+    await f.workflows.shutdown(200);
+    const afterClose = await applyWorkflowRetention(f.artifactRoot, { maxRuns: 0 });
+    assert.ok(afterClose.removed.includes(heldFinal.runId), "retention can reclaim the run after its manager closes");
+  } finally {
+    await other?.shutdown(200).catch(() => undefined);
+    await f.cleanup();
+  }
+});
+
+test("reclaimWorktree refuses a non-terminal run and persists removed isolation with reclaimedAt once reclaimed", async () => {
+  const f = await fixture(4);
+  try {
+    await execFileAsync("git", ["init", "-q", f.cwd]);
+    await execFileAsync("git", ["-C", f.cwd, "config", "user.email", "tests@example.invalid"]);
+    await execFileAsync("git", ["-C", f.cwd, "config", "user.name", "Workflow Tests"]);
+    await writeFile(join(f.cwd, "base.txt"), "base\n");
+    await execFileAsync("git", ["-C", f.cwd, "add", "base.txt"]);
+    await execFileAsync("git", ["-C", f.cwd, "commit", "-qm", "base"]);
+
+    const started = await f.workflows.start(f.request(`export default async () => agent("isolated reclaim", { isolation: "worktree" });`));
+    await waitFor(() => f.backend.requests.length === 1, "isolated agent dispatched");
+
+    await assert.rejects(
+      f.workflows.reclaimWorktree({ runId: started.snapshot.runId, agentIndex: 0, cwd: f.cwd, confirmed: true }),
+      /active workflow run/,
+    );
+
+    const request = f.backend.requests[0]!;
+    await writeFile(join(request.cwd, "changed.txt"), "changed\n");
+    f.backend.completeTask(request.task, "worker");
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.agents[0]?.isolation?.state, "preserved");
+    const patchArtifact = final.agents[0]?.isolation?.patchArtifact;
+    assert.ok(patchArtifact);
+
+    const worktrees = await f.workflows.listProtectedWorktrees({ cwd: f.cwd });
+    assert.equal(worktrees.length, 1);
+    assert.equal(worktrees[0]?.runId, final.runId);
+
+    const { reclamation, worktree } = await f.workflows.reclaimWorktree({ runId: final.runId, agentIndex: 0, cwd: f.cwd, confirmed: true });
+    assert.equal(reclamation.deletedBranch, true);
+    assert.equal(worktree.state, "preserved");
+
+    const checked = f.workflows.check(final.runId);
+    assert.equal(checked.agents[0]?.isolation?.state, "removed");
+    assert.equal(typeof checked.agents[0]?.isolation?.reclaimedAt, "number");
+
+    const persisted = JSON.parse(await readFile(join(f.artifactRoot, final.runId, "workflow.json"), "utf8")) as WorkflowSnapshot;
+    assert.equal(persisted.agents[0]?.isolation?.state, "removed");
+    assert.equal(typeof persisted.agents[0]?.isolation?.reclaimedAt, "number");
+    await readFile(join(f.artifactRoot, final.runId, patchArtifact!), "utf8");
+
+    assert.deepEqual(await f.workflows.listProtectedWorktrees({ cwd: f.cwd }), [], "reclaiming the last protected worktree clears the inventory");
   } finally {
     await f.cleanup();
   }

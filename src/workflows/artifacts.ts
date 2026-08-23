@@ -15,9 +15,10 @@ import type { ToolResultSnapshot, TranscriptEntry } from "../types.ts";
 import { formatWorkflowBudget } from "./budget.ts";
 import { workflowTaskOutcome } from "./outcome.ts";
 import type { WorkflowJournalRecord, WorkflowSnapshot } from "./types.ts";
+import type { WorkflowWorktreeResult } from "./worktree.ts";
 
 const RUN_ID_PATTERN = /^wf_[a-f0-9]+$/;
-const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
+export const DEFAULT_STALE_AFTER_MS = 24 * 60 * 60 * 1_000;
 const TRANSCRIPT_ENTRY_BYTES = 4 * 1_024;
 const TRANSCRIPT_AGENT_BYTES = 32 * 1_024;
 const TRANSCRIPT_TRUNCATION_TOOL_ID = "transcript";
@@ -343,6 +344,12 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
     throw new Error("Workflow summary could not be compacted without losing its schema");
   }
   return parsed as WorkflowSnapshot;
+}
+
+/** Public alias of the traversal-guarded run directory resolver, for
+ * retention and reclamation callers outside this module. */
+export function workflowRunDirectory(root: string, runId: string): string {
+  return runDirectory(root, runId);
 }
 
 function runDirectory(root: string, runId: string): string {
@@ -758,4 +765,52 @@ export async function loadWorkflowSummaries(
   }
 
   return summaries.sort((left, right) => right.timestamps.updatedAt - left.timestamps.updatedAt);
+}
+
+/** Directory names under the artifact root that look like run IDs. Does not
+ * validate their contents; a caller must still read and check `workflow.json`. */
+export async function listWorkflowRunIds(root: string): Promise<string[]> {
+  const normalizedRoot = resolve(root);
+  let entries;
+  try { entries = await readdir(normalizedRoot, { withFileTypes: true }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
+  return entries.filter((entry) => entry.isDirectory() && RUN_ID_PATTERN.test(entry.name)).map((entry) => entry.name);
+}
+
+/** Reads only `workflow.json` for one run; undefined on any read, parse, or schema failure. */
+export async function readWorkflowRunSummary(root: string, runId: string): Promise<WorkflowSnapshot | undefined> {
+  try {
+    const directory = runDirectory(root, runId);
+    const parsed: unknown = JSON.parse(await readFile(join(directory, "workflow.json"), "utf8"));
+    if (!isWorkflowSnapshot(parsed) || parsed.runId !== runId) return undefined;
+    return { ...parsed, artifactDir: directory };
+  } catch { return undefined; }
+}
+
+/** Deletes a run directory outright. Callers must verify retention eligibility first. */
+export async function removeWorkflowRun(root: string, runId: string): Promise<void> {
+  await rm(runDirectory(root, runId), { recursive: true, force: true });
+}
+
+/** Patches one agent's isolation result in the durable summary, applying the
+ * same structural-validity floor as {@link checkpointWorkflow}. */
+export async function updateWorkflowRunIsolation(
+  root: string,
+  runId: string,
+  agentIndex: number,
+  isolation: WorkflowWorktreeResult,
+): Promise<void> {
+  const directory = await requireRunDirectory(root, runId);
+  const parsed: unknown = JSON.parse(await readFile(join(directory, "workflow.json"), "utf8"));
+  if (!isWorkflowSnapshot(parsed) || parsed.runId !== runId) throw new Error(`Workflow run summary is invalid: ${runId}`);
+  if (!parsed.agents[agentIndex]) throw new Error(`Unknown workflow agent: ${agentIndex}`);
+  const next: WorkflowSnapshot = {
+    ...parsed,
+    artifactDir: directory,
+    agents: parsed.agents.map((agent, index) => index === agentIndex ? { ...agent, isolation } : agent),
+  };
+  await atomicWriteJson(join(directory, "workflow.json"), durableWorkflowSnapshot(next), { maxTotalBytes: 512 * 1024 });
 }

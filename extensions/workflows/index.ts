@@ -13,6 +13,7 @@ import {
   workflowIsTerminal,
   type StartWorkflowRequest,
 } from "../../src/workflows/manager.ts";
+import type { WorkflowProtectedWorktree } from "../../src/workflows/retention.ts";
 import type { WorkflowSnapshot } from "../../src/workflows/types.ts";
 import { workflowTaskOutcome } from "../../src/workflows/outcome.ts";
 import { openWorkflowsDashboard } from "./dashboard.ts";
@@ -142,6 +143,87 @@ function parseArgs(value: string | undefined): unknown {
 function sessionId(ctx: ExtensionContext): string {
   const manager = ctx.sessionManager as { getSessionId?: () => string };
   return manager.getSessionId?.() ?? "session-unknown";
+}
+
+const MAX_PROTECTED_WORKTREE_LINES = 64;
+
+function formatProtectedWorktree(entry: WorkflowProtectedWorktree): string {
+  const patch = entry.patchArtifact ? `patch ${sanitizeInline(entry.patchArtifact)}` : "no patch";
+  const git = entry.git
+    ? ` · registered ${entry.git.registered ? "yes" : "no"} · branch-ref ${entry.git.branchExists ? "yes" : "no"} · checkout ${entry.git.checkoutPresent ? "yes" : "no"}`
+    : "";
+  const unrecorded = entry.unrecorded ? " · unrecorded" : "";
+  const error = entry.error ? ` · ${sanitizeInline(entry.error).slice(0, 200)}` : "";
+  return `${entry.runId} · agent ${entry.agentIndex} · ${entry.state}${unrecorded} · branch ${sanitizeInline(entry.branch)} · ${entry.worktreePath} · ${patch}${git}${error}`;
+}
+
+async function reportProtectedWorktrees(ctx: ExtensionContext, workflows: WorkflowManager): Promise<void> {
+  let worktrees: WorkflowProtectedWorktree[];
+  try {
+    worktrees = await workflows.listProtectedWorktrees({ cwd: ctx.cwd });
+  } catch (error) {
+    ctx.ui.notify(`Could not inspect protected worktrees: ${error instanceof Error ? error.message : String(error)}`, "error");
+    return;
+  }
+  if (!worktrees.length) {
+    ctx.ui.notify("No protected worktrees; every isolated worktree either finished cleanly or was reclaimed.", "info");
+    return;
+  }
+  const shown = worktrees.slice(0, MAX_PROTECTED_WORKTREE_LINES).map(formatProtectedWorktree);
+  const overflow = worktrees.length > MAX_PROTECTED_WORKTREE_LINES ? [`… ${worktrees.length - MAX_PROTECTED_WORKTREE_LINES} more`] : [];
+  ctx.ui.notify([
+    `${worktrees.length} protected worktree${worktrees.length === 1 ? "" : "s"}:`,
+    ...shown,
+    ...overflow,
+    "",
+    "Usage: /workflows reclaim <runId> <agentIndex> [--force]",
+  ].join("\n"), "warning");
+}
+
+async function reclaimProtectedWorktree(rest: string, ctx: ExtensionContext, workflows: WorkflowManager): Promise<void> {
+  const parts = rest.trim().split(/\s+/).filter(Boolean);
+  const [runId, agentIndexRaw, ...flags] = parts;
+  const force = flags.includes("--force");
+  if (!runId || !agentIndexRaw || !/^wf_[a-f0-9]+$/.test(runId) || !/^\d+$/.test(agentIndexRaw)) {
+    ctx.ui.notify("Usage: /workflows reclaim <runId> <agentIndex> [--force]", "warning");
+    return;
+  }
+  const agentIndex = Number(agentIndexRaw);
+  if (!ctx.hasUI || typeof ctx.ui.confirm !== "function") {
+    ctx.ui.notify("Reclaiming a worktree requires host confirmation, which is unavailable in this context.", "warning");
+    return;
+  }
+  let worktree: WorkflowProtectedWorktree | undefined;
+  try {
+    const worktrees = await workflows.listProtectedWorktrees({ cwd: ctx.cwd });
+    worktree = worktrees.find((candidate) => candidate.runId === runId && candidate.agentIndex === agentIndex);
+  } catch (error) {
+    ctx.ui.notify(`Could not inspect protected worktrees: ${error instanceof Error ? error.message : String(error)}`, "error");
+    return;
+  }
+  if (!worktree) {
+    ctx.ui.notify(`No protected worktree for ${runId} agent ${agentIndex}.`, "warning");
+    return;
+  }
+  const confirmed = await ctx.ui.confirm(
+    "Reclaim isolated worktree?",
+    `${formatProtectedWorktree(worktree)}\n\nThis removes the Git worktree registration and its branch.${force ? " --force discards a checkout with no patch artifact." : ""}`,
+    { timeout: 60_000 },
+  );
+  if (!confirmed) {
+    ctx.ui.notify("Reclamation cancelled.", "info");
+    return;
+  }
+  try {
+    const result = await workflows.reclaimWorktree({ runId, agentIndex, cwd: ctx.cwd, confirmed: true, force });
+    const lines = [
+      `Reclaimed ${runId} agent ${agentIndex}: registration ${result.reclamation.removedRegistration ? "removed" : "unchanged"}, checkout ${result.reclamation.removedCheckout ? "removed" : "unchanged"}, branch ${result.reclamation.deletedBranch ? "deleted" : "unchanged"}.`,
+      ...result.reclamation.warnings.map((warning) => `Warning: ${sanitizeInline(warning)}`),
+    ];
+    ctx.ui.notify(lines.join("\n"), result.reclamation.warnings.length ? "warning" : "info");
+  } catch (error) {
+    ctx.ui.notify(`Reclamation failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+  }
 }
 
 export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOptions): WorkflowRegistration {
@@ -380,14 +462,28 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   });
 
   pi.registerCommand("workflows", {
-    description: "Inspect, pause, resume, restart, or cancel workflow runs.",
-    handler: async (_args, ctx) => {
+    description: "Inspect, pause, resume, restart, or cancel workflow runs. `worktrees` lists protected isolated worktrees; `reclaim <runId> <agentIndex> [--force]` reclaims one.",
+    getArgumentCompletions: (prefix) => ["worktrees", "reclaim"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    handler: async (args, ctx) => {
       if (!ctx.isProjectTrusted()) {
         ctx.ui.notify("Workflow history is unavailable for untrusted projects.", "error");
         return;
       }
       await getManager().initialize();
-      await openWorkflowsDashboard(ctx, getManager());
+      const trimmed = args.trim();
+      if (!trimmed) {
+        await openWorkflowsDashboard(ctx, getManager());
+        return;
+      }
+      if (trimmed === "worktrees") {
+        await reportProtectedWorktrees(ctx, getManager());
+        return;
+      }
+      if (trimmed === "reclaim" || trimmed.startsWith("reclaim ")) {
+        await reclaimProtectedWorktree(trimmed.slice("reclaim".length), ctx, getManager());
+        return;
+      }
+      ctx.ui.notify("Usage: /workflows [worktrees|reclaim <runId> <agentIndex> [--force]]", "warning");
     },
   });
 
