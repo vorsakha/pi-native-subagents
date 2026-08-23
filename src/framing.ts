@@ -1,6 +1,6 @@
 import { StringDecoder } from "node:string_decoder";
 
-export const MAX_JSONL_FRAME_BYTES = 1024 * 1024;
+export const MAX_JSONL_FRAME_BYTES = 16 * 1024 * 1024;
 
 export class JsonlFramer {
   readonly #decoder = new StringDecoder("utf8");

@@ -32,6 +32,7 @@ const OPTIONAL_INTEGRATION = /mcp|plugin|marketplace|oauth|invalid_grant|refresh
 interface CodexBackendOptions {
   requestTimeoutMs?: number;
   inactivityTimeoutMs?: number;
+  maxFrameBytes?: number;
 }
 
 export interface CodexTokenTotals {
@@ -89,11 +90,13 @@ export class CodexAppServerBackend implements Backend {
   readonly #command: string;
   readonly #requestTimeoutMs: number;
   readonly #inactivityTimeoutMs: number;
+  readonly #maxFrameBytes: number | undefined;
 
   constructor(command = "codex", options: CodexBackendOptions = {}) {
     this.#command = command;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.#inactivityTimeoutMs = options.inactivityTimeoutMs ?? 15 * 60_000;
+    this.#maxFrameBytes = options.maxFrameBytes;
   }
 
   /**
@@ -109,6 +112,7 @@ export class CodexAppServerBackend implements Backend {
     });
     const peer = new JsonRpcPeer({
       process: managed,
+      maxFrameBytes: this.#maxFrameBytes,
       // Discovery is unattended: never answer an interactive server request.
       onRequest: (_id, method) => { throw new Error(`Interactive request denied during discovery: ${method}`); },
     });
@@ -275,6 +279,7 @@ export class CodexAppServerBackend implements Backend {
     let closing = false;
     let cancellingReason: string | undefined;
     let stderr = "";
+    let protocolFailure: string | undefined;
     let previousTokenTotals: CodexTokenTotals | undefined;
     /** Model identity reported by the runtime; never seeded from configured policy. */
     let servingModel: string | undefined;
@@ -324,7 +329,12 @@ export class CodexAppServerBackend implements Backend {
 
     peer = new JsonRpcPeer({
       process: managed,
+      maxFrameBytes: this.#maxFrameBytes,
       onActivity: () => watchdog.touch(),
+      onProtocolError: (error) => {
+        protocolFailure = error.message;
+        finish({ type: "failed", error: `Codex app-server protocol failure: ${error.message}` });
+      },
       onRequest: (_id, method, params) => {
         if (method === "item/tool/call" && request.parentThread) {
           if (params.tool !== PARENT_THREAD_TOOL_NAME) throw new Error(`Unsupported dynamic tool: ${String(params.tool ?? "unknown")}`);
@@ -444,7 +454,12 @@ export class CodexAppServerBackend implements Backend {
     });
     managed.child.on("close", (code, signal) => {
       if (!settled && !closing) {
-        finish({ type: "failed", error: `Codex app-server exited (${code ?? signal ?? "signal"})${stderr.trim() ? `: ${stderr.trim()}` : ""}` });
+        finish({
+          type: "failed",
+          error: protocolFailure
+            ? `Codex app-server protocol failure: ${protocolFailure}`
+            : `Codex app-server exited (${code ?? signal ?? "signal"})${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
+        });
       }
     });
 

@@ -86,6 +86,23 @@ test("JSON-RPC malformed and oversized frames reject pending work and tear down"
   }
 });
 
+test("JSON-RPC reports malformed and oversized frame failures to an observer even with no pending request", async () => {
+  for (const [output, options, error] of [
+    ["{not-json}\n", {}, /framing failed.*invalid JSON object/],
+    ["123456789", { maxFrameBytes: 8 }, /framing failed.*exceeds 8 bytes/],
+  ] as const) {
+    const fake = fakeManaged();
+    const observed: Error[] = [];
+    const peer = new JsonRpcPeer({ process: fake.managed, ...options, onProtocolError: (err) => observed.push(err) });
+    fake.stdout.write(output);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(observed.length, 1, "the observer fires exactly once");
+    assert.match(observed[0]!.message, error);
+    assert.equal(fake.terminated, true);
+    await peer.close();
+  }
+});
+
 test("JSON-RPC close and stdin failures reject pending requests with teardown", async () => {
   const fake = fakeManaged();
   const peer = new JsonRpcPeer({ process: fake.managed });

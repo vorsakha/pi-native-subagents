@@ -113,6 +113,12 @@ process.stdin.on("data", chunk => {
       if (process.env.PARAM_FILE) fs.appendFileSync(process.env.PARAM_FILE, JSON.stringify(value.params) + "\\n");
       const number = ++turns; const id = "turn-" + number;
       reply(value.id, { turn: { id } });
+      if (process.env.MODE === "large-item" || process.env.MODE === "oversized") {
+        // Unsolicited notification, not a response to any pending request.
+        process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: {
+          id: "command-1", type: "commandExecution", command: "big", aggregatedOutput: "x".repeat(1_100_000), status: "completed",
+        } } }) + "\\n");
+      }
       if (process.env.MODE === "usage") {
         const params = { threadId: "thread-1", turnId: id, tokenUsage: {
           total: { inputTokens: 104685, outputTokens: 106, cachedInputTokens: 102144, cacheWriteInputTokens: 0 },
@@ -318,6 +324,38 @@ test("Codex ignores thread-scoped telemetry whose threadId or turnId does not ma
       .start(request("codex", fake.dir, { ...process.env, MODE: "stale-scope" }), (event) => events.push(event));
     await run.completed;
     assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 4_242, window: 100_000 }, "only telemetry scoped to this job's current threadId/turnId is accepted");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex normalizes a valid 1.1 MB tool-result notification with no pending request instead of masquerading as an app-server exit", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+      .start(request("codex", fake.dir, { ...process.env, MODE: "large-item" }), (event) => events.push(event));
+    await run.completed;
+    assert.deepEqual(terminal(events), { type: "completed", output: "FIRST" });
+    const toolEnd = events.find((event): event is Extract<BackendEvent, { type: "tool_end" }> => event.type === "tool_end" && event.id === "command-1");
+    assert.ok(toolEnd, "the large notification still produces a tool_end event");
+    const text = toolEnd?.result?.content[0]?.text ?? "";
+    assert.ok(text.length > 0 && text.length <= 4_096, "normalized output stays within the bounded transcript limit");
+    assert.ok(!events.some((event) => event.type === "failed"), "a valid large notification must not fail the run");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex reports the framing cause, not an unexplained app-server exit, for a genuinely oversized frame", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, maxFrameBytes: 4_096 })
+      .start(request("codex", fake.dir, { ...process.env, MODE: "oversized" }), (event) => events.push(event));
+    await run.completed;
+    const event = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+    assert.equal(event.type, "failed");
+    assert.match(event.error, /JSONL frame exceeds/);
+    assert.doesNotMatch(event.error, /exited \(/);
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });

@@ -16,6 +16,7 @@ export class JsonRpcPeer {
   readonly #onActivity: () => void;
   readonly #onRequest: (id: JsonRpcId, method: string, params: Record<string, unknown>) => unknown | Promise<unknown>;
   readonly #requestId: () => JsonRpcId;
+  readonly #onProtocolError: (error: Error) => void;
   #nextId = 1;
   #closed = false;
   #stderr = "";
@@ -27,12 +28,14 @@ export class JsonRpcPeer {
     onRequest?: (id: JsonRpcId, method: string, params: Record<string, unknown>) => unknown | Promise<unknown>;
     requestId?: () => JsonRpcId;
     maxFrameBytes?: number;
+    onProtocolError?: (error: Error) => void;
   }) {
     this.#process = options.process;
     this.#onNotification = options.onNotification ?? (() => undefined);
     this.#onActivity = options.onActivity ?? (() => undefined);
     this.#onRequest = options.onRequest ?? (() => ({ decision: "decline" }));
     this.#requestId = options.requestId ?? (() => this.#nextId++);
+    this.#onProtocolError = options.onProtocolError ?? (() => undefined);
     const framer = new JsonlFramer(options.maxFrameBytes);
     const receive = (records: string[]) => { for (const record of records) this.#receive(record); };
     this.#process.child.stdout.on("data", (chunk: Buffer) => {
@@ -143,7 +146,9 @@ export class JsonRpcPeer {
   #protocolFailure(error: unknown): void {
     if (this.#closed) return;
     this.#closed = true;
-    this.#failPending(new Error(`JSON-RPC framing failed: ${error instanceof Error ? error.message : String(error)}`));
+    const failure = new Error(`JSON-RPC framing failed: ${error instanceof Error ? error.message : String(error)}`);
+    this.#failPending(failure);
+    try { this.#onProtocolError(failure); } catch { /* observers cannot break teardown */ }
     void this.#process.terminate();
   }
 }
