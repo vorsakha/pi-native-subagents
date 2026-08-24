@@ -104,6 +104,25 @@ function classifyClaudeUnavailability(error: SDKAssistantMessageError, info: SDK
   };
 }
 
+/** Keep this list anchored. Extra assistant content is model progress, not refusal metadata. */
+const CLAUDE_QUOTA_BOILERPLATE_PATTERNS = [
+  /^You've hit your session limit · resets \d{1,2}(?::\d{2})? ?(?:am|pm) \([-A-Za-z0-9_+]+(?:\/[-A-Za-z0-9_+]+)+\)$/i,
+] as const;
+
+function isClaudeQuotaBoilerplate(
+  message: Extract<SDKMessage, { type: "assistant" }>,
+  unavailable: ProviderUnavailability | undefined,
+): boolean {
+  if (message.error !== "rate_limit" || unavailable?.authoritative !== true) return false;
+  let text = "";
+  for (const block of message.message.content) {
+    if (block.type !== "text") return false;
+    text += block.text;
+  }
+  text = text.replace(/\s+/g, " ").trim();
+  return CLAUDE_QUOTA_BOILERPLATE_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 function emitClaudeContext(telemetry: ClaudeTelemetry, emit: (event: BackendEvent) => void): void {
   if (telemetry.servingModel === undefined && telemetry.tokens === undefined && telemetry.window === undefined) return;
   const context: ContextSnapshot = {
@@ -636,6 +655,8 @@ function handleMessage(
     return;
   }
   if (message.type === "assistant") {
+    const unavailable = message.error ? classifyClaudeUnavailability(message.error, telemetry.rateLimit) : undefined;
+    const quotaBoilerplate = isClaudeQuotaBoilerplate(message, unavailable);
     // Sidechain frames (subagent/Task output) never represent this job's own turn.
     if (!message.parent_tool_use_id) {
       const usage = record(message.message.usage);
@@ -653,26 +674,28 @@ function handleMessage(
       }
       emitClaudeContext(telemetry, emit);
     }
-    let text = "";
-    for (const block of message.message.content) {
-      if (block.type === "text") text += block.text;
-      else if (block.type === "thinking") emit({ type: "thinking_message", text: block.thinking });
-      else if (block.type === "redacted_thinking") emit({ type: "thinking_message", text: "[redacted reasoning]" });
-      else if (block.type === "tool_use") emit({
-        type: "tool_start",
-        id: block.id,
-        name: block.name,
-        args: record(block.input),
-        summary: summarize(block.input),
-      });
+    if (!quotaBoilerplate) {
+      let text = "";
+      for (const block of message.message.content) {
+        if (block.type === "text") text += block.text;
+        else if (block.type === "thinking") emit({ type: "thinking_message", text: block.thinking });
+        else if (block.type === "redacted_thinking") emit({ type: "thinking_message", text: "[redacted reasoning]" });
+        else if (block.type === "tool_use") emit({
+          type: "tool_start",
+          id: block.id,
+          name: block.name,
+          args: record(block.input),
+          summary: summarize(block.input),
+        });
+      }
+      if (text) emit({ type: "message", text: boundedAppend("", text).text });
     }
-    if (text) emit({ type: "message", text: boundedAppend("", text).text });
     if (message.error) {
       return {
         success: false,
         output: "",
         error: `Claude assistant error: ${message.error}`,
-        unavailable: classifyClaudeUnavailability(message.error, telemetry.rateLimit),
+        unavailable,
       };
     }
     return;

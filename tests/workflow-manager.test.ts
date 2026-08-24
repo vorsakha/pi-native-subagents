@@ -16,6 +16,7 @@ import {
 } from "../src/workflows/manager.ts";
 import { formatWorkflowBudget, workflowBudgetHealth } from "../src/workflows/budget.ts";
 import { applyWorkflowRetention } from "../src/workflows/retention.ts";
+import type { BackendEvent } from "../src/types.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 
 const reviewer: ProfileDefinition = {
@@ -1527,6 +1528,39 @@ test("an opted-in workflow waits for a fake provider quota window, then redispat
   }
 });
 
+test("an opted-in workflow waits for an authoritative Claude quota refusal and retries the same logical call", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("quota check");`,
+      {
+        defaultHarness: "claude",
+        retry: { providerUnavailable: "wait", maxWaitMs: 10 * 60_000, maxAttempts: 2 },
+      },
+    ));
+    await waitFor(() => f.claude.requests.length === 1, "first Claude attempt");
+    f.claude.fail(f.claude.starts[0]!, "Claude assistant error: rate_limit", fakeQuota(clock.now() + 5 * 60_000, "claude"));
+    await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "Claude waiting state");
+    const waiting = f.workflows.check(started.snapshot.runId).agents[0]!;
+    assert.equal(waiting.providerWait?.provider, "claude");
+    assert.equal(waiting.providerWait?.attempt, 1);
+    assert.equal(f.backend.requests.length, 0, "a Claude wait never reroutes to Codex");
+
+    advance(5 * 60_000);
+    await waitFor(() => f.claude.requests.length === 2, "second Claude attempt redispatched");
+    assert.equal(f.claude.requests[1]?.task, "quota check");
+    f.claude.complete(f.claude.starts[1]!, "done");
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.agents.length, 1, "the retry keeps one logical agent record");
+    assert.equal(final.agents[0]?.callIndex, 0, "the retry keeps the original call ordinal");
+    assert.equal(final.agents[0]?.state, "completed");
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("a provider wait frees the workflow's own concurrency slot for a sibling agent", async () => {
   const { clock, advance } = fakeProviderWaitClock();
   const f = await fixture(4, undefined, undefined, clock);
@@ -1706,6 +1740,40 @@ test("a mutating call that already produced tool activity is not replayed after 
     assert.equal(f.backend.requests.length, 1, "no replay occurred");
   } finally {
     await f.cleanup();
+  }
+});
+
+test("Claude quota redispatch is refused after model, thinking, or tool activity", async () => {
+  const cases: Array<{ label: string; event: BackendEvent }> = [
+    { label: "model output", event: { type: "message", text: "partial output" } },
+    { label: "thinking", event: { type: "thinking_message", text: "partial thinking" } },
+    { label: "tool activity", event: { type: "tool_start", id: "write-1", name: "Write" } },
+  ];
+
+  for (const scenario of cases) {
+    const { clock } = fakeProviderWaitClock();
+    const f = await fixture(4, undefined, undefined, clock);
+    try {
+      const started = await f.workflows.start(f.request(
+        `export default async () => agent("quota check", { access: "readOnly" });`,
+        {
+          defaultHarness: "claude",
+          retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 3 },
+        },
+      ));
+      await waitFor(() => f.claude.requests.length === 1, `${scenario.label} first attempt`);
+      const jobId = f.claude.starts[0]!;
+      const run = f.claude.runs.get(jobId)!;
+      run.emit(scenario.event);
+      f.claude.fail(jobId, "Claude assistant error: rate_limit", fakeQuota(clock.now() + 60_000, "claude"));
+      const final = await started.completion;
+      const result = final.result as { ok: boolean; error?: string };
+      assert.equal(result.ok, false, `${scenario.label} refusal is surfaced`);
+      assert.match(result.error ?? "", /already produced model or tool activity/, `${scenario.label} blocks replay`);
+      assert.equal(f.claude.requests.length, 1, `${scenario.label} does not redispatch`);
+    } finally {
+      await f.cleanup();
+    }
   }
 });
 

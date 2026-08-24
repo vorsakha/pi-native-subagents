@@ -984,13 +984,19 @@ test("Codex and Pi reject a structuredOutput policy instead of silently ignoring
 });
 
 test("Claude classifies an authoritative rate_limit rejection into structured unavailability", async () => {
+  const quotaText = "You've hit your session limit · resets 12pm (America/Sao_Paulo)";
   async function* messages() {
     yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
     yield {
       type: "rate_limit_event",
       rate_limit_info: { status: "rejected", resetsAt: Math.floor((Date.now() + 5 * 60_000) / 1000), rateLimitType: "five_hour" },
     };
-    yield { type: "assistant", parent_tool_use_id: null, message: { content: [] }, error: "rate_limit" };
+    yield {
+      type: "assistant",
+      parent_tool_use_id: null,
+      message: { content: [{ type: "text", text: quotaText }], usage: { input_tokens: 0, output_tokens: 0 } },
+      error: "rate_limit",
+    };
   }
   const stream = Object.assign(messages(), { close() {} });
   const events: BackendEvent[] = [];
@@ -1009,6 +1015,46 @@ test("Claude classifies an authoritative rate_limit rejection into structured un
   assert.equal(failed.unavailable?.scope, "five_hour");
   assert.ok(failed.unavailable!.retryAt! > Date.now());
   assert.ok(!failed.unavailable?.detail.includes("@"), "detail must never include a raw email address");
+  assert.equal(events.some((event) => event.type === "message"), false, "Claude quota boilerplate is refusal metadata, not model output");
+  assert.equal(events.some((event) => event.type === "thinking_message"), false);
+  assert.equal(events.some((event) => event.type === "tool_start"), false);
+  await run.close();
+});
+
+test("Claude preserves mixed content on an authoritative rate_limit rejection", async () => {
+  const quotaText = "You've hit your session limit · resets 12pm (America/Sao_Paulo)";
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield {
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: Math.floor((Date.now() + 5 * 60_000) / 1000), rateLimitType: "five_hour" },
+    };
+    yield {
+      type: "assistant",
+      parent_tool_use_id: null,
+      message: {
+        content: [
+          { type: "text", text: `${quotaText} Please save your work.` },
+          { type: "thinking", thinking: "the refusal followed model activity" },
+          { type: "tool_use", id: "write-1", name: "Write", input: { path: "out.txt" } },
+        ],
+        usage: { input_tokens: 0, output_tokens: 0 },
+      },
+      error: "rate_limit",
+    };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
+  await run.completed;
+  assert.ok(events.some((event) => event.type === "message" && event.text.includes("Please save your work.")));
+  assert.ok(events.some((event) => event.type === "thinking_message" && event.text === "the refusal followed model activity"));
+  assert.ok(events.some((event) => event.type === "tool_start" && event.id === "write-1"));
+  assert.equal(terminal(events)?.type, "failed");
   await run.close();
 });
 
