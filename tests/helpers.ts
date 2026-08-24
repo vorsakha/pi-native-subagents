@@ -19,6 +19,7 @@ import type {
   StructuredOutputSupport,
   Usage,
 } from "../src/types.ts";
+import type { ProviderUnavailability } from "../src/provider-unavailability.ts";
 
 /* ── async utilities ─────────────────────────────────────────────────────── */
 
@@ -273,10 +274,10 @@ export class ControlledBackend implements Backend {
     run.settle();
   }
 
-  fail(jobId: string, error: string): void {
+  fail(jobId: string, error: string, unavailable?: ProviderUnavailability): void {
     const run = this.runs.get(jobId);
     assert.ok(run, `backend never started job ${jobId}`);
-    run.emit({ type: "failed", error });
+    run.emit({ type: "failed", error, unavailable });
     run.settle();
   }
 
@@ -296,9 +297,9 @@ export class ControlledBackend implements Backend {
     run.settle();
   }
 
-  failTask(task: string, error: string): void {
+  failTask(task: string, error: string, unavailable?: ProviderUnavailability): void {
     const run = this.#activeRunForTask(task);
-    run.emit({ type: "failed", error });
+    run.emit({ type: "failed", error, unavailable });
     run.settle();
   }
 }

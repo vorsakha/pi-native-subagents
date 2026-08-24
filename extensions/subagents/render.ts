@@ -150,6 +150,7 @@ export type TraceStatusColor = "accent" | "success" | "warning" | "error" | "mut
 export function traceStatusMeta(status: string, now?: number): { glyph: string; color: TraceStatusColor } {
   switch (status) {
     case "running": return { glyph: "●", color: "accent" };
+    case "waiting": return { glyph: "⧗", color: "warning" };
     case "paused": return { glyph: "Ⅱ", color: "warning" };
     case "completed": return { glyph: "✓", color: "success" };
     case "failed": return { glyph: "×", color: "error" };

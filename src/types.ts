@@ -5,6 +5,7 @@ import type {
 } from "./capabilities.ts";
 import type { ParentThreadSnapshot } from "./parent-thread-context.ts";
 import type { SpendBudget } from "./budget.ts";
+import type { ProviderUnavailability } from "./provider-unavailability.ts";
 
 export type HarnessName = "pi" | "claude" | "codex";
 export type ProviderFamily = "claude" | "codex" | "other";
@@ -63,7 +64,7 @@ export type BackendEvent =
   | { type: "context"; context: ContextSnapshot; at?: number }
   /** `structured` is the authoritative terminal payload from a provider-native structured-result channel; present only when `BackendPolicy.structuredOutput` was requested and the runtime honored it. */
   | { type: "completed"; output?: string; structured?: unknown; at?: number }
-  | { type: "failed"; error: string; at?: number }
+  | { type: "failed"; error: string; unavailable?: ProviderUnavailability; at?: number }
   | { type: "cancelled"; reason?: string; at?: number }
   /** An optional native integration failed; the job continues without it. */
   | { type: "degraded"; source: string; detail: string; at?: number };
@@ -336,4 +337,8 @@ export interface JobSnapshot {
   capabilities?: JobCapabilityRoute;
   /** Bounded degraded-integration notices reported by the harness. */
   warnings?: string[];
+  /** Structured provider-quota classification from the terminal `failed` event, when recognized. */
+  unavailable?: ProviderUnavailability;
+  /** True once the job observed model text, thinking, or tool activity; unset means a rejection before any progress. */
+  progressed?: boolean;
 }

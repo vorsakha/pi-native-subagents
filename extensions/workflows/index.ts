@@ -95,6 +95,8 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
       structuredTransport: agent.structuredTransport,
       error: agent.error,
       usage: structuredClone(agent.usage),
+      providerWait: agent.providerWait ? structuredClone(agent.providerWait) : undefined,
+      attempts: agent.attempts ? structuredClone(agent.attempts) : undefined,
       output: undefined,
       transcript: undefined,
     })),
@@ -347,6 +349,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       "Use approval=plan for read-only planning or approval=onMutate to require a host confirmation before mutation.",
       "Use workflowName for a saved user/project workflow or scriptPath for a trusted project-local script; provide exactly one script source.",
       "Use agent schema for validated JSON output when downstream phases need structure; schema cannot change access policy.",
+      "Set retry={ providerUnavailable: 'wait' } to keep the workflow active and retry the same agent() call after an authoritative provider-quota rejection; default fail keeps today's immediate-failure behavior.",
     ],
     parameters: Type.Object({
       name: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
@@ -365,6 +368,11 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         maxTokensPerAgent: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000_000, description: "Fresh input plus output ceiling for any single workflow agent" })),
         maxCost: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 10_000, description: "Aggregate cost budget across workflow agents" })),
         maxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000, description: "Aggregate native-provider turns across all workflow agents; not a per-agent allowance" })),
+      })),
+      retry: Type.Optional(Type.Object({
+        providerUnavailable: Type.Optional(Type.Union([Type.Literal("fail"), Type.Literal("wait")], { description: "wait opts into waiting out an authoritative provider-quota rejection instead of failing the call; default fail preserves today's behavior" })),
+        maxWaitMs: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 21_600_000, description: "Total provider-wait allowance for the whole run" })),
+        maxAttempts: Type.Optional(Type.Integer({ minimum: 1, maximum: 8, description: "Provider-wait retries allowed per logical agent()/followUp() call" })),
       })),
       background: Type.Optional(Type.Boolean()),
     }),
@@ -401,6 +409,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         resumeFromRunId: params.resumeFromRunId,
         approval: params.approval,
         budget: params.budget,
+        retry: params.retry,
       };
       const started = await workflows.start(request);
       const runGeneration = generation;

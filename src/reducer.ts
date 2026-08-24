@@ -140,20 +140,24 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
       pushTranscript(next, { kind: "user", text: event.text, at: event.at ?? now });
       break;
     case "text_delta": {
+      next.progressed = true;
       const appended = boundedAppend(next.output, event.text);
       next.output = appended.text;
       next.truncated ||= appended.truncated;
       break;
     }
     case "thinking_delta":
+      next.progressed = true;
       next.liveThinking = boundedText(next.liveThinking + event.text, MAX_OUTPUT_BYTES);
       break;
     case "thinking_message":
+      next.progressed = true;
       next.liveThinking = "";
       next.transcript = job.transcript.map((entry) => ({ ...entry }));
       pushTranscript(next, { kind: "thinking", text: event.text, at: event.at ?? now });
       break;
     case "message": {
+      next.progressed = true;
       next.transcript = job.transcript.map((entry) => ({ ...entry }));
       const appended = boundedAppend("", event.text);
       next.output = appended.text;
@@ -166,6 +170,7 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
       next.queuedMessages = event.messages.slice(-32).map((message) => ({ ...message, text: boundedText(message.text, 4 * 1024) }));
       break;
     case "tool_start": {
+      next.progressed = true;
       const args = boundedArgs(event.args);
       next.tools = job.tools.map((tool) => ({ ...tool }));
       next.transcript = job.transcript.map((entry) => ({ ...entry }));
@@ -189,6 +194,7 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
       break;
     }
     case "tool_end": {
+      next.progressed = true;
       const result = boundedResult(event.result, event.output, event.error);
       const failed = result?.isError ?? event.error === true;
       next.tools = job.tools.map((tool) => ({ ...tool }));
@@ -253,7 +259,9 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
     case "failed":
       next.status = "failed";
       next.queuedMessages = [];
-      next.error = event.error;      next.endedAt = event.at ?? now;
+      next.error = event.error;
+      next.unavailable = event.unavailable;
+      next.endedAt = event.at ?? now;
       break;
     case "cancelled":
       next.status = "cancelled";

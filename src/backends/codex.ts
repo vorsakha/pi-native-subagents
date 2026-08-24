@@ -4,6 +4,7 @@ import { sanitizeSubscriptionEnv } from "../env.ts";
 import { asObject, JsonRpcPeer } from "../jsonrpc.ts";
 import { spawnManaged } from "../process-tree.ts";
 import { boundedAppend } from "../reducer.ts";
+import { normalizeRetryAt, providerUnavailabilityDetail, type ProviderUnavailability } from "../provider-unavailability.ts";
 import {
   PARENT_THREAD_INPUT_SCHEMA,
   PARENT_THREAD_TOOL_DESCRIPTION,
@@ -73,6 +74,57 @@ function codexTokenTotals(value: Record<string, unknown>): CodexTokenTotals {
 
 function hasUsage(usage: Usage): boolean {
   return usage.input > 0 || usage.output > 0 || usage.cacheRead > 0 || usage.cacheWrite > 0;
+}
+
+/**
+ * Exact, known Codex usage-limit-exhaustion error codes. Deliberately not a
+ * broad substring match: a loose `/quota|rate.?limit/i` pattern also accepts
+ * unrelated errors such as `quota_configuration_error`, which is a
+ * provisioning problem, not a temporary exhaustion the caller should wait out.
+ */
+const CODEX_USAGE_LIMIT_CODES = new Set(["usage_limit_reached", "usage_limit_exceeded"]);
+/**
+ * Known aliases for an absolute reset timestamp field. The exact field name
+ * for the installed app-server build is not verifiable from this repository
+ * (no Codex protocol schema ships in node_modules); this fail-closed reader
+ * accepts only unambiguous absolute-time spellings and reports
+ * non-authoritative unavailability when none is present, so Codex simply
+ * never waits rather than guessing at an unverified schema. `retryAfter` /
+ * `retry_after` are deliberately excluded: by HTTP convention that field is a
+ * relative delay, not an absolute epoch, and normalizing it as one would
+ * silently misinterpret its units.
+ */
+const CODEX_RESET_FIELD_ALIASES = ["resetAt", "resetsAt", "reset_at", "resets_at"];
+
+/**
+ * Classifies a Codex `turn/completed` failure using only structured fields on
+ * the reported error. Returns `undefined` (normal failure, never a wait) when
+ * the error does not look like a usage-limit rejection.
+ */
+export function classifyCodexUnavailability(turnError: unknown, now: number): ProviderUnavailability | undefined {
+  const error = asObject(turnError);
+  const code = typeof error.code === "string" ? error.code : typeof error.type === "string" ? error.type : undefined;
+  if (!code || !CODEX_USAGE_LIMIT_CODES.has(code)) return undefined;
+  let retryAt: number | undefined;
+  for (const key of CODEX_RESET_FIELD_ALIASES) {
+    if (!(key in error)) continue;
+    retryAt = normalizeRetryAt(error[key], now);
+    if (retryAt !== undefined) break;
+  }
+  return {
+    provider: "codex",
+    kind: "quota",
+    retryAt,
+    authoritative: retryAt !== undefined,
+    // No verified schema constrains `error.window` or `error.message` (see the
+    // alias comment above); unlike Claude's typed `rateLimitType` enum, they are
+    // unbounded, provider-controlled text that could carry API keys, bearer
+    // tokens, account/organization identifiers, or other credentials, so
+    // neither is ever copied into `scope` or `detail`. `code` is safe here only
+    // because it was just checked against the fixed `CODEX_USAGE_LIMIT_CODES`
+    // allowlist above.
+    detail: providerUnavailabilityDetail(`Codex reported a usage-limit rejection (${code})`),
+  };
 }
 
 /**
@@ -436,7 +488,11 @@ export class CodexAppServerBackend implements Backend {
               finish({ type: "completed", output });
             }
           } else if (status === "interrupted") finish({ type: "cancelled", reason: "Codex turn interrupted" });
-          else finish({ type: "failed", error: String(asObject(turn.error).message ?? `Codex turn ${status}`) });
+          else finish({
+            type: "failed",
+            error: String(asObject(turn.error).message ?? `Codex turn ${status}`),
+            unavailable: classifyCodexUnavailability(turn.error, Date.now()),
+          });
         }
       },
     });

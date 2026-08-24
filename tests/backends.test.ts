@@ -5,7 +5,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ClaudeBackend } from "../src/backends/claude.ts";
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
-import { CodexAppServerBackend } from "../src/backends/codex.ts";
+import { CodexAppServerBackend, classifyCodexUnavailability } from "../src/backends/codex.ts";
 import { MAX_OUTPUT_BYTES } from "../src/reducer.ts";
 import type { BackendEvent, HarnessName, BackendRequest } from "../src/types.ts";
 
@@ -981,6 +981,139 @@ test("Codex and Pi reject a structuredOutput policy instead of silently ignoring
     new PiRpcBackend("fixture-pi-missing").start(piRequest, () => {}),
     /does not support native structured results/,
   );
+});
+
+test("Claude classifies an authoritative rate_limit rejection into structured unavailability", async () => {
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield {
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: Math.floor((Date.now() + 5 * 60_000) / 1000), rateLimitType: "five_hour" },
+    };
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [] }, error: "rate_limit" };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
+  await run.completed;
+  const failed = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+  assert.equal(failed.type, "failed");
+  assert.ok(failed.unavailable, "an authoritative rate_limit rejection must classify as provider unavailability");
+  assert.equal(failed.unavailable?.provider, "claude");
+  assert.equal(failed.unavailable?.kind, "quota");
+  assert.equal(failed.unavailable?.authoritative, true);
+  assert.equal(failed.unavailable?.scope, "five_hour");
+  assert.ok(failed.unavailable!.retryAt! > Date.now());
+  assert.ok(!failed.unavailable?.detail.includes("@"), "detail must never include a raw email address");
+  await run.close();
+});
+
+test("Claude does not classify its own api_retry notice as provider unavailability", async () => {
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield { type: "system", subtype: "api_retry", attempt: 1, max_retries: 3, retry_delay_ms: 500, error_status: 529, error: "overloaded" };
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: "hi" }] } };
+    yield { type: "result", subtype: "success", result: "done", usage: {}, total_cost_usd: 0, num_turns: 1 };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
+  await run.completed;
+  const final = terminal(events) as Extract<BackendEvent, { type: "completed" }>;
+  assert.equal(final.type, "completed");
+  assert.ok(!events.some((event) => event.type === "failed"));
+  await run.close();
+});
+
+test("Claude reports a non-authoritative rate_limit rejection when no reset time is available", async () => {
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [] }, error: "rate_limit" };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
+  await run.completed;
+  const failed = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+  assert.equal(failed.unavailable?.authoritative, false);
+  assert.equal(failed.unavailable?.retryAt, undefined);
+  await run.close();
+});
+
+test("Codex classifies a structured usage-limit error only when a plausible reset field is present", () => {
+  const now = Date.now();
+  const withReset = classifyCodexUnavailability({ code: "usage_limit_reached", message: "quota exhausted", resetsAt: new Date(now + 10 * 60_000).toISOString(), window: "weekly" }, now);
+  assert.ok(withReset);
+  assert.equal(withReset?.provider, "codex");
+  assert.equal(withReset?.authoritative, true);
+  assert.equal(withReset?.scope, undefined, "Codex's error.window has no verified schema and must never reach scope");
+  assert.ok(!withReset?.detail.includes("@"));
+
+  const withoutReset = classifyCodexUnavailability({ code: "usage_limit_reached", message: "quota exhausted" }, now);
+  assert.ok(withoutReset, "still classified as a quota rejection, but not authoritative");
+  assert.equal(withoutReset?.authoritative, false);
+  assert.equal(withoutReset?.retryAt, undefined);
+
+  const unrelated = classifyCodexUnavailability({ code: "invalid_request", message: "bad params" }, now);
+  assert.equal(unrelated, undefined, "unrelated Codex errors never classify as provider unavailability");
+
+  const nameCollision = classifyCodexUnavailability({ code: "quota_configuration_error", message: "no quota configured", resetsAt: new Date(now + 60_000).toISOString() }, now);
+  assert.equal(nameCollision, undefined, "a quota-named but non-exhaustion error code must never classify as provider unavailability");
+
+  const relativeDelayField = classifyCodexUnavailability({ code: "usage_limit_reached", retryAfter: 120 }, now);
+  assert.equal(relativeDelayField?.authoritative, false, "retryAfter is a relative delay by convention and must never be read as an absolute reset time");
+});
+
+test("Codex never copies unverified error.window data into scope, even when oversized or account-bearing", () => {
+  const now = Date.now();
+  const oversized = classifyCodexUnavailability({ code: "usage_limit_reached", window: "x".repeat(10_000) }, now);
+  assert.equal(oversized?.scope, undefined, "an oversized window value must not reach scope");
+
+  const accountBearing = classifyCodexUnavailability({
+    code: "usage_limit_reached",
+    window: "acct_1a2b3c4d org-secret-billing-id user@example.com",
+  }, now);
+  assert.equal(accountBearing?.scope, undefined, "account/plan-identifying window text must not reach scope");
+  assert.ok(JSON.stringify(accountBearing).length < 300, "classified unavailability must stay bounded regardless of the raw error payload size");
+});
+
+test("Codex never copies error.message credentials or identifiers into detail, even when the code is allowlisted", () => {
+  const now = Date.now();
+  const secretMessage = {
+    code: "usage_limit_reached",
+    message: "sk-proj-aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV org-4f9a8b7c6d5e Bearer eyJhbGciOiJIUzI1NiJ9.secret acct_9z8y7x6w5v user@example.com",
+  };
+  const classified = classifyCodexUnavailability(secretMessage, now);
+  assert.ok(classified);
+  assert.equal(classified?.detail, "Codex reported a usage-limit rejection (usage_limit_reached)", "detail must be the fixed, provider-neutral template, not raw prose");
+  assert.ok(!classified?.detail.includes("sk-proj-"), "API keys must never survive classification");
+  assert.ok(!classified?.detail.includes("org-4f9a8b7c6d5e"), "organization ids must never survive classification");
+  assert.ok(!classified?.detail.includes("Bearer"), "bearer tokens must never survive classification");
+  assert.ok(!classified?.detail.includes("acct_9z8y7x6w5v"), "account ids must never survive classification");
+  assert.ok(!classified?.detail.includes("@"), "emails must never survive classification");
+
+  const serialized = JSON.stringify(classified);
+  assert.ok(!serialized.includes("sk-proj-"), "API keys must never survive serialization");
+  assert.ok(!serialized.includes("org-4f9a8b7c6d5e"), "organization ids must never survive serialization");
+  assert.ok(!serialized.includes("Bearer"), "bearer tokens must never survive serialization");
+  assert.ok(!serialized.includes("acct_9z8y7x6w5v"), "account ids must never survive serialization");
+  assert.ok(!serialized.includes("@"), "emails must never survive serialization");
+
+  const usageLimitExceeded = classifyCodexUnavailability({ code: "usage_limit_exceeded", message: "sk-live-topsecretkey12345" }, now);
+  assert.equal(usageLimitExceeded?.detail, "Codex reported a usage-limit rejection (usage_limit_exceeded)");
+  assert.ok(!usageLimitExceeded?.detail.includes("sk-live-"), "the other allowlisted exhaustion code must also strip raw error.message");
 });
 
 test("Pi reports the concrete responseModel over the requested alias and totalTokens as occupancy", async () => {

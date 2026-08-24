@@ -1,4 +1,5 @@
-import type { AccessMode, ContextSnapshot, EffortLevel, HarnessName, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
+import type { AccessMode, ContextSnapshot, EffortLevel, HarnessName, ProviderFamily, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
+import type { ProviderUnavailabilityKind } from "../provider-unavailability.ts";
 import type { WorkflowWorktreeResult } from "./worktree.ts";
 import type { SpendBudget } from "../budget.ts";
 
@@ -7,6 +8,7 @@ export type WorkflowStatus = "pending" | "running" | "paused" | "completed" | "f
 export type WorkflowAgentState =
   | "queued"
   | "running"
+  | "waiting"
   | "completed"
   | "failed"
   | "cancelled"
@@ -18,6 +20,42 @@ export type WorkflowAgentState =
  * fallback did. Present only when the call requested a `schema`.
  */
 export type WorkflowStructuredTransport = "native" | "portable";
+
+/**
+ * Opt-in policy for continuing an `agent()` call after an authoritative
+ * provider-quota rejection instead of failing it immediately. Absent (or
+ * `"fail"`) preserves today's behavior exactly.
+ */
+export interface WorkflowRetryPolicy {
+  /** Absent means `"fail"`, preserving today's immediate-failure behavior. */
+  providerUnavailable?: "fail" | "wait";
+  /** Total wait allowance for the whole workflow run, in ms. */
+  maxWaitMs?: number;
+  /** Provider-wait retries allowed per logical `agent()`/`followUp()` call. */
+  maxAttempts?: number;
+}
+
+/** Bounded, display-safe record of one provider wait a logical call went through. */
+export interface WorkflowAgentProviderWait {
+  provider: ProviderFamily;
+  kind: ProviderUnavailabilityKind;
+  scope?: string;
+  detail: string;
+  /** Epoch ms this attempt is waiting until. */
+  retryAt: number;
+  attempt: number;
+  maxAttempts: number;
+}
+
+/** Bounded provenance for one abandoned attempt of a logical call that later retried. */
+export interface WorkflowAgentAttempt {
+  jobId?: string;
+  harness?: string;
+  model?: string;
+  error?: string;
+  usage: WorkflowUsage;
+  endedAt?: number;
+}
 
 export interface WorkflowTimestamps {
   createdAt: number;
@@ -119,6 +157,12 @@ export interface WorkflowAgentRecord {
   transcript?: TranscriptEntry[];
   error?: string;
   usage: WorkflowUsage;
+  /** Usage carried over from abandoned provider-wait attempts of this same logical call. */
+  retryUsage?: WorkflowUsage;
+  /** Present while `state` is `"waiting"`; cleared once the call redispatches. */
+  providerWait?: WorkflowAgentProviderWait;
+  /** Bounded provenance for prior abandoned attempts of this logical call, oldest first. */
+  attempts?: WorkflowAgentAttempt[];
   /** Latest native request occupancy, when exposed by the harness. */
   context?: ContextSnapshot;
   /**
@@ -237,6 +281,8 @@ export interface WorkflowSnapshot {
   journalArtifact?: string;
   approval?: WorkflowApprovalMode;
   budget?: WorkflowBudgetPolicy;
+  /** Opt-in provider-quota wait policy; absent means today's immediate-failure behavior. Not part of the replay fingerprint. */
+  retry?: WorkflowRetryPolicy;
   warnings?: string[];
   result?: unknown;
   error?: string;

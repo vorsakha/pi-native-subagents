@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { Check } from "typebox/value";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
 import type { Backend } from "../src/types.ts";
 import { ControlledBackend, HoldingBackend, ImmediateBackend, context, fakePi, tempDir, theme, waitFor } from "./helpers.ts";
@@ -60,6 +61,27 @@ test("direct and workflow agents use Pi by default and forward exact models or n
   assert.equal(nativeDefault.details.job.harness, "pi");
   assert.equal(nativeDefault.details.job.model, "default");
   assert.equal(piBackend.requests.at(-1)?.policy.model, undefined);
+  await pi.handlers.get("session_shutdown")?.();
+});
+
+test("the workflow tool's retry schema accepts opt-in wait policies and rejects out-of-range or unknown values", async () => {
+  const { pi } = await setup();
+  const { ctx } = context({ hasUI: true });
+  pi.handlers.get("session_start")?.({}, ctx);
+  const tool = pi.tools.get("workflow");
+  const schema = tool.parameters;
+  assert.ok(Object.hasOwn(schema.properties, "retry"), "workflow exposes a retry field");
+  const base = { name: "wf", script: "export default async () => 1;" };
+  assert.ok(Check(schema, base), "retry is optional");
+  assert.ok(Check(schema, { ...base, retry: {} }), "an empty retry object is valid");
+  assert.ok(Check(schema, { ...base, retry: { providerUnavailable: "fail" } }));
+  assert.ok(Check(schema, { ...base, retry: { providerUnavailable: "wait", maxWaitMs: 1_000, maxAttempts: 1 } }));
+  assert.ok(Check(schema, { ...base, retry: { providerUnavailable: "wait", maxWaitMs: 21_600_000, maxAttempts: 8 } }));
+  assert.ok(!Check(schema, { ...base, retry: { providerUnavailable: "retry" } }), "unknown providerUnavailable values are rejected");
+  assert.ok(!Check(schema, { ...base, retry: { maxWaitMs: 999 } }), "maxWaitMs below 1000 is rejected");
+  assert.ok(!Check(schema, { ...base, retry: { maxWaitMs: 21_600_001 } }), "maxWaitMs above the 6h ceiling is rejected");
+  assert.ok(!Check(schema, { ...base, retry: { maxAttempts: 0 } }), "maxAttempts below 1 is rejected");
+  assert.ok(!Check(schema, { ...base, retry: { maxAttempts: 9 } }), "maxAttempts above 8 is rejected");
   await pi.handlers.get("session_shutdown")?.();
 });
 

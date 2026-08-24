@@ -6,6 +6,7 @@ import type { JobManager } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
 import { normalizeModel } from "../policy.ts";
 import { reachedSpendWarning, spendBudgetMetrics, validateSpendBudget } from "../budget.ts";
+import { waitDecision, type ProviderUnavailability } from "../provider-unavailability.ts";
 import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SpawnRequest, StructuredOutputSupport, Usage } from "../types.ts";
 import {
   appendWorkflowJournal,
@@ -34,6 +35,7 @@ import {
   type WorkflowSessionLease,
 } from "./retention.ts";
 import type {
+  WorkflowAgentAttempt,
   WorkflowAgentGeneration,
   WorkflowAgentRecord,
   WorkflowAgentState,
@@ -45,6 +47,7 @@ import type {
   WorkflowPhase,
   WorkflowReplayCall,
   WorkflowReplacementReference,
+  WorkflowRetryPolicy,
   WorkflowSnapshot,
   WorkflowStatus,
   WorkflowStructuredTransport,
@@ -81,6 +84,8 @@ export interface StartWorkflowRequest {
   replacementOf?: WorkflowReplacementReference;
   approval?: WorkflowApprovalMode;
   budget?: WorkflowBudgetPolicy;
+  /** Opt-in provider-quota wait policy; absent preserves today's immediate-failure behavior. */
+  retry?: WorkflowRetryPolicy;
 }
 
 export interface StartedWorkflow {
@@ -113,6 +118,10 @@ interface RunEntry {
   dispatchWaiters: Set<() => void>;
   reachedBudgetWarnings: Set<string>;
   metadataReceived: boolean;
+  /** Per-call abort controllers for an in-progress provider wait, keyed by callIndex, so `cancelAgent` can end a wait with no active job. */
+  providerWaits: Map<number, AbortController>;
+  /** Shared, run-wide `retry.maxWaitMs` allowance. Synchronously decremented by every call (sequential or concurrent) so the total time spent waiting across the whole run never exceeds the configured budget. */
+  providerWaitBudgetMs: number;
 }
 
 interface ReplaySource {
@@ -130,6 +139,52 @@ function workflowUsage(usage?: Partial<Usage>): WorkflowUsage {
     turns: usage?.turns ?? 0,
   };
 }
+
+function addWorkflowUsage(base: WorkflowUsage | undefined, addition: WorkflowUsage): WorkflowUsage {
+  if (!base) return addition;
+  return {
+    input: base.input + addition.input,
+    output: base.output + addition.output,
+    cacheRead: base.cacheRead + addition.cacheRead,
+    cacheWrite: base.cacheWrite + addition.cacheWrite,
+    cost: base.cost + addition.cost,
+    turns: base.turns + addition.turns,
+  };
+}
+
+/** Isolates one attempt's own usage out of a cumulative total, for bounded per-attempt provenance. */
+function subtractWorkflowUsage(total: WorkflowUsage, base: WorkflowUsage | undefined): WorkflowUsage {
+  if (!base) return total;
+  return {
+    input: total.input - base.input,
+    output: total.output - base.output,
+    cacheRead: total.cacheRead - base.cacheRead,
+    cacheWrite: total.cacheWrite - base.cacheWrite,
+    cost: total.cost - base.cost,
+    turns: total.turns - base.turns,
+  };
+}
+
+/** Injectable clock/timer for provider-wait scheduling; tests supply a controllable fake so they never sleep on a real provider window. */
+export interface ProviderWaitClock {
+  now(): number;
+  sleep(ms: number, signal: AbortSignal): Promise<void>;
+}
+
+const DEFAULT_PROVIDER_WAIT_CLOCK: ProviderWaitClock = {
+  now: () => Date.now(),
+  sleep: (ms, signal) => new Promise<void>((resolveSleep, rejectSleep) => {
+    if (signal.aborted) { rejectSleep(abortError(signal.reason)); return; }
+    const cleanup = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const onAbort = () => { cleanup(); rejectSleep(abortError(signal.reason)); };
+    const timer = setTimeout(() => { cleanup(); resolveSleep(); }, Math.max(0, ms));
+    timer.unref?.();
+    signal.addEventListener("abort", onAbort, { once: true });
+  }),
+};
 
 function clone<T>(value: T): T {
   return structuredClone(value);
@@ -240,6 +295,7 @@ export class WorkflowManager {
   #retentionLease?: WorkflowSessionLease;
   readonly #replaySourceRunIds = new Set<string>();
   readonly #maxRetainedRuns: number;
+  readonly #providerWaitClock: ProviderWaitClock;
 
   constructor(options: {
     jobs: JobManager;
@@ -251,6 +307,8 @@ export class WorkflowManager {
     resolveProfile?: (name: string) => ProfileDefinition | undefined;
     /** Overrides the retained-run window (default {@link DEFAULT_WORKFLOW_RETAINED_RUNS}); test-only knob, in-memory and on-disk retention always share this one bound. */
     retainedRuns?: number;
+    /** Test-only injection point for provider-quota wait scheduling; defaults to a real, abortable, unref'd timer. */
+    providerWaitClock?: ProviderWaitClock;
   }) {
     this.#jobs = options.jobs;
     this.#artifactRoot = resolve(options.artifactRoot);
@@ -261,6 +319,7 @@ export class WorkflowManager {
     this.#maxRetainedRuns = Number.isSafeInteger(options.retainedRuns) && options.retainedRuns! > 0
       ? options.retainedRuns!
       : DEFAULT_WORKFLOW_RETAINED_RUNS;
+    this.#providerWaitClock = options.providerWaitClock ?? DEFAULT_PROVIDER_WAIT_CLOCK;
     this.#unsubscribeJobs = this.#jobs.subscribe((job, event) => this.#updateAgentFromJob(job, event));
   }
 
@@ -314,6 +373,7 @@ export class WorkflowManager {
     const approval = request.approval ?? "auto";
     if (!["auto", "plan", "onMutate"].includes(approval)) throw new Error(`Unknown workflow approval mode: ${approval}`);
     const budget = normalizeWorkflowBudget(request.budget);
+    const retry = normalizeWorkflowRetry(request.retry);
     const fingerprintInput = {
       script: request.script,
       argsJson,
@@ -374,6 +434,7 @@ export class WorkflowManager {
       journalArtifact: "journal.jsonl",
       approval,
       budget,
+      retry,
       warnings: warnings.length ? warnings : undefined,
       replay: replay ? {
         sourceRunId: replay.sourceRunId,
@@ -410,6 +471,8 @@ export class WorkflowManager {
       dispatchWaiters: new Set(),
       reachedBudgetWarnings: new Set(),
       metadataReceived: false,
+      providerWaits: new Map(),
+      providerWaitBudgetMs: retry?.maxWaitMs ?? 0,
     };
     this.#runs.set(snapshot.runId, entry);
     entry.completion = this.#execute(entry, request);
@@ -455,6 +518,8 @@ export class WorkflowManager {
       dispatchWaiters: new Set(),
       reachedBudgetWarnings: new Set(),
       metadataReceived: true,
+      providerWaits: new Map(),
+      providerWaitBudgetMs: snapshot.retry?.maxWaitMs ?? 0,
     };
     this.#runs.set(snapshot.runId, entry);
     return entry;
@@ -619,6 +684,11 @@ export class WorkflowManager {
     if (!entry) throw new Error(`Unknown workflow: ${runId}`);
     const agent = entry.snapshot.agents.find((candidate) => candidate.index === agentIndex);
     if (!agent) throw new Error(`Unknown workflow agent: ${agentIndex}`);
+    if (agent.state === "waiting") {
+      const controller = agent.callIndex === undefined ? undefined : entry.providerWaits.get(agent.callIndex);
+      if (controller) controller.abort(new Error(reason));
+      return this.check(runId);
+    }
     if (!agent.jobId) throw new Error(`Workflow agent ${agent.name} has not started`);
     if (["completed", "failed", "cancelled", "aborted"].includes(agent.state)) return this.check(runId);
     await this.#jobs.cancel(agent.jobId, reason);
@@ -757,42 +827,110 @@ export class WorkflowManager {
       this.#touch(entry);
     }
 
-    let result: WorkflowAgentResult;
-    try {
-      const execute = () => this.#runFreshAgent(entry, request, prompt, options, signal, callIndex, fingerprint);
-      const isolated = () => options.access === "readOnly" || options.isolation === "worktree"
-        ? execute()
-        : this.#withMutationLock(request.cwd, signal, execute);
-      result = await this.#withDispatchSlot(entry, signal, isolated);
-    } catch (error) {
-      const failed = { ok: false, output: "", error: boundedText(error) } satisfies WorkflowJournalResult;
-      const record = entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
-      await this.#appendJournal(entry, {
-        callIndex,
-        fingerprint,
-        kind: "agent",
-        state: "failed",
-        at: Date.now(),
-        agentIndex: record?.index,
-        result: failed,
-        route: journalRoute(record),
-        replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
-      });
-      throw error;
+    type Attempt = WorkflowAgentResult & { unavailable?: ProviderUnavailability; progressed?: boolean };
+    let result: Attempt;
+    const policy = entry.snapshot.retry;
+    let record: WorkflowAgentRecord | undefined;
+    let pinnedHarness: HarnessName | undefined;
+    let attempt = 0;
+    for (;;) {
+      try {
+        const attemptRetry = record ? { record, attempt, pinnedHarness } : undefined;
+        const execute = () => this.#runFreshAgent(entry, request, prompt, options, signal, callIndex, fingerprint, attemptRetry);
+        const isolated = () => options.access === "readOnly" || options.isolation === "worktree"
+          ? execute()
+          : this.#withMutationLock(request.cwd, signal, execute);
+        result = await this.#withDispatchSlot(entry, signal, isolated);
+      } catch (error) {
+        const failed = { ok: false, output: "", error: boundedText(error) } satisfies WorkflowJournalResult;
+        const failedRecord = record ?? entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
+        await this.#appendJournal(entry, {
+          callIndex,
+          fingerprint,
+          kind: "agent",
+          state: "failed",
+          at: Date.now(),
+          agentIndex: failedRecord?.index,
+          result: failed,
+          route: journalRoute(failedRecord),
+        });
+        throw error;
+      }
+      record ??= entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
+      if (result.ok || !policy || policy.providerUnavailable !== "wait" || !record) break;
+      // `entry.providerWaitBudgetMs` is a run-wide allowance shared by every logical
+      // call, including concurrent ones from `parallel()`. Reading and decrementing
+      // it here happens synchronously (no `await` in between), so concurrent calls
+      // never see a stale or double-spent balance.
+      const decision = this.#planProviderWait(record, result, policy, attempt, entry.providerWaitBudgetMs);
+      if (!decision.wait) {
+        result = { ok: false, output: result.output, jobId: result.jobId, error: decision.reason, usage: result.usage };
+        break;
+      }
+      pinnedHarness ??= record.harness as HarnessName | undefined;
+      const unavailable = result.unavailable!;
+      entry.providerWaitBudgetMs = Math.max(0, entry.providerWaitBudgetMs - Math.max(0, decision.until - this.#providerWaitClock.now()));
+      const maxAttempts = policy.maxAttempts ?? 1;
+      this.#beginProviderWait(entry, record, unavailable, decision.until, attempt + 1, maxAttempts);
+      const waitController = new AbortController();
+      entry.providerWaits.set(callIndex, waitController);
+      const bridgeAbort = () => waitController.abort(signal.reason);
+      if (signal.aborted) bridgeAbort();
+      else signal.addEventListener("abort", bridgeAbort, { once: true });
+      try {
+        await this.#providerWaitClock.sleep(Math.max(0, decision.until - this.#providerWaitClock.now()), waitController.signal);
+        await this.#waitUntilResumed(entry, waitController.signal);
+      } catch (error) {
+        signal.removeEventListener("abort", bridgeAbort);
+        entry.providerWaits.delete(callIndex);
+        // A waiting call has no active job, so nothing else moves it out of
+        // "waiting" on cancellation; settle it explicitly before journaling,
+        // both to leave a clean terminal record and because "waiting" is not
+        // a valid persisted route status.
+        record.state = "cancelled";
+        record.providerWait = undefined;
+        record.error = boundedText(error);
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt = record.timestamps.updatedAt;
+        this.#touch(entry);
+        const failed = { ok: false, output: "", error: boundedText(error) } satisfies WorkflowJournalResult;
+        await this.#appendJournal(entry, {
+          callIndex,
+          fingerprint,
+          kind: "agent",
+          state: "failed",
+          at: Date.now(),
+          agentIndex: record.index,
+          result: failed,
+          route: journalRoute(record),
+        });
+        throw error;
+      }
+      signal.removeEventListener("abort", bridgeAbort);
+      entry.providerWaits.delete(callIndex);
+      attempt++;
     }
-    const record = entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
+    const finalRecord = record ?? entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
+    const sanitized: WorkflowAgentResult = {
+      ok: result.ok,
+      output: result.output,
+      jobId: result.jobId,
+      error: result.error,
+      usage: result.usage,
+      structured: result.structured,
+    };
     await this.#appendJournal(entry, {
       callIndex,
       fingerprint,
       kind: "agent",
-      state: result.ok ? "completed" : "failed",
+      state: sanitized.ok ? "completed" : "failed",
       at: Date.now(),
-      agentIndex: record?.index,
-      result: { ...clone(result), transport: record?.structuredTransport } as WorkflowJournalResult,
-      route: journalRoute(record),
+      agentIndex: finalRecord?.index,
+      result: { ...clone(sanitized), transport: finalRecord?.structuredTransport } as WorkflowJournalResult,
+      route: journalRoute(finalRecord),
       replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
     });
-    return result;
+    return sanitized;
   }
 
   /**
@@ -911,14 +1049,17 @@ export class WorkflowManager {
     signal: AbortSignal,
     callIndex: number,
     fingerprint: string,
-  ): Promise<WorkflowAgentResult> {
+    retry?: { record: WorkflowAgentRecord; attempt: number; pinnedHarness?: HarnessName },
+  ): Promise<WorkflowAgentResult & { unavailable?: ProviderUnavailability; progressed?: boolean }> {
     if (!prompt.trim()) return { ok: false, output: "", error: "agent() requires a non-empty prompt" };
     const preflightError = this.#budgetPreflight(entry);
     if (preflightError) return { ok: false, output: "", error: preflightError };
     if (["role", "agent", "tier", "modelTier", "modelProfile", "backend"].some((key) => Object.hasOwn(options, key))) {
       return { ok: false, output: "", error: "Workflow agent() API schema mismatch: use the current task-driven schema." };
     }
-    const harness = options.harness === undefined ? undefined : String(options.harness) as RequestedHarness;
+    // A provider-wait redispatch always reuses the harness the first attempt
+    // actually resolved to, so waiting can never move a call to a different provider.
+    const harness = retry?.pinnedHarness ?? (options.harness === undefined ? undefined : String(options.harness) as RequestedHarness);
     if (harness && !isRequestedHarness(harness)) return { ok: false, output: "", error: `Unknown harness: ${harness}` };
     let model: string | undefined;
     try { model = normalizeModel(options.model); }
@@ -943,32 +1084,64 @@ export class WorkflowManager {
     }
     await this.#waitUntilResumed(entry, signal);
 
-    const phase = this.#resolveAgentPhase(entry, options.phase);
-    this.#markPhaseRunning(entry, phase);
-    const index = entry.snapshot.agents.length;
-    const name = label(options.name ?? options.label, `agent-${index + 1}`);
+    const phase = retry ? retry.record.phase : this.#resolveAgentPhase(entry, options.phase);
+    if (!retry) this.#markPhaseRunning(entry, phase);
+    const index = retry ? retry.record.index : entry.snapshot.agents.length;
+    const name = retry ? retry.record.name : label(options.name ?? options.label, `agent-${index + 1}`);
     const now = Date.now();
-    const record: WorkflowAgentRecord = {
-      index,
-      callIndex,
-      callFingerprint: fingerprint,
-      name,
-      access: access ?? "full",
-      profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
-      independent: options.independent === true || options.independentOf !== undefined,
-      independentOf: typeof options.independentOf === "string" ? options.independentOf.trim() : undefined,
-      phase,
-      state: "queued",
-      timestamps: { createdAt: now, updatedAt: now },
-      harness: harness && harness !== "auto" ? harness : undefined,
-      model,
-      prompt: boundedText(prompt, 2 * 1024),
-      effort,
-      tools: [],
-      usage: workflowUsage(),
-    };
-    entry.snapshot.agents.push(record);
-    entry.snapshot.phases[phase]?.agents.push(index);
+    let record: WorkflowAgentRecord;
+    if (retry) {
+      record = retry.record;
+      const attempts = record.attempts ??= [];
+      attempts.push({
+        jobId: record.jobId,
+        harness: record.harness,
+        model: record.model,
+        error: record.error,
+        // record.usage is already cumulative (prior retryUsage + this attempt's own
+        // usage); isolate just this attempt's contribution for bounded provenance.
+        usage: subtractWorkflowUsage(record.usage, record.retryUsage),
+        endedAt: record.timestamps.endedAt,
+      } satisfies WorkflowAgentAttempt);
+      if (attempts.length > 4) attempts.splice(0, attempts.length - 4);
+      // record.usage already includes every prior attempt (see above), so the new
+      // baseline for the next attempt IS record.usage, not retryUsage + record.usage
+      // — adding retryUsage again would double-count every attempt before this one.
+      record.retryUsage = record.usage;
+      record.usage = workflowUsage();
+      record.providerWait = undefined;
+      record.state = "queued";
+      record.jobId = undefined;
+      record.error = undefined;
+      record.tools = [];
+      record.transcript = undefined;
+      record.liveThinking = undefined;
+      record.truncated = undefined;
+      record.timestamps.updatedAt = now;
+      record.timestamps.endedAt = undefined;
+    } else {
+      record = {
+        index,
+        callIndex,
+        callFingerprint: fingerprint,
+        name,
+        access: access ?? "full",
+        profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
+        independent: options.independent === true || options.independentOf !== undefined,
+        independentOf: typeof options.independentOf === "string" ? options.independentOf.trim() : undefined,
+        phase,
+        state: "queued",
+        timestamps: { createdAt: now, updatedAt: now },
+        harness: harness && harness !== "auto" ? harness : undefined,
+        model,
+        prompt: boundedText(prompt, 2 * 1024),
+        effort,
+        tools: [],
+        usage: workflowUsage(),
+      };
+      entry.snapshot.agents.push(record);
+      entry.snapshot.phases[phase]?.agents.push(index);
+    }
     this.#touch(entry);
 
     const schema = options.schema === undefined ? undefined : workflowSchema(options.schema);
@@ -1149,7 +1322,15 @@ export class WorkflowManager {
         }
         return { ok: true, output: final.output, jobId: final.id, usage: clone(final.usage) };
       }
-      return { ok: false, output: final.output, jobId: final.id, error: final.error ?? `Agent ${final.status}`, usage: clone(final.usage) };
+      return {
+        ok: false,
+        output: final.output,
+        jobId: final.id,
+        error: final.error ?? `Agent ${final.status}`,
+        usage: clone(final.usage),
+        unavailable: final.unavailable,
+        progressed: final.progressed,
+      };
     } catch (error) {
       await this.#jobs.cancel(job.id, "Workflow agent wait aborted").catch(() => undefined);
       const final = this.#jobs.check(job.id);
@@ -1475,6 +1656,64 @@ export class WorkflowManager {
     return undefined;
   }
 
+  /**
+   * Decides whether a failed attempt may be redispatched after an authoritative
+   * provider-quota wait. Automatic redispatch is only safe when the provider
+   * rejected inference before any observable model/tool progress, and when the
+   * failed attempt's isolated worktree (if any) fully finalized — otherwise a
+   * mutating call is returned as a terminal, actionable failure instead.
+   */
+  #planProviderWait(
+    record: WorkflowAgentRecord,
+    result: { unavailable?: ProviderUnavailability; progressed?: boolean; error?: string },
+    policy: WorkflowRetryPolicy,
+    attempt: number,
+    remainingWaitMs: number,
+  ): ReturnType<typeof waitDecision> {
+    if (!result.unavailable) return { wait: false, reason: result.error ?? "Agent failed" };
+    if (result.progressed) {
+      return {
+        wait: false,
+        reason: `Provider ${result.unavailable.provider} reported a ${result.unavailable.kind} rejection, but this call already produced model or tool activity; it was not replayed automatically. Rerun with resumeFromRunId after the window resets.`,
+      };
+    }
+    if (record.isolation && record.isolation.state !== "removed") {
+      return {
+        wait: false,
+        reason: `Provider ${result.unavailable.provider} reported a ${result.unavailable.kind} rejection, but this call used an isolated worktree that was not fully finalized; it was not replayed automatically. Rerun with resumeFromRunId after the window resets.`,
+      };
+    }
+    return waitDecision({
+      unavailable: result.unavailable,
+      now: this.#providerWaitClock.now(),
+      attempt,
+      maxAttempts: policy.maxAttempts ?? 1,
+      remainingWaitMs,
+    });
+  }
+
+  #beginProviderWait(
+    entry: RunEntry,
+    record: WorkflowAgentRecord,
+    unavailable: ProviderUnavailability,
+    retryAt: number,
+    attempt: number,
+    maxAttempts: number,
+  ): void {
+    record.state = "waiting";
+    record.providerWait = {
+      provider: unavailable.provider,
+      kind: unavailable.kind,
+      scope: unavailable.scope,
+      detail: unavailable.detail,
+      retryAt,
+      attempt,
+      maxAttempts,
+    };
+    record.timestamps.updatedAt = Date.now();
+    this.#touch(entry);
+  }
+
   async #withMutationLock<T>(cwd: string, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
     const key = await realpath(resolve(cwd)).catch(() => resolve(cwd));
     const previous = this.#mutationTails.get(key) ?? Promise.resolve();
@@ -1536,7 +1775,10 @@ export class WorkflowManager {
   }
 
   #projectAgent(agent: WorkflowAgentRecord): WorkflowAgentRecord {
-    if (!agent.jobId || ["completed", "failed", "cancelled", "aborted"].includes(agent.state)) return agent;
+    // A "waiting" agent has no active job — its jobId still names the prior
+    // terminal (failed) attempt, and re-reading it would flip the displayed
+    // state back to "failed" until the redispatch actually starts.
+    if (!agent.jobId || ["completed", "failed", "cancelled", "aborted", "waiting"].includes(agent.state)) return agent;
     let job: JobSnapshot;
     try { job = this.#jobs.check(agent.jobId); }
     catch { return agent; }
@@ -1558,7 +1800,7 @@ export class WorkflowManager {
       liveThinking: job.liveThinking,
       truncated: job.truncated,
       error: job.error,
-      usage: workflowUsage(job.usage),
+      usage: addWorkflowUsage(agent.retryUsage, workflowUsage(job.usage)),
       context: job.context ? { ...job.context } : undefined,
       timestamps: {
         ...agent.timestamps,
@@ -1592,7 +1834,7 @@ export class WorkflowManager {
     agent.effort = job.effort;
     agent.preview = job.output.slice(-500);
     agent.error = job.error;
-    agent.usage = workflowUsage(job.usage);
+    agent.usage = addWorkflowUsage(agent.retryUsage, workflowUsage(job.usage));
     agent.context = job.context ? { ...job.context } : undefined;
     agent.timestamps.updatedAt = now;
     agent.timestamps.startedAt ??= job.startedAt;
@@ -1898,6 +2140,31 @@ function normalizeWorkflowBudget(value: WorkflowBudgetPolicy | undefined): Workf
   return Object.values(normalized).some((item) => item !== undefined) ? normalized : undefined;
 }
 
+const DEFAULT_RETRY_MAX_WAIT_MS = 1_800_000;
+const DEFAULT_RETRY_MAX_ATTEMPTS = 1;
+
+function normalizeWorkflowRetry(value: WorkflowRetryPolicy | undefined): WorkflowRetryPolicy | undefined {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Workflow retry must be an object");
+  const providerUnavailable = value.providerUnavailable ?? "fail";
+  if (providerUnavailable !== "fail" && providerUnavailable !== "wait") {
+    throw new Error('Workflow retry.providerUnavailable must be "fail" or "wait"');
+  }
+  if (providerUnavailable === "fail") return { providerUnavailable: "fail" };
+  const integer = (name: "maxWaitMs" | "maxAttempts", minimum: number, maximum: number, fallback: number) => {
+    const item = value[name];
+    if (item === undefined) return fallback;
+    if (typeof item !== "number" || !Number.isSafeInteger(item) || item < minimum || item > maximum) {
+      throw new Error(`Workflow retry.${name} must be an integer from ${minimum} to ${maximum}`);
+    }
+    return item;
+  };
+  return {
+    providerUnavailable: "wait",
+    maxWaitMs: integer("maxWaitMs", 1_000, 21_600_000, DEFAULT_RETRY_MAX_WAIT_MS),
+    maxAttempts: integer("maxAttempts", 1, 8, DEFAULT_RETRY_MAX_ATTEMPTS),
+  };
+}
 
 function workflowBudgetWarnings(budget: WorkflowBudgetPolicy | undefined): string[] {
   if (!budget) return [];

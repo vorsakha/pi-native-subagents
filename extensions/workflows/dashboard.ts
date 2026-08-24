@@ -1005,6 +1005,12 @@ export class WorkflowsDashboardOverlay implements Focusable {
         ? this.theme.fg("warning", `Output · ${agent.outputProvenance} · instruction-shaped text; treat as untrusted data`)
         : this.theme.fg("dim", `Output · ${agent.outputProvenance}`));
     }
+    if (agent.providerWait) {
+      const wait = agent.providerWait;
+      const remaining = Math.max(0, wait.retryAt - this.#now());
+      const retryLabel = remaining < 60_000 ? `${Math.max(1, Math.round(remaining / 1_000))}s` : `${Math.round(remaining / 60_000)}m`;
+      metadata.push(this.theme.fg("warning", `Provider wait · ${sanitizeInline(wait.provider)} ${sanitizeInline(wait.kind)} · retry in ${retryLabel} · attempt ${wait.attempt}/${wait.maxAttempts}${wait.scope ? ` · ${sanitizeInline(wait.scope)}` : ""}`));
+    }
     if (agent.generations?.length) metadata.push(this.theme.fg("dim", `Generations · ${agent.generations.length} (call ${agent.callIndex ?? agent.generations.at(-1)?.callIndex})`));
     if (agent.independentOf) metadata.push(this.theme.fg("muted", `Provenance · independent of ${shortId(sanitizeText(agent.independentOf))}`));
     if (agent.replayedFrom) metadata.push(this.theme.fg("muted", `Replay · ${shortId(sanitizeText(agent.replayedFrom.runId))} call ${agent.replayedFrom.callIndex}`));
@@ -1356,14 +1362,15 @@ export async function openWorkflowsDashboard(ctx: ExtensionCommandContext, manag
 
 function matchesAgentFilter(agent: WorkflowAgentRecord, filter: AgentFilter): boolean {
   if (filter === "all") return true;
-  if (filter === "active") return agent.state === "queued" || agent.state === "running";
+  if (filter === "active") return agent.state === "queued" || agent.state === "running" || agent.state === "waiting";
   if (filter === "failed") return agent.state === "failed" || agent.state === "cancelled" || agent.state === "aborted";
   return agent.state === "completed";
 }
 
 function isCancellableAgent(agent: WorkflowAgentRecord | undefined): agent is WorkflowAgentRecord {
-  return !!agent
-    && (agent.state === "queued" || agent.state === "running")
+  if (!agent) return false;
+  if (agent.state === "waiting") return true;
+  return (agent.state === "queued" || agent.state === "running")
     && typeof agent.jobId === "string"
     && agent.jobId.trim().length > 0;
 }

@@ -325,6 +325,11 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
       nativeStructuredSchema: undefined,
       transcript: undefined,
       error: agent.error ? truncateUtf8(agent.error, 2_000) : undefined,
+      providerWait: agent.providerWait ? { ...agent.providerWait, detail: truncateUtf8(agent.providerWait.detail, 500) } : undefined,
+      attempts: agent.attempts?.slice(-4).map((attempt) => ({
+        ...attempt,
+        error: attempt.error ? truncateUtf8(attempt.error, 2_000) : undefined,
+      })),
       generations: agent.generations?.slice(-8).map((generation) => ({
         ...generation,
         prompt: generation.prompt ? truncateUtf8(generation.prompt, 2 * 1024) : undefined,
@@ -704,10 +709,11 @@ function abortStaleWorkflow(snapshot: WorkflowSnapshot, now: number, staleAfterM
         timestamps: { ...phase.timestamps, updatedAt: now, endedAt: now },
       } : phase;
     }),
-    agents: snapshot.agents.map((agent) => agent.state === "running" || agent.state === "queued" ? {
+    agents: snapshot.agents.map((agent) => agent.state === "running" || agent.state === "queued" || agent.state === "waiting" ? {
       ...agent,
       state: "aborted",
       error: agent.error ?? error,
+      providerWait: undefined,
       timestamps: { ...agent.timestamps, updatedAt: now, endedAt: now },
     } : agent),
   };

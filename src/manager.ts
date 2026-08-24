@@ -56,6 +56,7 @@ function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: J
       ? { ...snapshot.capabilities, matched: [...snapshot.capabilities.matched], warnings: snapshot.capabilities.warnings ? [...snapshot.capabilities.warnings] : undefined }
       : undefined,
     warnings: previous && previous.source.warnings === snapshot.warnings ? previous.value.warnings : snapshot.warnings ? [...snapshot.warnings] : undefined,
+    unavailable: snapshot.unavailable ? { ...snapshot.unavailable } : undefined,
   };
 }
 

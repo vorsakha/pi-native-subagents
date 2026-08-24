@@ -12,6 +12,7 @@ import { workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowU
 import {
   aggregateWorkflowUsage,
   WorkflowManager,
+  type ProviderWaitClock,
 } from "../src/workflows/manager.ts";
 import { formatWorkflowBudget, workflowBudgetHealth } from "../src/workflows/budget.ts";
 import { applyWorkflowRetention } from "../src/workflows/retention.ts";
@@ -30,10 +31,49 @@ const reviewer: ProfileDefinition = {
 const execFileAsync = promisify(execFile);
 
 
+/** Deterministic, abortable, manually advanced clock so provider-wait tests never sleep on a real timer. */
+export function fakeProviderWaitClock(startAt = 1_700_000_000_000): { clock: ProviderWaitClock; advance(ms: number): void } {
+  let current = startAt;
+  interface Pending { until: number; resolve: () => void; signal: AbortSignal; onAbort: () => void }
+  const pending: Pending[] = [];
+  const settle = () => {
+    for (const entry of [...pending]) {
+      if (entry.until > current) continue;
+      const index = pending.indexOf(entry);
+      if (index >= 0) pending.splice(index, 1);
+      entry.signal.removeEventListener("abort", entry.onAbort);
+      entry.resolve();
+    }
+  };
+  return {
+    clock: {
+      now: () => current,
+      sleep: (ms, signal) => new Promise<void>((resolve, reject) => {
+        const fail = () => {
+          const index = pending.findIndex((entry) => entry.onAbort === onAbort);
+          if (index >= 0) pending.splice(index, 1);
+          const error = new Error(signal.reason instanceof Error ? signal.reason.message : String(signal.reason ?? "aborted"));
+          error.name = "AbortError";
+          reject(error);
+        };
+        const onAbort = () => fail();
+        if (signal.aborted) { fail(); return; }
+        signal.addEventListener("abort", onAbort, { once: true });
+        pending.push({ until: current + Math.max(0, ms), resolve, signal, onAbort });
+      }),
+    },
+    advance(ms: number) {
+      current += ms;
+      settle();
+    },
+  };
+}
+
 async function fixture(
   concurrency = 4,
   approveMutation?: ConstructorParameters<typeof WorkflowManager>[0]["approveMutation"],
   retainedRuns?: number,
+  providerWaitClock?: ProviderWaitClock,
 ) {
   const parent = await tempDir("workflow-manager");
   const cwd = join(parent, "cwd");
@@ -46,7 +86,7 @@ async function fixture(
     profiles: new Map([[reviewer.name, reviewer]]),
     concurrency,
   });
-  const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1", approveMutation, retainedRuns });
+  const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1", approveMutation, retainedRuns, providerWaitClock });
   return {
     parent,
     cwd,
@@ -1425,6 +1465,426 @@ test("aggregates usage across all workflow agents", async () => {
     assert.equal(final.agents[1]?.instructionShaped, true);
     assert.equal(final.status, "completed");
     assert.equal(final.error, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+function fakeQuota(retryAt: number, provider: "codex" | "claude" = "codex") {
+  return { provider, kind: "quota" as const, authoritative: true, retryAt, detail: "quota exhausted" };
+}
+
+test("a workflow without the retry option fails immediately on a classified provider-quota rejection", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => agent("quota check");`));
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    f.backend.fail(f.backend.starts[0]!, "Codex reported usage_limit_reached", fakeQuota(Date.now() + 60_000));
+    const final = await started.completion;
+    assert.equal(final.status, "completed", "the sandbox script observes an ok:false result rather than a thrown error");
+    const result = final.result as { ok: boolean; error?: string };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /usage_limit_reached/);
+    assert.equal(final.agents[0]?.state, "failed");
+    assert.equal(f.backend.requests.length, 1, "today's behavior never retries");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("an opted-in workflow waits for a fake provider quota window, then redispatches the same call and succeeds", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("quota check");`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 10 * 60_000, maxAttempts: 2 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    f.backend.fail(f.backend.starts[0]!, "quota exhausted", fakeQuota(clock.now() + 5 * 60_000));
+    await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "waiting state");
+    const waiting = f.workflows.check(started.snapshot.runId).agents[0]!;
+    assert.equal(waiting.providerWait?.provider, "codex");
+    assert.equal(waiting.providerWait?.attempt, 1);
+    assert.equal(waiting.providerWait?.maxAttempts, 2);
+    assert.equal(f.backend.active, 0, "the failed attempt's native slot is released while waiting");
+
+    advance(5 * 60_000);
+    await waitFor(() => f.backend.requests.length === 2, "second attempt redispatched");
+    assert.equal(f.claude.requests.length, 0, "waiting never reroutes to a different provider");
+    f.backend.complete(f.backend.starts[1]!, "done");
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    const result = final.result as { ok: boolean; output?: string };
+    assert.equal(result.ok, true);
+    assert.equal(result.output, "done");
+    assert.equal(final.agents.length, 1, "the retry reuses the same logical agent record");
+    assert.equal(final.agents[0]?.state, "completed");
+    assert.equal(final.agents[0]?.attempts?.length, 1);
+    assert.equal(final.agents[0]?.providerWait, undefined, "the wait marker clears once the call settles");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a provider wait frees the workflow's own concurrency slot for a sibling agent", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => {
+        const [a, b] = await parallel([
+          () => agent("first", { access: "readOnly" }),
+          () => agent("second", { access: "readOnly" }),
+        ]);
+        return { a, b };
+      }`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 10 * 60_000, maxAttempts: 1 }, budget: { maxConcurrency: 1 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "first dispatched");
+    f.backend.failTask("first", "quota exhausted", fakeQuota(clock.now() + 60_000));
+    await waitFor(() => f.backend.requests.length === 2, "second dispatches while the first waits, one concurrency slot at a time");
+    assert.equal(f.workflows.check(started.snapshot.runId).agents.find((agent) => agent.prompt === "first")?.state, "waiting");
+    f.backend.completeTask("second", "second-done");
+    advance(60_000);
+    await waitFor(() => f.backend.requests.length === 3, "first attempt retried");
+    f.backend.completeTask("first", "first-done");
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("pausing a workflow blocks a due provider-wait retry until the user resumes it", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("quota check");`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 10 * 60_000, maxAttempts: 2 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    f.backend.fail(f.backend.starts[0]!, "quota exhausted", fakeQuota(clock.now() + 60_000));
+    await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "waiting");
+    await f.workflows.pause(started.snapshot.runId);
+    advance(60_000);
+    await tick();
+    await tick();
+    assert.equal(f.backend.requests.length, 1, "a paused run must not redispatch a due retry");
+    await f.workflows.resume(started.snapshot.runId);
+    await waitFor(() => f.backend.requests.length === 2, "resumed run redispatches the due retry");
+    f.backend.complete(f.backend.starts[1]!, "done");
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("cancelling a run or shutting down the session immediately ends a pending provider wait", async () => {
+  {
+    const { clock } = fakeProviderWaitClock();
+    const f = await fixture(4, undefined, undefined, clock);
+    try {
+      const started = await f.workflows.start(f.request(
+        `export default async () => agent("quota check");`,
+        { retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 3 } },
+      ));
+      await waitFor(() => f.backend.requests.length === 1, "first attempt");
+      f.backend.fail(f.backend.starts[0]!, "quota exhausted", fakeQuota(clock.now() + 30 * 60_000));
+      await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "waiting");
+      await f.workflows.cancel(started.snapshot.runId, "test cancel");
+      const final = await started.completion;
+      assert.equal(final.status, "aborted");
+    } finally {
+      await f.cleanup();
+    }
+  }
+  {
+    const { clock } = fakeProviderWaitClock();
+    const f = await fixture(4, undefined, undefined, clock);
+    try {
+      const started = await f.workflows.start(f.request(
+        `export default async () => agent("quota check");`,
+        { retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 3 } },
+      ));
+      await waitFor(() => f.backend.requests.length === 1, "first attempt");
+      f.backend.fail(f.backend.starts[0]!, "quota exhausted", fakeQuota(clock.now() + 30 * 60_000));
+      await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "waiting");
+      await f.workflows.shutdown(500);
+      const final = await started.completion;
+      assert.notEqual(final.status, "running");
+      assert.notEqual(final.status, "paused");
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+/** Reads and parses a workflow checkpoint from disk without racing the debounce timer that writes it. */
+async function readCheckpoint(artifactDir: string): Promise<WorkflowSnapshot> {
+  return JSON.parse(await readFile(join(artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
+}
+
+test("cancelAgent ends a pending provider wait with a terminal failure while the run continues", async () => {
+  const { clock } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("quota check");`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 3 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    f.backend.fail(f.backend.starts[0]!, "quota exhausted", fakeQuota(clock.now() + 30 * 60_000));
+    await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "waiting");
+    await f.workflows.cancelAgent(started.snapshot.runId, 0, "operator cancel");
+    const final = await started.completion;
+    assert.equal(final.status, "completed", "the run continues after a waiting agent is cancelled");
+    const result = final.result as { ok: boolean; error?: string };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /operator cancel/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("provider wait exhaustion produces distinct maxAttempts and maxWaitMs terminal errors", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    // maxAttempts: 1 allows exactly one redispatch; a second quota rejection exhausts it.
+    const started1 = await f.workflows.start(f.request(
+      `export default async () => agent("quota check one");`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 1 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    f.backend.fail(f.backend.starts[0]!, "quota exhausted", fakeQuota(clock.now() + 60_000));
+    await waitFor(() => f.workflows.check(started1.snapshot.runId).agents[0]?.state === "waiting", "waiting for the one allowed retry");
+    advance(60_000);
+    await waitFor(() => f.backend.requests.length === 2, "the one allowed retry redispatches");
+    f.backend.fail(f.backend.starts[1]!, "quota exhausted again", fakeQuota(clock.now() + 60_000));
+    const final1 = await started1.completion;
+    const result1 = final1.result as { ok: boolean; error?: string };
+    assert.equal(result1.ok, false);
+    assert.match(result1.error ?? "", /attempt 1\/1/);
+    assert.equal(f.backend.requests.length, 2, "no further retries once attempts are exhausted");
+
+    const started2 = await f.workflows.start(f.request(
+      `export default async () => agent("quota check two");`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 1_000, maxAttempts: 3 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 3, "second workflow's first attempt");
+    f.backend.failTask("quota check two", "quota exhausted", fakeQuota(clock.now() + 60_000));
+    const final2 = await started2.completion;
+    const result2 = final2.result as { ok: boolean; error?: string };
+    assert.equal(result2.ok, false);
+    assert.match(result2.error ?? "", /maxWaitMs allowance/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a mutating call that already produced tool activity is not replayed after a quota rejection", async () => {
+  const { clock } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("quota check");`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 3 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    const jobId = f.backend.starts[0]!;
+    const run = f.backend.runs.get(jobId)!;
+    run.emit({ type: "tool_start", id: "1", name: "Write" });
+    run.emit({ type: "tool_end", id: "1" });
+    f.backend.fail(jobId, "quota exhausted", fakeQuota(clock.now() + 60_000));
+    const final = await started.completion;
+    const result = final.result as { ok: boolean; error?: string };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /already produced model or tool activity/);
+    assert.equal(f.backend.requests.length, 1, "no replay occurred");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("retry usage counts toward workflow budgets under one call ordinal with a single started/completed journal pair", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("quota check");`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 2 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    const firstRun = f.backend.runs.get(f.backend.starts[0]!)!;
+    firstRun.emit({ type: "usage", usage: { input: 100, output: 50, turns: 1 } });
+    f.backend.fail(f.backend.starts[0]!, "quota exhausted", fakeQuota(clock.now() + 60_000));
+    await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "waiting");
+    advance(60_000);
+    await waitFor(() => f.backend.requests.length === 2, "second attempt");
+    const secondRun = f.backend.runs.get(f.backend.starts[1]!)!;
+    secondRun.emit({ type: "usage", usage: { input: 40, output: 10, turns: 1 } });
+    f.backend.complete(f.backend.starts[1]!, "done");
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    const usage = aggregateWorkflowUsage(final);
+    assert.equal(usage.input, 140);
+    assert.equal(usage.output, 60);
+    assert.equal(usage.turns, 2);
+    assert.equal(final.agents.length, 1, "retries never consume another logical call ordinal");
+    assert.equal(final.agents[0]?.attempts?.length, 1);
+
+    const journal = await loadWorkflowJournal(f.artifactRoot, started.snapshot.runId);
+    const callRecords = journal.filter((record) => record.callIndex === 0);
+    assert.deepEqual(callRecords.map((record) => record.state), ["started", "completed"]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("usage across two redispatches (three attempts) sums exactly, without double-counting earlier attempts", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("quota check");`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 3 } },
+    ));
+
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    f.backend.runs.get(f.backend.starts[0]!)!.emit({ type: "usage", usage: { input: 100, output: 10, turns: 1 } });
+    f.backend.fail(f.backend.starts[0]!, "quota exhausted", fakeQuota(clock.now() + 60_000));
+    await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "waiting after attempt 1");
+    advance(60_000);
+
+    await waitFor(() => f.backend.requests.length === 2, "second attempt");
+    f.backend.runs.get(f.backend.starts[1]!)!.emit({ type: "usage", usage: { input: 20, output: 20, turns: 1 } });
+    f.backend.fail(f.backend.starts[1]!, "quota exhausted again", fakeQuota(clock.now() + 60_000));
+    await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "waiting after attempt 2");
+    advance(60_000);
+
+    await waitFor(() => f.backend.requests.length === 3, "third attempt");
+    f.backend.runs.get(f.backend.starts[2]!)!.emit({ type: "usage", usage: { input: 3, output: 30, turns: 1 } });
+    f.backend.complete(f.backend.starts[2]!, "done");
+
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    const usage = aggregateWorkflowUsage(final);
+    // U1 + U2 + U3 = (100,10) + (20,20) + (3,30); a regression that double-counts
+    // earlier attempts would report input 223 (2*100+20+3) instead of 123.
+    assert.equal(usage.input, 123);
+    assert.equal(usage.output, 60);
+    assert.equal(usage.turns, 3);
+    assert.equal(final.agents.length, 1);
+    assert.deepEqual(final.agents[0]?.attempts?.map((entry) => entry.usage), [
+      { input: 100, output: 10, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+      { input: 20, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+    ]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("maxWaitMs is a run-wide allowance: sequential provider waits on the same call cannot exceed it in aggregate", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("quota check");`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 90_000, maxAttempts: 5 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    f.backend.fail(f.backend.starts[0]!, "quota exhausted", fakeQuota(clock.now() + 60_000));
+    await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "waiting after attempt 1");
+    advance(60_000);
+
+    await waitFor(() => f.backend.requests.length === 2, "second attempt");
+    // A second 60s wait would total 120s against a 90s run-wide allowance.
+    f.backend.fail(f.backend.starts[1]!, "quota exhausted again", fakeQuota(clock.now() + 60_000));
+    const final = await started.completion;
+    const result = final.result as { ok: boolean; error?: string };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /maxWaitMs allowance/, "the second wait must be rejected once the run-wide budget is spent");
+    assert.equal(f.backend.requests.length, 2, "no third attempt is dispatched once the run-wide wait budget is exhausted");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("maxWaitMs is a run-wide allowance shared across concurrent parallel calls", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => {
+        const [a, b] = await parallel([
+          () => agent("first", { access: "readOnly" }),
+          () => agent("second", { access: "readOnly" }),
+        ]);
+        return { a, b };
+      }`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 90_000, maxAttempts: 5 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 2, "both first attempts dispatched");
+    // Together, two concurrent 60s waits exceed the 90s run-wide allowance even
+    // though neither one alone would: exactly one of the two must be granted the
+    // wait and the other must be rejected immediately for exceeding what remains.
+    f.backend.failTask("first", "quota exhausted", fakeQuota(clock.now() + 60_000));
+    f.backend.failTask("second", "quota exhausted", fakeQuota(clock.now() + 60_000));
+    await waitFor(() => {
+      const agents = f.workflows.check(started.snapshot.runId).agents;
+      return agents.some((entry) => entry.state === "waiting");
+    }, "exactly one concurrent call is granted the remaining wait budget");
+    advance(60_000);
+    await waitFor(() => f.backend.requests.length === 3, "the granted call redispatches");
+    f.backend.complete(f.backend.starts[2]!, "done");
+
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    const result = final.result as { a: { ok: boolean; error?: string }; b: { ok: boolean; error?: string } };
+    const outcomes = [result.a, result.b];
+    assert.equal(outcomes.filter((entry) => entry.ok).length, 1, "exactly one concurrent call is redispatched and succeeds");
+    assert.equal(outcomes.filter((entry) => !entry.ok && /maxWaitMs allowance/.test(entry.error ?? "")).length, 1, "exactly one concurrent call is rejected once the shared budget is spent");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a live checkpoint captures provider-wait metadata; the final checkpoint does not, and replay is unaffected", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("quota check");`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 2 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    f.backend.fail(f.backend.starts[0]!, "quota exhausted", fakeQuota(clock.now() + 60_000));
+    await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "waiting");
+    let waitingCheckpoint: WorkflowSnapshot | undefined;
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      const checkpoint = await readCheckpoint(started.snapshot.artifactDir);
+      if (checkpoint.agents[0]?.state === "waiting" && checkpoint.agents[0]?.providerWait) { waitingCheckpoint = checkpoint; break; }
+      await delay(20);
+    }
+    assert.ok(waitingCheckpoint, "checkpoint reflects the live wait");
+
+    advance(60_000);
+    await waitFor(() => f.backend.requests.length === 2, "second attempt");
+    f.backend.complete(f.backend.starts[1]!, "done");
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    const finalCheckpoint = await readCheckpoint(started.snapshot.artifactDir);
+    assert.equal(finalCheckpoint.agents[0]?.state, "completed");
+    assert.equal(finalCheckpoint.agents[0]?.providerWait, undefined);
+
+    const resumed = await f.workflows.start(f.request(`export default async () => agent("quota check");`, { resumeFromRunId: started.snapshot.runId }));
+    const resumedFinal = await resumed.completion;
+    assert.equal(resumedFinal.status, "completed");
+    assert.equal(resumedFinal.replay?.matchedCalls, 1);
   } finally {
     await f.cleanup();
   }

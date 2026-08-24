@@ -1,11 +1,12 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createSdkMcpServer, query, tool, type Options, type SDKMessage, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, tool, type Options, type SDKAssistantMessageError, type SDKMessage, type SDKRateLimitInfo, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 import { createActivityWatchdog } from "../activity-watchdog.ts";
 import type { CapabilityHealth, CapabilitySourceStatus, DiscoveredCapability } from "../capabilities.ts";
 import { sanitizeSubscriptionEnv } from "../env.ts";
 import { boundedAppend } from "../reducer.ts";
+import { normalizeRetryAt, providerUnavailabilityDetail, type ProviderUnavailability } from "../provider-unavailability.ts";
 import {
   PARENT_THREAD_MCP_SERVER,
   PARENT_THREAD_TOOL_DESCRIPTION,
@@ -84,6 +85,23 @@ interface ClaudeTelemetry {
   servingModel?: string;
   tokens?: number;
   window?: number;
+  /** Latest rate-limit reading; only a `rejected` status is ever classified as unavailability. */
+  rateLimit?: SDKRateLimitInfo;
+}
+
+/** Maps an authoritative `rate_limit` assistant error onto the shared provider-unavailability shape. */
+function classifyClaudeUnavailability(error: SDKAssistantMessageError, info: SDKRateLimitInfo | undefined): ProviderUnavailability | undefined {
+  if (error !== "rate_limit") return undefined;
+  const now = Date.now();
+  const retryAt = info?.status === "rejected" ? normalizeRetryAt(info.resetsAt, now) : undefined;
+  return {
+    provider: "claude",
+    kind: "quota",
+    retryAt,
+    authoritative: retryAt !== undefined,
+    scope: info?.rateLimitType,
+    detail: providerUnavailabilityDetail(`Claude reported a rate_limit rejection${info?.rateLimitType ? ` (${info.rateLimitType})` : ""}`),
+  };
 }
 
 function emitClaudeContext(telemetry: ClaudeTelemetry, emit: (event: BackendEvent) => void): void {
@@ -438,7 +456,7 @@ export class ClaudeBackend implements Backend {
           }
           output = appendOutput(output, result.output);
           if (!result.success) {
-            finish({ type: "failed", error: result.error });
+            finish({ type: "failed", error: result.error, unavailable: result.unavailable });
           } else if (resultCount >= expectedResults) {
             finish({ type: "completed", output, ...(result.structured !== undefined ? { structured: result.structured } : {}) });
           }
@@ -556,7 +574,13 @@ function userMessage(text: string, priority: "now" | "next" | "later"): SDKUserM
   };
 }
 
-interface ClaudeResult { success: boolean; output: string; error: string; structured?: unknown }
+interface ClaudeResult {
+  success: boolean;
+  output: string;
+  error: string;
+  structured?: unknown;
+  unavailable?: ProviderUnavailability;
+}
 
 function handleMessage(
   message: SDKMessage,
@@ -567,6 +591,10 @@ function handleMessage(
   telemetry: ClaudeTelemetry,
   structuredRequested = false,
 ): ClaudeResult | undefined {
+  if (message.type === "rate_limit_event") {
+    telemetry.rateLimit = message.rate_limit_info;
+    return;
+  }
   if (message.type === "system" && message.subtype === "init") {
     const source = message.apiKeySource as string;
     if (source !== "oauth" && source !== "none") {
@@ -639,7 +667,14 @@ function handleMessage(
       });
     }
     if (text) emit({ type: "message", text: boundedAppend("", text).text });
-    if (message.error) return { success: false, output: "", error: `Claude assistant error: ${message.error}` };
+    if (message.error) {
+      return {
+        success: false,
+        output: "",
+        error: `Claude assistant error: ${message.error}`,
+        unavailable: classifyClaudeUnavailability(message.error, telemetry.rateLimit),
+      };
+    }
     return;
   }
   if (message.type === "user" && Array.isArray(message.message.content)) {

@@ -63,6 +63,24 @@ test("reducer preserves a native structured payload exactly, without the string/
   assert.equal((state.structured as typeof large).longArray.length, 100);
 });
 
+test("reducer projects progressed only from model/tool activity, and carries unavailable onto a failed job", () => {
+  assert.equal(reduceJob(job(), { type: "usage", usage: { input: 1 } }).progressed, undefined, "usage alone is not progress");
+  assert.equal(reduceJob(job(), { type: "text_delta", text: "hi" }).progressed, true);
+  assert.equal(reduceJob(job(), { type: "thinking_delta", text: "hi" }).progressed, true);
+  assert.equal(reduceJob(job(), { type: "thinking_message", text: "hi" }).progressed, true);
+  assert.equal(reduceJob(job(), { type: "message", text: "hi" }).progressed, true);
+  assert.equal(reduceJob(job(), { type: "tool_start", id: "1", name: "read" }).progressed, true);
+  assert.equal(reduceJob(job(), { type: "tool_end", id: "1" }).progressed, true);
+
+  const unavailable = { provider: "claude" as const, kind: "quota" as const, authoritative: true, retryAt: 123, detail: "d" };
+  const failed = reduceJob(job(), { type: "failed", error: "quota exceeded", unavailable });
+  assert.equal(failed.status, "failed");
+  assert.deepEqual(failed.unavailable, unavailable);
+
+  const failedWithoutUnavailable = reduceJob(job(), { type: "failed", error: "boom" });
+  assert.equal(failedWithoutUnavailable.unavailable, undefined);
+});
+
 test("reducer bounds in-memory transcript output", () => {
   const seeded = job();
   seeded.transcript = [{ kind: "assistant", text: "retained context" }];

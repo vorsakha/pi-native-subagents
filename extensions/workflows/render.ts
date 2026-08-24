@@ -131,13 +131,23 @@ function finalPreview(snapshot: WorkflowSnapshot): unknown {
 
 /** Most recently active agent, or the last agent recorded once every agent has settled. */
 function focusedAgent(snapshot: WorkflowSnapshot): WorkflowAgentRecord | undefined {
-  return [...snapshot.agents].reverse().find((agent) => agent.state === "queued" || agent.state === "running")
+  return [...snapshot.agents].reverse().find((agent) => agent.state === "queued" || agent.state === "running" || agent.state === "waiting")
     ?? snapshot.agents.at(-1);
+}
+
+/** Bounded, credential-free summary of a live provider wait: reason, remaining time, attempt count. */
+function formatProviderWait(agent: WorkflowAgentRecord, now: number): string | undefined {
+  const wait = agent.providerWait;
+  if (!wait) return undefined;
+  const remaining = Math.max(0, wait.retryAt - now);
+  const retryLabel = remaining < 60_000 ? `${Math.max(1, Math.round(remaining / 1_000))}s` : `${Math.round(remaining / 60_000)}m`;
+  return `waiting for ${sanitizeInline(wait.provider)} ${sanitizeInline(wait.kind)} · retry in ${retryLabel} · attempt ${wait.attempt}/${wait.maxAttempts}`;
 }
 
 /** Quiet fallback copy for an agent with no semantic preview yet — avoids restating "running",
  *  which the header and phase spine already convey. */
-function agentActivity(agent: WorkflowAgentRecord): string {
+function agentActivity(agent: WorkflowAgentRecord, now: number): string {
+  if (agent.state === "waiting") return formatProviderWait(agent, now) ?? "waiting for provider";
   if (typeof agent.preview === "string" && agent.preview) return sanitizeInline(agent.preview);
   switch (agent.state) {
     case "queued": return "waiting to start";
@@ -149,10 +159,10 @@ function agentActivity(agent: WorkflowAgentRecord): string {
 
 /** The focused agent's name plus its activity — no status glyph, since the header and phase
  *  spine already carry the workflow's running state. */
-function latestValue(snapshot: WorkflowSnapshot, theme: Theme): string | undefined {
+function latestValue(snapshot: WorkflowSnapshot, theme: Theme, now: number): string | undefined {
   const agent = focusedAgent(snapshot);
   if (!agent) return undefined;
-  return `${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", "·")} ${theme.fg("muted", agentActivity(agent))}`;
+  return `${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", "·")} ${theme.fg("muted", agentActivity(agent, now))}`;
 }
 
 export interface WorkflowPhaseProgress {
@@ -281,17 +291,18 @@ function phaseRosterLines(snapshot: WorkflowSnapshot, theme: Theme, now: number)
   return lines;
 }
 
-interface AgentCounts { total: number; queued: number; running: number; done: number; failed: number }
+interface AgentCounts { total: number; queued: number; running: number; waiting: number; done: number; failed: number }
 
 function agentCounts(agents: WorkflowAgentRecord[]): AgentCounts {
   return agents.reduce<AgentCounts>((acc, agent) => {
     acc.total += 1;
     if (agent.state === "queued") acc.queued += 1;
     else if (agent.state === "running") acc.running += 1;
+    else if (agent.state === "waiting") acc.waiting += 1;
     else if (agent.state === "completed") acc.done += 1;
     else acc.failed += 1; // failed, cancelled, aborted
     return acc;
-  }, { total: 0, queued: 0, running: 0, done: 0, failed: 0 });
+  }, { total: 0, queued: 0, running: 0, waiting: 0, done: 0, failed: 0 });
 }
 
 /** Compact wording for a roster that's entirely in one state, so it doesn't repeat the
@@ -300,6 +311,7 @@ function singleStateSummary(counts: AgentCounts, theme: Theme): string | undefin
   if (counts.running === counts.total) return theme.fg("text", `${counts.total} active`);
   if (counts.done === counts.total) return theme.fg("muted", `${counts.total} done`);
   if (counts.queued === counts.total) return theme.fg("muted", `${counts.total} queued`);
+  if (counts.waiting === counts.total) return theme.fg("warning", `${counts.total} waiting`);
   if (counts.failed === counts.total) return theme.fg("error", `${counts.total} failed`);
   return undefined;
 }
@@ -314,6 +326,7 @@ function agentRollupValue(snapshot: WorkflowSnapshot, theme: Theme): string {
   const parts = [theme.fg("text", String(counts.total))];
   if (counts.queued) parts.push(theme.fg("muted", `${counts.queued} queued`));
   if (counts.running) parts.push(theme.fg("muted", `${counts.running} running`));
+  if (counts.waiting) parts.push(theme.fg("warning", `${counts.waiting} waiting`));
   if (counts.done) parts.push(theme.fg("dim", `${counts.done} done`));
   if (counts.failed) parts.push(theme.fg("error", `${counts.failed} failed`));
   return parts.join(theme.fg("dim", " · "));
@@ -413,7 +426,7 @@ export function buildWorkflowCardLines(
       lines.push(group(theme, "Result", theme.fg("dim", "(no result)")));
     }
   } else {
-    lines.push(group(theme, "Latest", latestValue(snapshot, theme) ?? theme.fg("dim", "waiting for the first agent")));
+    lines.push(group(theme, "Latest", latestValue(snapshot, theme, options.now) ?? theme.fg("dim", "waiting for the first agent")));
   }
 
   const usageSnapshot = aggregateWorkflowUsage(snapshot);

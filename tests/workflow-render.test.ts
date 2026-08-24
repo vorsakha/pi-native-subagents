@@ -373,6 +373,43 @@ test("mixed-state agent rollups stay textual and readable, and failures/queued r
   assert.ok(coloredAgentsLine.includes("[error]1 failed"), "the failed count keeps its attention color as reinforcement, on top of its own word");
 });
 
+test("a waiting agent renders distinctly from failed/queued, is excluded from the failure count, and never shows credential data", () => {
+  const waiting = workflow({
+    agents: [
+      agent({
+        index: 0,
+        name: "quota-check",
+        state: "waiting",
+        providerWait: {
+          provider: "claude",
+          kind: "quota",
+          scope: "five_hour",
+          detail: "Claude reported a rate_limit rejection (five_hour)",
+          retryAt: 6_000 + 12 * 60_000,
+          attempt: 1,
+          maxAttempts: 2,
+        },
+      }),
+    ],
+  });
+  const lines = buildWorkflowCardLines(waiting, theme, { expanded: false, now: 6_000 });
+  const header = lines[0]!;
+  assert.doesNotMatch(header, /×1/, "a waiting agent is never counted as a header failure");
+
+  const agentsLine = lines.find((line) => line.startsWith("Agents"))!;
+  assert.match(agentsLine, /\bwaiting\b/);
+  assert.doesNotMatch(agentsLine, /\bfailed\b/, "waiting is distinct from failed in the rollup");
+
+  const latestLine = lines.find((line) => line.startsWith("Latest"))!;
+  assert.match(latestLine, /waiting for claude quota/);
+  assert.match(latestLine, /attempt 1\/2/);
+  assert.doesNotMatch(latestLine, /@/, "no email or account identifier ever appears in the rendered wait reason");
+
+  const coloredTheme = { ...theme, fg: (color: string, text: string) => `[${color}]${text}` } as unknown as Theme;
+  const coloredAgentsLine = buildWorkflowCardLines(waiting, coloredTheme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("[dim]Agents"))!;
+  assert.ok(coloredAgentsLine.includes("[warning]1 waiting"), "waiting keeps an attention color distinct from failed/error");
+});
+
 test("Latest identifies the focused agent by name plus its activity, without a status glyph, and never just repeats the word running", () => {
   const withPreview = workflow({
     agents: [
