@@ -12,7 +12,7 @@ import {
   type CapabilityMatch,
   type RequirementResolution,
 } from "./capabilities.ts";
-import type { AccessMode, Backend, CustomizationMode, HarnessName, JobCapabilityRoute } from "./types.ts";
+import type { AccessMode, Backend, CustomizationMode, HarnessName, JobCapabilityRoute, StructuredOutputSupport } from "./types.ts";
 
 const DEFAULT_TTL_MS = 60_000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 20_000;
@@ -52,12 +52,20 @@ interface CacheEntry {
   catalog: CapabilityCatalog;
 }
 
+interface StructuredCacheEntry {
+  fingerprint: string;
+  discoveredAt: number;
+  support: StructuredOutputSupport;
+}
+
 /**
  * Narrow pre-dispatch routing dependency. Direct tools and workflow `agent()`
  * calls depend on this instead of the whole service so both stay testable.
  */
 export interface CapabilityRouter {
   route(request: CapabilityRouteRequest): Promise<CapabilityRouteResult>;
+  /** Zero-model-turn probe of a harness's native structured-result support. Absent means unsupported: callers must not guess. */
+  structuredOutput?(harness: HarnessName, request: CapabilityRequest): Promise<StructuredOutputSupport>;
 }
 
 export interface CapabilityServiceOptions {
@@ -82,6 +90,8 @@ export class CapabilityService {
   readonly #backends: Map<HarnessName, Backend>;
   readonly #cache = new Map<string, CacheEntry>();
   readonly #inflight = new Map<string, Promise<CapabilityCatalog>>();
+  readonly #structuredCache = new Map<string, StructuredCacheEntry>();
+  readonly #structuredInflight = new Map<string, Promise<StructuredOutputSupport>>();
   readonly #ttlMs: number;
   readonly #timeoutMs: number;
   readonly #now: () => number;
@@ -104,8 +114,68 @@ export class CapabilityService {
 
   /** Drop cached catalogs after a harness reports a resource/skill change. */
   invalidate(harness?: HarnessName): void {
-    if (!harness) return void this.#cache.clear();
+    if (!harness) {
+      this.#cache.clear();
+      this.#structuredCache.clear();
+      return;
+    }
     for (const [key, entry] of this.#cache) if (entry.catalog.harness === harness) this.#cache.delete(key);
+    for (const key of this.#structuredCache.keys()) if (key.startsWith(`${harness}|`)) this.#structuredCache.delete(key);
+  }
+
+  /**
+   * Live, zero-model-turn probe of a harness's native structured-result
+   * support, cached like {@link catalog}. Never throws: a missing adapter
+   * method, thrown error, or timeout all report `{ supported: false }` rather
+   * than guessing from a version number.
+   */
+  async structuredOutput(harness: HarnessName, request: CapabilityRequest): Promise<StructuredOutputSupport> {
+    const customization = request.customization ?? "native";
+    const key = `${harness}|${request.cwd}|${request.access}|${customization}|${request.model ?? "default"}`;
+    const fingerprint = this.#fingerprint(harness, request.cwd);
+    const cached = this.#structuredCache.get(key);
+    if (!request.refresh && cached && cached.fingerprint === fingerprint && this.#now() - cached.discoveredAt < this.#ttlMs) {
+      return cached.support;
+    }
+    const pending = this.#structuredInflight.get(key);
+    if (pending && !request.refresh) return pending;
+    const probe = this.#probeStructuredOutput(harness, request, customization)
+      .then((support) => {
+        this.#structuredCache.set(key, { fingerprint, discoveredAt: this.#now(), support });
+        return support;
+      })
+      .finally(() => {
+        if (this.#structuredInflight.get(key) === probe) this.#structuredInflight.delete(key);
+      });
+    this.#structuredInflight.set(key, probe);
+    return probe;
+  }
+
+  async #probeStructuredOutput(harness: HarnessName, request: CapabilityRequest, customization: CustomizationMode): Promise<StructuredOutputSupport> {
+    const backend = this.#backends.get(harness);
+    if (!backend?.structuredOutputSupport) {
+      return { supported: false, detail: `${harness} does not expose native structured-result detection` };
+    }
+    const controller = new AbortController();
+    const abort = () => controller.abort(request.signal?.reason ?? new Error("Structured output discovery aborted"));
+    request.signal?.addEventListener("abort", abort, { once: true });
+    const timer = setTimeout(() => controller.abort(new Error(`${harness} structured output discovery timed out after ${this.#timeoutMs}ms`)), this.#timeoutMs);
+    try {
+      return await backend.structuredOutputSupport({
+        cwd: request.cwd,
+        access: request.access,
+        customization,
+        model: request.model,
+        env: this.#env,
+        signal: controller.signal,
+        refresh: request.refresh === true,
+      });
+    } catch (error) {
+      return { supported: false, detail: error instanceof Error ? error.message : String(error) };
+    } finally {
+      clearTimeout(timer);
+      request.signal?.removeEventListener("abort", abort);
+    }
   }
 
   async catalog(harness: HarnessName, request: CapabilityRequest): Promise<CapabilityCatalog> {

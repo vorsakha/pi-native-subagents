@@ -12,6 +12,13 @@ export type WorkflowAgentState =
   | "cancelled"
   | "aborted";
 
+/**
+ * `native` means a provider-native terminal structured-result channel produced
+ * and validated `structured`; `portable` means the prompt/parse/validate
+ * fallback did. Present only when the call requested a `schema`.
+ */
+export type WorkflowStructuredTransport = "native" | "portable";
+
 export interface WorkflowTimestamps {
   createdAt: number;
   updatedAt: number;
@@ -68,6 +75,7 @@ export interface WorkflowAgentGeneration {
   state: WorkflowAgentState;
   output?: unknown;
   structured?: unknown;
+  structuredTransport?: WorkflowStructuredTransport;
   outputProvenance?: "subagent" | "replay";
   error?: string;
   timestamps: WorkflowTimestamps;
@@ -105,6 +113,9 @@ export interface WorkflowAgentRecord {
   preview?: string;
   output?: unknown;
   structured?: unknown;
+  structuredTransport?: WorkflowStructuredTransport;
+  /** The bounded schema this lineage is validating against, when `structuredTransport` is `native`. A retained native session is schema-bound at `agent()` time; `followUp()` may reuse it but cannot change it. In-memory only — not required for replay because a purely replayed lineage cannot be targeted by `followUp()` either way. */
+  nativeStructuredSchema?: Record<string, unknown>;
   transcript?: TranscriptEntry[];
   error?: string;
   usage: WorkflowUsage;
@@ -142,6 +153,7 @@ export interface WorkflowJournalResult {
   error?: string;
   usage?: Usage;
   structured?: unknown;
+  transport?: WorkflowStructuredTransport;
 }
 
 export interface WorkflowJournalRoute {

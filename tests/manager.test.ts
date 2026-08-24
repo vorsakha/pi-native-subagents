@@ -547,6 +547,23 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
   await manager.shutdown();
 });
 
+test("a follow-up's queued generation clears the prior generation's structured payload before any new terminal result arrives", async () => {
+  const { backend, manager } = setup(1);
+  const job = manager.spawn(request(1));
+  await tick();
+  backend.complete(job.id, "first result", undefined, { first: true });
+  const first = await manager.wait(job.id);
+  assert.deepEqual(first.structured, { first: true });
+
+  const queued = await manager.send(job.id, "continue", "followUp");
+  assert.equal(queued.structured, undefined, "the new generation's structured payload is unread until its own terminal result arrives");
+  await tick();
+  backend.complete(job.id, "second result");
+  const second = await manager.wait(job.id);
+  assert.equal(second.structured, undefined, "a generation that reports no structured payload leaves it absent rather than reusing the prior generation's");
+  await manager.shutdown();
+});
+
 test("continueWorkflowJob is the workflow-only follow-up path: it retains and reuses a completed job's session, accumulates usage, and releaseRun later closes it", async () => {
   const { backend, manager } = setup(1);
   const owned = manager.spawn({ ...request(1), workflow: { runId: "wf-1", agentIndex: 0, label: "planner" } });

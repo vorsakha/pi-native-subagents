@@ -851,6 +851,138 @@ test("Claude emits no context event when the stream omits model and usage fields
   await run.close();
 });
 
+test("Claude wires a requested structuredOutput policy into outputFormat and returns the native payload separate from narrative output", async () => {
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [{ type: "text", text: "here is the result" }] } };
+    yield { type: "result", subtype: "success", result: "here is the result", structured_output: { ok: true }, usage: {}, total_cost_usd: 0, num_turns: 1 };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  let capturedOptions: Record<string, unknown> | undefined;
+  const claudeRequest = request("claude", process.cwd(), process.env);
+  claudeRequest.policy.structuredOutput = { schema: { type: "object", properties: { ok: { type: "boolean" } } } };
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: ((input: { options?: Record<string, unknown> }) => { capturedOptions = input.options; return stream; }) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(claudeRequest, (event) => events.push(event));
+  await run.completed;
+  assert.deepEqual(capturedOptions?.outputFormat, { type: "json_schema", schema: claudeRequest.policy.structuredOutput.schema });
+  const final = terminal(events) as Extract<BackendEvent, { type: "completed" }>;
+  assert.equal(final.type, "completed");
+  assert.equal(final.output, "here is the result");
+  assert.deepEqual(final.structured, { ok: true });
+  await run.close();
+});
+
+test("Claude fails clearly, without accepting narrative text, when a schema-constrained turn reports no native structured result", async () => {
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield { type: "result", subtype: "success", result: `{"ok":true}`, usage: {}, total_cost_usd: 0, num_turns: 1 };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const claudeRequest = request("claude", process.cwd(), process.env);
+  claudeRequest.policy.structuredOutput = { schema: { type: "object" } };
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(claudeRequest, (event) => events.push(event));
+  await run.completed;
+  const final = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+  assert.equal(final.type, "failed");
+  assert.match(final.error, /reported no native structured result/);
+  await run.close();
+});
+
+test("Claude maps exhausted native structured-output retries to a clear failure", async () => {
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield {
+      type: "result", subtype: "error_max_structured_output_retries", errors: ["retries exhausted"],
+      usage: {}, total_cost_usd: 0, num_turns: 3,
+    };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const claudeRequest = request("claude", process.cwd(), process.env);
+  claudeRequest.policy.structuredOutput = { schema: { type: "object" } };
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(claudeRequest, (event) => events.push(event));
+  await run.completed;
+  const final = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+  assert.equal(final.type, "failed");
+  assert.match(final.error, /exhausted its native structured-output retries/);
+  await run.close();
+});
+
+test("Claude structured-output support probe reports supported only when the installed CLI accepts the zero-turn json_schema handshake", async () => {
+  async function* accepted() {
+    // No user message and no result frame: initializationResult() must resolve without one.
+  }
+  const acceptedStream = Object.assign(accepted(), {
+    close() {},
+    initializationResult: async () => ({ commands: [], agents: [] }),
+  });
+  const supported = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => acceptedStream) as never,
+  }).structuredOutputSupport({
+    cwd: process.cwd(), access: "readOnly", customization: "isolated", env: process.env,
+    signal: new AbortController().signal, refresh: true,
+  });
+  assert.equal(supported.supported, true);
+  assert.equal(supported.mechanism, "claude-agent-sdk:outputFormat.json_schema");
+
+  async function* rejected() {}
+  const rejectedStream = Object.assign(rejected(), {
+    close() {},
+    initializationResult: async () => { throw new Error("unrecognized flag --json-schema"); },
+  });
+  const unsupported = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => rejectedStream) as never,
+  }).structuredOutputSupport({
+    cwd: process.cwd(), access: "readOnly", customization: "isolated", env: process.env,
+    signal: new AbortController().signal, refresh: true,
+  });
+  assert.equal(unsupported.supported, false);
+  assert.match(unsupported.detail ?? "", /unrecognized flag/);
+
+  let queried = false;
+  const unauthenticated = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => { throw new Error("authentication_failed"); },
+    queryFn: (() => { queried = true; throw new Error("must not query after auth failure"); }) as never,
+  }).structuredOutputSupport({
+    cwd: process.cwd(), access: "readOnly", customization: "isolated", env: process.env,
+    signal: new AbortController().signal, refresh: true,
+  });
+  assert.equal(unauthenticated.supported, false);
+  assert.match(unauthenticated.detail ?? "", /authentication_failed/);
+  assert.equal(queried, false);
+});
+
+test("Codex and Pi reject a structuredOutput policy instead of silently ignoring it", async () => {
+  const codexRequest = request("codex", process.cwd(), process.env);
+  codexRequest.policy.structuredOutput = { schema: { type: "object" } };
+  await assert.rejects(
+    new CodexAppServerBackend("fixture-codex-missing").start(codexRequest, () => {}),
+    /does not support native structured results/,
+  );
+
+  const piRequest = request("pi", process.cwd(), process.env);
+  piRequest.policy.structuredOutput = { schema: { type: "object" } };
+  await assert.rejects(
+    new PiRpcBackend("fixture-pi-missing").start(piRequest, () => {}),
+    /does not support native structured results/,
+  );
+});
+
 test("Pi reports the concrete responseModel over the requested alias and totalTokens as occupancy", async () => {
   const fake = await fixture(PI_FIXTURE);
   const events: BackendEvent[] = [];

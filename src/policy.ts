@@ -105,6 +105,7 @@ export function compilePolicy(
       codexSandbox: readOnly
         ? { type: "readOnly", networkAccess: false }
         : { type: "dangerFullAccess" },
+      structuredOutput: request.structuredOutput,
     },
   };
 }

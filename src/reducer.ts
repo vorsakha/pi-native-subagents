@@ -240,6 +240,12 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
         next.transcript = job.transcript.map((entry) => ({ ...entry }));
         pushTranscript(next, { kind: "assistant", text: event.output, at: event.at ?? now });
       }
+      // Kept exact, unlike every other bounded field on this snapshot: this is the
+      // authoritative native structured-result payload workflow schema validation
+      // and replay operate on, so truncating it here would let corrupted data pass
+      // a permissive schema silently. Presentation surfaces (dashboard, artifacts)
+      // apply their own bounded serialization when they render or persist it.
+      if (event.structured !== undefined) next.structured = event.structured;
       next.status = "completed";
       next.queuedMessages = [];
       next.endedAt = event.at ?? now;

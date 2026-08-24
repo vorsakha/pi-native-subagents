@@ -1059,7 +1059,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
       const text = boundedHeadTailText(raw, MAX_STRUCTURED_CHARS, "structured result");
       const structured = this.renderMarkdownLines(`\`\`\`json\n${text}\n\`\`\``, width);
       if (text.length < raw.length) structured.push(this.theme.fg("muted", "… structured result truncated to 4 KiB"));
-      appendBoundedSection(body, this.theme, "Structured result", structured, 72);
+      const heading = agent.structuredTransport ? `Structured result (${agent.structuredTransport})` : "Structured result";
+      appendBoundedSection(body, this.theme, heading, structured, 72);
     }
     if (agent.generations?.length) {
       const rows = agent.generations.map((generation) => {

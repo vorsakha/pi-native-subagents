@@ -61,11 +61,26 @@ export type BackendEvent =
   | { type: "tool_end"; id: string; name?: string; result?: ToolResultSnapshot; output?: string; error?: boolean; at?: number }
   | { type: "usage"; usage: Partial<Usage>; at?: number }
   | { type: "context"; context: ContextSnapshot; at?: number }
-  | { type: "completed"; output?: string; at?: number }
+  /** `structured` is the authoritative terminal payload from a provider-native structured-result channel; present only when `BackendPolicy.structuredOutput` was requested and the runtime honored it. */
+  | { type: "completed"; output?: string; structured?: unknown; at?: number }
   | { type: "failed"; error: string; at?: number }
   | { type: "cancelled"; reason?: string; at?: number }
   /** An optional native integration failed; the job continues without it. */
   | { type: "degraded"; source: string; detail: string; at?: number };
+
+/** Bounded JSON Schema a caller wants a provider-native terminal channel to validate and return, instead of prompt/parse text extraction. Workflow-internal only; never a model-facing tool field. */
+export interface StructuredOutputPolicy {
+  schema: Record<string, unknown>;
+}
+
+/** What a live runtime reports about its own native structured-result mechanism, from a zero-model-turn probe. */
+export interface StructuredOutputSupport {
+  supported: boolean;
+  /** Free-form mechanism id for receipts, e.g. `claude-agent-sdk:outputFormat.json_schema`. */
+  mechanism?: string;
+  /** Why unsupported, or how support was detected. */
+  detail?: string;
+}
 
 /**
  * `native` loads the harness's installed context, skills, plugins, and MCP
@@ -90,6 +105,8 @@ export interface BackendPolicy {
   claudeTools: string[];
   approvalPolicy: "never";
   codexSandbox: { type: "dangerFullAccess" } | { type: "readOnly"; networkAccess: false };
+  /** Present only when the workflow runtime selected a provider-native structured-result transport for this dispatch. */
+  structuredOutput?: StructuredOutputPolicy;
 }
 
 export interface BackendRequest {
@@ -169,6 +186,8 @@ export interface Backend {
   start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun>;
   /** Optional zero-model-turn native inventory. Absent adapters report an unknown catalog. */
   discover?(request: DiscoveryRequest): Promise<DiscoveryResult>;
+  /** Optional zero-model-turn probe of this runtime's native structured-result support. Absent adapters are treated as unsupported. */
+  structuredOutputSupport?(request: DiscoveryRequest): Promise<StructuredOutputSupport>;
 }
 
 export type ProfileOrigin = "global" | "project";
@@ -257,6 +276,8 @@ export interface SpawnRequest {
   dispatchGate?: () => string | undefined;
   /** Internal session-peer fork data (source provenance plus the already-forked session file to resume). Pi-only; never set by a harness adapter. */
   peer?: PeerSessionReference & { sessionFile: string };
+  /** Internal workflow-runtime request for a provider-native structured-result channel; never a model-facing tool field. */
+  structuredOutput?: StructuredOutputPolicy;
 }
 
 export interface ToolTrace {
@@ -291,6 +312,8 @@ export interface JobSnapshot {
   startedAt?: number;
   endedAt?: number;
   output: string;
+  /** Authoritative terminal payload from a provider-native structured-result channel; absent when only the fallback prompt/parse path applies. */
+  structured?: unknown;
   error?: string;
   truncated: boolean;
   usage: Usage;

@@ -22,6 +22,7 @@ import type {
   DiscoveryRequest,
   DiscoveryResult,
   SendBehavior,
+  StructuredOutputSupport,
   ToolResultSnapshot,
 } from "../types.ts";
 
@@ -273,6 +274,60 @@ export class ClaudeBackend implements Backend {
     return { capabilities, sources, warnings };
   }
 
+  /**
+   * Zero-model-turn probe of the installed CLI's native structured-result
+   * support: a fresh SDK session requesting `outputFormat: json_schema`,
+   * closed before any user message exists. The installed CLI accepting the
+   * handshake is the only evidence used; there is no version guessing.
+   */
+  async structuredOutputSupport(request: DiscoveryRequest): Promise<StructuredOutputSupport> {
+    request.signal.throwIfAborted();
+    const env = sanitizeSubscriptionEnv(request.env, "claude");
+    try {
+      await this.#verifyAuth(this.#command, request.cwd, env, request.signal);
+    } catch (error) {
+      return { supported: false, detail: error instanceof Error ? error.message : String(error) };
+    }
+    const controller = new AbortController();
+    const abort = () => controller.abort(request.signal.reason ?? new Error("Claude structured-output discovery aborted"));
+    request.signal.addEventListener("abort", abort, { once: true });
+    const input = new AsyncInput();
+    const policy = { customization: request.customization, access: request.access, claudeTools: [] as string[] };
+    const toolPolicy = claudeToolPolicy(policy);
+    const stream = this.#query({
+      prompt: input,
+      options: {
+        abortController: controller,
+        cwd: request.cwd,
+        env: { ...env, CLAUDE_AGENT_SDK_CLIENT_APP: "pi-native-subagents/0.1.0" },
+        pathToClaudeCodeExecutable: this.#command,
+        systemPrompt: { type: "preset", preset: "claude_code" },
+        disallowedTools: toolPolicy.disallowedTools,
+        permissionMode: "dontAsk",
+        settingSources: request.customization === "native" ? ["user", "project", "local"] : [],
+        ...(request.customization === "native" ? { skills: "all" as const } : {}),
+        settings: claudeSettings(policy),
+        extraArgs: { "safe-mode": null },
+        outputFormat: { type: "json_schema", schema: { type: "object" } },
+        persistSession: false,
+        maxTurns: 1,
+      },
+    });
+    try {
+      const target = stream as unknown as { initializationResult(): Promise<unknown> };
+      await target.initializationResult();
+      return { supported: true, mechanism: "claude-agent-sdk:outputFormat.json_schema" };
+    } catch (error) {
+      if (request.signal.aborted) throw request.signal.reason;
+      return { supported: false, detail: error instanceof Error ? error.message : String(error) };
+    } finally {
+      request.signal.removeEventListener("abort", abort);
+      input.close();
+      controller.abort();
+      try { stream.close(); } catch { /* discovery teardown is best effort */ }
+    }
+  }
+
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     request.signal.throwIfAborted();
     const env = sanitizeSubscriptionEnv(request.env, "claude");
@@ -307,6 +362,7 @@ export class ClaudeBackend implements Backend {
     };
     const native = request.policy.customization === "native";
     const readOnly = request.policy.access === "readOnly";
+    const structuredRequested = !!request.policy.structuredOutput;
     const baseToolPolicy = claudeToolPolicy(request.policy);
     const toolPolicy = request.parentThread && readOnly
       ? {
@@ -345,6 +401,7 @@ export class ClaudeBackend implements Backend {
         ...(request.policy.effort ? { effort: request.policy.effort } : {}),
         thinking: request.policy.thinking === "off" ? { type: "disabled" } : { type: "adaptive" },
         systemPrompt: { type: "preset", preset: "claude_code", append: request.systemPrompt },
+        ...(request.policy.structuredOutput ? { outputFormat: { type: "json_schema" as const, schema: request.policy.structuredOutput.schema } } : {}),
         tools: toolPolicy.tools,
         ...(toolPolicy.allowedTools ? { allowedTools: toolPolicy.allowedTools } : {}),
         ...(parentThreadServer ? { mcpServers: { [PARENT_THREAD_MCP_SERVER]: parentThreadServer } } : {}),
@@ -372,7 +429,7 @@ export class ClaudeBackend implements Backend {
       try {
         for await (const message of stream) {
           watchdog.touch();
-          const result = handleMessage(message, emit, controller, request.policy.access === "readOnly", !!request.parentThread, telemetry);
+          const result = handleMessage(message, emit, controller, request.policy.access === "readOnly", !!request.parentThread, telemetry, structuredRequested);
           if (!result) continue;
           resultCount++;
           if (queuedMessages.length) {
@@ -383,7 +440,7 @@ export class ClaudeBackend implements Backend {
           if (!result.success) {
             finish({ type: "failed", error: result.error });
           } else if (resultCount >= expectedResults) {
-            finish({ type: "completed", output });
+            finish({ type: "completed", output, ...(result.structured !== undefined ? { structured: result.structured } : {}) });
           }
         }
         if (!terminal && !closing) finish({ type: "failed", error: "Claude stream ended without a result" });
@@ -499,7 +556,7 @@ function userMessage(text: string, priority: "now" | "next" | "later"): SDKUserM
   };
 }
 
-interface ClaudeResult { success: boolean; output: string; error: string }
+interface ClaudeResult { success: boolean; output: string; error: string; structured?: unknown }
 
 function handleMessage(
   message: SDKMessage,
@@ -508,6 +565,7 @@ function handleMessage(
   readOnly: boolean,
   allowParentThread: boolean,
   telemetry: ClaudeTelemetry,
+  structuredRequested = false,
 ): ClaudeResult | undefined {
   if (message.type === "system" && message.subtype === "init") {
     const source = message.apiKeySource as string;
@@ -612,9 +670,17 @@ function handleMessage(
       emitClaudeContext(telemetry, emit);
     }
     if (message.subtype === "success" && message.result) emit({ type: "message", text: boundedAppend("", message.result).text });
-    return message.subtype === "success"
-      ? { success: true, output: message.result, error: "" }
-      : { success: false, output: "", error: message.errors.join("\n") || message.subtype };
+    if (message.subtype === "success") {
+      const structured = message.structured_output;
+      if (structuredRequested && structured === undefined) {
+        return { success: false, output: "", error: "Claude reported no native structured result for a schema-constrained turn" };
+      }
+      return { success: true, output: message.result, error: "", structured };
+    }
+    if (message.subtype === "error_max_structured_output_retries") {
+      return { success: false, output: "", error: "Claude exhausted its native structured-output retries" };
+    }
+    return { success: false, output: "", error: message.errors.join("\n") || message.subtype };
   }
 }
 

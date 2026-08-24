@@ -111,6 +111,10 @@ export default async function () {
 
 For a workflow with a known plan, add `phases` to the exported metadata, for example `export const meta = { name: "release review", phases: ["review", "verify", "summarize"] };`. The plan accepts 1–64 unique names; names are trimmed and internal whitespace is collapsed, matching is case-sensitive, and each normalized name is limited to 160 characters. Declared phases appear as pending before the first `phase(title)` call, and `phase(title)` must activate them forward in plan order (conditional phases may be skipped). Repeating the active phase is harmless; use `phase(title)` to advance rather than `agent({ phase })`. Omit `meta.phases` when phases are discovered dynamically.
 
+## Structured output with schema
+
+When `schema` is provided, supported runtimes may use native structured output; others use the portable JSON fallback. Both paths apply the same schema validation, fail clearly on invalid or missing results, and preserve transport metadata through persistence and replay.
+
 ## Continuing a retained agent with followUp
 
 `followUp(jobId, prompt, options?)` sends another turn to an `agent()` call this same workflow run already completed successfully, reusing its retained native session instead of starting a fresh child. This is the only supported way to return to earlier reasoning — for example, asking the phase-1 planner to review phase-2's implementation, or sending review findings back to the implementer for a bounded fix cycle:
@@ -131,6 +135,7 @@ Rules:
 
 - The target job must be a job this run's own `agent()` call started, and it must still be `completed` with a retained session; cross-workflow, direct (non-workflow) `subagent_spawn` jobs, expired, failed, cancelled, and not-yet-settled jobs are all rejected.
 - `options` accepts only `phase` and `schema` — the same non-policy presentation/validation fields `agent()` accepts for those concerns. Harness, model, effort, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original `agent()` call and cannot be changed by a follow-up.
+- A retained native structured session remains bound to its original schema. A `followUp()` may reuse that schema, but cannot replace it.
 - An `agent()` call that used `isolation: "worktree"` can never be targeted by `followUp()`. Its worktree is finalized when the call returns, so the follow-up is rejected whether the recorded isolation state is `preserved`, `removed`, or `orphaned`.
 - Each `followUp()` call consumes its own agent-call ordinal (it counts toward the 32-call budget) and appears in `/workflows` as another bounded generation under the same agent, not a new agent card. Cumulative usage and per-agent token budgets already include every generation.
 - Await every `followUp()` call, exactly like `agent()`.

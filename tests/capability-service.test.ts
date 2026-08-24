@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { CapabilityService } from "../src/capability-service.ts";
 import type { DiscoveredCapability } from "../src/capabilities.ts";
-import type { Backend, DiscoveryRequest, DiscoveryResult, HarnessName } from "../src/types.ts";
+import type { Backend, DiscoveryRequest, DiscoveryResult, HarnessName, StructuredOutputSupport } from "../src/types.ts";
 
 class FakeBackend implements Backend {
   readonly name: HarnessName;
@@ -324,4 +324,77 @@ test("route() live-revalidation catches a capability that disappeared between br
     service.route({ ...request(), harness: "codex", requires: ["codex:tool:lint"] }),
     /Selected harness cannot satisfy the required capabilities/,
   );
+});
+
+class StructuredOutputBackend extends FakeBackend {
+  calls = 0;
+  #support: StructuredOutputSupport;
+
+  constructor(name: HarnessName, support: StructuredOutputSupport) {
+    super(name);
+    this.#support = support;
+  }
+
+  async structuredOutputSupport(): Promise<StructuredOutputSupport> {
+    this.calls++;
+    return this.#support;
+  }
+}
+
+test("structuredOutput serves from cache within the TTL and refetches once the fingerprint changes", async () => {
+  const backend = new StructuredOutputBackend("claude", { supported: true, mechanism: "fixture" });
+  let fingerprint = "v1";
+  const service = new CapabilityService({ backends: [backend], fingerprint: () => fingerprint, ttlMs: 60_000 });
+  const first = await service.structuredOutput("claude", request());
+  const second = await service.structuredOutput("claude", request());
+  assert.equal(backend.calls, 1, "an unchanged fingerprint within the TTL is served from cache");
+  assert.deepEqual(first, second);
+
+  fingerprint = "v2";
+  await service.structuredOutput("claude", request());
+  assert.equal(backend.calls, 2, "a changed fingerprint invalidates the cached probe");
+});
+
+test("structuredOutput reports unsupported without throwing when the backend has no probe, the probe throws, or it times out", async () => {
+  const noProbe: Backend = { name: "pi", async start() { throw new Error("unused"); } };
+  const noProbeService = new CapabilityService({ backends: [noProbe], fingerprint: () => "stable" });
+  const noProbeResult = await noProbeService.structuredOutput("pi", request());
+  assert.equal(noProbeResult.supported, false);
+  assert.match(noProbeResult.detail ?? "", /does not expose native structured-result detection/);
+
+  const throwing: Backend = {
+    name: "codex",
+    async start() { throw new Error("unused"); },
+    async structuredOutputSupport() { throw new Error("probe exploded"); },
+  };
+  const throwingService = new CapabilityService({ backends: [throwing], fingerprint: () => "stable" });
+  const throwingResult = await throwingService.structuredOutput("codex", request());
+  assert.equal(throwingResult.supported, false);
+  assert.match(throwingResult.detail ?? "", /probe exploded/);
+
+  const hanging: Backend = {
+    name: "claude",
+    async start() { throw new Error("unused"); },
+    async structuredOutputSupport(discoveryRequest) {
+      return new Promise((_resolve, reject) => {
+        discoveryRequest.signal.addEventListener("abort", () => reject(discoveryRequest.signal.reason), { once: true });
+      });
+    },
+  };
+  const hangingService = new CapabilityService({ backends: [hanging], fingerprint: () => "stable", discoveryTimeoutMs: 1_000 });
+  const hangingResult = await hangingService.structuredOutput("claude", request());
+  assert.equal(hangingResult.supported, false);
+  assert.match(hangingResult.detail ?? "", /timed out after 1000ms/);
+});
+
+test("structuredOutput de-duplicates concurrent probes for the same key and invalidate() clears its cache too", async () => {
+  const backend = new StructuredOutputBackend("claude", { supported: true });
+  const service = new CapabilityService({ backends: [backend], fingerprint: () => "stable" });
+  const [a, b] = await Promise.all([service.structuredOutput("claude", request()), service.structuredOutput("claude", request())]);
+  assert.equal(backend.calls, 1, "two concurrent probes for the same cache key share one call");
+  assert.deepEqual(a, b);
+
+  service.invalidate("claude");
+  await service.structuredOutput("claude", request());
+  assert.equal(backend.calls, 2, "invalidate() drops the cached probe result too");
 });
