@@ -1,5 +1,5 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { truncateToWidth, visibleWidth, type KeybindingsManager, type Keybinding } from "@earendil-works/pi-tui";
 
 /*
  * The panel shell shared by /subagents and /workflows, following Pi's `/ps`
@@ -223,4 +223,152 @@ export function alignDashboardRow(
     leftTruncated + " ".repeat(gap) + right,
     safeWidth,
   );
+}
+
+export type DashboardFrame = ReturnType<typeof createDashboardFrame>;
+
+/** A fixed-size, top-aligned viewport into a longer list, centered on `selected`. */
+export interface DashboardListViewport<T> {
+  items: readonly T[];
+  start: number;
+  end: number;
+}
+
+export function dashboardListViewport<T>(items: readonly T[], selected: number, rows: number): DashboardListViewport<T> {
+  const size = Math.max(0, Math.min(rows, items.length));
+  const start = clampDashboard(selected - Math.floor(size / 2), 0, Math.max(0, items.length - size));
+  return { items: items.slice(start, start + size), start, end: start + size };
+}
+
+/** Pads or truncates `lines` to exactly `rows` entries so panel geometry never shifts. */
+export function fitDashboardRows(lines: string[], rows: number): string[] {
+  const bounded = lines.slice(0, Math.max(0, rows));
+  while (bounded.length < rows) bounded.push("");
+  return bounded;
+}
+
+export function clampDashboard(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(value, max));
+}
+
+/** Shared `Ns`/`Nm SSs` elapsed-time formatting for jobs, runs, and agents. */
+export function formatDurationLabel(elapsedMs: number): string {
+  const seconds = Math.floor(Math.max(0, elapsedMs) / 1000);
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+/** A `── label ──` divider matching the panel's rounded-border rule style. */
+export function dashboardScrollRule(theme: Theme, label: string, width: number): string {
+  const safeWidth = Math.max(0, width);
+  return theme.fg("dim", truncateToWidth(`── ${label} ${"─".repeat(safeWidth)}`, safeWidth, ""));
+}
+
+/** Primary (run/job-level) selection marker. */
+export function dashboardSelectionMarker(theme: Theme, selected: boolean): string {
+  return selected ? theme.fg("accent", "❯") : " ";
+}
+
+/** Secondary (nested, e.g. agent-within-run) selection marker. */
+export function dashboardNestedSelectionMarker(theme: Theme, selected: boolean): string {
+  return selected ? theme.fg("accent", "›") : " ";
+}
+
+/**
+ * Renders a two-step destructive confirmation hint, degrading through
+ * shorter candidate texts until the marker text (e.g. "Press x again to
+ * confirm") survives truncation at the current width.
+ */
+export function renderDashboardConfirmHint(
+  frame: DashboardFrame,
+  marker: string,
+  candidates: ReadonlyArray<readonly [string, string]>,
+  fallbackText: string,
+  fallbackRight: string,
+): { rendered: string; confirmed: boolean } {
+  for (const [text, hintRight] of candidates) {
+    const rendered = frame.hint(text, hintRight);
+    if (rendered.includes(marker)) return { rendered, confirmed: true };
+  }
+  return { rendered: frame.hint(fallbackText, fallbackRight), confirmed: false };
+}
+
+const DEFAULT_CONFIRM_KEYS: readonly string[] = ["enter"];
+const DEFAULT_CANCEL_KEYS: readonly string[] = ["escape", "ctrl+c"];
+const DEFAULT_SUBMIT_KEYS: readonly string[] = ["enter"];
+
+function formatKeyId(key: string): string {
+  return key.split("+").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join("+");
+}
+
+/**
+ * Resolves a hint label for a configurable binding, falling back to the
+ * default wording (e.g. "Enter", "Esc") whenever the binding is unconfigured,
+ * still at its default keys, or the injected `keybindings` cannot report keys
+ * (e.g. a minimal test double).
+ */
+function resolveKeyLabel(
+  keybindings: Pick<KeybindingsManager, "getKeys">,
+  binding: Keybinding,
+  defaultKeys: readonly string[],
+  fallback: string,
+): string {
+  try {
+    const keys = keybindings.getKeys(binding);
+    if (!keys.length) return fallback;
+    const isDefault = keys.length === defaultKeys.length && keys.every((key, index) => key === defaultKeys[index]);
+    return isDefault ? fallback : keys.map(formatKeyId).join("/");
+  } catch {
+    return fallback;
+  }
+}
+
+/** Display label for the confirm/select binding (`tui.select.confirm`, default "Enter"). */
+export function dashboardConfirmKeyLabel(keybindings: Pick<KeybindingsManager, "getKeys">, fallback = "Enter"): string {
+  return resolveKeyLabel(keybindings, "tui.select.confirm", DEFAULT_CONFIRM_KEYS, fallback);
+}
+
+/** Display label for the cancel/back binding (`tui.select.cancel`, default "Esc"). */
+export function dashboardCancelKeyLabel(keybindings: Pick<KeybindingsManager, "getKeys">, fallback = "Esc"): string {
+  return resolveKeyLabel(keybindings, "tui.select.cancel", DEFAULT_CANCEL_KEYS, fallback);
+}
+
+/** Display label for the composer submit binding (`tui.input.submit`, default "Enter"). */
+export function dashboardSubmitKeyLabel(keybindings: Pick<KeybindingsManager, "getKeys">, fallback = "Enter"): string {
+  return resolveKeyLabel(keybindings, "tui.input.submit", DEFAULT_SUBMIT_KEYS, fallback);
+}
+
+export interface DashboardKeyGroup {
+  title: string;
+  entries: ReadonlyArray<readonly [string, string]>;
+}
+
+/**
+ * Renders the `?` cheatsheet body: a width-safe, grouped key legend for the
+ * panel's current pane. Reuses the same rounded-border frame as the rest of
+ * the dashboard so the overlay never looks like a distinct surface.
+ */
+export function renderDashboardHelp(
+  theme: Theme,
+  frame: DashboardFrame,
+  header: string,
+  groups: readonly DashboardKeyGroup[],
+  rows: number,
+): string[] {
+  const width = frame.innerWidth;
+  const keyColumn = Math.min(
+    18,
+    Math.max(4, ...groups.flatMap((group) => group.entries.map(([key]) => visibleWidth(key)))),
+  );
+  const body: string[] = [];
+  for (const group of groups) {
+    if (!group.entries.length) continue;
+    if (body.length) body.push("");
+    body.push(theme.fg("accent", group.title));
+    for (const [key, description] of group.entries) {
+      const label = truncateToWidth(key, keyColumn).padEnd(keyColumn, " ");
+      body.push(truncateToWidth(`  ${theme.fg("text", label)}  ${theme.fg("muted", description)}`, width, ""));
+    }
+  }
+  const lines = [frame.top(header), ...fitDashboardRows(body, rows).map((line) => frame.row(line)), frame.bottom()];
+  return lines;
 }

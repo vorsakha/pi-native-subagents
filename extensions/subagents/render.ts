@@ -1,6 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth } from "@earendil-works/pi-tui";
+import { formatDurationLabel } from "../dashboard-style.ts";
 import { isTerminal } from "../../src/manager.ts";
 import { formatSpendBudget } from "../../src/budget.ts";
 import type { PeerSessionSummary } from "../../src/session-peers.ts";
@@ -105,9 +106,7 @@ export function shortId(id: string): string {
 }
 
 export function formatElapsed(job: Pick<JobSnapshot, "createdAt" | "startedAt" | "endedAt">, now: number): string {
-  const elapsed = Math.max(0, (job.endedAt ?? now) - (job.startedAt ?? job.createdAt));
-  const seconds = Math.floor(elapsed / 1000);
-  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
+  return formatDurationLabel((job.endedAt ?? now) - (job.startedAt ?? job.createdAt));
 }
 
 function formatTokens(count: number): string {

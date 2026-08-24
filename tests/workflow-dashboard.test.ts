@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { initTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import { type KeybindingsManager, visibleWidth } from "@earendil-works/pi-tui";
-import { tempDir, theme } from "./helpers.ts";
+import { tempDir, theme, tick } from "./helpers.ts";
 import {
   createWorkflowsDashboardOverlay,
   openWorkflowsDashboard,
@@ -63,7 +63,16 @@ interface HarnessOptions {
   cancelBinding?: string;
   renderMarkdown?: (text: string, width: number) => string[];
   theme?: Theme;
+  getKeys?: (binding: string) => string[];
 }
+
+/** Live-manager calls the overlay makes directly, applied in place while it stays mounted. */
+type WorkflowManagerAction =
+  | { type: "cancel"; runId: string }
+  | { type: "cancelAgent"; runId: string; agentIndex: number }
+  | { type: "pause"; runId: string }
+  | { type: "resume"; runId: string }
+  | { type: "restartAgent"; runId: string; agentIndex: number };
 
 function harness(
   runs: WorkflowSnapshot[],
@@ -74,7 +83,7 @@ function harness(
   let renders = 0;
   const listeners = new Set<(snapshot: WorkflowSnapshot) => void>();
   const checked: string[] = [];
-  const actions: WorkflowsDashboardAction[] = [];
+  const actions: WorkflowManagerAction[] = [];
   const manager = {
     list: () => runs,
     check: (runId: string) => {
@@ -126,12 +135,11 @@ function harness(
     options.theme ?? theme,
     {
       matches: (data: string, binding: string) => binding === "tui.select.cancel" && data === (options.cancelBinding ?? "\u0003"),
+      ...(options.getKeys ? { getKeys: options.getKeys } : {}),
     } as unknown as KeybindingsManager,
     manager,
-    (action) => {
-      actions.push(action);
-      done(action);
-    },
+    // `done` is reserved for close; every other action applies in place via the manager mock above.
+    done,
     {
       now: () => 65_000,
       renderMarkdown: options.renderMarkdown,
@@ -807,6 +815,144 @@ test("pause, resume, restart, filters, and configured cancel binding remain keyb
   assert.deepEqual(closed, [{ type: "close" }]);
 });
 
+test("pause and resume apply in place, preserving phase, filter, and pane state without closing the dashboard", async (t) => {
+  const run = workflow("inplace-pause");
+  const template = run.phases[0]!;
+  run.phases = [
+    { ...template, index: 0, name: "First", agents: [0] },
+    { ...template, index: 1, name: "Second", agents: [1] },
+  ];
+  run.currentPhase = 1;
+  run.agents[0]!.phase = 0;
+  run.agents[1]!.phase = 1;
+  const closed: WorkflowsDashboardAction[] = [];
+  const { overlay, actions } = harness([run], 30, (action) => closed.push(action), { fullscreen: true });
+  t.after(() => overlay.dispose());
+
+  overlay.render(72);
+  overlay.handleInput("f");
+  const before = overlay.render(72).join("\n");
+  assert.match(before, /filter active/);
+  assert.match(before, /Second/, "the current phase is selected by default");
+
+  overlay.handleInput("p");
+  assert.deepEqual(actions.at(-1), { type: "pause", runId: "inplace-pause" });
+  await tick();
+  const paused = overlay.render(72).join("\n");
+  assert.match(paused, /paused/);
+  assert.match(paused, /filter active/, "the agent filter survives the in-place pause");
+  assert.match(paused, /Second/, "the selected phase survives the in-place pause");
+  assert.deepEqual(closed, [], "pausing does not close or reopen the dashboard");
+
+  overlay.handleInput("p");
+  assert.deepEqual(actions.at(-1), { type: "resume", runId: "inplace-pause" });
+  await tick();
+  const resumed = overlay.render(72).join("\n");
+  assert.match(resumed, /running/);
+  assert.match(resumed, /filter active/);
+  assert.match(resumed, /Second/);
+  assert.deepEqual(closed, []);
+});
+
+test("a rejected pause, resume, restart, agent-cancel, or run-cancel shows an in-panel notice and preserves dashboard state", async (t) => {
+  const run = workflow("rejected-actions");
+  const closed: WorkflowsDashboardAction[] = [];
+  const { overlay, manager } = harness([run], 30, (action) => closed.push(action), { fullscreen: true });
+  t.after(() => overlay.dispose());
+
+  overlay.render(72);
+  overlay.handleInput("\t"); // select the running "tests" agent so restart/cancel stay actionable below
+
+  manager.pause = (async () => { throw new Error("pause rejected"); }) as typeof manager.pause;
+  overlay.handleInput("p");
+  await tick();
+  let after = overlay.render(72).join("\n");
+  assert.match(after, /! pause rejected/);
+  assert.match(after, /workflow · phase/, "the overview pane stays open after a rejected pause");
+  assert.deepEqual(closed, []);
+
+  manager.resume = (async () => { throw new Error("resume rejected"); }) as typeof manager.resume;
+  run.status = "paused";
+  overlay.handleInput("p");
+  await tick();
+  after = overlay.render(72).join("\n");
+  assert.match(after, /! resume rejected/);
+  assert.deepEqual(closed, []);
+
+  manager.restartAgent = (async () => { throw new Error("restart rejected"); }) as typeof manager.restartAgent;
+  overlay.handleInput("r");
+  await tick();
+  after = overlay.render(72).join("\n");
+  assert.match(after, /! restart rejected/);
+  assert.deepEqual(closed, []);
+
+  manager.cancelAgent = (async () => { throw new Error("agent cancel rejected"); }) as typeof manager.cancelAgent;
+  overlay.handleInput("x");
+  overlay.handleInput("x");
+  await tick();
+  after = overlay.render(72).join("\n");
+  assert.match(after, /! agent cancel rejected/);
+  assert.deepEqual(closed, []);
+
+  manager.cancel = (async () => { throw new Error("run cancel rejected"); }) as typeof manager.cancel;
+  overlay.handleInput("X");
+  overlay.handleInput("X");
+  await tick();
+  after = overlay.render(72).join("\n");
+  assert.match(after, /! run cancel rejected/);
+  assert.match(after, /workflow · phase/, "the dashboard remains open after every rejected action");
+  assert.deepEqual(closed, [], "no rejected action closes the dashboard");
+});
+
+test("a restarted replacement run becomes selected in place, without tearing down the dashboard", async (t) => {
+  const original = workflow("restart-original", "completed");
+  const runsArray = [original];
+  const closed: WorkflowsDashboardAction[] = [];
+  const { overlay, manager } = harness(runsArray, 30, (action) => closed.push(action), { fullscreen: true });
+  t.after(() => overlay.dispose());
+
+  const replacement = workflow("restart-replacement");
+  manager.restartAgent = (async () => {
+    runsArray.push(replacement);
+    return { snapshot: replacement };
+  }) as typeof manager.restartAgent;
+
+  overlay.render(72);
+  overlay.handleInput("r");
+  await tick();
+
+  const after = overlay.render(72).join("\n");
+  assert.match(after, /Release restart-replacement/, "the replacement run becomes selected");
+  assert.deepEqual(closed, [], "restarting does not close or reopen the dashboard");
+});
+
+test("a successful agent or run cancellation applies in place, preserving phase and agent selection without closing the dashboard", async (t) => {
+  const run = workflow("inplace-cancel");
+  const closed: WorkflowsDashboardAction[] = [];
+  const { overlay, actions } = harness([run], 30, (action) => closed.push(action), { fullscreen: true });
+  t.after(() => overlay.dispose());
+
+  overlay.render(72);
+  overlay.handleInput("\t"); // select the running "tests" agent
+  overlay.render(72); // re-mark the newly selected agent visible before arming its cancellation
+  overlay.handleInput("x");
+  overlay.handleInput("x");
+  assert.deepEqual(actions.at(-1), { type: "cancelAgent", runId: "inplace-cancel", agentIndex: 1 });
+  await tick();
+  let after = overlay.render(72).join("\n");
+  assert.match(after, /workflow · phase/, "the overview pane stays open after a successful agent cancellation");
+  assert.match(after, /tests/, "the cancelled agent remains selected and visible");
+  assert.deepEqual(closed, []);
+
+  overlay.handleInput("X");
+  overlay.handleInput("X");
+  assert.deepEqual(actions.at(-1), { type: "cancel", runId: "inplace-cancel" });
+  await tick();
+  after = overlay.render(72).join("\n");
+  assert.match(after, /workflow · phase/, "the overview pane stays open after a successful run cancellation");
+  assert.deepEqual(closed, [], "successful cancellation never closes or reopens the dashboard");
+});
+
 test("widths below the interactive threshold accept only Escape or the configured cancel binding", (t) => {
   const closed: WorkflowsDashboardAction[] = [];
   const state = harness([workflow("tiny")], 30, (action) => closed.push(action), { fullscreen: true, cancelBinding: "q" });
@@ -1055,6 +1201,70 @@ test("resizing wide, medium, narrow, and back to wide preserves run, phase, and 
 
   overlay.handleInput(ESCAPE);
   assert.deepEqual(closed, [{ type: "close" }], "the final Escape closes the dashboard");
+});
+
+test("? opens a width-safe grouped cheatsheet in every browse pane and dismisses without losing state", (t) => {
+  for (const width of [40, 72, 120]) {
+    const state = harness([workflow("cheatsheet")], 30, () => {}, { fullscreen: true });
+    t.after(() => state.overlay.dispose());
+    state.overlay.render(width);
+    state.overlay.handleInput("j"); // move some transient input through first, unrelated to help
+    const before = state.overlay.render(width).join("\n");
+
+    state.overlay.handleInput("?");
+    const help = state.overlay.render(width);
+    assertPanel(help, width, 30);
+    assert.match(help.join("\n"), /help/);
+    assert.match(help.join("\n"), /Navigate/);
+
+    state.overlay.handleInput("?");
+    assert.equal(state.overlay.render(width).join("\n"), before, "dismissing with ? restores the exact prior state");
+
+    state.overlay.handleInput("?");
+    state.overlay.handleInput(ESCAPE);
+    assert.equal(state.overlay.render(width).join("\n"), before, "Esc also dismisses the cheatsheet without losing state");
+  }
+});
+
+test("the cheatsheet reflects the currently active pane and never closes the dashboard", (t) => {
+  const { overlay, actions } = harness([workflow("cheatsheet-pane")], 30, () => {}, { fullscreen: true });
+  t.after(() => overlay.dispose());
+
+  overlay.render(52); // narrow: starts on the run list
+  overlay.handleInput("?");
+  assert.match(overlay.render(52).join("\n"), /open overview/i, "the narrow-list cheatsheet documents opening the overview");
+  overlay.handleInput("?");
+
+  overlay.handleInput(ENTER); // -> overview
+  overlay.handleInput(ENTER); // -> agent pane
+  overlay.handleInput("?");
+  const agentHelp = overlay.render(52).join("\n");
+  assert.match(agentHelp, /restart this agent/i, "the agent-pane cheatsheet documents restart");
+  assert.doesNotMatch(agentHelp, /pause \/ resume/i, "the agent-pane cheatsheet omits overview-only actions");
+
+  for (const input of ["p", "r", "x", "X", "j", "k"]) overlay.handleInput(input);
+  assert.deepEqual(actions, [], "input is inert while the cheatsheet is shown");
+});
+
+test("configurable confirm/cancel bindings render their configured key names in workflow hints, falling back to defaults otherwise", (t) => {
+  const configured = harness([workflow("configured-keys")], 30, () => {}, {
+    fullscreen: true,
+    getKeys: (binding) => binding === "tui.select.cancel" ? ["q"] : binding === "tui.select.confirm" ? ["space"] : [],
+  });
+  t.after(() => configured.overlay.dispose());
+  assert.match(configured.overlay.render(60).join("\n"), /Space open/i, "the narrow run-list hint reflects the configured confirm key");
+  // Medium/wide always show the overview pane's content, even while `#pane`
+  // is still "list", so no navigation is needed to reach its hint.
+  const overview = configured.overlay.render(90).join("\n");
+  assert.match(overview, /Space inspect/i);
+  assert.match(overview, /Q close/i);
+  assert.doesNotMatch(overview, /Esc close/);
+
+  const defaulted = harness([workflow("default-keys")], 30, () => {}, { fullscreen: true });
+  t.after(() => defaulted.overlay.dispose());
+  const defaultHint = defaulted.overlay.render(90).join("\n");
+  assert.match(defaultHint, /Enter inspect/);
+  assert.match(defaultHint, /Esc close/);
 });
 
 test("/workflows keeps the host overlay geometry and non-TUI summary contract", async () => {

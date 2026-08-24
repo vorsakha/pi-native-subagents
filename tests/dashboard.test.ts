@@ -218,7 +218,7 @@ function dashboard(
   rows = 24,
   done: (value: unknown) => void = () => {},
   renderMarkdown: (text: string, width: number) => string[] = (text) => text.split("\n"),
-  options: { focusJobId?: string; fullscreen?: boolean; sendError?: string; sendPromise?: Promise<JobSnapshot>; submitKey?: string } = {},
+  options: { focusJobId?: string; fullscreen?: boolean; sendError?: string; sendPromise?: Promise<JobSnapshot>; submitKey?: string; getKeys?: (binding: string) => string[] } = {},
 ): DashboardHarness {
   let renders = 0;
   const listeners = new Set<(job: JobSnapshot) => void>();
@@ -265,6 +265,7 @@ function dashboard(
       matches: (data: string, binding: string) =>
         (binding === "tui.select.cancel" && data === "\u0003") ||
         (binding === "tui.input.submit" && data === options.submitKey),
+      ...(options.getKeys ? { getKeys: options.getKeys } : {}),
     } as unknown as KeybindingsManager,
     manager,
     done as never,
@@ -473,6 +474,91 @@ test("dashboard toggles between compact groups and full Pi tool rendering with t
   overlay.handleInput("t");
   const backToCompact = overlay.render(90);
   assert.deepEqual(backToCompact, compact, "toggling twice reproduces the original compact output, including the cache key");
+});
+
+test("t toggles tool display from the narrow list pane, and the detail title carries the mode even when hints truncate", (t) => {
+  const current = {
+    ...job("narrow-tool-toggle", "completed"),
+    output: "",
+    transcript: [
+      { kind: "tool" as const, phase: "start" as const, toolId: "r1", name: "read", args: { path: "a.ts" } },
+      { kind: "tool" as const, phase: "end" as const, toolId: "r1", name: "read", result: { content: [{ type: "text", text: "contents" }], isError: false } },
+    ],
+  };
+  const { overlay } = dashboard([current], 30, () => {}, undefined, { focusJobId: current.id, fullscreen: true });
+  t.after(() => overlay.dispose());
+
+  overlay.render(52);
+  assert.ok(overlay.render(52).some((line) => line.includes("jobs ·")), "narrow layout starts on the list pane");
+  overlay.handleInput("t");
+  overlay.handleInput("\r");
+  const full = overlay.render(52).join("\n");
+  assert.match(full, /detail · [\w-]+ · completed · full/, "the detail title carries the toggled mode");
+  assert.ok(full.includes("a.ts"), "the narrow-list t toggle applied before entering detail");
+
+  overlay.handleInput(ESCAPE);
+  overlay.handleInput("t");
+  overlay.handleInput("\r");
+  assert.match(overlay.render(52).join("\n"), /detail · [\w-]+ · completed · compact/, "a second narrow-list t toggle reverts the mode");
+});
+
+test("? opens a width-safe grouped cheatsheet in browse, dismisses without losing state, and stays printable in takeover", (t) => {
+  for (const width of [40, 72, 120]) {
+    const state = dashboard([job("cheatsheet")], 30, () => {}, undefined, { fullscreen: true });
+    t.after(() => state.overlay.dispose());
+    state.overlay.render(width);
+    state.overlay.handleInput(PAGE_DOWN); // move some transient input through first, unrelated to help
+    state.overlay.handleInput("j"); // narrow layouts stay on the list pane; wide/medium keep the same job selected
+    const before = state.overlay.render(width).join("\n");
+
+    state.overlay.handleInput("?");
+    const help = state.overlay.render(width);
+    assert.equal(help.length, 30);
+    assert.ok(help.every((line) => visibleWidth(line) <= width), `a cheatsheet line exceeds ${width} columns`);
+    assert.match(help.join("\n"), /help/);
+    assert.match(help.join("\n"), /Navigate/);
+
+    state.overlay.handleInput("?");
+    assert.equal(state.overlay.render(width).join("\n"), before, "dismissing with ? restores the exact prior state");
+
+    state.overlay.handleInput("?");
+    state.overlay.handleInput(ESCAPE);
+    assert.equal(state.overlay.render(width).join("\n"), before, "Esc also dismisses the cheatsheet without losing state");
+  }
+});
+
+test("the cheatsheet never intercepts ? inside the takeover composer", (t) => {
+  const state = dashboard([job("cheatsheet-takeover")], 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+  state.overlay.render(90);
+  state.overlay.handleInput("\r");
+  assert.match(state.overlay.render(90).join("\n"), /takeover/);
+
+  state.overlay.handleInput("?");
+  state.overlay.handleInput("!");
+  const composer = state.overlay.render(90).join("\n");
+  assert.match(composer, /\?!/, "? reaches the composer as ordinary text instead of opening the cheatsheet");
+  assert.doesNotMatch(composer, /Navigate/, "the cheatsheet legend never appears while composing");
+});
+
+test("configurable confirm/cancel/submit bindings render their configured key names in hints, falling back to defaults otherwise", (t) => {
+  const configured = dashboard([job("configured-keys")], 30, () => {}, undefined, {
+    fullscreen: true,
+    getKeys: (binding) => binding === "tui.select.cancel" ? ["q"] : binding === "tui.select.confirm" ? ["space"] : [],
+  });
+  t.after(() => configured.overlay.dispose());
+  assert.match(configured.overlay.render(60).join("\n"), /Space open/i, "the narrow list hint reflects the configured confirm key");
+  const wide = configured.overlay.render(90).join("\n");
+  assert.match(wide, /Space takeover/i, "the browse hint reflects the configured confirm key");
+  assert.match(wide, /Q close/i, "the browse hint reflects the configured cancel key");
+  assert.doesNotMatch(wide, /Esc close/);
+
+  const defaulted = dashboard([job("default-keys")], 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => defaulted.overlay.dispose());
+  const defaultHint = defaulted.overlay.render(90).join("\n");
+  assert.match(defaultHint, /Enter takeover/);
+  assert.match(defaultHint, /Esc close/);
 });
 
 test("in-panel takeover toggles tool rendering with Ctrl+T and treats a bare t as composer input", (t) => {
