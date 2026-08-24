@@ -43,6 +43,26 @@ test("reducer tracks lifecycle, tools, usage, and authoritative final message", 
   assert.equal(cancelled.error, "stop");
 });
 
+test("reducer records a native structured completion payload separately from narrative output, and leaves it absent otherwise", () => {
+  const withStructured = reduceJob(job(), { type: "completed", output: "narrative summary", structured: { ok: true }, at: 3 });
+  assert.equal(withStructured.output, "narrative summary");
+  assert.deepEqual(withStructured.structured, { ok: true });
+
+  const withoutStructured = reduceJob(job(), { type: "completed", output: "narrative only", at: 3 });
+  assert.equal(withoutStructured.output, "narrative only");
+  assert.equal(withoutStructured.structured, undefined);
+});
+
+test("reducer preserves a native structured payload exactly, without the string/array/byte truncation applied to other bounded fields", () => {
+  const longString = "x".repeat(30 * 1024);
+  const longArray = Array.from({ length: 100 }, (_, index) => index);
+  const large = { longString, longArray, nested: { longString } };
+  const state = reduceJob(job(), { type: "completed", output: "ok", structured: large, at: 3 });
+  assert.deepEqual(state.structured, large, "a >4 KiB string, a >32 item array, and an overall >50 KiB payload must survive untouched for schema validation");
+  assert.equal((state.structured as typeof large).longString.length, 30 * 1024);
+  assert.equal((state.structured as typeof large).longArray.length, 100);
+});
+
 test("reducer bounds in-memory transcript output", () => {
   const seeded = job();
   seeded.transcript = [{ kind: "assistant", text: "retained context" }];

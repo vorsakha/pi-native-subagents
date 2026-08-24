@@ -16,6 +16,7 @@ import type {
   DiscoveryResult,
   HarnessName,
   JobSnapshot,
+  StructuredOutputSupport,
   Usage,
 } from "../src/types.ts";
 
@@ -71,6 +72,8 @@ export interface ImmediateBackendOptions {
   usage?: Partial<Usage>;
   /** When true, `send` re-completes the run with `<harness>-<message>`. */
   echoSend?: boolean;
+  /** Native structured-output support this backend reports; absent means no `structuredOutputSupport` method at all. */
+  structuredSupport?: StructuredOutputSupport;
 }
 
 /** Backend that completes every run synchronously inside `start`. */
@@ -111,6 +114,13 @@ export class ImmediateBackend implements Backend {
 /** {@link ImmediateBackend} that also answers capability discovery. */
 export class DiscoverableBackend extends ImmediateBackend {
   readonly #capabilities: DiscoveredCapability[];
+  readonly structuredOutputSupportCalls: DiscoveryRequest[] = [];
+  /**
+   * Present only when the fixture was constructed with `structuredSupport`,
+   * exactly like a real adapter that may or may not implement this optional
+   * method at all; an absent method must fail closed to portable, not throw.
+   */
+  structuredOutputSupport?: (request: DiscoveryRequest) => Promise<StructuredOutputSupport>;
 
   constructor(
     name: HarnessName,
@@ -119,6 +129,13 @@ export class DiscoverableBackend extends ImmediateBackend {
   ) {
     super(name, options);
     this.#capabilities = capabilities;
+    if (options.structuredSupport) {
+      const support = options.structuredSupport;
+      this.structuredOutputSupport = async (request) => {
+        this.structuredOutputSupportCalls.push(request);
+        return support;
+      };
+    }
   }
 
   async discover(_request: DiscoveryRequest): Promise<DiscoveryResult> {
@@ -248,11 +265,11 @@ export class ControlledBackend implements Backend {
    * Completes a run by job id. A settled run may be completed again so tests can
    * drive follow-ups on a retained native session; {@link settle} is idempotent.
    */
-  complete(jobId: string, output = "ok", usage?: Partial<Usage>): void {
+  complete(jobId: string, output = "ok", usage?: Partial<Usage>, structured?: unknown): void {
     const run = this.runs.get(jobId);
     assert.ok(run, `backend never started job ${jobId}`);
     if (usage) run.emit({ type: "usage", usage });
-    run.emit({ type: "completed", output });
+    run.emit({ type: "completed", output, ...(structured !== undefined ? { structured } : {}) });
     run.settle();
   }
 
@@ -272,10 +289,10 @@ export class ControlledBackend implements Backend {
     return run;
   }
 
-  completeTask(task: string, output = `${task} output`, usage?: Partial<Usage>): void {
+  completeTask(task: string, output = `${task} output`, usage?: Partial<Usage>, structured?: unknown): void {
     const run = this.#activeRunForTask(task);
     if (usage) run.emit({ type: "usage", usage });
-    run.emit({ type: "completed", output });
+    run.emit({ type: "completed", output, ...(structured !== undefined ? { structured } : {}) });
     run.settle();
   }
 

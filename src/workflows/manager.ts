@@ -1,14 +1,12 @@
 import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
-import type { TSchema } from "typebox";
-import { Check } from "typebox/value";
 import { isRequestedHarness, routeCapabilities, type RequestedHarness } from "../capability-routing.ts";
 import type { CapabilityRouter } from "../capability-service.ts";
 import type { JobManager } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
 import { normalizeModel } from "../policy.ts";
 import { reachedSpendWarning, spendBudgetMetrics, validateSpendBudget } from "../budget.ts";
-import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SpawnRequest, Usage } from "../types.ts";
+import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SpawnRequest, StructuredOutputSupport, Usage } from "../types.ts";
 import {
   appendWorkflowJournal,
   checkpointWorkflow,
@@ -20,7 +18,8 @@ import {
   writeWorkflowReport,
   writeWorkflowResult,
 } from "./artifacts.ts";
-import { replayableJournalCalls, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint } from "./journal.ts";
+import { canonicalJson, replayableJournalCalls, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint } from "./journal.ts";
+import { resolveWorkflowStructured, workflowSchema } from "./schema.ts";
 import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
 import { workflowTaskOutcome } from "./outcome.ts";
 import { finishWorkflowWorktree, prepareWorkflowWorktree, reclaimWorkflowWorktree, type WorkflowWorktreeHandle, type WorkflowWorktreeReclamation } from "./worktree.ts";
@@ -48,6 +47,7 @@ import type {
   WorkflowReplacementReference,
   WorkflowSnapshot,
   WorkflowStatus,
+  WorkflowStructuredTransport,
   WorkflowUsage,
 } from "./types.ts";
 
@@ -788,7 +788,7 @@ export class WorkflowManager {
       state: result.ok ? "completed" : "failed",
       at: Date.now(),
       agentIndex: record?.index,
-      result: clone(result) as WorkflowJournalResult,
+      result: { ...clone(result), transport: record?.structuredTransport } as WorkflowJournalResult,
       route: journalRoute(record),
       replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
     });
@@ -896,7 +896,7 @@ export class WorkflowManager {
       state: result.ok ? "completed" : "failed",
       at: Date.now(),
       agentIndex: record?.index,
-      result: clone(result) as WorkflowJournalResult,
+      result: { ...clone(result), transport: record?.structuredTransport } as WorkflowJournalResult,
       route: journalRoute(record),
       replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
     });
@@ -980,10 +980,6 @@ export class WorkflowManager {
       this.#touch(entry);
       return { ok: false, output: "", error: record.error };
     }
-    const task = schema
-      ? `${prompt}\n\nReturn ONLY valid JSON matching this JSON Schema (no markdown fences):\n${JSON.stringify(schema)}`
-      : prompt;
-
     let worktree: WorkflowWorktreeHandle | undefined;
     const finishIsolation = async () => {
       if (!worktree) return;
@@ -1028,11 +1024,12 @@ export class WorkflowManager {
       ? entry.replay?.priorJobProviders.get(record.independentOf)
       : undefined;
     let job: JobSnapshot;
+    let structuredTransport: WorkflowStructuredTransport | undefined;
     try {
       const routing = await routeCapabilities(this.#router, {
         request: {
           name,
-          task,
+          task: prompt,
           cwd: agentCwd,
           trusted: request.trusted,
           harness,
@@ -1054,7 +1051,7 @@ export class WorkflowManager {
       });
       const spawnRequest = {
         name,
-        task,
+        task: prompt,
         cwd: agentCwd,
         trusted: request.trusted,
         harness: routing.harness ?? (harness === "auto" ? undefined : harness),
@@ -1069,6 +1066,7 @@ export class WorkflowManager {
         profile: record.profile,
         defaultHarness: request.defaultHarness,
         parentProvider: request.parentProvider,
+        structuredOutput: undefined as { schema: Record<string, unknown> } | undefined,
         workflow: {
           runId: entry.snapshot.runId,
           agentIndex: index,
@@ -1077,6 +1075,29 @@ export class WorkflowManager {
         },
         dispatchGate: () => this.#budgetPreflight(entry),
       } satisfies SpawnRequest;
+      if (schema) {
+        // Transport is decided against the exact harness compilePolicy will
+        // pick for this spawnRequest, never a re-derived guess: capability
+        // routing, requires, independence, profile locks, and defaultHarness
+        // all stay authoritative over native structured-output selection.
+        const targetHarness = this.#jobs.resolveHarness(spawnRequest);
+        const support = await this.#router?.structuredOutput?.(targetHarness, {
+          cwd: agentCwd,
+          access: access ?? "full",
+          model,
+          signal,
+        }).catch((error): StructuredOutputSupport => ({ supported: false, detail: boundedText(error) }));
+        structuredTransport = support?.supported ? "native" : "portable";
+        if (structuredTransport === "native") {
+          spawnRequest.structuredOutput = { schema: schema as Record<string, unknown> };
+          record.nativeStructuredSchema = schema as Record<string, unknown>;
+        }
+        spawnRequest.task = structuredTransport === "native"
+          ? prompt
+          : `${prompt}\n\nReturn ONLY valid JSON matching this JSON Schema (no markdown fences):\n${JSON.stringify(schema)}`;
+        record.structuredTransport = structuredTransport;
+        this.#touch(entry);
+      }
       this.#jobs.assertSpendBudgetSupported(spawnRequest, entry.snapshot.budget);
       job = this.#jobs.spawn(spawnRequest);
     } catch (error) {
@@ -1112,19 +1133,19 @@ export class WorkflowManager {
       this.#updateAgentFromJob(final);
       if (final.status === "completed") {
         if (schema) {
-          const structured = parseStructuredOutput(final.output);
-          if (structured === undefined || !Check(schema, structured)) {
+          const outcome = resolveWorkflowStructured(schema, structuredTransport, final);
+          if (!outcome.ok) {
             record.state = "failed";
-            record.error = "Agent output did not match the requested JSON Schema";
+            record.error = outcome.error;
             record.timestamps.updatedAt = Date.now();
             record.timestamps.endedAt = record.timestamps.updatedAt;
             record.structured = undefined;
             this.#touch(entry);
-            return { ok: false, output: final.output, jobId: final.id, error: record.error, usage: clone(final.usage) };
+            return { ok: false, output: final.output, jobId: final.id, error: outcome.error, usage: clone(final.usage) };
           }
-          record.structured = structured;
+          record.structured = outcome.value;
           this.#touch(entry);
-          return { ok: true, output: final.output, structured, jobId: final.id, usage: clone(final.usage) };
+          return { ok: true, output: final.output, structured: outcome.value, jobId: final.id, usage: clone(final.usage) };
         }
         return { ok: true, output: final.output, jobId: final.id, usage: clone(final.usage) };
       }
@@ -1159,6 +1180,7 @@ export class WorkflowManager {
       state: record.state,
       output: record.output,
       structured: record.structured,
+      structuredTransport: record.structuredTransport,
       error: record.error,
       outputProvenance: record.outputProvenance,
       timestamps: { ...record.timestamps },
@@ -1198,16 +1220,30 @@ export class WorkflowManager {
     if (options.schema !== undefined && !schema) {
       return { ok: false, output: "", error: "followUp schema must be a bounded JSON Schema object" };
     }
-    const message = schema
-      ? `${prompt}\n\nReturn ONLY valid JSON matching this JSON Schema (no markdown fences):\n${JSON.stringify(schema)}`
-      : prompt;
+    // A retained native session is schema-bound at agent() time (the SDK
+    // exposes no way to change outputFormat mid-session): followUp() may
+    // reuse that exact schema, or omit schema and still receive it validated,
+    // but cannot request a different one.
+    const nativeLineage = record.structuredTransport === "native" && record.nativeStructuredSchema;
+    if (nativeLineage && schema && canonicalJson(schema) !== canonicalJson(record.nativeStructuredSchema)) {
+      return { ok: false, output: "", error: "followUp() cannot change the schema of a native structured lineage; the retained session is bound to its agent() schema" };
+    }
+    const effectiveSchema = nativeLineage ? workflowSchema(record.nativeStructuredSchema) : schema;
+    // Snapshot generation 0 from the record's pre-follow-up fields before any
+    // mutation below, then re-derive structuredTransport strictly for this
+    // call: it must not linger from a schema-bearing agent() call now
+    // followed by a schemaless followUp() (or the reverse).
+    record.generations ??= [this.#snapshotGeneration(record)];
+    record.structuredTransport = nativeLineage ? "native" : effectiveSchema ? "portable" : undefined;
+    const message = nativeLineage || !schema
+      ? prompt
+      : `${prompt}\n\nReturn ONLY valid JSON matching this JSON Schema (no markdown fences):\n${JSON.stringify(schema)}`;
     // Phase validation/progression mirrors agent(), but a follow-up continues
     // its original lineage card rather than relisting it under a new phase.
     const phase = this.#resolveAgentPhase(entry, options.phase);
     this.#markPhaseRunning(entry, phase);
 
     const now = Date.now();
-    record.generations ??= [this.#snapshotGeneration(record)];
     record.generations.push({
       index: record.generations.length,
       callIndex,
@@ -1252,29 +1288,32 @@ export class WorkflowManager {
       const final = await this.#jobs.wait(jobId, { signal });
       this.#updateAgentFromJob(final);
       if (final.status === "completed") {
-        if (schema) {
-          const structured = parseStructuredOutput(final.output);
-          if (structured === undefined || !Check(schema, structured)) {
+        if (effectiveSchema) {
+          const outcome = resolveWorkflowStructured(effectiveSchema, nativeLineage ? "native" : "portable", final);
+          const generation = record.generations.at(-1);
+          if (!outcome.ok) {
             record.state = "failed";
-            record.error = "Agent output did not match the requested JSON Schema";
+            record.error = outcome.error;
             record.timestamps.updatedAt = Date.now();
             record.timestamps.endedAt = record.timestamps.updatedAt;
             record.structured = undefined;
-            const generation = record.generations.at(-1);
             if (generation) {
               generation.state = "failed";
-              generation.error = record.error;
+              generation.error = outcome.error;
               generation.structured = undefined;
+              generation.structuredTransport = nativeLineage ? "native" : "portable";
               generation.timestamps = { ...generation.timestamps, updatedAt: record.timestamps.updatedAt, endedAt: record.timestamps.endedAt };
             }
             this.#touch(entry);
-            return { ok: false, output: final.output, jobId: final.id, error: record.error, usage: clone(final.usage) };
+            return { ok: false, output: final.output, jobId: final.id, error: outcome.error, usage: clone(final.usage) };
           }
-          record.structured = structured;
-          const generation = record.generations.at(-1);
-          if (generation) generation.structured = structured;
+          record.structured = outcome.value;
+          if (generation) {
+            generation.structured = outcome.value;
+            generation.structuredTransport = nativeLineage ? "native" : "portable";
+          }
           this.#touch(entry);
-          return { ok: true, output: final.output, structured, jobId: final.id, usage: clone(final.usage) };
+          return { ok: true, output: final.output, structured: outcome.value, jobId: final.id, usage: clone(final.usage) };
         }
         return { ok: true, output: final.output, jobId: final.id, usage: clone(final.usage) };
       }
@@ -1309,6 +1348,7 @@ export class WorkflowManager {
       state: "completed",
       output: replay.result.output,
       structured,
+      structuredTransport: replay.result.transport,
       outputProvenance: "replay",
       timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now },
     });
@@ -1321,6 +1361,7 @@ export class WorkflowManager {
     record.state = "completed";
     record.output = replay.result.output;
     record.structured = structured;
+    record.structuredTransport = replay.result.transport;
     record.error = undefined;
     record.timestamps.updatedAt = now;
     record.timestamps.endedAt = now;
@@ -1368,6 +1409,7 @@ export class WorkflowManager {
       tools: [],
       output: replay.result.output,
       structured: replay.result.structured === undefined ? undefined : clone(replay.result.structured),
+      structuredTransport: replay.result.transport,
       usage: workflowUsage(),
     };
     entry.snapshot.agents.push(record);
@@ -1866,80 +1908,6 @@ function workflowBudgetWarnings(budget: WorkflowBudgetPolicy | undefined): strin
   if ((budget.maxTokensPerAgent ?? 0) > 250_000) warnings.push(`Large per-agent token allowance: ${budget.maxTokensPerAgent} fresh/output tokens`);
   if ((budget.maxCost ?? 0) > 20) warnings.push(`Large cost allowance: $${budget.maxCost}`);
   return warnings;
-}
-
-function workflowSchema(value: unknown): TSchema | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  const types = new Set(["null", "boolean", "object", "array", "number", "integer", "string"]);
-  const annotations = new Set(["$id", "$schema", "title", "description", "default", "examples", "readOnly", "writeOnly"]);
-  const numeric = new Set(["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"]);
-  const nonnegative = new Set(["minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"]);
-  const seen = new WeakSet<object>();
-  let nodes = 0;
-  const schema = (current: unknown, depth: number): boolean => {
-    if (current === true || current === false) return true;
-    if (!current || typeof current !== "object" || Array.isArray(current) || seen.has(current) || ++nodes > 2_000 || depth > 16) return false;
-    seen.add(current);
-    let constraint = false;
-    for (const [key, item] of Object.entries(current)) {
-      if (["__proto__", "prototype", "constructor", "$ref", "$dynamicRef"].includes(key)) return false;
-      if (annotations.has(key)) {
-        if (["$id", "$schema", "title", "description"].includes(key) && typeof item !== "string") return false;
-        continue;
-      }
-      if (key === "type") {
-        const values = Array.isArray(item) ? item : [item];
-        if (!values.length || !values.every((entry) => typeof entry === "string" && types.has(entry))) return false;
-        constraint = true;
-      } else if (["properties", "patternProperties", "$defs", "dependentSchemas"].includes(key)) {
-        if (!item || typeof item !== "object" || Array.isArray(item) || !Object.values(item).every((entry) => schema(entry, depth + 1))) return false;
-        constraint = true;
-      } else if (["items", "contains", "additionalProperties", "unevaluatedProperties", "propertyNames", "not", "if", "then", "else"].includes(key)) {
-        if (!schema(item, depth + 1)) return false;
-        constraint = true;
-      } else if (["allOf", "anyOf", "oneOf", "prefixItems"].includes(key)) {
-        if (!Array.isArray(item) || !item.length || !item.every((entry) => schema(entry, depth + 1))) return false;
-        constraint = true;
-      } else if (key === "required" || key === "dependentRequired") {
-        const valid = key === "required"
-          ? Array.isArray(item) && item.every((entry) => typeof entry === "string")
-          : !!item && typeof item === "object" && !Array.isArray(item) && Object.values(item).every((entry) => Array.isArray(entry) && entry.every((name) => typeof name === "string"));
-        if (!valid) return false;
-        constraint = true;
-      } else if (key === "enum") {
-        if (!Array.isArray(item) || !item.length) return false;
-        constraint = true;
-      } else if (key === "const") {
-        constraint = true;
-      } else if (numeric.has(key)) {
-        if (typeof item !== "number" || !Number.isFinite(item) || nonnegative.has(key) && (!Number.isInteger(item) || item < 0) || key === "multipleOf" && item <= 0) return false;
-        constraint = true;
-      } else if (key === "pattern") {
-        if (typeof item !== "string") return false;
-        try { new RegExp(item); } catch { return false; }
-        constraint = true;
-      } else if (key === "format") {
-        if (typeof item !== "string") return false;
-        constraint = true;
-      } else if (key === "uniqueItems") {
-        if (typeof item !== "boolean") return false;
-        constraint = true;
-      } else {
-        return false;
-      }
-    }
-    seen.delete(current);
-    return constraint;
-  };
-  return schema(value, 0) ? value as TSchema : undefined;
-}
-
-function parseStructuredOutput(output: string): unknown {
-  const text = output.trim();
-  const candidate = text.startsWith("```")
-    ? text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")
-    : text;
-  try { return JSON.parse(candidate); } catch { return undefined; }
 }
 
 export function workflowIsTerminal(status: WorkflowStatus): boolean {

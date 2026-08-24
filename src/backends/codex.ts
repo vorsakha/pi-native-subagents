@@ -263,6 +263,7 @@ export class CodexAppServerBackend implements Backend {
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     request.signal.throwIfAborted();
+    if (request.policy.structuredOutput) throw new Error("Codex does not support native structured results");
     const managed = spawnManaged(this.#command, ["app-server", "--stdio"], {
       cwd: request.cwd,
       env: sanitizeSubscriptionEnv(request.env, "codex"),

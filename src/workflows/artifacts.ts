@@ -321,6 +321,8 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
       preview: agent.preview ? truncateUtf8(agent.preview, 1_000) : undefined,
       output: serializeWorkflowValue(agent.output, { maxNodes: 256, maxStringBytes: 4 * 1024, maxTotalBytes: 6 * 1024 }),
       structured: serializeWorkflowValue(agent.structured, { maxNodes: 512, maxStringBytes: 8 * 1024, maxTotalBytes: 16 * 1024 }),
+      // In-memory only: a purely replayed lineage cannot be targeted by followUp() either way, so the schema needed to validate a live native follow-up never survives a process restart.
+      nativeStructuredSchema: undefined,
       transcript: undefined,
       error: agent.error ? truncateUtf8(agent.error, 2_000) : undefined,
       generations: agent.generations?.slice(-8).map((generation) => ({
@@ -400,7 +402,8 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
   if (!record.result || typeof record.result !== "object" || typeof record.result.ok !== "boolean"
       || typeof record.result.output !== "string" || record.result.output.length > JOURNAL_RECORD_BYTES
       || record.result.jobId !== undefined && (typeof record.result.jobId !== "string" || !record.result.jobId || record.result.jobId.length > 200)
-      || record.result.error !== undefined && typeof record.result.error !== "string") return false;
+      || record.result.error !== undefined && typeof record.result.error !== "string"
+      || record.result.transport !== undefined && record.result.transport !== "native" && record.result.transport !== "portable") return false;
   return record.state === "completed" ? record.result.ok : !record.result.ok;
 }
 

@@ -295,6 +295,7 @@ export class JobManager {
       endedAt: undefined,
       error: undefined,
       output: "",
+      structured: undefined,
       truncated: false,
       tools: [],
       liveThinking: "",
