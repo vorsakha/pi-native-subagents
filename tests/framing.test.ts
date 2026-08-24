@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { JsonlFramer, parseJsonRecord } from "../src/framing.ts";
+import { JsonlFramer, MAX_JSONL_FRAME_BYTES, parseJsonRecord } from "../src/framing.ts";
 
 test("JSONL framer accepts split UTF-8 and CRLF but only LF delimits records", () => {
   const framer = new JsonlFramer();
@@ -29,4 +29,14 @@ test("JSONL framer rejects oversized complete and unterminated frames", () => {
   assert.throws(() => new JsonlFramer(8).push("123456789"), /exceeds 8 bytes/);
   assert.throws(() => new JsonlFramer(8).push("123456789\n"), /exceeds 8 bytes/);
   assert.throws(() => new JsonlFramer(8).end("123456789"), /exceeds 8 bytes/);
+});
+
+test("JSONL framer accepts a valid 1.1 MB record at the default bound and still rejects a record past it", () => {
+  const records = new JsonlFramer().push(`${"x".repeat(1_100_000)}\n`);
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.length, 1_100_000);
+  assert.throws(
+    () => new JsonlFramer().push(`${"x".repeat(MAX_JSONL_FRAME_BYTES + 1)}\n`),
+    /JSONL frame exceeds/,
+  );
 });
