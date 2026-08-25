@@ -7,6 +7,7 @@ import {
   type CapabilityCatalog,
 } from "../src/capabilities.ts";
 import { compilePolicy, isIndependent, selectAccess, selectHarness } from "../src/policy.ts";
+import { SUBAGENT_ASK_TOOL_NAME } from "../src/interactions.ts";
 import type { ProfileDefinition, SpawnRequest } from "../src/types.ts";
 
 function request(overrides: Partial<SpawnRequest> = {}): SpawnRequest {
@@ -153,4 +154,18 @@ test("end-to-end: a real capability catalog can never let a delegation-denied re
   })).policy;
   assert.ok(policy.piTools.includes("lint"));
   assert.ok(!policy.piTools.includes("task"), "a denied capability can never reach the compiled tool set because it was never in matched");
+});
+
+test("the routed-question tool is compiled in only for an explicitly authorized job", () => {
+  assert.ok(!compilePolicy(request({ harness: "pi" })).policy.piTools.includes(SUBAGENT_ASK_TOOL_NAME));
+  const granted = compilePolicy(request({ harness: "pi", interaction: { orchestrator: "allow" } })).policy;
+  assert.ok(granted.piTools.includes(SUBAGENT_ASK_TOOL_NAME));
+
+  // A read-only sandbox still gets it: the tool mutates nothing, and the grant
+  // is a per-job authorization rather than an inherited capability.
+  const readOnly = compilePolicy(request({ harness: "pi", access: "readOnly", interaction: { peers: true } })).policy;
+  assert.ok(readOnly.piTools.includes(SUBAGENT_ASK_TOOL_NAME));
+  // Human parent-tool inheritance can never introduce it on its own.
+  const inherited = compilePolicy(request({ harness: "pi", humanVisible: true, humanPiTools: [SUBAGENT_ASK_TOOL_NAME, "read"] })).policy;
+  assert.ok(!inherited.piTools.includes(SUBAGENT_ASK_TOOL_NAME), "the ask tool is never inherited from the parent's own inventory");
 });

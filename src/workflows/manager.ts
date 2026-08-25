@@ -2,8 +2,9 @@ import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isRequestedHarness, routeCapabilities, type RequestedHarness } from "../capability-routing.ts";
 import type { CapabilityRouter } from "../capability-service.ts";
-import type { JobManager } from "../manager.ts";
+import type { JobManager, PeerInteractionRequest, PeerInteractionResult } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
+import { renderPeerQuestionPrompt, type PendingInteraction } from "../interactions.ts";
 import { normalizeModel } from "../policy.ts";
 import { reachedSpendWarning, spendBudgetMetrics, validateSpendBudget } from "../budget.ts";
 import { waitDecision, type ProviderUnavailability } from "../provider-unavailability.ts";
@@ -19,7 +20,15 @@ import {
   writeWorkflowReport,
   writeWorkflowResult,
 } from "./artifacts.ts";
-import { canonicalJson, replayableJournalCalls, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint } from "./journal.ts";
+import {
+  canonicalJson,
+  replayableJournalCalls,
+  replayableJournalInteractions,
+  workflowCallFingerprint,
+  workflowDefinitionFingerprint,
+  workflowFollowUpFingerprint,
+  workflowInteractionFingerprint,
+} from "./journal.ts";
 import { resolveWorkflowStructured, workflowSchema } from "./schema.ts";
 import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
 import { workflowTaskOutcome } from "./outcome.ts";
@@ -44,6 +53,9 @@ import type {
   WorkflowJournalRoute,
   WorkflowApprovalMode,
   WorkflowBudgetPolicy,
+  WorkflowInteractionJournalDetail,
+  WorkflowInteractionSummary,
+  WorkflowReplayInteraction,
   WorkflowPhase,
   WorkflowReplayCall,
   WorkflowReplacementReference,
@@ -62,6 +74,14 @@ export const MAX_WORKFLOW_PHASES = 64;
 export const MAX_WORKFLOW_PHASE_NAME_LENGTH = 160;
 /** Bounded turn history retained per agent lineage; older generations are dropped, newest first preserved. */
 const MAX_AGENT_GENERATIONS = 8;
+/**
+ * Bounded host-routed questions per run. Interactions share the run's hard
+ * 32-call ceiling but own a separate ordinal, so asking a question never
+ * consumes a sandbox `agent()`/`followUp()` ordinal from inside a child.
+ */
+export const MAX_WORKFLOW_INTERACTIONS = 32;
+/** Bounded interaction history kept on the snapshot for `/workflows`. */
+const MAX_WORKFLOW_INTERACTION_HISTORY = 16;
 /** followUp() options are presentation/validation only; every policy field stays fixed at the original agent() call. */
 const FOLLOWUP_OPTION_KEYS = new Set(["phase", "schema"]);
 
@@ -96,6 +116,10 @@ export interface StartedWorkflow {
 interface ReplayRuntime {
   sourceRunId: string;
   calls: WorkflowReplayCall[];
+  /** Completed peer answers from the source run, matched by identity rather than ordinal. */
+  interactions: WorkflowReplayInteraction[];
+  /** Ordinals already served in this run, so one record answers at most one question. */
+  usedInteractions: Set<number>;
   active: boolean;
   priorJobProviders: Map<string, ProviderFamily>;
 }
@@ -122,11 +146,14 @@ interface RunEntry {
   providerWaits: Map<number, AbortController>;
   /** Shared, run-wide `retry.maxWaitMs` allowance. Synchronously decremented by every call (sequential or concurrent) so the total time spent waiting across the whole run never exceeds the configured budget. */
   providerWaitBudgetMs: number;
+  /** Interaction ordinal assigned to each routed question, keyed by host request ID. */
+  interactionOrdinals: Map<string, number>;
 }
 
 interface ReplaySource {
   snapshot: WorkflowSnapshot;
   calls: WorkflowReplayCall[];
+  interactions: WorkflowReplayInteraction[];
 }
 
 function workflowUsage(usage?: Partial<Usage>): WorkflowUsage {
@@ -286,6 +313,7 @@ export class WorkflowManager {
   readonly #mutationTails = new Map<string, Promise<void>>();
   readonly #listeners = new Set<(snapshot: WorkflowSnapshot) => void>();
   readonly #unsubscribeJobs: () => void;
+  readonly #releasePeerRouter: () => void;
   readonly #approveMutation?: (request: { runId: string; workflow: string; agent: string; prompt: string; signal: AbortSignal }) => Promise<boolean>;
   readonly #router?: CapabilityRouter;
   readonly #resolveProfile?: (name: string) => ProfileDefinition | undefined;
@@ -321,6 +349,9 @@ export class WorkflowManager {
       : DEFAULT_WORKFLOW_RETAINED_RUNS;
     this.#providerWaitClock = options.providerWaitClock ?? DEFAULT_PROVIDER_WAIT_CLOCK;
     this.#unsubscribeJobs = this.#jobs.subscribe((job, event) => this.#updateAgentFromJob(job, event));
+    // Same-run peer routing is workflow policy; JobManager owns only the
+    // generic lifecycle rules and hands the authorized request over here.
+    this.#releasePeerRouter = this.#jobs.setPeerInteractionRouter((request) => this.#answerPeerQuestion(request));
   }
 
   async initialize(): Promise<void> {
@@ -407,6 +438,8 @@ export class WorkflowManager {
       replay = {
         sourceRunId: source.snapshot.runId,
         calls,
+        interactions: source.interactions,
+        usedInteractions: new Set(),
         active: true,
         priorJobProviders: new Map(calls.flatMap((call) => {
           const jobId = call.result.jobId ?? call.route?.jobId;
@@ -473,6 +506,7 @@ export class WorkflowManager {
       metadataReceived: false,
       providerWaits: new Map(),
       providerWaitBudgetMs: retry?.maxWaitMs ?? 0,
+      interactionOrdinals: new Map(),
     };
     this.#runs.set(snapshot.runId, entry);
     entry.completion = this.#execute(entry, request);
@@ -520,6 +554,7 @@ export class WorkflowManager {
       metadataReceived: true,
       providerWaits: new Map(),
       providerWaitBudgetMs: snapshot.retry?.maxWaitMs ?? 0,
+      interactionOrdinals: new Map(),
     };
     this.#runs.set(snapshot.runId, entry);
     return entry;
@@ -533,9 +568,11 @@ export class WorkflowManager {
   async #loadReplaySource(runId: string): Promise<ReplaySource | undefined> {
     const inMemory = this.#runs.get(runId);
     if (inMemory) {
+      const records = await loadWorkflowJournal(this.#artifactRoot, runId);
       return {
         snapshot: inMemory.snapshot,
-        calls: replayableJournalCalls(await loadWorkflowJournal(this.#artifactRoot, runId)),
+        calls: replayableJournalCalls(records),
+        interactions: replayableJournalInteractions(records),
       };
     }
     const lease = this.#retentionLease;
@@ -543,11 +580,11 @@ export class WorkflowManager {
     return withWorkflowRetentionLock(this.#artifactRoot, async () => {
       const snapshot = await readWorkflowRunSummary(this.#artifactRoot, runId);
       if (!snapshot) return undefined;
-      if (!terminalWorkflow(snapshot.status)) return { snapshot, calls: [] };
+      if (!terminalWorkflow(snapshot.status)) return { snapshot, calls: [], interactions: [] };
       await lease.claimWhileLocked([runId]);
       this.#replaySourceRunIds.add(runId);
-      const calls = replayableJournalCalls(await loadWorkflowJournal(this.#artifactRoot, runId));
-      return { snapshot, calls };
+      const records = await loadWorkflowJournal(this.#artifactRoot, runId);
+      return { snapshot, calls: replayableJournalCalls(records), interactions: replayableJournalInteractions(records) };
     });
   }
 
@@ -716,6 +753,7 @@ export class WorkflowManager {
     ]);
     if (timer) clearTimeout(timer);
     this.#unsubscribeJobs();
+    this.#releasePeerRouter();
     for (const entry of this.#runs.values()) {
       if (entry.checkpointTimer) clearTimeout(entry.checkpointTimer);
       entry.checkpointTimer = undefined;
@@ -1247,6 +1285,12 @@ export class WorkflowManager {
           phase: entry.snapshot.phases[phase]?.name,
         },
         dispatchGate: () => this.#budgetPreflight(entry),
+        // A workflow child may ask an authorized same-run peer, and may wake the
+        // parent orchestrator only when this run is itself in the background:
+        // a foreground workflow's parent turn is blocked awaiting the workflow
+        // tool result and cannot safely start another turn.
+        interaction: { orchestrator: entry.snapshot.background ? "allow" : "foregroundDenied", peers: true },
+        interactionGate: (target) => this.#interactionGate(entry, target),
       } satisfies SpawnRequest;
       if (schema) {
         // Transport is decided against the exact harness compilePolicy will
@@ -1617,6 +1661,12 @@ export class WorkflowManager {
   }
 
   async #withDispatchSlot<T>(entry: RunEntry, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+    await this.#acquireDispatchSlot(entry, signal);
+    try { return await operation(); }
+    finally { this.#releaseDispatchSlot(entry); }
+  }
+
+  async #acquireDispatchSlot(entry: RunEntry, signal: AbortSignal): Promise<void> {
     const limit = entry.snapshot.budget?.maxConcurrency ?? 4;
     while (entry.activeDispatches >= limit) {
       if (signal.aborted) throw abortError(signal.reason);
@@ -1632,14 +1682,366 @@ export class WorkflowManager {
       });
     }
     entry.activeDispatches++;
-    try { return await operation(); }
-    finally {
-      entry.activeDispatches--;
-      const ready = entry.dispatchWaiters.values().next().value as (() => void) | undefined;
-      if (ready) {
-        entry.dispatchWaiters.delete(ready);
-        ready();
+  }
+
+  #releaseDispatchSlot(entry: RunEntry): void {
+    entry.activeDispatches--;
+    const ready = entry.dispatchWaiters.values().next().value as (() => void) | undefined;
+    if (ready) {
+      entry.dispatchWaiters.delete(ready);
+      ready();
+    }
+  }
+
+  /**
+   * Runs a peer-answer turn under the same workflow dispatch limit as ordinary
+   * calls. The asking agent still owns its own dispatch slot but is parked in a
+   * host tool callback and performs no inference, so its slot is handed back
+   * first: otherwise a run with maxConcurrency 1 would deadlock against itself.
+   * The slot is always taken back before the caller resumes, including on abort,
+   * so the caller's own `finally` releases exactly one slot.
+   */
+  async #withParkedDispatchSlot<T>(entry: RunEntry, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
+    this.#releaseDispatchSlot(entry);
+    try {
+      return await this.#withDispatchSlot(entry, signal, operation);
+    } finally {
+      try { await this.#acquireDispatchSlot(entry, signal); }
+      catch { entry.activeDispatches++; }
+    }
+  }
+
+  /* ── routed interactions ─────────────────────────────────────────────── */
+
+  /**
+   * Admission check for one routed question, run before any interaction state
+   * exists. Bounds the run's interaction count and refuses to open a question
+   * the run could not afford to answer anyway.
+   */
+  #interactionGate(entry: RunEntry, target: "orchestrator" | "agent"): string | undefined {
+    if (terminalWorkflow(entry.snapshot.status)) return `Workflow ${entry.snapshot.runId} already ${entry.snapshot.status}`;
+    if (entry.interactionOrdinals.size >= MAX_WORKFLOW_INTERACTIONS) {
+      return `Workflow interaction budget exhausted (${MAX_WORKFLOW_INTERACTIONS} routed questions)`;
+    }
+    // A peer answer is a real model turn on the target lineage; an orchestrator
+    // answer costs this run no provider work, so it is not budget-gated here.
+    return target === "agent" ? this.#budgetPreflight(entry) : undefined;
+  }
+
+  /** Stable interaction ordinal for one host request, allocated on first sight. */
+  #interactionOrdinal(entry: RunEntry, requestId: string): number {
+    const existing = entry.interactionOrdinals.get(requestId);
+    if (existing !== undefined) return existing;
+    const ordinal = entry.interactionOrdinals.size;
+    entry.interactionOrdinals.set(requestId, ordinal);
+    return ordinal;
+  }
+
+  /**
+   * Mirrors one routed-question transition onto the run so `/workflows` can
+   * distinguish an interaction wait from a provider-quota wait, scheduler
+   * queueing, or a user pause. Authoritative state stays in `JobManager`.
+   */
+  #applyInteractionEvent(job: JobSnapshot, event: BackendEvent): void {
+    const owner = this.#jobOwners.get(job.id);
+    if (!owner) return;
+    const entry = this.#runs.get(owner.runId);
+    const agent = entry?.snapshot.agents[owner.agentIndex];
+    if (!entry || !agent) return;
+    if (event.type === "interaction_answering") {
+      agent.answering = event.answering
+        ? {
+            requestId: event.answering.requestId,
+            sourceAgentIndex: this.#jobOwners.get(event.answering.sourceJobId)?.agentIndex,
+            sourceName: event.answering.sourceName,
+          }
+        : undefined;
+      this.#touch(entry);
+      return;
+    }
+    if (event.type === "interaction_cleared") {
+      if (agent.waitingOn?.requestId === event.requestId) agent.waitingOn = undefined;
+      this.#touch(entry);
+      return;
+    }
+    if (event.type !== "interaction") return;
+    const summary = this.#interactionSummary(entry, owner.agentIndex, agent.name, event.interaction);
+    agent.waitingOn = summary.state === "pending" || summary.state === "answering" ? summary : undefined;
+    const history = entry.snapshot.interactions ??= [];
+    const index = history.findIndex((item) => item.requestId === summary.requestId);
+    if (index >= 0) history[index] = summary;
+    else history.push(summary);
+    if (history.length > MAX_WORKFLOW_INTERACTION_HISTORY) history.splice(0, history.length - MAX_WORKFLOW_INTERACTION_HISTORY);
+    this.#touch(entry);
+  }
+
+  #interactionSummary(
+    entry: RunEntry,
+    sourceAgentIndex: number,
+    sourceName: string,
+    interaction: PendingInteraction,
+  ): WorkflowInteractionSummary {
+    const targetAgentIndex = interaction.target.jobId
+      ? entry.snapshot.agents.findIndex((candidate) => candidate.jobId === interaction.target.jobId)
+      : -1;
+    return {
+      ordinal: this.#interactionOrdinal(entry, interaction.requestId),
+      requestId: interaction.requestId,
+      target: interaction.target.kind === "orchestrator" ? "orchestrator" : "peer",
+      sourceAgentIndex,
+      sourceName,
+      targetAgentIndex: targetAgentIndex >= 0 ? targetAgentIndex : undefined,
+      targetName: targetAgentIndex >= 0 ? entry.snapshot.agents[targetAgentIndex].name : interaction.target.label,
+      question: boundedText(interaction.question, 2 * 1024),
+      context: interaction.context ? boundedText(interaction.context, 2 * 1024) : undefined,
+      state: interaction.state,
+      route: interaction.route,
+      createdAt: interaction.createdAt,
+      answeredAt: interaction.answeredAt,
+      answer: interaction.answer ? boundedText(interaction.answer, 4 * 1024) : undefined,
+      error: interaction.error,
+    };
+  }
+
+  /**
+   * Answers one same-workflow peer question. `JobManager` has already enforced
+   * the generic rules (authorized policy, not self, one outstanding question,
+   * no wait cycle, live target still completed and retained); this owns the
+   * workflow-specific ones: run membership, worktree eligibility, budgets,
+   * durable journalling, and replay of a recorded answer when the target
+   * lineage was itself replayed and has no live session left.
+   */
+  async #answerPeerQuestion(request: PeerInteractionRequest): Promise<PeerInteractionResult> {
+    const owner = this.#jobOwners.get(request.source.id);
+    if (!owner) throw new Error("Peer questions are limited to workflow-owned agents");
+    const entry = this.#runs.get(owner.runId);
+    if (!entry) throw new Error("The asking agent's workflow run is no longer active");
+    if (terminalWorkflow(entry.snapshot.status)) throw new Error(`Workflow ${entry.snapshot.runId} already ${entry.snapshot.status}`);
+    const source = entry.snapshot.agents[owner.agentIndex];
+    if (!source) throw new Error("The asking agent is no longer part of this workflow run");
+    const targetIndex = entry.snapshot.agents.findIndex((candidate) => candidate.jobId === request.targetJobId);
+    const target = targetIndex >= 0 ? entry.snapshot.agents[targetIndex] : undefined;
+    if (!target || targetIndex === owner.agentIndex) {
+      throw new Error(`Peer agent ${request.targetJobId} does not belong to this workflow run`);
+    }
+    if (target.isolation) {
+      throw new Error(`Peer agent ${target.name} ran in an isolated worktree that already finalized (${target.isolation.state}); its retained session is intentionally unavailable`);
+    }
+    if (target.state !== "completed") {
+      throw new Error(`Peer agent ${target.name} is ${target.state}; only a completed agent can answer a peer question`);
+    }
+    if (!target.callFingerprint) {
+      throw new Error(`Peer agent ${target.name} has no durable call fingerprint and cannot safely answer or replay a peer question`);
+    }
+    // The host already marked this target as answering *this* request; only a
+    // different one means the lineage is busy.
+    if (target.answering && target.answering.requestId !== request.requestId) {
+      throw new Error(`Peer agent ${target.name} is already answering another question`);
+    }
+
+    const ordinal = this.#interactionOrdinal(entry, request.requestId);
+    if (ordinal >= MAX_WORKFLOW_INTERACTIONS) {
+      throw new Error(`Workflow interaction budget exhausted (${MAX_WORKFLOW_INTERACTIONS} routed questions)`);
+    }
+    const questionFingerprint = workflowInteractionFingerprint({ question: request.question, context: request.context });
+    const detail: WorkflowInteractionJournalDetail = {
+      sourceAgentIndex: owner.agentIndex,
+      sourceGeneration: request.source.generation,
+      targetAgentIndex: targetIndex,
+      targetJobId: target.jobId,
+      targetCallFingerprint: target.callFingerprint,
+    };
+    await this.#appendJournal(entry, {
+      callIndex: ordinal,
+      fingerprint: questionFingerprint,
+      kind: "peerQuestion",
+      state: "started",
+      at: Date.now(),
+      agentIndex: owner.agentIndex,
+      interaction: { ...detail },
+    });
+
+    try {
+      const replayed = this.#matchReplayedInteraction(entry, questionFingerprint, detail);
+      if (replayed) {
+        await this.#appendJournal(entry, {
+          callIndex: ordinal,
+          fingerprint: questionFingerprint,
+          kind: "peerQuestion",
+          state: "completed",
+          at: Date.now(),
+          agentIndex: owner.agentIndex,
+          result: { ok: true, output: replayed.answer, usage: replayed.usage },
+          interaction: { ...detail, targetGeneration: replayed.detail.targetGeneration, route: "replay" },
+        });
+        return { answer: replayed.answer, targetGeneration: replayed.detail.targetGeneration, targetLabel: target.name, route: "replay" };
       }
+      if (!request.target) {
+        if (target.replayedFrom) {
+          throw new Error(`Peer agent ${target.name} was replayed from ${entry.replay?.sourceRunId ?? "an earlier run"} and retains no native session, and no recorded answer matches this question. Re-run without resumeFromRunId, or ask the orchestrator instead.`);
+        }
+        throw new Error(`Peer agent ${target.name} no longer has a live retained session (it may have been evicted); ask the orchestrator or rerun the target agent`);
+      }
+      const preflight = this.#budgetPreflight(entry);
+      if (preflight) throw new Error(preflight);
+      const dispatched = await this.#withParkedDispatchSlot(entry, request.signal, async () => {
+        await this.#waitUntilResumed(entry, request.signal);
+        return this.#dispatchPeerAnswer(entry, target, {
+          requestId: request.requestId,
+          sourceAgentIndex: owner.agentIndex,
+          sourceName: source.name,
+          question: request.question,
+          context: request.context,
+          signal: request.signal,
+        });
+      });
+      await this.#appendJournal(entry, {
+        callIndex: ordinal,
+        fingerprint: questionFingerprint,
+        kind: "peerQuestion",
+        state: "completed",
+        at: Date.now(),
+        agentIndex: owner.agentIndex,
+        result: { ok: true, output: dispatched.answer, jobId: target.jobId, usage: dispatched.usage },
+        route: journalRoute(target),
+        interaction: { ...detail, targetGeneration: dispatched.targetGeneration, route: "peer" },
+      });
+      return { answer: dispatched.answer, targetGeneration: dispatched.targetGeneration, targetLabel: target.name, route: "peer" };
+    } catch (error) {
+      await this.#appendJournal(entry, {
+        callIndex: ordinal,
+        fingerprint: questionFingerprint,
+        kind: "peerQuestion",
+        state: "failed",
+        at: Date.now(),
+        agentIndex: owner.agentIndex,
+        result: { ok: false, output: "", error: boundedText(error, 2_000) },
+        interaction: { ...detail },
+      }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * A recorded answer is reusable only as an exact identity match: same asking
+   * lineage and generation, same target lineage and target call fingerprint,
+   * and the same question. Ordinals are deliberately not part of the key,
+   * because a rerun replays a different mix of calls and would otherwise never
+   * line up. Each record answers at most one question per run.
+   */
+  #matchReplayedInteraction(
+    entry: RunEntry,
+    questionFingerprint: string,
+    detail: WorkflowInteractionJournalDetail,
+  ): WorkflowReplayInteraction | undefined {
+    const replay = entry.replay;
+    if (!replay?.active) return undefined;
+    const match = replay.interactions.find((candidate) =>
+      !replay.usedInteractions.has(candidate.ordinal)
+      && candidate.questionFingerprint === questionFingerprint
+      && candidate.detail.sourceAgentIndex === detail.sourceAgentIndex
+      && candidate.detail.sourceGeneration === detail.sourceGeneration
+      && candidate.detail.targetAgentIndex === detail.targetAgentIndex
+      && candidate.detail.targetCallFingerprint === detail.targetCallFingerprint);
+    if (match) replay.usedInteractions.add(match.ordinal);
+    return match;
+  }
+
+  /**
+   * Continues the target's retained native session with the constrained peer
+   * prompt and records the answer as another generation on that lineage. The
+   * target keeps its original policy and context; usage lands on the target's
+   * own record, so aggregate workflow budgets charge it like any other turn.
+   */
+  async #dispatchPeerAnswer(
+    entry: RunEntry,
+    target: WorkflowAgentRecord,
+    input: { requestId: string; sourceAgentIndex: number; sourceName: string; question: string; context?: string; signal: AbortSignal },
+  ): Promise<{ answer: string; targetGeneration: number; usage?: Usage }> {
+    const jobId = target.jobId;
+    if (!jobId) throw new Error(`Peer agent ${target.name} has no retained native session`);
+    const prompt = renderPeerQuestionPrompt({ sourceName: input.sourceName, question: input.question, context: input.context });
+    const now = Date.now();
+    target.generations ??= [this.#snapshotGeneration(target)];
+    target.generations.push({
+      index: target.generations.length,
+      callIndex: target.callIndex ?? 0,
+      prompt: `Peer question from ${input.sourceName}: ${boundedText(input.question, 1_000)}`,
+      state: "queued",
+      outputProvenance: "peerAnswer",
+      timestamps: { createdAt: now, updatedAt: now },
+    });
+    if (target.generations.length > MAX_AGENT_GENERATIONS) target.generations.splice(0, target.generations.length - MAX_AGENT_GENERATIONS);
+    const generationIndex = target.generations.at(-1)!.index;
+    // The completed lineage as the script already saw it. A peer answer is
+    // auxiliary work, so a failed one marks only its own generation failed and
+    // restores this projection instead of retroactively turning a completed
+    // agent — whose result the script has already consumed — into a failed one.
+    const settled = {
+      state: target.state,
+      output: target.output,
+      structured: target.structured,
+      outputProvenance: target.outputProvenance,
+      preview: target.preview,
+      truncated: target.truncated,
+      instructionShaped: target.instructionShaped,
+      error: target.error,
+      endedAt: target.timestamps.endedAt,
+    };
+    target.answering = { requestId: input.requestId, sourceAgentIndex: input.sourceAgentIndex, sourceName: input.sourceName };
+    target.state = "queued";
+    target.error = undefined;
+    target.timestamps.updatedAt = now;
+    this.#touch(entry);
+
+    const failGeneration = (message: string) => {
+      const generation = target.generations?.find((candidate) => candidate.index === generationIndex);
+      const at = Date.now();
+      target.state = settled.state;
+      target.output = settled.output;
+      target.structured = settled.structured;
+      target.outputProvenance = settled.outputProvenance;
+      target.preview = settled.preview;
+      target.truncated = settled.truncated;
+      target.instructionShaped = settled.instructionShaped;
+      target.error = settled.error;
+      target.timestamps.updatedAt = at;
+      target.timestamps.endedAt = settled.endedAt ?? at;
+      if (generation) {
+        generation.state = "failed";
+        generation.error = message;
+        generation.output = undefined;
+        generation.outputProvenance = "peerAnswer";
+        generation.timestamps = { ...generation.timestamps, updatedAt: at, endedAt: at };
+      }
+      this.#touch(entry);
+    };
+
+    let abort: (() => void) | undefined;
+    try {
+      const queued = await this.#jobs.continueWorkflowJob(jobId, prompt);
+      this.#updateAgentFromJob(queued);
+      abort = () => { void this.#jobs.cancel(jobId, "Peer answer cancelled").catch(() => undefined); };
+      if (input.signal.aborted) abort();
+      else input.signal.addEventListener("abort", abort, { once: true });
+      const final = await this.#jobs.wait(jobId, { signal: input.signal });
+      this.#updateAgentFromJob(final);
+      if (final.status !== "completed") throw new Error(final.error ?? `Peer agent ${final.status} before answering`);
+      if (!final.output.trim()) throw new Error(`Peer agent ${target.name} returned no answer text`);
+      // The lineage's latest turn is a host-routed answer, not script-driven
+      // work; tag it after the terminal projection so provenance survives.
+      const generation = target.generations?.find((candidate) => candidate.index === generationIndex);
+      if (generation) generation.outputProvenance = "peerAnswer";
+      target.outputProvenance = "peerAnswer";
+      this.#touch(entry);
+      return { answer: final.output, targetGeneration: generationIndex, usage: final.usage };
+    } catch (error) {
+      failGeneration(boundedText(error));
+      throw error;
+    } finally {
+      if (abort) input.signal.removeEventListener("abort", abort);
+      target.answering = undefined;
+      this.#touch(entry);
     }
   }
 
@@ -1812,6 +2214,10 @@ export class WorkflowManager {
   }
 
   #updateAgentFromJob(job: JobSnapshot, event: BackendEvent = { type: "started" }): void {
+    if (event.type === "interaction" || event.type === "interaction_cleared" || event.type === "interaction_answering") {
+      this.#applyInteractionEvent(job, event);
+      return;
+    }
     const owner = this.#jobOwners.get(job.id);
     if (!owner) return;
     const entry = this.#runs.get(owner.runId);

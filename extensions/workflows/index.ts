@@ -96,6 +96,8 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
       error: agent.error,
       usage: structuredClone(agent.usage),
       providerWait: agent.providerWait ? structuredClone(agent.providerWait) : undefined,
+      waitingOn: agent.waitingOn ? structuredClone(agent.waitingOn) : undefined,
+      answering: agent.answering ? structuredClone(agent.answering) : undefined,
       attempts: agent.attempts ? structuredClone(agent.attempts) : undefined,
       output: undefined,
       transcript: undefined,

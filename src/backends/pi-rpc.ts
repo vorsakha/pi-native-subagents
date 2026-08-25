@@ -9,6 +9,13 @@ import { JsonlFramer, parseJsonRecord } from "../framing.ts";
 import { spawnManaged } from "../process-tree.ts";
 import { boundedAppend } from "../reducer.ts";
 import { PI_PARENT_THREAD_FILE } from "../parent-thread-context.ts";
+import { openInteractionBridge, type InteractionBridge } from "../interaction-bridge.ts";
+import {
+  PI_INTERACTION_ADDRESS,
+  PI_INTERACTION_TARGETS,
+  PI_INTERACTION_TOKEN,
+  type InteractionHandler,
+} from "../interactions.ts";
 import type {
   Backend,
   BackendEvent,
@@ -24,6 +31,7 @@ import type {
 /** Marks a Pi child so this package registers nothing inside it. */
 export const PI_CHILD_MARKER = "PI_NATIVE_SUBAGENTS_CHILD";
 const CHILD_EXTENSION_PATH = fileURLToPath(new URL("../../extensions/parent-thread/index.ts", import.meta.url));
+const INTERACTION_EXTENSION_PATH = fileURLToPath(new URL("../../extensions/interactions/index.ts", import.meta.url));
 
 /** Parent-session inventory injected by the extension; discovery never imports Pi's runtime. */
 export interface PiParentInventory {
@@ -36,6 +44,8 @@ interface PiBackendOptions {
   inactivityTimeoutMs?: number;
   /** Live parent tool/command inventory, e.g. `pi.getAllTools()` and `pi.getCommands()`. */
   parentInventory?: () => PiParentInventory;
+  /** Injected for tests; production opens a real authenticated loopback bridge. */
+  openInteractionBridge?: (jobId: string, handler: InteractionHandler) => Promise<InteractionBridge>;
 }
 
 /**
@@ -79,12 +89,14 @@ export class PiRpcBackend implements Backend {
   readonly #requestTimeoutMs: number;
   readonly #inactivityTimeoutMs: number;
   readonly #parentInventory?: () => PiParentInventory;
+  readonly #openBridge: (jobId: string, handler: InteractionHandler) => Promise<InteractionBridge>;
 
   constructor(command = "pi", options: PiBackendOptions = {}) {
     this.#command = command;
     this.#requestTimeoutMs = options.requestTimeoutMs ?? 30_000;
     this.#inactivityTimeoutMs = options.inactivityTimeoutMs ?? 15 * 60_000;
     this.#parentInventory = options.parentInventory;
+    this.#openBridge = options.openInteractionBridge ?? openInteractionBridge;
   }
 
   /**
@@ -271,12 +283,20 @@ export class PiRpcBackend implements Backend {
       "--name", `subagent-${request.name}-${request.jobId.slice(0, 8)}`,
     ];
     let parentThreadDir: string | undefined;
-    let parentThreadCleaned = false;
+    let childResourcesCleaned = false;
+    let bridge: InteractionBridge | undefined;
     const cleanupParentThread = async () => {
-      if (parentThreadCleaned || !parentThreadDir) return;
-      parentThreadCleaned = true;
-      await rm(parentThreadDir, { recursive: true, force: true });
+      if (childResourcesCleaned) return;
+      childResourcesCleaned = true;
+      if (bridge) await bridge.close().catch(() => undefined);
+      if (parentThreadDir) await rm(parentThreadDir, { recursive: true, force: true });
     };
+    // The Pi child runs in its own process, so its ask tool cannot call the
+    // host callback directly. The bridge is a live authenticated loopback
+    // channel opened only for this job; the watchdog handle is bound after the
+    // process exists, so a validated wait suspends the same countdown the
+    // in-process adapters suspend.
+    const park = { suspend: () => {}, resume: () => {} };
     let childEnv = piChildEnv(request.env);
     try {
       if (request.parentThread) {
@@ -285,6 +305,23 @@ export class PiRpcBackend implements Backend {
         await writeFile(snapshotPath, JSON.stringify(request.parentThread), { encoding: "utf8", mode: 0o600 });
         childEnv = { ...childEnv, [PI_PARENT_THREAD_FILE]: snapshotPath };
         args.push("--extension", CHILD_EXTENSION_PATH);
+      }
+      if (request.interactions) {
+        const handler = request.interactions;
+        bridge = await this.#openBridge(request.jobId, {
+          ask: async (input) => {
+            park.suspend();
+            try { return await handler.ask(input); }
+            finally { park.resume(); }
+          },
+        });
+        childEnv = {
+          ...childEnv,
+          [PI_INTERACTION_ADDRESS]: bridge.address,
+          [PI_INTERACTION_TOKEN]: bridge.token,
+          [PI_INTERACTION_TARGETS]: request.interactionTargets?.join(",") || "orchestrator",
+        };
+        args.push("--extension", INTERACTION_EXTENSION_PATH);
       }
     } catch (error) {
       await cleanupParentThread();
@@ -324,6 +361,8 @@ export class PiRpcBackend implements Backend {
       finish({ type: "failed", error: `Pi RPC produced no activity for ${this.#inactivityTimeoutMs}ms` });
       void managed.terminate();
     });
+    park.suspend = () => watchdog.suspend();
+    park.resume = () => watchdog.resume();
 
     const rejectPending = (error: Error) => {
       for (const item of pending.values()) {

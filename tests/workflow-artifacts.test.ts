@@ -161,6 +161,18 @@ test("no-resume loading aborts paused future checkpoints plus queued agents and 
   input.timestamps.pausedAt = future;
   input.phases[0]!.status = "pending";
   input.agents[0]!.state = "queued";
+  input.agents[0]!.waitingOn = {
+    ordinal: 0,
+    requestId: "req-stale",
+    target: "orchestrator",
+    sourceAgentIndex: 0,
+    sourceName: "security",
+    question: "Which policy applies?",
+    state: "pending",
+    createdAt: future,
+  };
+  input.agents[0]!.answering = { requestId: "req-other", sourceName: "planner" };
+  input.interactions = [input.agents[0]!.waitingOn];
   const created = await createWorkflowArtifacts(root, {
     script: "export default async () => null;\n",
     args: {},
@@ -175,6 +187,10 @@ test("no-resume loading aborts paused future checkpoints plus queued agents and 
   assert.equal(loaded[0]?.status, "aborted");
   assert.equal(loaded[0]?.phases[0]?.status, "aborted");
   assert.equal(loaded[0]?.agents[0]?.state, "aborted");
+  assert.equal(loaded[0]?.agents[0]?.waitingOn, undefined, "a restored run cannot keep advertising an unanswerable question");
+  assert.equal(loaded[0]?.agents[0]?.answering, undefined);
+  assert.equal(loaded[0]?.interactions?.[0]?.state, "cancelled", "the durable audit trail records how the stale wait ended");
+  assert.equal(loaded[0]?.interactions?.[0]?.answeredAt, 1);
   assert.equal(loaded[0]?.plannedPhaseCount, 1, "the declared total survives stale restoration");
 });
 

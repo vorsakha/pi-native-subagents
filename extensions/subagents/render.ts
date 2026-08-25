@@ -5,6 +5,7 @@ import { formatDurationLabel } from "../dashboard-style.ts";
 import { isTerminal } from "../../src/manager.ts";
 import { formatSpendBudget } from "../../src/budget.ts";
 import type { PeerSessionSummary } from "../../src/session-peers.ts";
+import type { PendingInteraction } from "../../src/interactions.ts";
 import type { ContextSnapshot, JobSnapshot, JobStatus, SendBehavior, Usage } from "../../src/types.ts";
 
 /*
@@ -232,7 +233,9 @@ export interface JobCardOptions {
 export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCardOptions): string[] {
   const { expanded, now } = options;
   const budget = expanded ? MAX_EXPANDED_LINES : MAX_COLLAPSED_LINES;
-  const status = statusMeta(job.status, now);
+  const status = pendingInteraction(job)
+    ? { glyph: "?", color: "warning" as TraceStatusColor }
+    : statusMeta(job.status, now);
   const lines: string[] = [];
 
   if (options.lead) lines.push(options.lead);
@@ -240,10 +243,20 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
   const profile = job.profile ? ` · profile ${sanitizeInline(job.profile)}` : "";
   const independent = job.independent ? " · independent" : "";
   const peerMarker = job.peer ? " · peer" : "";
-  const statusLabel = sanitizeInline(options.statusLabel ?? job.status);
+  const statusLabel = sanitizeInline(options.statusLabel ?? interactionStatusLabel(job) ?? job.status);
   const header = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(job.name)))} ${theme.fg("dim", `${shortId(sanitizeText(job.id))} · ${statusLabel} · ${formatElapsed(job, now)}`)}`;
   const policy = theme.fg("dim", `${job.access}${profile}${independent}${peerMarker} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}`);
   lines.push(header, policy);
+
+  const pending = pendingInteraction(job);
+  if (pending) {
+    // The blocked question outranks the task text: it is the only thing that
+    // moves this job forward, so it is pinned directly under the header.
+    lines.push(sectionLine(theme, "Question", `${interactionWaitLabel(pending)} — ${sanitizeInline(pending.question)}`, "text"));
+  }
+  if (job.answeringInteraction) {
+    lines.push(sectionLine(theme, "Answering", `peer question from ${sanitizeInline(job.answeringInteraction.sourceName)}`, "muted"));
+  }
 
   const task = sanitizeInline(job.task);
   if (options.expanded && task) lines.push(sectionLine(theme, "Task", task));
@@ -314,6 +327,62 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
   return [...content, footer].slice(0, budget);
 }
 
+/** The live question a job is parked on, if any; a settled record renders as ordinary history. */
+export function pendingInteraction(job: Pick<JobSnapshot, "interaction">): PendingInteraction | undefined {
+  const interaction = job.interaction;
+  return interaction && (interaction.state === "pending" || interaction.state === "answering") ? interaction : undefined;
+}
+
+/** Word-carried wait vocabulary; never color alone. */
+export function interactionWaitLabel(interaction: PendingInteraction): string {
+  if (interaction.target.kind === "orchestrator") {
+    return interaction.humanVisible ? "needs your answer" : "needs orchestrator";
+  }
+  return `waiting for ${sanitizeInline(interaction.target.label ?? shortId(interaction.target.jobId ?? "peer"))}`;
+}
+
+/** Display-only status label for a job parked on a routed question. */
+export function interactionStatusLabel(job: Pick<JobSnapshot, "interaction" | "answeringInteraction">): string | undefined {
+  const pending = pendingInteraction(job);
+  if (pending) return interactionWaitLabel(pending);
+  return job.answeringInteraction ? "answering peer" : undefined;
+}
+
+/**
+ * Standalone card for one routed question delivered to the parent thread. It
+ * carries the request ID the parent must answer with, and marks the question as
+ * untrusted child text rather than an instruction.
+ */
+export function renderInteractionCard(
+  interaction: PendingInteraction,
+  theme: Theme,
+  options: { expanded: boolean; now: number; state?: string; standalone?: boolean },
+): Component {
+  const state = options.state ?? interaction.state;
+  const meta = state === "answered"
+    ? { glyph: "✓", color: "success" as TraceStatusColor }
+    : state === "pending" || state === "answering"
+      ? { glyph: "?", color: "warning" as TraceStatusColor }
+      : { glyph: "■", color: "warning" as TraceStatusColor };
+  const lines: string[] = [
+    `${theme.fg(meta.color, meta.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(interaction.sourceName)))} ${theme.fg("dim", `${shortId(sanitizeText(interaction.sourceJobId))} · asks the orchestrator · ${state}`)}`,
+    sectionLine(theme, "Request", sanitizeInline(interaction.requestId), "muted"),
+    sectionLine(theme, "Question", sanitizeInline(interaction.question), "text"),
+  ];
+  if (interaction.context) lines.push(sectionLine(theme, "Context", sanitizeInline(interaction.context), "muted"));
+  if (interaction.answer) {
+    const answerLines = sanitizeText(interaction.answer).split("\n").map((line) => line.trimEnd()).filter(Boolean);
+    const preview = headTailPreview(answerLines, options.expanded ? MAX_TAIL_EXPANDED : MAX_TAIL_COLLAPSED);
+    for (const [index, line] of preview.shown.entries()) lines.push(sectionLine(theme, index ? "" : "Answer", line || " ", "toolOutput"));
+  }
+  if (interaction.error) lines.push(sectionLine(theme, "Error", sanitizeInline(interaction.error), "error"));
+  if (state === "pending") {
+    lines.push(sectionLine(theme, "Reply", `answer with subagent_answer({ requestId, answer }) · the child is parked until then`, "dim"));
+  }
+  const budget = options.expanded ? MAX_EXPANDED_LINES : MAX_COLLAPSED_LINES;
+  return linesComponent(traceResultLines(theme, clampLines(theme, lines, budget), options.standalone));
+}
+
 export function renderJobCard(job: JobSnapshot, theme: Theme, options: JobCardOptions & { standalone?: boolean }): Component {
   return linesComponent(traceResultLines(theme, buildJobCardLines(job, theme, options), options.standalone));
 }
@@ -327,9 +396,10 @@ export function renderJobReceipt(job: JobSnapshot, theme: Theme, options: { acti
 }
 
 function jobRow(job: JobSnapshot, theme: Theme, now: number): string {
-  const status = statusMeta(job.status, now);
+  const status = pendingInteraction(job) ? { glyph: "?", color: "warning" as TraceStatusColor } : statusMeta(job.status, now);
   const peerMarker = job.peer ? " · peer" : "";
-  return `${theme.fg(status.color, status.glyph)} ${theme.fg("dim", job.status.padEnd(9))} ${theme.fg("toolTitle", shortId(sanitizeText(job.id)))} ${sanitizeInline(job.name)} ${theme.fg("dim", `· ${job.access}${job.independent ? " · independent" : ""}${peerMarker} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)} · ${formatElapsed(job, now)}`)}`;
+  const label = interactionStatusLabel(job) ?? job.status;
+  return `${theme.fg(status.color, status.glyph)} ${theme.fg("dim", label.slice(0, 20).padEnd(9))} ${theme.fg("toolTitle", shortId(sanitizeText(job.id)))} ${sanitizeInline(job.name)} ${theme.fg("dim", `· ${job.access}${job.independent ? " · independent" : ""}${peerMarker} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)} · ${formatElapsed(job, now)}`)}`;
 }
 
 export function renderJobListCard(jobs: JobSnapshot[], theme: Theme, options: { expanded: boolean; now: number }): Component {

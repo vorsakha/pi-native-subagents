@@ -2,6 +2,22 @@ import { randomUUID } from "node:crypto";
 import { compilePolicy } from "./policy.ts";
 import { assertSupportedSpendBudget, firstReachedSpendWarning, reachedSpendWarning, spendBudgetMetrics, validateSpendBudget, type SpendBudget, type SpendMetric } from "./budget.ts";
 import { emptyUsage, reduceJob } from "./reducer.ts";
+import {
+  DEFAULT_INTERACTION_TIMEOUT_MS,
+  InteractionError,
+  InteractionWaitGraph,
+  normalizeAnswer,
+  normalizeContext,
+  normalizeQuestion,
+  normalizeTarget,
+  renderInteractionAnswer,
+  type InteractionAskInput,
+  type InteractionAskResult,
+  type InteractionHandler,
+  type InteractionRoute,
+  type InteractionTargetKind,
+  type PendingInteraction,
+} from "./interactions.ts";
 import type { Backend, BackendEvent, BackendRun, HarnessName, JobSnapshot, ProfileDefinition, ProviderFamily, SendBehavior, SpawnRequest } from "./types.ts";
 
 const GENERIC_SYSTEM_PROMPT = `You are an isolated, task-driven subagent. Work only on the supplied task and return a concise, evidence-based result. You do not have access to parent conversation context beyond the task. Before recommending structural changes, inspect applicable repository instructions, scripts, CI, and nearby conventions. Distinguish acceptance failures, convention violations, verification gaps, and optional improvements; do not prescribe an implementation mechanism that the acceptance wording does not require. Treat absent tests as a defect only when repository convention or concrete regression risk justifies it. Do not spawn subagents or workflows.`;
@@ -34,7 +50,36 @@ interface InternalJob {
   /** Last observer-safe projection, used to reuse unchanged bounded collections on streaming events. */
   publishedSource?: JobSnapshot;
   publishedSnapshot?: JobSnapshot;
+  /** The single active-turn lease this job's in-flight generation owns. */
+  lease?: ActiveTurnLease;
+  /** The one outstanding question this generation is parked on. */
+  interaction?: InternalInteraction;
+  /** Set while this job's retained session is producing a peer answer. */
+  answeringInteraction?: { requestId: string; sourceJobId: string; sourceName: string };
 }
+
+interface InternalInteraction {
+  record: PendingInteraction;
+  settle(outcome: { answer: string; route: InteractionRoute; targetGeneration?: number; label?: string } | { error: Error; state: PendingInteraction["state"] }): void;
+  cancelDeadline?: () => void;
+  controller: AbortController;
+  settled: boolean;
+}
+
+/** Injectable interaction deadline clock. Tests advance it without sleeping. */
+export interface InteractionDeadlineClock {
+  now(): number;
+  schedule(callback: () => void, delayMs: number): () => void;
+}
+
+const DEFAULT_INTERACTION_CLOCK: InteractionDeadlineClock = {
+  now: () => Date.now(),
+  schedule(callback, delayMs) {
+    const timer = setTimeout(callback, Math.max(0, delayMs));
+    timer.unref?.();
+    return () => clearTimeout(timer);
+  },
+};
 
 function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: JobSnapshot }): JobSnapshot {
   return {
@@ -57,6 +102,121 @@ function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: J
       : undefined,
     warnings: previous && previous.source.warnings === snapshot.warnings ? previous.value.warnings : snapshot.warnings ? [...snapshot.warnings] : undefined,
     unavailable: snapshot.unavailable ? { ...snapshot.unavailable } : undefined,
+    interaction: snapshot.interaction
+      ? { ...snapshot.interaction, target: { ...snapshot.interaction.target }, workflow: snapshot.interaction.workflow ? { ...snapshot.interaction.workflow } : undefined }
+      : undefined,
+    answeringInteraction: snapshot.answeringInteraction ? { ...snapshot.answeringInteraction } : undefined,
+  };
+}
+
+/**
+ * Idempotent ownership of exactly one active-turn slot.
+ *
+ * The scheduler cap counts active native model turns, not resident native
+ * sessions: a caller parked on a routed question keeps its provider process
+ * open but performs no inference, so it must give the slot back. Release and
+ * reacquisition live here rather than in ad-hoc `#active` arithmetic so no race
+ * can create a fifth active turn or leak capacity.
+ */
+class ActiveTurnLease {
+  readonly #hooks: { release(): void; enqueue(lease: ActiveTurnLease): void; dequeue(lease: ActiveTurnLease): void };
+  /** Direct work keeps the scheduler priority it had before leases existed. */
+  readonly direct: boolean;
+  #state: "held" | "parked" | "waiting" | "released" = "held";
+  #waiter?: { resolve(): void; reject(error: Error): void };
+
+  constructor(
+    direct: boolean,
+    hooks: { release(): void; enqueue(lease: ActiveTurnLease): void; dequeue(lease: ActiveTurnLease): void },
+  ) {
+    this.direct = direct;
+    this.#hooks = hooks;
+  }
+
+  get held(): boolean {
+    return this.#state === "held";
+  }
+
+  /** Gives the slot back without invalidating the lease. Safe to call twice. */
+  park(): void {
+    if (this.#state !== "held") return;
+    this.#state = "parked";
+    this.#hooks.release();
+  }
+
+  /** Queues for a slot again. Rejects if the lease was released or shut down. */
+  reacquire(): Promise<void> {
+    if (this.#state === "held") return Promise.resolve();
+    if (this.#state !== "parked") return Promise.reject(new Error("Scheduler lease is no longer valid"));
+    this.#state = "waiting";
+    return new Promise<void>((resolve, reject) => {
+      this.#waiter = { resolve, reject };
+      this.#hooks.enqueue(this);
+    });
+  }
+
+  /** Scheduler-side grant; the caller has already accounted for the slot. */
+  grant(): void {
+    if (this.#state !== "waiting") return;
+    this.#state = "held";
+    const waiter = this.#waiter;
+    this.#waiter = undefined;
+    waiter?.resolve();
+  }
+
+  /** Permanently gives up the slot and fails any queued reacquisition. Idempotent. */
+  release(reason = "Scheduler lease was released"): void {
+    if (this.#state === "released") return;
+    const previous = this.#state;
+    this.#state = "released";
+    if (previous === "held") this.#hooks.release();
+    else if (previous === "waiting") {
+      this.#hooks.dequeue(this);
+      const waiter = this.#waiter;
+      this.#waiter = undefined;
+      waiter?.reject(new Error(reason));
+    }
+  }
+}
+
+/** Bounded request the workflow runtime answers when a child asks an authorized peer. */
+export interface PeerInteractionRequest {
+  requestId: string;
+  source: JobSnapshot;
+  /** The opaque job ID the caller addressed, always present. */
+  targetJobId: string;
+  /** The live target job, when one is still retained; absent for a replayed lineage. */
+  target?: JobSnapshot;
+  question: string;
+  context?: string;
+  /** Aborted when the caller is cancelled, the deadline passes, or the session shuts down. */
+  signal: AbortSignal;
+}
+
+export interface PeerInteractionResult {
+  answer: string;
+  /** Lineage generation on the target that produced this answer. */
+  targetGeneration?: number;
+  targetLabel?: string;
+  /** `replay` marks an answer served from the durable journal with no new dispatch. */
+  route?: "peer" | "replay";
+}
+
+export type PeerInteractionRouter = (request: PeerInteractionRequest) => Promise<PeerInteractionResult>;
+
+/** Target kinds this job's grant actually allows, for accurate tool description. */
+function interactionTargetKinds(policy: { orchestrator?: string; peers?: boolean }): InteractionTargetKind[] {
+  return [
+    ...(policy.orchestrator ? ["orchestrator" as const] : []),
+    ...(policy.peers ? ["agent" as const] : []),
+  ];
+}
+
+function cloneInteraction(record: PendingInteraction): PendingInteraction {
+  return {
+    ...record,
+    target: { ...record.target },
+    workflow: record.workflow ? { ...record.workflow } : undefined,
   };
 }
 
@@ -91,6 +251,13 @@ export class JobManager {
   readonly #concurrency: number;
   readonly #startupTimeoutMs: number;
   readonly #operationTimeoutMs: number;
+  readonly #interactionTimeoutMs: number;
+  readonly #interactionClock: InteractionDeadlineClock;
+  /** Parked callers waiting to reacquire a slot, in arrival order. */
+  readonly #leaseQueue = new Set<ActiveTurnLease>();
+  readonly #interactions = new Map<string, InternalJob>();
+  readonly #waitGraph = new InteractionWaitGraph();
+  #peerRouter?: PeerInteractionRouter;
   #active = 0;
   #closed = false;
 
@@ -100,12 +267,18 @@ export class JobManager {
     concurrency?: number;
     startupTimeoutMs?: number;
     operationTimeoutMs?: number;
+    /** Bounded deadline for one routed question; a parked caller never waits forever. */
+    interactionTimeoutMs?: number;
+    /** Test-only deadline clock; production uses wall time and an unref'd timer. */
+    interactionClock?: InteractionDeadlineClock;
   }) {
     this.#backends = new Map(options.backends.map((backend) => [backend.name, backend]));
     this.#profiles = options.profiles ?? new Map();
     this.#concurrency = Math.max(1, Math.min(4, options.concurrency ?? 4));
     this.#startupTimeoutMs = Math.max(1, options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS);
     this.#operationTimeoutMs = Math.max(1, options.operationTimeoutMs ?? DEFAULT_OPERATION_TIMEOUT_MS);
+    this.#interactionTimeoutMs = Math.max(1_000, options.interactionTimeoutMs ?? DEFAULT_INTERACTION_TIMEOUT_MS);
+    this.#interactionClock = options.interactionClock ?? DEFAULT_INTERACTION_CLOCK;
   }
 
   /** The single global concurrent-job budget shared by direct and workflow jobs. */
@@ -228,6 +401,12 @@ export class JobManager {
     if (job.snapshot.status === "queued" && job.pendingRestart) {
       throw new Error(`Cannot send to ${id}: a follow-up is waiting for an available slot`);
     }
+    if (job.interaction && !job.interaction.settled) {
+      throw new Error(`Cannot send to ${id}: the job is parked on a pending question; answer or dismiss it first`);
+    }
+    if (job.answeringInteraction) {
+      throw new Error(`Cannot send to ${id}: the job is answering a peer question`);
+    }
     if (behavior === "followUp" && !isTerminal(job.snapshot.status)) {
       await this.wait(id);
       return this.send(id, message, "followUp");
@@ -343,6 +522,10 @@ export class JobManager {
   async cancel(id: string, reason = "Cancelled by parent"): Promise<JobSnapshot> {
     const job = this.#jobs.get(id);
     if (!job) throw new Error(`Unknown job: ${id}`);
+    // A completed target can already be marked as answering while its retained
+    // follow-up is crossing the queue boundary. Cancel the interaction before
+    // the ordinary terminal no-op so that race cannot orphan peer-answer work.
+    this.#cancelJobInteractions(job, reason);
     if (isTerminal(job.snapshot.status)) return clone(job.snapshot);
     if (job.snapshot.status === "queued") {
       const index = this.#queue.indexOf(id);
@@ -375,6 +558,14 @@ export class JobManager {
   async shutdown(timeoutMs = 5_000): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    // Session shutdown cancels session-local questions, matching the job
+    // lifecycle: a parked tool callback must be rejected, and a queued
+    // peer-answer follow-up must never dispatch afterwards.
+    for (const job of this.#jobs.values()) this.#cancelJobInteractions(job, "Session shutdown");
+    for (const lease of [...this.#leaseQueue]) lease.release("Session shutdown");
+    this.#leaseQueue.clear();
+    this.#waitGraph.clear();
+    this.#peerRouter = undefined;
     const operations: Promise<unknown>[] = [];
     for (const job of this.#jobs.values()) {
       operations.push((async () => {
@@ -435,15 +626,51 @@ export class JobManager {
     if (this.#jobs.size >= MAX_RETAINED_JOBS) throw new Error(`Job retention limit reached (${MAX_RETAINED_JOBS}); wait for or cancel existing jobs`);
   }
 
+  #createLease(job: InternalJob): ActiveTurnLease {
+    this.#active++;
+    return new ActiveTurnLease(!job.snapshot.workflow, {
+      release: () => {
+        this.#active--;
+        this.#pump();
+      },
+      enqueue: (lease) => {
+        this.#leaseQueue.add(lease);
+        this.#pump();
+      },
+      dequeue: (lease) => this.#leaseQueue.delete(lease),
+    });
+  }
+
   #pump(): void {
-    while (!this.#closed && this.#active < this.#concurrency && this.#queue.length > 0) {
+    while (!this.#closed && this.#active < this.#concurrency) {
+      // A parked direct caller keeps the same priority as other direct work.
+      // Within that class it has already started a native turn, so resume it
+      // before launching another direct process.
+      const waitingDirect = [...this.#leaseQueue].find((lease) => lease.direct);
+      if (waitingDirect) {
+        this.#leaseQueue.delete(waitingDirect);
+        this.#active++;
+        waitingDirect.grant();
+        continue;
+      }
       // Interactive/direct work gets the next available slot instead of
-      // sitting behind a workflow's entire fan-out. Workflows still use every
-      // idle slot when no direct job is waiting.
+      // sitting behind a workflow's fan-out or a workflow caller waiting to
+      // resume after a question.
       const directIndex = this.#queue.findIndex((id) => {
         const candidate = this.#jobs.get(id);
         return candidate?.snapshot.status === "queued" && !candidate.inFlight && !candidate.snapshot.workflow;
       });
+      if (directIndex < 0) {
+        // With no direct work waiting, resume a workflow caller before launching
+        // more workflow work. This prevents full-cap question deadlocks.
+        const waiting = this.#leaseQueue.values().next().value as ActiveTurnLease | undefined;
+        if (waiting) {
+          this.#leaseQueue.delete(waiting);
+          this.#active++;
+          waiting.grant();
+          continue;
+        }
+      }
       const nextIndex = directIndex >= 0 ? directIndex : this.#queue.findIndex((id) => {
         const candidate = this.#jobs.get(id);
         return candidate?.snapshot.status === "queued" && !candidate.inFlight;
@@ -458,7 +685,7 @@ export class JobManager {
         continue;
       }
       job.inFlight = true;
-      this.#active++;
+      job.lease = this.#createLease(job);
       const launch = job.run && job.pendingRestart ? this.#restart(job) : this.#launch(job);
       this.#launches.add(launch);
       void launch.finally(() => this.#launches.delete(launch));
@@ -491,6 +718,8 @@ export class JobManager {
         resumeSessionFile: job.request.peer?.sessionFile,
         rawInitialMessage: job.request.peer ? true : undefined,
         parentThread: job.request.parentThread,
+        interactions: job.request.interaction ? this.#interactionHandler(job) : undefined,
+        interactionTargets: job.request.interaction ? interactionTargetKinds(job.request.interaction) : undefined,
       }, (event) => this.#handleBackendEvent(job, event));
       let startedRun: BackendRun;
       try {
@@ -538,9 +767,7 @@ export class JobManager {
         if (run) await this.#serialize(job, () => run.close()).catch(() => undefined);
         job.run = undefined;
       }
-      job.inFlight = false;
-      this.#active--;
-      this.#pump();
+      this.#releaseLease(job);
     }
   }
 
@@ -551,9 +778,7 @@ export class JobManager {
     job.pendingRestart = undefined;
     if (!run || !pending) {
       this.#emit(job, { type: "failed", error: "Native session is no longer available" });
-      job.inFlight = false;
-      this.#active--;
-      this.#pump();
+      this.#releaseLease(job);
       return;
     }
     try {
@@ -570,10 +795,323 @@ export class JobManager {
         await this.#serialize(job, () => run.close()).catch(() => undefined);
         if (job.run === run) job.run = undefined;
       }
-      job.inFlight = false;
-      this.#active--;
-      this.#pump();
+      this.#releaseLease(job);
     }
+  }
+
+  /** Ends a generation's slot ownership exactly once and rescheduling follows. */
+  #releaseLease(job: InternalJob): void {
+    const lease = job.lease;
+    job.lease = undefined;
+    job.inFlight = false;
+    lease?.release("Job generation ended while its scheduler lease was queued");
+    // A parked lease already returned its slot, so its release() does not pump;
+    // schedule unconditionally so the freed generation cannot strand the queue.
+    this.#pump();
+  }
+
+  /* ── routed interactions ─────────────────────────────────────────────── */
+
+  /**
+   * Installs the same-workflow peer answerer. `JobManager` owns the generic
+   * lifecycle rules (target exists, completed, retained, not recursive, no
+   * cycle); run membership, worktree eligibility, budgets, journalling, and
+   * replay stay with the workflow runtime that actually owns those agents.
+   */
+  setPeerInteractionRouter(router: PeerInteractionRouter | undefined): () => void {
+    this.#peerRouter = router;
+    return () => {
+      if (this.#peerRouter === router) this.#peerRouter = undefined;
+    };
+  }
+
+  /** Every interaction currently pending or being answered, oldest first. */
+  pendingInteractions(): PendingInteraction[] {
+    return [...this.#interactions.values()]
+      .map((job) => job.interaction!.record)
+      .filter((record) => record.state === "pending" || record.state === "answering")
+      .sort((left, right) => left.createdAt - right.createdAt)
+      .map((record) => cloneInteraction(record));
+  }
+
+  interaction(requestId: string): PendingInteraction | undefined {
+    const record = this.#interactions.get(requestId)?.interaction?.record;
+    return record ? cloneInteraction(record) : undefined;
+  }
+
+  /**
+   * Resolves one pending orchestrator question. Deliberately not part of
+   * {@link send}: steer and follow-up messages start or queue user turns, while
+   * this resolves a provider tool call that is already in progress. Late,
+   * duplicate, dismissed, expired, and terminal-job answers all fail here.
+   */
+  answerInteraction(requestId: string, answer: string, route: "orchestrator-model" | "human" = "orchestrator-model"): PendingInteraction {
+    const job = this.#interactions.get(requestId);
+    const pending = job?.interaction;
+    if (!job || !pending || pending.record.requestId !== requestId) {
+      throw new InteractionError(`Unknown or already-resolved question: ${requestId}`);
+    }
+    if (pending.settled || pending.record.state !== "pending") {
+      throw new InteractionError(`Question ${requestId} is ${pending.record.state} and can no longer be answered`);
+    }
+    if (pending.record.target.kind !== "orchestrator") {
+      throw new InteractionError(`Question ${requestId} is routed to a peer agent and is not answerable here`);
+    }
+    if (isTerminal(job.snapshot.status)) {
+      throw new InteractionError(`Question ${requestId} belongs to a ${job.snapshot.status} job`);
+    }
+    pending.settle({ answer: normalizeAnswer(answer), route });
+    return cloneInteraction(pending.record);
+  }
+
+  /** Rejects a pending question without answering it; the child's tool call fails. */
+  dismissInteraction(requestId: string, reason = "Question dismissed"): PendingInteraction {
+    const job = this.#interactions.get(requestId);
+    const pending = job?.interaction;
+    if (!job || !pending) throw new InteractionError(`Unknown or already-resolved question: ${requestId}`);
+    if (pending.settled) throw new InteractionError(`Question ${requestId} is ${pending.record.state} and can no longer be dismissed`);
+    pending.settle({ error: new InteractionError(reason), state: "dismissed" });
+    return cloneInteraction(pending.record);
+  }
+
+  #interactionHandler(job: InternalJob): InteractionHandler {
+    return { ask: (input) => this.#ask(job, input) };
+  }
+
+  async #ask(job: InternalJob, input: InteractionAskInput): Promise<InteractionAskResult> {
+    const policy = job.request.interaction;
+    if (!policy) throw new InteractionError("This subagent is not authorized to ask routed questions");
+    if (this.#closed) throw new InteractionError("The Pi session is shutting down; the question was not routed");
+    // The recursion guard is checked before lifecycle: a job producing a peer
+    // answer gets the accurate refusal, not an incidental status message.
+    if (job.answeringInteraction) {
+      throw new InteractionError("A peer-answer turn cannot ask another agent or the orchestrator; answer the question you were given");
+    }
+    if (isTerminal(job.snapshot.status)) throw new InteractionError("This job has already settled and cannot ask a question");
+    if (job.interaction) throw new InteractionError("This turn already has an outstanding question; wait for its answer before asking another");
+
+    const gate = job.request.interactionGate?.(normalizeTarget(input.target).kind);
+    if (gate) throw new InteractionError(gate);
+
+    const question = normalizeQuestion(input.question);
+    const context = normalizeContext(input.context);
+    const target = normalizeTarget(input.target);
+    if (target.kind === "orchestrator") {
+      if (policy.orchestrator === undefined) throw new InteractionError("This subagent is not authorized to ask the parent orchestrator");
+      if (policy.orchestrator === "foregroundDenied") {
+        throw new InteractionError("A foreground subagent cannot ask the parent orchestrator: the parent turn is already blocked awaiting this tool result and cannot start another turn. Ask the parent to re-run this work as a background subagent_spawn job, or proceed with a stated assumption.");
+      }
+    } else {
+      if (!policy.peers) throw new InteractionError("This subagent is not authorized to ask peer agents");
+      this.#assertPeerEligible(job, target.jobId!);
+    }
+
+    const now = this.#interactionClock.now();
+    const record: PendingInteraction = {
+      requestId: randomUUID(),
+      sourceJobId: job.snapshot.id,
+      sourceName: job.snapshot.name,
+      sourceGeneration: job.snapshot.generation,
+      humanVisible: job.snapshot.humanVisible,
+      workflow: job.snapshot.workflow ? { ...job.snapshot.workflow } : undefined,
+      target,
+      question,
+      context,
+      createdAt: now,
+      expiresAt: now + this.#interactionTimeoutMs,
+      state: "pending",
+    };
+
+    const controller = new AbortController();
+    let settle!: InternalInteraction["settle"];
+    const answered = new Promise<PendingInteraction>((resolve, reject) => {
+      settle = (outcome) => {
+        if (pending.settled) return;
+        pending.settled = true;
+        pending.cancelDeadline?.();
+        pending.cancelDeadline = undefined;
+        record.answeredAt = this.#interactionClock.now();
+        if ("error" in outcome) {
+          record.state = outcome.state;
+          record.error = outcome.error.message;
+          controller.abort(outcome.error);
+          this.#publishInteraction(job, record);
+          reject(outcome.error);
+          return;
+        }
+        record.state = "answered";
+        record.route = outcome.route;
+        record.answer = outcome.answer;
+        record.targetGeneration = outcome.targetGeneration;
+        if (outcome.label) record.target = { ...record.target, label: outcome.label };
+        this.#publishInteraction(job, record);
+        resolve(record);
+      };
+    });
+    const pending: InternalInteraction = { record, settle, controller, settled: false };
+    pending.cancelDeadline = this.#interactionClock.schedule(
+      () => settle({ error: new InteractionError(`Question ${record.requestId} expired after ${this.#interactionTimeoutMs}ms with no answer`), state: "expired" }),
+      this.#interactionTimeoutMs,
+    );
+
+    job.interaction = pending;
+    this.#interactions.set(record.requestId, job);
+    if (target.kind === "agent") this.#waitGraph.add(job.snapshot.id, target.jobId!);
+    this.#publishInteraction(job, record);
+
+    // The provider has already entered this host tool callback, so the caller's
+    // turn performs no inference until the answer arrives: give the slot back.
+    const lease = job.lease;
+    lease?.park();
+
+    try {
+      if (target.kind === "agent") await this.#routePeerQuestion(job, pending);
+      const settled = await answered;
+      // Resolve the provider tool call only after the caller owns a slot again.
+      if (lease) await lease.reacquire();
+      return {
+        answer: renderInteractionAnswer(settled),
+        requestId: settled.requestId,
+        route: settled.route ?? "orchestrator-model",
+        answeredBy: settled.target.kind === "orchestrator" ? "orchestrator" : settled.target.label ?? settled.target.jobId ?? "peer",
+      };
+    } catch (error) {
+      // A dismissed, expired, or failed question returns a tool error and the
+      // child may continue reasoning, so it still needs a slot first. A
+      // cancelled or terminal generation is ending instead and must not queue
+      // a pointless reacquisition behind unrelated work.
+      const continuing = record.state !== "cancelled"
+        && !this.#closed
+        && !job.cancelRequested
+        && !isTerminal(job.snapshot.status);
+      if (continuing && lease && !lease.held) await lease.reacquire().catch(() => undefined);
+      throw error;
+    } finally {
+      this.#clearInteraction(job, record.requestId);
+    }
+  }
+
+  /**
+   * Generic peer eligibility. Run membership, worktree isolation, budgets, and
+   * journal replay stay with the workflow runtime that owns those agents. A
+   * target this manager has never seen is not rejected here: a replayed lineage
+   * legitimately has no live job, and only the workflow runtime can decide
+   * whether a recorded answer satisfies it.
+   */
+  #assertPeerEligible(job: InternalJob, targetId: string): InternalJob | undefined {
+    if (targetId === job.snapshot.id) throw new InteractionError("A peer question cannot target the asking agent");
+    if (!job.snapshot.workflow) throw new InteractionError("Peer questions are limited to agents from the same workflow run");
+    if (this.#waitGraph.wouldCycle(job.snapshot.id, targetId)) {
+      throw new InteractionError(`Peer question from ${job.snapshot.id} to ${targetId} would create a wait cycle`);
+    }
+    const target = this.#jobs.get(targetId);
+    if (!target) return undefined;
+    if (target.snapshot.workflow?.runId !== job.snapshot.workflow.runId) {
+      // A live session owned by another run is never continued from here. The
+      // caller's own run may still legitimately address this job ID after
+      // replaying that lineage, so when a workflow runtime is installed the
+      // membership decision — a recorded answer, or an actionable failure —
+      // belongs to it. With no runtime installed nothing could claim it.
+      if (this.#peerRouter) return undefined;
+      throw new InteractionError("Peer questions are limited to agents from the same workflow run");
+    }
+    if (target.snapshot.status !== "completed") {
+      throw new InteractionError(`Peer agent ${targetId} is ${target.snapshot.status}; only a completed agent that still retains its native session can answer`);
+    }
+    if (!target.run) throw new InteractionError(`Peer agent ${targetId} no longer retains a native session`);
+    if (target.pendingRestart || target.inFlight) throw new InteractionError(`Peer agent ${targetId} already has an active or queued follow-up`);
+    if (target.answeringInteraction) throw new InteractionError(`Peer agent ${targetId} is already answering another question`);
+    if (target.interaction && !target.interaction.settled) throw new InteractionError(`Peer agent ${targetId} has its own outstanding question`);
+    return target;
+  }
+
+  async #routePeerQuestion(job: InternalJob, pending: InternalInteraction): Promise<void> {
+    const record = pending.record;
+    const targetId = record.target.jobId!;
+    const router = this.#peerRouter;
+    let target: InternalJob | undefined;
+    try {
+      target = this.#assertPeerEligible(job, targetId);
+      if (!router) throw new InteractionError("Peer questions require an active workflow run");
+    } catch (error) {
+      pending.settle({ error: error instanceof Error ? error : new Error(String(error)), state: "dismissed" });
+      return;
+    }
+    record.state = "answering";
+    if (target) {
+      record.target = { ...record.target, label: target.snapshot.name };
+      target.answeringInteraction = { requestId: record.requestId, sourceJobId: job.snapshot.id, sourceName: job.snapshot.name };
+      this.#publishAnswering(target);
+    }
+    this.#publishInteraction(job, record);
+    const answering = target;
+    void router({
+      requestId: record.requestId,
+      source: clone(job.snapshot),
+      targetJobId: targetId,
+      target: answering ? clone(answering.snapshot) : undefined,
+      question: record.question,
+      context: record.context,
+      signal: pending.controller.signal,
+    }).then(
+      (result) => pending.settle({ answer: normalizeAnswer(result.answer), route: result.route ?? "peer", targetGeneration: result.targetGeneration, label: result.targetLabel ?? answering?.snapshot.name }),
+      (error: unknown) => pending.settle({ error: error instanceof Error ? error : new Error(String(error)), state: "dismissed" }),
+    ).finally(() => {
+      if (!answering) return;
+      answering.answeringInteraction = undefined;
+      this.#publishAnswering(answering);
+    });
+  }
+
+  #clearInteraction(job: InternalJob, requestId: string): void {
+    const pending = job.interaction;
+    if (!pending || pending.record.requestId !== requestId) return;
+    pending.cancelDeadline?.();
+    job.interaction = undefined;
+    this.#interactions.delete(requestId);
+    this.#waitGraph.remove(job.snapshot.id);
+    this.#publishInteractionEvent(job, { type: "interaction_cleared", requestId });
+  }
+
+  /** Publishes one interaction transition on the asking side. */
+  #publishInteraction(job: InternalJob, record: PendingInteraction): void {
+    this.#publishInteractionEvent(job, { type: "interaction", interaction: cloneInteraction(record) });
+  }
+
+  /** Publishes the answering side's projection so dashboards can show the peer turn. */
+  #publishAnswering(job: InternalJob): void {
+    this.#publishInteractionEvent(job, { type: "interaction_answering", answering: job.answeringInteraction ? { ...job.answeringInteraction } : undefined });
+  }
+
+  /**
+   * Interaction transitions bypass the terminal guard in {@link #emit}. A
+   * parked caller's question is failed exactly when its job dies, and a target
+   * settles the moment it finishes answering: dropping those transitions would
+   * leave dashboards showing a question nobody can answer any more. They never
+   * touch lifecycle status, so publishing them after settlement is safe.
+   */
+  #publishInteractionEvent(job: InternalJob, event: BackendEvent): void {
+    job.snapshot = reduceJob(job.snapshot, event);
+    this.#publish(job, event);
+  }
+
+  /** Fails the question this job is parked on, if any. Idempotent. */
+  #failCallerInteraction(job: InternalJob, reason: string): void {
+    job.interaction?.settle({ error: new InteractionError(reason), state: "cancelled" });
+  }
+
+  /**
+   * Fails both sides: the question this job asked and the one its retained
+   * session was answering. Reserved for explicit cancellation and shutdown. An
+   * ordinary terminal settlement is *not* routed here, because a peer-answer
+   * generation settles as `completed` on its way to a successful answer; the
+   * peer router owns that outcome.
+   */
+  #cancelJobInteractions(job: InternalJob, reason: string): void {
+    this.#failCallerInteraction(job, reason);
+    if (!job.answeringInteraction) return;
+    const source = this.#interactions.get(job.answeringInteraction.requestId);
+    source?.interaction?.settle({ error: new InteractionError(reason), state: "cancelled" });
   }
 
   #waitForGenerationTerminal(job: InternalJob, generation: number): Promise<void> {
@@ -670,6 +1208,9 @@ export class JobManager {
     for (const waiter of job.generationWaiters?.get(generation) ?? []) waiter();
     job.generationWaiters?.delete(generation);
     if (!isTerminal(job.snapshot.status)) return;
+    // Only the caller side: a target settling here may be completing the very
+    // peer answer this interaction is waiting for.
+    this.#failCallerInteraction(job, `Job ${job.snapshot.status} before its question was answered`);
     this.#resolveRunWaiters(job);
     for (const waiter of this.#waiters.get(job.snapshot.id) ?? []) waiter();
     this.#waiters.delete(job.snapshot.id);

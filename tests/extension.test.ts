@@ -8,7 +8,7 @@ import { PI_CHILD_MARKER } from "../src/backends/pi-rpc.ts";
 import { PI_PARENT_THREAD_FILE } from "../src/parent-thread-context.ts";
 import { buildCatalog } from "../src/capabilities.ts";
 import { claudeStatus, codexStatus, parseClaudeAuthStatus, parseCodexAccount, piStatusFromCatalog } from "../src/provider-status.ts";
-import { HoldingBackend, ImmediateBackend, context, fakePi, jobSnapshot, tempDir, theme } from "./helpers.ts";
+import { ControlledBackend, HoldingBackend, ImmediateBackend, context, fakePi, jobSnapshot, tempDir, theme, tick } from "./helpers.ts";
 
 /** The parent session's tool inventory, including surfaces children must never inherit. */
 const PARENT_TOOLS = [
@@ -89,7 +89,7 @@ test("the subagent extension surface", async (t) => {
     assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_BACKEND: "codex" }), "pi", "obsolete backend env is ignored");
     assert.deepEqual([...pi.tools.keys()].sort(), [
       "session_peer_fork", "session_peer_list",
-      "subagent", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
+      "subagent", "subagent_answer", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
     ]);
     assert.deepEqual([...pi.commands.keys()].sort(), ["subagent", "subagents", "subagents-config", "workflows"]);
     assert.deepEqual(parseHumanSubagentCommand('--harness claude --model opus --name "auth review" --effort high --access readOnly "Review the auth flow"'), {
@@ -228,7 +228,11 @@ test("the subagent extension surface", async (t) => {
 
     await pi.commands.get("subagent").handler("--access readOnly read-only human task", ctx);
     const readOnlyHumanRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.task === "read-only human task");
-    assert.deepEqual(readOnlyHumanRequest?.policy.piTools, ["read", "grep", "find", "ls", "parent_thread_context"]);
+    assert.deepEqual(
+      readOnlyHumanRequest?.policy.piTools,
+      ["read", "grep", "find", "ls", "parent_thread_context", "subagent_ask"],
+      "a read-only human job keeps its host-owned parent-thread and routed-question tools and nothing else",
+    );
   });
 
   await t.test("wait consumes delivery once per retained-session generation", async () => {
@@ -420,4 +424,107 @@ test("summarizeSubagentActivity distinguishes direct and workflow-owned jobs", (
   const directKey = summarizeSubagentActivity([jobSnapshot({ status: "running" })]).key;
   const workflowKey = summarizeSubagentActivity([jobSnapshot({ status: "running", workflow: workflowRef })]).key;
   assert.notEqual(directKey, workflowKey, "ownership must be part of the widget dedup key");
+});
+test("routed questions wake the parent thread once and resolve through subagent_answer", async () => {
+  const pi = fakePi({ allTools: PARENT_TOOLS });
+  const backend = new ControlledBackend("pi");
+  registerNativeSubagents(pi.api, {
+    registry: {},
+    legacyRoot: false,
+    backends: [backend],
+    workflowArtifactRoot: join(await tempDir("extension-question-workflows"), "runs"),
+    globalProfilesDir: join(await tempDir("extension-question-profiles"), "profiles"),
+  });
+  const { ctx } = context({ sessionId: "question-session" });
+  pi.handlers.get("session_start")?.({}, ctx);
+
+  const first = await pi.tools.get("subagent_spawn").execute("s1", { name: "first", task: "first task" }, undefined, undefined, ctx);
+  const second = await pi.tools.get("subagent_spawn").execute("s2", { name: "second", task: "second task" }, undefined, undefined, ctx);
+  await tick();
+  // Settle-shaped so a rejection observed later in the test is never reported
+  // as an unhandled rejection by the runner.
+  const settle = (promise: Promise<{ answer: string }>) => promise.then(
+    (value) => ({ ok: true as const, value }),
+    (error: unknown) => ({ ok: false as const, error: error instanceof Error ? error.message : String(error) }),
+  );
+  const asks = [
+    settle(backend.ask(first.details.job.id, { question: "Which compatibility behavior stays?" })),
+    settle(backend.ask(second.details.job.id, { question: "Which fixture is authoritative?" })),
+  ];
+  await tick();
+  assert.equal(pi.messages.length, 0, "a busy parent turn is never re-entered mid-turn");
+
+  pi.handlers.get("agent_settled")?.();
+  const questions = pi.messages.filter((entry) => entry.message.customType === "native-subagent-question");
+  assert.equal(questions.length, 2);
+  assert.deepEqual(questions.map((entry) => entry.options.triggerTurn), [false, true],
+    "a deliverable batch wakes exactly one parent turn");
+  assert.match(questions[0]!.message.content, /Which compatibility behavior stays\?/);
+
+  // Re-delivery must not happen for an already-delivered request.
+  pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-question").length, 2);
+
+  const requestId = (questions[0]!.message.details as { interaction: { requestId: string } }).interaction.requestId;
+  const answered = await pi.tools.get("subagent_answer").execute("a1", { requestId, answer: "keep the legacy flag" }, undefined, undefined, ctx);
+  assert.equal(answered.details.interaction.state, "answered");
+  const resumed = await asks[0]!;
+  assert.ok(resumed.ok && /keep the legacy flag/.test(resumed.value.answer));
+  await assert.rejects(
+    pi.tools.get("subagent_answer").execute("a2", { requestId, answer: "again" }, undefined, undefined, ctx),
+    /Unknown or already-resolved question/,
+  );
+
+  const card = pi.messageRenderers.get("native-subagent-question")(questions[0]!.message, { expanded: true }, theme).render(100).join("\n");
+  assert.match(card, /asks the orchestrator/);
+  assert.match(card, /Which compatibility behavior stays\?/);
+  assert.match(card, /answered/, "a settled question stops advertising itself as pending in the transcript");
+  assert.match(card, /keep the legacy flag/, "the delivered answer stays auditable next to the question");
+
+  await pi.handlers.get("session_shutdown")?.();
+  const abandoned = await asks[1]!;
+  assert.ok(!abandoned.ok && /Session shutdown/.test(abandoned.error), "shutdown rejects every still-parked tool callback");
+});
+
+test("a wait-consumed job still delivers its question, and human jobs keep theirs off the parent thread", async () => {
+  const pi = fakePi({ allTools: PARENT_TOOLS });
+  const backend = new ControlledBackend("pi");
+  registerNativeSubagents(pi.api, {
+    registry: {},
+    legacyRoot: false,
+    backends: [backend],
+    workflowArtifactRoot: join(await tempDir("extension-question2-workflows"), "runs"),
+    globalProfilesDir: join(await tempDir("extension-question2-profiles"), "profiles"),
+  });
+  const { ctx } = context({ sessionId: "question-session-2", idle: true });
+  pi.handlers.get("session_start")?.({}, ctx);
+
+  const spawned = await pi.tools.get("subagent_spawn").execute("s1", { name: "watched", task: "watched task" }, undefined, undefined, ctx);
+  await tick();
+  const waiting = pi.tools.get("subagent_wait").execute("w1", { jobId: spawned.details.job.id, timeoutMs: 5_000 }, undefined, undefined, ctx);
+  const asked = backend.ask(spawned.details.job.id, { question: "Do we keep the old header?" });
+  await tick();
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-question").length, 1,
+    "subagent_wait consumes the eventual result, never the question that unblocks it");
+
+  await pi.commands.get("subagent").handler('--name "human job" "human task"', ctx);
+  await tick();
+  const humanJob = (await pi.tools.get("subagent_list").execute()).details.jobs.find((job: any) => job.humanVisible);
+  const humanAsk = backend.ask(humanJob.id, { question: "Which directory did you mean?" });
+  await tick();
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-question").length, 1,
+    "a human /subagent question stays in /subagents instead of notifying the orchestrator");
+  const parked = (await pi.tools.get("subagent_list").execute()).details.jobs.find((job: any) => job.id === humanJob.id);
+  assert.equal(parked.interaction.humanVisible, true);
+  assert.equal(parked.interaction.state, "pending");
+
+  const requestId = (pi.messages.find((entry) => entry.message.customType === "native-subagent-question")!
+    .message.details as { interaction: { requestId: string } }).interaction.requestId;
+  await pi.tools.get("subagent_answer").execute("a1", { requestId, answer: "yes, keep it" }, undefined, undefined, ctx);
+  assert.match((await asked).answer, /yes, keep it/);
+  backend.complete(spawned.details.job.id, "finished");
+  await waiting;
+  const humanOutcome = humanAsk.then(() => undefined, (error: Error) => error.message);
+  await pi.handlers.get("session_shutdown")?.();
+  assert.match(await humanOutcome ?? "", /Session shutdown/);
 });

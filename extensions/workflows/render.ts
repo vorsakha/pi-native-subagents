@@ -2,8 +2,10 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { aggregateWorkflowUsage } from "../../src/workflows/manager.ts";
 import { formatWorkflowBudget, workflowBudgetHealth } from "../../src/workflows/budget.ts";
+import { formatDurationLabel } from "../dashboard-style.ts";
 import type {
   WorkflowAgentRecord,
+  WorkflowInteractionSummary,
   WorkflowPhase,
   WorkflowSnapshot,
 } from "../../src/workflows/types.ts";
@@ -144,9 +146,38 @@ function formatProviderWait(agent: WorkflowAgentRecord, now: number): string | u
   return `waiting for ${sanitizeInline(wait.provider)} ${sanitizeInline(wait.kind)} · retry in ${retryLabel} · attempt ${wait.attempt}/${wait.maxAttempts}`;
 }
 
+/**
+ * Bounded wait vocabulary for a routed question, kept distinct from a
+ * provider-quota wait, scheduler queueing, and a user pause: it names who owes
+ * the answer, how long the agent has been blocked, and the question itself.
+ */
+export function formatWorkflowInteraction(interaction: WorkflowInteractionSummary, now: number): string {
+  const who = interaction.target === "orchestrator"
+    ? "needs orchestrator"
+    : `waiting for ${sanitizeInline(interaction.targetName ?? "peer")}`;
+  const elapsed = formatDurationLabel(Math.max(0, (interaction.answeredAt ?? now) - interaction.createdAt));
+  const state = interaction.state === "pending" || interaction.state === "answering"
+    ? interaction.state === "answering" ? "answering" : "unanswered"
+    : interaction.state;
+  return `${who} · ${elapsed} · ${state} · ${sanitizeInline(interaction.question)}`;
+}
+
+/** Per-agent interaction wait, or the peer answer this agent is producing. */
+export function workflowAgentInteraction(agent: WorkflowAgentRecord, now: number): string | undefined {
+  if (agent.waitingOn) return formatWorkflowInteraction(agent.waitingOn, now);
+  return agent.answering ? `answering peer question from ${sanitizeInline(agent.answering.sourceName)}` : undefined;
+}
+
+/** Agents currently blocked on a routed question; drives the `N need input` marker. */
+export function workflowNeedsInput(snapshot: Pick<WorkflowSnapshot, "agents">): number {
+  return snapshot.agents.filter((agent) => agent.waitingOn).length;
+}
+
 /** Quiet fallback copy for an agent with no semantic preview yet — avoids restating "running",
  *  which the header and phase spine already convey. */
 function agentActivity(agent: WorkflowAgentRecord, now: number): string {
+  const interaction = workflowAgentInteraction(agent, now);
+  if (interaction) return interaction;
   if (agent.state === "waiting") return formatProviderWait(agent, now) ?? "waiting for provider";
   if (typeof agent.preview === "string" && agent.preview) return sanitizeInline(agent.preview);
   switch (agent.state) {
@@ -400,7 +431,9 @@ export function buildWorkflowCardLines(
   if (options.expanded) for (const line of phaseRosterLines(snapshot, theme, options.now)) lines.push(line);
 
   // Agents: collapsed is always a rollup of counts; roster rows and the live preview expand only.
-  lines.push(group(theme, "Agents", agentRollupValue(snapshot, theme)));
+  const needInput = workflowNeedsInput(snapshot);
+  lines.push(group(theme, "Agents", agentRollupValue(snapshot, theme)
+    + (needInput ? theme.fg("warning", ` · ? ${needInput} need input`) : "")));
   if (options.expanded) {
     const roster = snapshot.agents.slice(-MAX_AGENTS_EXPANDED);
     const hiddenBefore = snapshot.agents.length - roster.length;

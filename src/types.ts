@@ -3,6 +3,7 @@ import type {
   CapabilitySourceStatus,
   DiscoveredCapability,
 } from "./capabilities.ts";
+import type { InteractionHandler, InteractionTargetKind, JobInteractionPolicy, PendingInteraction } from "./interactions.ts";
 import type { ParentThreadSnapshot } from "./parent-thread-context.ts";
 import type { SpendBudget } from "./budget.ts";
 import type { ProviderUnavailability } from "./provider-unavailability.ts";
@@ -67,7 +68,13 @@ export type BackendEvent =
   | { type: "failed"; error: string; unavailable?: ProviderUnavailability; at?: number }
   | { type: "cancelled"; reason?: string; at?: number }
   /** An optional native integration failed; the job continues without it. */
-  | { type: "degraded"; source: string; detail: string; at?: number };
+  | { type: "degraded"; source: string; detail: string; at?: number }
+  /** A host-routed question opened, advanced, or settled on this job. */
+  | { type: "interaction"; interaction: PendingInteraction; at?: number }
+  /** The job's pending question is no longer displayable; the caller resumed. */
+  | { type: "interaction_cleared"; requestId: string; at?: number }
+  /** This job's retained session started or finished producing a peer answer. */
+  | { type: "interaction_answering"; answering?: { requestId: string; sourceJobId: string; sourceName: string }; at?: number };
 
 /** Bounded JSON Schema a caller wants a provider-native terminal channel to validate and return, instead of prompt/parse text extraction. Workflow-internal only; never a model-facing tool field. */
 export interface StructuredOutputPolicy {
@@ -126,6 +133,14 @@ export interface BackendRequest {
   rawInitialMessage?: boolean;
   /** Read-only spawn-time snapshot available only to human /subagent jobs through parent_thread_context. */
   parentThread?: ParentThreadSnapshot;
+  /**
+   * Live host callback for routed questions. Present only when the job carries
+   * an authorized interaction policy; adapters must not advertise the child ask
+   * tool without it. Never serialized into a snapshot or artifact.
+   */
+  interactions?: InteractionHandler;
+  /** Authorized target kinds, used only to describe the injected tool accurately. */
+  interactionTargets?: InteractionTargetKind[];
 }
 
 export type SendBehavior = "steer" | "followUp";
@@ -279,6 +294,15 @@ export interface SpawnRequest {
   peer?: PeerSessionReference & { sessionFile: string };
   /** Internal workflow-runtime request for a provider-native structured-result channel; never a model-facing tool field. */
   structuredOutput?: StructuredOutputPolicy;
+  /** Internal authorization for host-routed questions; absent means the child never sees an ask tool. */
+  interaction?: JobInteractionPolicy;
+  /**
+   * Host-side admission check for one routed question, mirroring
+   * {@link SpawnRequest.dispatchGate}. Returns a bounded refusal reason to
+   * reject the question before any interaction state is created; the workflow
+   * runtime uses it for the bounded interaction count and budget preflight.
+   */
+  interactionGate?: (target: InteractionTargetKind) => string | undefined;
 }
 
 export interface ToolTrace {
@@ -341,4 +365,10 @@ export interface JobSnapshot {
   unavailable?: ProviderUnavailability;
   /** True once the job observed model text, thinking, or tool activity; unset means a rejection before any progress. */
   progressed?: boolean;
+  /** Bounded pending or just-settled host-routed question this job is parked on. */
+  interaction?: PendingInteraction;
+  /** Present while this job's retained session is answering a peer question. */
+  answeringInteraction?: { requestId: string; sourceJobId: string; sourceName: string };
+  /** Cumulative host-routed questions this job has asked. */
+  interactionsAsked?: number;
 }

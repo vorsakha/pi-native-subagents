@@ -20,12 +20,47 @@ import type {
   Usage,
 } from "../src/types.ts";
 import type { ProviderUnavailability } from "../src/provider-unavailability.ts";
+import { normalizeTarget, type InteractionAskResult, type PendingInteraction } from "../src/interactions.ts";
+import type { InteractionDeadlineClock } from "../src/manager.ts";
 
 /* ── async utilities ─────────────────────────────────────────────────────── */
 
 export const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 export const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Deterministic deadline clock for interaction lifecycle tests. */
+export class ControlledInteractionClock implements InteractionDeadlineClock {
+  #now: number;
+  #sequence = 0;
+  readonly #scheduled = new Map<number, { at: number; callback: () => void }>();
+
+  constructor(now = 1_000) {
+    this.#now = now;
+  }
+
+  now(): number {
+    return this.#now;
+  }
+
+  schedule(callback: () => void, delayMs: number): () => void {
+    const id = this.#sequence++;
+    this.#scheduled.set(id, { at: this.#now + Math.max(0, delayMs), callback });
+    return () => { this.#scheduled.delete(id); };
+  }
+
+  advance(ms: number): void {
+    this.#now += Math.max(0, ms);
+    for (;;) {
+      const due = [...this.#scheduled.entries()]
+        .filter(([, timer]) => timer.at <= this.#now)
+        .sort((left, right) => left[1].at - right[1].at || left[0] - right[0])[0];
+      if (!due) return;
+      this.#scheduled.delete(due[0]);
+      due[1].callback();
+    }
+  }
+}
 
 export async function waitFor(
   predicate: () => boolean,
@@ -105,6 +140,18 @@ export class ImmediateBackend implements Backend {
       async cancel() {},
       async close() {},
     };
+  }
+
+  /** Drives the normalized host ask callback exactly as a provider's client-hosted tool would. */
+  ask(jobId: string, input: AskInput): Promise<InteractionAskResult> {
+    return askThroughBackend(this.requests, jobId, input);
+  }
+
+  /** Same as {@link ask}, addressed by the task text that started the job. */
+  askTask(task: string, input: AskInput): Promise<InteractionAskResult> {
+    const request = this.requestForTask(task);
+    assert.ok(request, `backend did not start task ${task}`);
+    return askThroughBackend(this.requests, request.jobId, input);
   }
 
   requestForTask(task: string): BackendRequest | undefined {
@@ -254,6 +301,18 @@ export class ControlledBackend implements Backend {
     };
   }
 
+  /** Drives the normalized host ask callback exactly as a provider's client-hosted tool would. */
+  ask(jobId: string, input: AskInput): Promise<InteractionAskResult> {
+    return askThroughBackend(this.requests, jobId, input);
+  }
+
+  /** Same as {@link ask}, addressed by the task text that started the job. */
+  askTask(task: string, input: AskInput): Promise<InteractionAskResult> {
+    const request = this.requestForTask(task);
+    assert.ok(request, `backend did not start task ${task}`);
+    return askThroughBackend(this.requests, request.jobId, input);
+  }
+
   requestForTask(task: string): BackendRequest | undefined {
     return [...this.requests].reverse().find((request) => request.task === task);
   }
@@ -302,6 +361,27 @@ export class ControlledBackend implements Backend {
     run.emit({ type: "failed", error, unavailable });
     run.settle();
   }
+}
+
+export interface AskInput {
+  question: string;
+  context?: string;
+  target?: unknown;
+}
+
+/**
+ * Calls the host ask callback a backend request was authorized with, exactly as
+ * a provider's client-hosted tool would, so tests exercise the real routing path
+ * instead of reaching into JobManager internals.
+ */
+function askThroughBackend(requests: BackendRequest[], jobId: string, input: AskInput): Promise<InteractionAskResult> {
+  const request = requests.find((candidate) => candidate.jobId === jobId);
+  assert.ok(request?.interactions, `job ${jobId} was not authorized to ask routed questions`);
+  return request.interactions.ask({
+    question: input.question,
+    context: input.context,
+    target: normalizeTarget(input.target),
+  });
 }
 
 /* ── Pi extension host doubles ───────────────────────────────────────────── */
@@ -365,6 +445,8 @@ export interface ContextOptions {
   hasUI?: boolean;
   sessionId?: string;
   cwd?: string;
+  /** Whether the parent turn is idle; drives deferred question/result delivery. */
+  idle?: boolean;
 }
 
 /** Builds a Pi tool-execution context plus handles on the UI side effects it records. */
@@ -384,7 +466,7 @@ export function context(options: ContextOptions = {}) {
     model: options.provider ? { provider: options.provider, id: "parent-model" } : undefined,
     mode: "rpc",
     isProjectTrusted: () => options.trusted ?? true,
-    isIdle: () => false,
+    isIdle: () => options.idle ?? false,
     sessionManager: {
       getBranch: () => branch,
       buildContextEntries: () => branch,
@@ -425,5 +507,21 @@ export function jobSnapshot(overrides: Partial<JobSnapshot> = {}): JobSnapshot {
     transcript: overrides.transcript ?? [],
     liveThinking: overrides.liveThinking ?? "",
     queuedMessages: overrides.queuedMessages ?? [],
+  };
+}
+
+/** A pending orchestrator question, as JobManager projects it to observers. */
+export function interactionSnapshot(overrides: Partial<PendingInteraction> = {}): PendingInteraction {
+  return {
+    requestId: "req-1",
+    sourceJobId: "0123456789abcdef",
+    sourceName: "worker",
+    sourceGeneration: 0,
+    question: "Which compatibility behavior should stay?",
+    createdAt: 1_000,
+    expiresAt: 901_000,
+    state: "pending",
+    ...overrides,
+    target: overrides.target ?? { kind: "orchestrator" },
   };
 }

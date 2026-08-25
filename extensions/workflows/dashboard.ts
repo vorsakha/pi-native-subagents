@@ -36,7 +36,7 @@ import type {
   WorkflowSnapshot,
 } from "../../src/workflows/types.ts";
 import { formatContext, formatUsage, sanitizeInline, sanitizeText, shortId, traceStatusMeta } from "../subagents/render.ts";
-import { workflowPhaseProgress, workflowStatusMeta } from "./render.ts";
+import { formatWorkflowInteraction, workflowAgentInteraction, workflowNeedsInput, workflowPhaseProgress, workflowStatusMeta } from "./render.ts";
 import {
   appendBoundedSection,
   boundedHeadTailText,
@@ -1025,7 +1025,11 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const left = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name} ${this.theme.fg("dim", shortId(sanitizeText(run.runId)))}`;
     const phase = workflowPhaseProgress(run).label;
     const outcome = run.status === "completed" && run.taskOutcome ? ` · ${run.taskOutcome}` : "";
-    const right = `${this.theme.fg("muted", `phase ${phase} · ${formatElapsed(run, this.#now())}`)} · ${this.theme.fg(status.color, `${run.status}${outcome}`)} `;
+    // A blocked question is not a lifecycle state, so the run keeps its own
+    // status and carries the aggregate marker beside it, in words and a glyph.
+    const needInput = workflowNeedsInput(run);
+    const questions = needInput ? `${this.theme.fg("warning", `? ${needInput} need input`)} · ` : "";
+    const right = `${questions}${this.theme.fg("muted", `phase ${phase} · ${formatElapsed(run, this.#now())}`)} · ${this.theme.fg(status.color, `${run.status}${outcome}`)} `;
     return alignDashboardRow(left, right, width);
   }
 
@@ -1063,6 +1067,16 @@ export class WorkflowsDashboardOverlay implements Focusable {
     if (run.definitionFingerprint) lines.push(this.theme.fg("muted", `Provenance · definition ${shortId(run.definitionFingerprint)}`));
     for (const warning of run.warnings?.slice(0, 2) ?? []) lines.push(this.theme.fg("warning", `⚠ ${boundedInline(warning, 1_000)}`));
     if (run.error) lines.push(this.theme.fg("error", `× ${boundedInline(run.error, MAX_ERROR_CHARS)}`));
+    const needInput = workflowNeedsInput(run);
+    const interactions = (run.interactions ?? []).slice(-3);
+    if (needInput || interactions.length) {
+      const marker = needInput ? `${needInput} need input` : "none waiting";
+      lines.push(this.theme.fg(needInput ? "warning" : "muted", `Questions · ${marker}`));
+      for (const interaction of interactions) {
+        lines.push(this.theme.fg(interaction.state === "pending" || interaction.state === "answering" ? "warning" : "dim",
+          `· ${boundedInline(interaction.sourceName, 500)} → ${boundedInline(formatWorkflowInteraction(interaction, this.#now()), MAX_ACTIVITY_CHARS)}`));
+      }
+    }
     const activity = (run.logs ?? []).slice(-3);
     if (activity.length) {
       lines.push(this.theme.fg("muted", `Activity · ${activity.length} recent log${activity.length === 1 ? "" : "s"}`));
@@ -1144,6 +1158,11 @@ export class WorkflowsDashboardOverlay implements Focusable {
       const remaining = Math.max(0, wait.retryAt - this.#now());
       const retryLabel = remaining < 60_000 ? `${Math.max(1, Math.round(remaining / 1_000))}s` : `${Math.round(remaining / 60_000)}m`;
       metadata.push(this.theme.fg("warning", `Provider wait · ${sanitizeInline(wait.provider)} ${sanitizeInline(wait.kind)} · retry in ${retryLabel} · attempt ${wait.attempt}/${wait.maxAttempts}${wait.scope ? ` · ${sanitizeInline(wait.scope)}` : ""}`));
+    }
+    const agentInteraction = workflowAgentInteraction(agent, this.#now());
+    if (agentInteraction) {
+      metadata.push(this.theme.fg("warning", `Question · ${boundedInline(agentInteraction, 2_000)}`));
+      if (agent.waitingOn?.context) metadata.push(this.theme.fg("dim", `Question context · ${boundedInline(agent.waitingOn.context, 1_000)}`));
     }
     if (agent.generations?.length) metadata.push(this.theme.fg("dim", `Generations · ${agent.generations.length} (call ${agent.callIndex ?? agent.generations.at(-1)?.callIndex})`));
     if (agent.independentOf) metadata.push(this.theme.fg("muted", `Provenance · independent of ${shortId(sanitizeText(agent.independentOf))}`));
@@ -1234,13 +1253,18 @@ export class WorkflowsDashboardOverlay implements Focusable {
   }
 
   private renderAgentRow(agent: WorkflowAgentRecord, selected: boolean): string {
-    const status = traceStatusMeta(agent.state, this.#now());
+    // A routed-question wait is not the agent's lifecycle state: mark it with
+    // its own glyph and words so it never reads as ordinary queueing.
+    const status = agent.waitingOn ? { glyph: "?", color: "warning" as const } : traceStatusMeta(agent.state, this.#now());
     const marker = dashboardNestedSelectionMarker(this.theme, selected);
     const label = selected ? this.theme.fg("accent", boundedInline(agent.name, 1_000)) : this.theme.fg("text", boundedInline(agent.name, 1_000));
     const route = agent.harness || agent.model ? `${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
     const usage = formatUsage(agent.usage);
     const warning = agent.instructionShaped ? " · ⚠ instruction-like output" : "";
-    return `${marker} ${this.theme.fg(status.color, status.glyph)} ${label} ${this.theme.fg("dim", `· ${agent.access}${agent.profile ? ` · profile ${boundedInline(agent.profile, 500)}` : ""}${agent.independent ? " · independent" : ""} · ${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}${usage ? ` · ${usage}` : ""}${warning}`)}`;
+    const interaction = agent.waitingOn
+      ? `· ${agent.waitingOn.target === "orchestrator" ? "needs orchestrator" : `waiting for ${boundedInline(agent.waitingOn.targetName ?? "peer", 200)}`} `
+      : agent.answering ? "· answering peer " : "";
+    return `${marker} ${this.theme.fg(status.color, status.glyph)} ${label} ${this.theme.fg(agent.waitingOn ? "warning" : "muted", interaction)}${this.theme.fg("dim", `· ${agent.access}${agent.profile ? ` · profile ${boundedInline(agent.profile, 500)}` : ""}${agent.independent ? " · independent" : ""} · ${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}${usage ? ` · ${usage}` : ""}${warning}`)}`;
   }
 
   private allPhaseAgents(run: WorkflowSnapshot, phase: WorkflowPhase | undefined): WorkflowAgentRecord[] {

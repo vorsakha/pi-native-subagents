@@ -3,6 +3,7 @@ import type {
   WorkflowJournalRecord,
   WorkflowJournalResult,
   WorkflowReplayCall,
+  WorkflowReplayInteraction,
 } from "./types.ts";
 
 const FINGERPRINT_VERSION = "workflow-v1";
@@ -39,6 +40,15 @@ export function workflowFollowUpFingerprint(input: { jobId: string; prompt: stri
   return fingerprint("followup-call", { jobId: input.jobId, options: input.options, prompt: input.prompt });
 }
 
+/**
+ * Binds the exact question text and optional context so a replayed answer can
+ * only satisfy the same question. The asking agent's identity and the target's
+ * call fingerprint are matched separately, from the record's own detail.
+ */
+export function workflowInteractionFingerprint(input: { question: string; context?: string }): string {
+  return fingerprint("peer-question", { context: input.context ?? null, question: input.question });
+}
+
 export function workflowDefinitionFingerprint(input: {
   script: string;
   argsJson: string;
@@ -68,6 +78,10 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
   const invalid = new Set<number>();
 
   for (const record of records) {
+    // Peer questions carry their own ordinal namespace in `callIndex`; they are
+    // replayed by `replayableJournalInteractions` and must never be confused
+    // with the sandbox's contiguous agent()/followUp() ordinals.
+    if (record.kind === "peerQuestion") continue;
     const priorStart = started.get(record.callIndex);
     if (record.state === "started") {
       if (priorStart || completed.has(record.callIndex)) invalid.add(record.callIndex);
@@ -88,9 +102,50 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
     .map(([callIndex, record]) => ({
       callIndex,
       fingerprint: record.fingerprint,
-      kind: record.kind ?? "agent",
+      kind: record.kind === "followUp" ? "followUp" : "agent",
       agentIndex: record.agentIndex,
       result: structuredClone(record.result) as WorkflowJournalResult,
       route: record.route ? { ...record.route } : undefined,
     }));
+}
+
+/**
+ * Return every completed peer answer that may be replayed. A peer answer is
+ * only reusable as an exact triple: the same interaction ordinal, the same
+ * asking lineage identity, and the same question against the same target call
+ * fingerprint. Anything incomplete, duplicated, or failed is dropped so the
+ * question reruns live (or fails with an actionable error) instead.
+ */
+export function replayableJournalInteractions(records: WorkflowJournalRecord[]): WorkflowReplayInteraction[] {
+  const started = new Map<number, WorkflowJournalRecord>();
+  const completed = new Map<number, WorkflowJournalRecord>();
+  const invalid = new Set<number>();
+
+  for (const record of records) {
+    if (record.kind !== "peerQuestion") continue;
+    const ordinal = record.callIndex;
+    const priorStart = started.get(ordinal);
+    if (record.state === "started") {
+      if (priorStart || completed.has(ordinal)) invalid.add(ordinal);
+      else started.set(ordinal, record);
+      continue;
+    }
+    if (!priorStart || priorStart.fingerprint !== record.fingerprint || completed.has(ordinal)) {
+      invalid.add(ordinal);
+      continue;
+    }
+    if (record.state === "completed" && record.result?.ok === true && record.interaction) completed.set(ordinal, record);
+    else invalid.add(ordinal);
+  }
+
+  return [...completed.entries()]
+    .filter(([ordinal]) => !invalid.has(ordinal))
+    .sort(([left], [right]) => left - right)
+    .map(([ordinal, record]) => ({
+      ordinal,
+      questionFingerprint: record.fingerprint,
+      detail: { ...record.interaction! },
+      answer: record.result!.output,
+      usage: record.result!.usage ? { ...record.result!.usage } : undefined,
+    } satisfies WorkflowReplayInteraction));
 }

@@ -226,6 +226,18 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
       if (!job.warnings?.includes(warning)) next.warnings = [...(job.warnings ?? []), warning].slice(-MAX_JOB_WARNINGS);
       break;
     }
+    case "interaction":
+      // Bounded at creation in interactions.ts; the reducer only mirrors the
+      // authoritative record so observers never read manager-owned state directly.
+      next.interaction = { ...event.interaction, target: { ...event.interaction.target } };
+      if (event.interaction.state === "pending") next.interactionsAsked = (job.interactionsAsked ?? 0) + 1;
+      break;
+    case "interaction_cleared":
+      if (job.interaction?.requestId === event.requestId) next.interaction = undefined;
+      break;
+    case "interaction_answering":
+      next.answeringInteraction = event.answering ? { ...event.answering } : undefined;
+      break;
     case "usage":
       next.usage = { ...job.usage };
       for (const key of Object.keys(next.usage) as Array<keyof Usage>) {

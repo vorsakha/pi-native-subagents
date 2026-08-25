@@ -1,4 +1,5 @@
 import type { AccessMode, ContextSnapshot, EffortLevel, HarnessName, ProviderFamily, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
+import type { InteractionRoute, InteractionState } from "../interactions.ts";
 import type { ProviderUnavailabilityKind } from "../provider-unavailability.ts";
 import type { WorkflowWorktreeResult } from "./worktree.ts";
 import type { SpendBudget } from "../budget.ts";
@@ -98,6 +99,39 @@ export interface WorkflowReplacementReference {
 }
 
 /**
+ * Where a lineage turn's output came from. `peerAnswer` marks a turn the host
+ * ran to answer another agent's routed question rather than script-driven work.
+ */
+export type WorkflowOutputProvenance = "subagent" | "replay" | "peerAnswer";
+
+/**
+ * Bounded, display-safe projection of one host-routed question a workflow agent
+ * asked. Peer questions stay inside the run; orchestrator questions are mirrored
+ * here so `/workflows` can distinguish an interaction wait from a provider-quota
+ * wait, scheduler queueing, or a user pause.
+ */
+export interface WorkflowInteractionSummary {
+  /** Interaction ordinal within the run, separate from the sandbox call index. */
+  ordinal: number;
+  requestId: string;
+  target: "orchestrator" | "peer";
+  sourceAgentIndex: number;
+  sourceName: string;
+  /** Present for peer targets resolved to a lineage in this same run. */
+  targetAgentIndex?: number;
+  targetName?: string;
+  question: string;
+  context?: string;
+  state: InteractionState;
+  route?: InteractionRoute;
+  createdAt: number;
+  answeredAt?: number;
+  /** Bounded answer text, retained for auditability once the question settles. */
+  answer?: string;
+  error?: string;
+}
+
+/**
  * One turn in a workflow-agent lineage: either the originating `agent()` call
  * (index 0) or a later `followUp()` call against the same retained native
  * session. Bounded and bookkept separately from the top-level record so a
@@ -114,7 +148,7 @@ export interface WorkflowAgentGeneration {
   output?: unknown;
   structured?: unknown;
   structuredTransport?: WorkflowStructuredTransport;
-  outputProvenance?: "subagent" | "replay";
+  outputProvenance?: WorkflowOutputProvenance;
   error?: string;
   timestamps: WorkflowTimestamps;
 }
@@ -126,7 +160,7 @@ export interface WorkflowAgentRecord {
   callFingerprint?: string;
   replayedFrom?: WorkflowReplayReference;
   replacedBy?: WorkflowReplacementLink;
-  outputProvenance?: "subagent" | "replay";
+  outputProvenance?: WorkflowOutputProvenance;
   instructionShaped?: boolean;
   isolation?: WorkflowWorktreeResult;
   name: string;
@@ -165,6 +199,10 @@ export interface WorkflowAgentRecord {
   attempts?: WorkflowAgentAttempt[];
   /** Latest native request occupancy, when exposed by the harness. */
   context?: ContextSnapshot;
+  /** Present while this agent is parked on a host-routed question of its own. */
+  waitingOn?: WorkflowInteractionSummary;
+  /** Present while this agent's retained session is answering a peer question. */
+  answering?: { requestId: string; sourceAgentIndex?: number; sourceName: string };
   /**
    * Bounded turn history for this lineage. Present once a `followUp()` call
    * has targeted this agent; the top-level fields above always mirror the
@@ -209,20 +247,55 @@ export interface WorkflowJournalRoute {
   error?: string;
 }
 
+/**
+ * Durable provenance for one peer question. Persisted because a replayed
+ * lineage has no live retained session: a downstream agent that reruns and asks
+ * the same question again must be answerable from the journal instead of
+ * dispatching (and re-charging) the target a second time.
+ */
+export interface WorkflowInteractionJournalDetail {
+  /** Logical agent and lineage generation that asked. */
+  sourceAgentIndex: number;
+  sourceGeneration: number;
+  /** Logical target agent and the exact call fingerprint its lineage carried. */
+  targetAgentIndex: number;
+  targetJobId?: string;
+  targetCallFingerprint?: string;
+  /** Lineage generation on the target that produced the answer. */
+  targetGeneration?: number;
+  route?: "peer" | "replay";
+}
+
 export interface WorkflowJournalRecord {
   version: 1;
   sequence: number;
+  /**
+   * Sandbox `agent()`/`followUp()` call ordinal, except for `peerQuestion`
+   * records where it carries the run's separate interaction ordinal.
+   */
   callIndex: number;
+  /** Call fingerprint, or the question fingerprint for `peerQuestion` records. */
   fingerprint: string;
   state: "started" | "completed" | "failed";
   at: number;
   /** Absent means "agent" for journals written before followUp() existed. */
-  kind?: "agent" | "followUp";
+  kind?: "agent" | "followUp" | "peerQuestion";
   agentIndex?: number;
+  /** Present only on `peerQuestion` records. */
+  interaction?: WorkflowInteractionJournalDetail;
   result?: WorkflowJournalResult;
   route?: WorkflowJournalRoute;
   replayedFrom?: WorkflowReplayReference;
   replacementOf?: WorkflowReplacementReference;
+}
+
+/** A completed peer answer that may be replayed without dispatching the target again. */
+export interface WorkflowReplayInteraction {
+  ordinal: number;
+  questionFingerprint: string;
+  detail: WorkflowInteractionJournalDetail;
+  answer: string;
+  usage?: Usage;
 }
 
 export interface WorkflowReplayCall {
@@ -284,6 +357,8 @@ export interface WorkflowSnapshot {
   /** Opt-in provider-quota wait policy; absent means today's immediate-failure behavior. Not part of the replay fingerprint. */
   retry?: WorkflowRetryPolicy;
   warnings?: string[];
+  /** Bounded history of host-routed questions asked inside this run, oldest first. */
+  interactions?: WorkflowInteractionSummary[];
   result?: unknown;
   error?: string;
   artifactDir: string;

@@ -11,6 +11,14 @@ import {
   PARENT_THREAD_TOOL_NAME,
   renderParentThreadContext,
 } from "../parent-thread-context.ts";
+import {
+  SUBAGENT_ASK_INPUT_SCHEMA,
+  SUBAGENT_ASK_TOOL_DESCRIPTION,
+  SUBAGENT_ASK_TOOL_NAME,
+  normalizeContext,
+  normalizeQuestion,
+  normalizeTarget,
+} from "../interactions.ts";
 import type {
   Backend,
   BackendEvent,
@@ -388,13 +396,36 @@ export class CodexAppServerBackend implements Backend {
         protocolFailure = error.message;
         finish({ type: "failed", error: `Codex app-server protocol failure: ${error.message}` });
       },
-      onRequest: (_id, method, params) => {
-        if (method === "item/tool/call" && request.parentThread) {
-          if (params.tool !== PARENT_THREAD_TOOL_NAME) throw new Error(`Unsupported dynamic tool: ${String(params.tool ?? "unknown")}`);
-          return {
-            success: true,
-            contentItems: [{ type: "inputText", text: renderParentThreadContext(request.parentThread, params.arguments) }],
-          };
+      onRequest: async (_id, method, params) => {
+        if (method === "item/tool/call" && (request.parentThread || request.interactions)) {
+          if (params.tool === PARENT_THREAD_TOOL_NAME && request.parentThread) {
+            return {
+              success: true,
+              contentItems: [{ type: "inputText", text: renderParentThreadContext(request.parentThread, params.arguments) }],
+            };
+          }
+          if (params.tool === SUBAGENT_ASK_TOOL_NAME && request.interactions) {
+            const args = asObject(params.arguments);
+            // A validated wait is legitimate provider silence: hold the
+            // inactivity countdown instead of killing a healthy question.
+            watchdog.suspend();
+            try {
+              const answer = await request.interactions.ask({
+                question: normalizeQuestion(args.question),
+                context: normalizeContext(args.context),
+                target: normalizeTarget(args.target),
+              });
+              return { success: true, contentItems: [{ type: "inputText", text: answer.answer }] };
+            } catch (error) {
+              return {
+                success: false,
+                contentItems: [{ type: "inputText", text: `Question not answered: ${errorMessage(error)}` }],
+              };
+            } finally {
+              watchdog.resume();
+            }
+          }
+          throw new Error(`Unsupported dynamic tool: ${String(params.tool ?? "unknown")}`);
         }
         if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") return { decision: "decline" };
         if (method === "item/permissions/requestApproval") return { permissions: { network: false, fileSystem: { read: [], write: [] } }, scope: "turn" };
@@ -520,6 +551,22 @@ export class CodexAppServerBackend implements Backend {
       }
     });
 
+    // Client-hosted tools are injected only for the exact grants this job
+    // carries; they are never advertised as a general capability.
+    const dynamicTools = [
+      ...(request.parentThread ? [{
+        type: "function",
+        name: PARENT_THREAD_TOOL_NAME,
+        description: PARENT_THREAD_TOOL_DESCRIPTION,
+        inputSchema: PARENT_THREAD_INPUT_SCHEMA,
+      }] : []),
+      ...(request.interactions ? [{
+        type: "function",
+        name: SUBAGENT_ASK_TOOL_NAME,
+        description: SUBAGENT_ASK_TOOL_DESCRIPTION,
+        inputSchema: SUBAGENT_ASK_INPUT_SCHEMA,
+      }] : []),
+    ];
     const startThread = async (config?: Record<string, unknown>) => asObject(await peer.request("thread/start", {
       cwd: request.cwd,
       ...(request.policy.model ? { model: request.policy.model } : {}),
@@ -529,21 +576,14 @@ export class CodexAppServerBackend implements Backend {
       ephemeral: false,
       ...(config ? { config } : {}),
       developerInstructions: `${request.systemPrompt}\n\n${request.policy.access === "readOnly" ? "Hard policy: remain read-only; do not mutate files, Git state, or external systems." : "This is a trusted workspace. Work autonomously without asking for per-command approval."}`,
-      ...(request.parentThread ? {
-        dynamicTools: [{
-          type: "function",
-          name: PARENT_THREAD_TOOL_NAME,
-          description: PARENT_THREAD_TOOL_DESCRIPTION,
-          inputSchema: PARENT_THREAD_INPUT_SCHEMA,
-        }],
-      } : {}),
+      ...(dynamicTools.length ? { dynamicTools } : {}),
     }, this.#requestTimeoutMs));
 
     const initialization = (async () => {
       try {
         await peer.request("initialize", {
           clientInfo: CODEX_CLIENT_INFO,
-          ...(request.parentThread ? { capabilities: { experimentalApi: true } } : {}),
+          ...(dynamicTools.length ? { capabilities: { experimentalApi: true } } : {}),
         }, this.#requestTimeoutMs);
         peer.notify("initialized");
         const accountResult = asObject(await peer.request("account/read", { refreshToken: false }, this.#requestTimeoutMs));

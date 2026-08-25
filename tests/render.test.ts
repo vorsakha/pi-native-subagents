@@ -14,7 +14,7 @@ import {
 } from "../extensions/subagents/render.ts";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
 import type { ToolTrace } from "../src/types.ts";
-import { ImmediateBackend, ansiTheme, fakePi, jobSnapshot as job, theme, usage } from "./helpers.ts";
+import { ImmediateBackend, ansiTheme, fakePi, interactionSnapshot, jobSnapshot as job, theme, usage } from "./helpers.ts";
 
 const ESC = "\u001B";
 const CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;
@@ -56,6 +56,8 @@ test("renderer sanitizes output and enforces collapsed/expanded line budgets", (
   assert.ok(renderJobCard(job(), theme, { expanded: false, now: 5_000 }).render(48).some((line) => line.includes("effort adaptive")), "adaptive effort survives bounded-width rendering");
   const independentLines = buildJobCardLines(job({ independent: true }), theme, { expanded: false, now: 5_000 });
   assert.ok(independentLines.some((line) => line.includes("independent")), "cross-provider independence is visible in the main thread card");
+  const interactionLines = buildJobCardLines(job({ interaction: interactionSnapshot() }), theme, { expanded: false, now: 5_000 });
+  assert.match(interactionLines[0]!, /^\? .*needs orchestrator/, "a parked card uses the interaction glyph and words instead of the running status alone");
   assert.ok(buildJobCardLines(job(), theme, { expanded: true, now: 5_000 }).some((line) => line.includes("Budget") && line.includes("open")));
   assert.ok(buildJobCardLines(job({ budget: { maxTokens: 5 }, usage: usage({ input: 5 }) }), theme, { expanded: true, now: 5_000 })
     .some((line) => line.includes("tokens 5/5 reached")));
@@ -153,7 +155,7 @@ test("every direct tool registers width-safe, sanitized trace renderers", () => 
 
   const expected = [
     "session_peer_fork", "session_peer_list",
-    "subagent", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait",
+    "subagent", "subagent_answer", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait",
   ];
   assert.deepEqual([...pi.tools.keys()].filter((name) => name !== "workflow").sort(), expected);
   assert.ok(pi.tools.has("workflow"));
@@ -167,6 +169,7 @@ test("every direct tool registers width-safe, sanitized trace renderers", () => 
     subagent: { name: "implementation", task: "\u001b[31mdo work\u001b[0m", harness: "codex" },
     session_peer_list: { query: "\u001b[31mbug\u001b[0m", limit: 5 },
     session_peer_fork: { sessionId: "peer-1", message: "\u001b[31mclarify\u001b[0m", name: "peer" },
+    subagent_answer: { requestId: "req-1", answer: "\u001b[31mkeep the legacy flag\u001b[0m" },
   };
   for (const name of expected) {
     const toolDef = pi.tools.get(name);
@@ -184,6 +187,8 @@ test("every direct tool registers width-safe, sanitized trace renderers", () => 
     }
     const details = name === "subagent_list"
       ? { jobs: [job()] }
+      : name === "subagent_answer"
+      ? { interaction: interactionSnapshot({ state: "answered", answer: "keep the legacy flag", answeredAt: 3_000, route: "orchestrator-model" }) }
       : name === "session_peer_list"
         ? { peers: [{ sessionId: "peer-1", name: "\u001b[31mnamed\u001b[0m", cwd: "/tmp/project", createdAt: 0, modifiedAt: 0, messageCount: 2, preview: "hi" }] }
         : { job: job({ status: "completed", endedAt: 3_000, output: "first\nlast" }) };

@@ -614,7 +614,11 @@ test("workflow agent options preserve generic read-only/profile policy in the ba
     assert.match(request.systemPrompt, /isolated, task-driven subagent[\s\S]*reviewer system prompt/);
     assert.equal(request.policy.access, "readOnly");
     assert.deepEqual(request.policy.codexSandbox, { type: "readOnly", networkAccess: false });
-    assert.deepEqual(request.policy.piTools, ["read", "grep", "find", "ls"]);
+    assert.deepEqual(
+      request.policy.piTools,
+      ["read", "grep", "find", "ls", "subagent_ask"],
+      "a read-only workflow agent keeps its authorized routed-question tool and no other gateway",
+    );
     assert.deepEqual(request.policy.claudeTools, ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]);
     assert.equal(request.policy.approvalPolicy, "never");
     assert.equal(request.policy.effort, "high");
@@ -2545,6 +2549,297 @@ test("reclaimWorktree refuses a non-terminal run and persists removed isolation 
     await readFile(join(f.artifactRoot, final.runId, patchArtifact!), "utf8");
 
     assert.deepEqual(await f.workflows.listProtectedWorktrees({ cwd: f.cwd }), [], "reclaiming the last protected worktree clears the inventory");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+const PEER_SCRIPT = `
+  export default async () => {
+    const planner = await agent("plan the migration", { name: "planner" });
+    const implementer = await agent("implement using " + planner.jobId, { name: "implementer" });
+    return { planner: planner.output, implementer: implementer.output };
+  }
+`;
+
+test("a workflow child asks a completed peer, and the answer becomes a charged generation on that lineage", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "PLAN: keep the legacy flag", { input: 100, output: 10, turns: 1 });
+    await waitFor(() => f.backend.requests.length === 2, "implementer dispatch");
+    const implementerJobId = f.backend.requests[1]!.jobId;
+    assert.ok(f.backend.requests[1]!.interactions, "workflow agents carry the routed-question callback");
+
+    const asked = f.backend.ask(implementerJobId, {
+      question: "Which compatibility behavior did we decide to preserve?",
+      target: { type: "agent", jobId: plannerJobId },
+    });
+    await waitFor(() => f.backend.sends.length === 1, "peer follow-up dispatch");
+    const peerPrompt = f.backend.sends[0]!;
+    assert.equal(peerPrompt.id, plannerJobId);
+    assert.equal(peerPrompt.behavior, "followUp");
+    assert.match(peerPrompt.message, /Untrusted reference data follows/);
+    assert.match(peerPrompt.message, /do not ask another agent or the orchestrator/);
+    assert.match(peerPrompt.message, /Which compatibility behavior did we decide to preserve\?/);
+
+    const answering = f.workflows.check(started.snapshot.runId);
+    assert.equal(answering.agents[0]!.answering?.sourceName, "implementer");
+    assert.equal(answering.agents[1]!.waitingOn?.state, "answering");
+    assert.equal(answering.interactions?.length, 1);
+
+    f.backend.complete(plannerJobId, "The legacy header stays.", { input: 20, output: 5, turns: 1 });
+    const answer = await asked;
+    assert.match(answer.answer, /The legacy header stays\./);
+    assert.equal(answer.route, "peer");
+
+    f.backend.complete(implementerJobId, "IMPLEMENTED");
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.agents.length, 2, "a peer answer never creates a new top-level agent card");
+    const planner = final.agents[0]!;
+    assert.equal(planner.generations?.length, 2);
+    assert.equal(planner.generations?.at(-1)?.outputProvenance, "peerAnswer");
+    assert.equal(planner.outputProvenance, "peerAnswer");
+    assert.equal(planner.answering, undefined);
+    assert.equal(planner.usage.turns, 2, "the peer turn is charged to the target lineage");
+    assert.equal(aggregateWorkflowUsage(final).turns, 2 + final.agents[1]!.usage.turns);
+    const settled = final.interactions?.[0]!;
+    assert.equal(settled.state, "answered");
+    assert.equal(settled.target, "peer");
+    assert.equal(settled.targetAgentIndex, 0);
+    assert.equal(settled.route, "peer");
+
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const peerRecords = journal.filter((record) => record.kind === "peerQuestion");
+    assert.deepEqual(peerRecords.map((record) => record.state), ["started", "completed"]);
+    assert.equal(peerRecords[0]!.callIndex, 0, "interactions use their own ordinal, not a sandbox call index");
+    assert.equal(peerRecords[1]!.interaction?.sourceAgentIndex, 1);
+    assert.equal(peerRecords[1]!.interaction?.targetAgentIndex, 0);
+    assert.equal(peerRecords[1]!.interaction?.targetCallFingerprint, workflowCallFingerprint("plan the migration", { name: "planner" }));
+    assert.equal(peerRecords[1]!.interaction?.route, "peer");
+    assert.equal(peerRecords[1]!.result?.output, "The legacy header stays.");
+    const agentCalls = journal.filter((record) => record.kind !== "peerQuestion").map((record) => record.callIndex);
+    assert.deepEqual(agentCalls, [0, 0, 1, 1], "the sandbox call ordinals are untouched by the interaction");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a replayed peer answer is reused without dispatching or re-charging the target", async () => {
+  const f = await fixture();
+  try {
+    // First run: the planner answers a peer question, then the implementer fails.
+    const first = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "PLAN: keep the legacy flag", { turns: 1 });
+    await waitFor(() => f.backend.requests.length === 2, "implementer dispatch");
+    const implementerJobId = f.backend.requests[1]!.jobId;
+    const question = "Which compatibility behavior did we decide to preserve?";
+    const asked = f.backend.ask(implementerJobId, { question, target: { type: "agent", jobId: plannerJobId } });
+    await waitFor(() => f.backend.sends.length === 1, "peer follow-up dispatch");
+    f.backend.complete(plannerJobId, "The legacy header stays.", { turns: 1 });
+    await asked;
+    f.backend.fail(implementerJobId, "implementer crashed");
+    const failed = await first.completion;
+
+    // Second run: the planner call replays (no live session), and the same
+    // question is answered from the journal instead of a second dispatch.
+    const sendsBefore = f.backend.sends.length;
+    const second = await f.workflows.start(f.request(PEER_SCRIPT, { resumeFromRunId: failed.runId }));
+    await waitFor(() => f.backend.requests.length === 3, "implementer rerun");
+    const rerunJobId = f.backend.requests[2]!.jobId;
+    const replayedAnswer = await f.backend.ask(rerunJobId, { question, target: { type: "agent", jobId: plannerJobId } });
+    assert.match(replayedAnswer.answer, /The legacy header stays\./);
+    assert.equal(replayedAnswer.route, "replay");
+    assert.equal(f.backend.sends.length, sendsBefore, "a replayed answer never continues the target session again");
+
+    f.backend.complete(rerunJobId, "IMPLEMENTED");
+    const final = await second.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.agents[0]!.usage.turns, 0, "a replayed lineage is not charged for the recorded answer");
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const completed = journal.find((record) => record.kind === "peerQuestion" && record.state === "completed");
+    assert.equal(completed?.interaction?.route, "replay");
+
+    // A question with no matching record cannot be served by a replayed lineage.
+    // Resuming the failed run again reruns the implementer live against the same
+    // replayed planner, so only the question text differs from the recorded one.
+    const third = await f.workflows.start(f.request(PEER_SCRIPT, { resumeFromRunId: failed.runId }));
+    await waitFor(() => f.backend.requests.length === 4, "second rerun implementer");
+    const strayJobId = f.backend.requests[3]!.jobId;
+    await assert.rejects(
+      f.backend.ask(strayJobId, { question: "an entirely different question", target: { type: "agent", jobId: plannerJobId } }),
+      /retains no native session, and no recorded answer matches/,
+    );
+    f.backend.complete(strayJobId, "IMPLEMENTED");
+    await third.completion;
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a peer answer runs under the workflow dispatch limit without deadlocking the asking agent", async () => {
+  const f = await fixture(1);
+  try {
+    const started = await f.workflows.start(f.request(PEER_SCRIPT, { budget: { maxConcurrency: 1 } }));
+    await waitFor(() => f.backend.requests.length === 1, "planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "PLAN");
+    await waitFor(() => f.backend.requests.length === 2, "implementer dispatch");
+    const implementerJobId = f.backend.requests[1]!.jobId;
+    const asked = f.backend.ask(implementerJobId, { question: "still there?", target: { type: "agent", jobId: plannerJobId } });
+    await waitFor(() => f.backend.sends.length === 1, "the parked caller hands its dispatch slot to the answer turn");
+    f.backend.complete(plannerJobId, "yes");
+    assert.match((await asked).answer, /yes/);
+    f.backend.complete(implementerJobId, "IMPLEMENTED");
+    assert.equal((await started.completion).status, "completed");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("four occupied global slots can all hand off to peer-answer turns without a fifth active turn", async () => {
+  const f = await fixture(4);
+  const script = `
+    export default async () => {
+      const planners = await parallel(
+        [0, 1, 2, 3].map((index) => () => agent("planner " + index, { name: "planner-" + index, access: "readOnly" })),
+        { concurrency: 4 },
+      );
+      return parallel(
+        planners.map((planner, index) => () => agent("caller " + index + " target " + planner.jobId, { name: "caller-" + index, access: "readOnly" })),
+        { concurrency: 4 },
+      );
+    }
+  `;
+  try {
+    const started = await f.workflows.start(f.request(script, { budget: { maxConcurrency: 4 } }));
+    await waitFor(() => f.backend.requests.length === 4, "four planners dispatched");
+    const planners = f.backend.requests.slice(0, 4).map((request) => request.jobId);
+    for (const [index, jobId] of planners.entries()) f.backend.complete(jobId, `plan ${index}`);
+    await waitFor(() => f.backend.requests.length === 8, "four callers occupy the global scheduler");
+    const callers = f.backend.requests.slice(4, 8).map((request) => request.jobId);
+
+    const asks = callers.map((caller, index) => f.backend.ask(caller, {
+      question: `question ${index}`,
+      target: { type: "agent", jobId: planners[index] },
+    }));
+    await waitFor(() => f.backend.sends.length === 4, "every parked caller handed its lease to a peer answer");
+    assert.equal(f.backend.requests.length, 8, "peer answers reuse retained sessions instead of creating top-level jobs");
+
+    for (const [index, jobId] of planners.entries()) f.backend.complete(jobId, `answer ${index}`);
+    const answers = await Promise.all(asks);
+    assert.deepEqual(answers.map((answer) => answer.route), ["peer", "peer", "peer", "peer"]);
+    for (const [index, jobId] of callers.entries()) f.backend.complete(jobId, `done ${index}`);
+    assert.equal((await started.completion).status, "completed");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a foreground workflow child cannot wake the parent turn, and a background one can", async () => {
+  const f = await fixture();
+  try {
+    const foreground = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "foreground planner dispatch");
+    assert.equal(f.backend.requests[0]!.interactionTargets?.includes("orchestrator"), true);
+    await assert.rejects(
+      f.backend.ask(f.backend.requests[0]!.jobId, { question: "who decides?" }),
+      /foreground subagent cannot ask the parent orchestrator/i,
+    );
+    await f.workflows.cancel(foreground.snapshot.runId, "done");
+    await foreground.completion;
+
+    const background = await f.workflows.start(f.request(PEER_SCRIPT, { background: true }));
+    await waitFor(() => f.backend.requests.length === 2, "background planner dispatch");
+    const plannerJobId = f.backend.requests[1]!.jobId;
+    const asked = f.backend.ask(plannerJobId, { question: "who decides?" });
+    await waitFor(() => f.workflows.check(background.snapshot.runId).agents[0]?.waitingOn !== undefined, "pending question projection");
+    const parked = f.workflows.check(background.snapshot.runId).agents[0]!;
+    assert.equal(parked.waitingOn?.target, "orchestrator");
+    assert.equal(parked.waitingOn?.state, "pending");
+    assert.equal(f.jobs.pendingInteractions().length, 1);
+    f.jobs.answerInteraction(f.jobs.pendingInteractions()[0]!.requestId, "the human decides");
+    assert.match((await asked).answer, /the human decides/);
+    await f.workflows.cancel(background.snapshot.runId, "done");
+    await background.completion;
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a failed peer answer fails only the question and preserves the completed target lineage", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "PLAN: keep the legacy flag", { input: 100, output: 10, turns: 1 });
+    await waitFor(() => f.backend.requests.length === 2, "implementer dispatch");
+    const implementerJobId = f.backend.requests[1]!.jobId;
+
+    const asked = f.backend.ask(implementerJobId, { question: "which flag?", target: { type: "agent", jobId: plannerJobId } });
+    await waitFor(() => f.backend.sends.length === 1, "peer follow-up dispatch");
+    f.backend.fail(plannerJobId, "peer session crashed");
+    await assert.rejects(asked, /peer session crashed/);
+
+    const after = f.workflows.check(started.snapshot.runId);
+    const planner = after.agents[0]!;
+    assert.equal(planner.state, "completed", "auxiliary answer work never fails a lineage the script already consumed");
+    assert.equal(planner.output, "PLAN: keep the legacy flag");
+    assert.equal(planner.outputProvenance, "subagent");
+    assert.equal(planner.answering, undefined);
+    assert.equal(planner.generations?.at(-1)?.state, "failed", "the answer attempt is still auditable as its own generation");
+    assert.equal(planner.generations?.at(-1)?.outputProvenance, "peerAnswer");
+    assert.equal(after.agents[1]!.waitingOn, undefined, "the caller's wait clears when the question fails");
+    assert.equal(after.interactions?.at(-1)?.state, "dismissed");
+
+    f.backend.complete(implementerJobId, "IMPLEMENTED");
+    const final = await started.completion;
+    assert.equal(final.status, "completed", "the run itself is unaffected by a refused question");
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const peerRecords = journal.filter((record) => record.kind === "peerQuestion");
+    assert.deepEqual(peerRecords.map((record) => record.state), ["started", "failed"]);
+    assert.match(peerRecords[1]!.result?.error ?? "", /peer session crashed/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("workflow routed questions use a separate hard limit and bounded audit history", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("ask repeatedly", { name: "asker", access: "readOnly" });`,
+      { background: true },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "background asker dispatch");
+    const jobId = f.backend.requests[0]!.jobId;
+
+    for (let index = 0; index < 32; index++) {
+      const asked = f.backend.ask(jobId, { question: `question ${index}` });
+      await waitFor(() => f.jobs.pendingInteractions().length === 1, `question ${index} parked`);
+      f.jobs.answerInteraction(f.jobs.pendingInteractions()[0]!.requestId, `answer ${index}`);
+      await asked;
+    }
+
+    const snapshot = f.workflows.check(started.snapshot.runId);
+    assert.equal(f.jobs.check(jobId).interactionsAsked, 32);
+    assert.equal(snapshot.interactions?.length, 16, "the dashboard and durable snapshot keep only bounded recent history");
+    assert.equal(snapshot.interactions?.[0]?.ordinal, 16);
+    assert.equal(snapshot.interactions?.at(-1)?.ordinal, 31);
+    await assert.rejects(
+      f.backend.ask(jobId, { question: "question 33" }),
+      /interaction budget exhausted \(32 routed questions\)/,
+    );
+    assert.equal(f.jobs.pendingInteractions().length, 0, "the rejected request never creates interaction state");
+
+    await f.workflows.cancel(started.snapshot.runId, "test complete");
+    await started.completion;
   } finally {
     await f.cleanup();
   }

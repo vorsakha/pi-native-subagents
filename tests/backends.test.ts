@@ -3,11 +3,17 @@ import assert from "node:assert/strict";
 import { delay, tempDir } from "./helpers.ts";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { ClaudeBackend } from "../src/backends/claude.ts";
+import { ClaudeBackend, CLAUDE_SUBAGENT_ASK_TOOL, forbiddenInitTools } from "../src/backends/claude.ts";
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
 import { CodexAppServerBackend, classifyCodexUnavailability } from "../src/backends/codex.ts";
 import { MAX_OUTPUT_BYTES } from "../src/reducer.ts";
 import type { BackendEvent, HarnessName, BackendRequest } from "../src/types.ts";
+import {
+  SUBAGENT_ASK_TOOL_NAME,
+  type InteractionAskInput,
+  type InteractionHandler,
+} from "../src/interactions.ts";
+import { askThroughInteractionBridge, openInteractionBridge } from "../src/interaction-bridge.ts";
 
 const PI_FIXTURE = `#!/usr/bin/env node
 import fs from "node:fs";
@@ -16,6 +22,11 @@ if (process.env.ENV_FILE) fs.writeFileSync(process.env.ENV_FILE, JSON.stringify(
   openai: process.env.OPENAI_API_KEY,
   codex: process.env.CODEX_API_KEY,
   ...(process.env.PI_NATIVE_SUBAGENTS_PARENT_THREAD_FILE ? { parentThread: JSON.parse(fs.readFileSync(process.env.PI_NATIVE_SUBAGENTS_PARENT_THREAD_FILE, "utf8")) } : {}),
+  ask: {
+    address: process.env.PI_NATIVE_SUBAGENTS_INTERACTION_ADDRESS ?? null,
+    token: process.env.PI_NATIVE_SUBAGENTS_INTERACTION_TOKEN ?? null,
+    targets: process.env.PI_NATIVE_SUBAGENTS_INTERACTION_TARGETS ?? null,
+  },
 }));
 let buffer = "";
 process.stdin.setEncoding("utf8");
@@ -179,10 +190,13 @@ process.stdin.on("data", chunk => {
       if (process.env.MODE === "dynamic-tool") {
         process.stdout.write(JSON.stringify({ id: "server-tool-1", method: "item/tool/call", params: { threadId: "thread-1", turnId: id, callId: "call-1", tool: "parent_thread_context", arguments: { query: "decision" } } }) + "\\n");
       }
+      if (process.env.MODE === "ask-tool") {
+        process.stdout.write(JSON.stringify({ id: "server-tool-1", method: "item/tool/call", params: { threadId: "thread-1", turnId: id, callId: "call-1", tool: process.env.ASK_TOOL_NAME, arguments: JSON.parse(process.env.ASK_TOOL_ARGS) } }) + "\\n");
+      }
       if (process.env.MODE === "activity") {
         for (const delay of [80, 160, 240]) setTimeout(() => process.stdout.write(JSON.stringify({ method: "item/reasoning/summaryTextDelta", params: { delta: "." } }) + "\\n"), delay);
       }
-      if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool") setTimeout(() => {
+      if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool" && process.env.MODE !== "ask-tool") setTimeout(() => {
         if (process.env.MODE === "tool-events") {
           process.stdout.write(JSON.stringify({ method: "item/started", params: { item: { id: "command-1", type: "commandExecution", command: "pwd" } } }) + "\\n");
           process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { id: "command-1", type: "commandExecution", command: "pwd", aggregatedOutput: "/tmp", status: "completed" } } }) + "\\n");
@@ -482,6 +496,7 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
     assert.deepEqual(JSON.parse(await readFile(envFile, "utf8")), {
       openai: "pi-provider-key",
       codex: "pi-provider-token",
+      ask: { address: null, token: null, targets: null },
     }, "Pi inherits provider configuration instead of applying a native-harness subscription policy");
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
@@ -1287,4 +1302,187 @@ test("Codex startup timeout and early exit both settle clearly", async (t) => {
       } finally { await rm(fake.dir, { recursive: true, force: true }); }
     });
   }
+});
+
+
+/** Records every routed question a backend adapter forwards through the host callback. */
+function recordingInteractions(answer: string | Error = "keep the legacy flag"): InteractionHandler & { calls: InteractionAskInput[] } {
+  const calls: InteractionAskInput[] = [];
+  return {
+    calls,
+    async ask(input) {
+      calls.push(input);
+      if (answer instanceof Error) throw answer;
+      return { answer, requestId: "req-1", route: "orchestrator-model", answeredBy: "orchestrator" };
+    },
+  };
+}
+
+test("Claude exposes the ask tool as an in-process MCP server only for an authorized job", async () => {
+  const interactions = recordingInteractions();
+  let capturedOptions: Record<string, unknown> | undefined;
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [CLAUDE_SUBAGENT_ASK_TOOL] };
+    yield { type: "result", subtype: "success", result: "done", usage: {}, total_cost_usd: 0, num_turns: 1 };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const claudeRequest = request("claude", process.cwd(), process.env);
+  claudeRequest.interactions = interactions;
+  claudeRequest.interactionTargets = ["orchestrator"];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: ((input: { options?: Record<string, unknown> }) => { capturedOptions = input.options; return stream; }) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(claudeRequest, (event) => events.push(event));
+  await run.completed;
+  assert.equal(terminal(events)?.type, "completed", "a read-only init advertising the host ask tool is not a policy violation");
+  assert.ok((capturedOptions?.allowedTools as string[]).includes(CLAUDE_SUBAGENT_ASK_TOOL));
+  assert.ok((capturedOptions?.mcpServers as Record<string, unknown>).subagent_interactions);
+  await run.close();
+
+  // Without the host callback the tool is neither served nor tolerated.
+  const unauthorized = request("claude", process.cwd(), process.env);
+  let unauthorizedOptions: Record<string, unknown> | undefined;
+  async function* denied() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [CLAUDE_SUBAGENT_ASK_TOOL] };
+  }
+  const deniedStream = Object.assign(denied(), { close() {} });
+  const deniedEvents: BackendEvent[] = [];
+  const deniedRun = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: ((input: { options?: Record<string, unknown> }) => { unauthorizedOptions = input.options; return deniedStream; }) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(unauthorized, (event) => deniedEvents.push(event));
+  await deniedRun.completed;
+  assert.equal(unauthorizedOptions?.mcpServers, undefined);
+  assert.match((terminal(deniedEvents) as { error: string }).error, /exposed forbidden tools/);
+  await deniedRun.close();
+
+  assert.deepEqual(forbiddenInitTools([CLAUDE_SUBAGENT_ASK_TOOL, "mcp__user__other"], true, [CLAUDE_SUBAGENT_ASK_TOOL]), ["mcp__user__other"],
+    "a granted host tool is the only mcp surface a read-only child may see");
+});
+
+test("Codex routes its dynamic ask tool through the host callback and rejects unknown tools", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const threadParamFile = join(fake.dir, "thread-params.json");
+  const toolResultFile = join(fake.dir, "tool-result.json");
+  const interactions = recordingInteractions();
+  try {
+    const codexRequest = request("codex", fake.dir, {
+      ...process.env,
+      MODE: "ask-tool",
+      ASK_TOOL_NAME: SUBAGENT_ASK_TOOL_NAME,
+      ASK_TOOL_ARGS: JSON.stringify({ question: "Which flag stays?", target: { type: "orchestrator" } }),
+      THREAD_PARAM_FILE: threadParamFile,
+      TOOL_RESULT_FILE: toolResultFile,
+    });
+    codexRequest.interactions = interactions;
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 5_000, inactivityTimeoutMs: 5_000 })
+      .start(codexRequest, () => {});
+    await run.completed;
+    const threadParams = JSON.parse(await readFile(threadParamFile, "utf8"));
+    assert.deepEqual(threadParams.dynamicTools.map((tool: { name: string }) => tool.name), [SUBAGENT_ASK_TOOL_NAME]);
+    const toolResult = JSON.parse(await readFile(toolResultFile, "utf8"));
+    assert.equal(toolResult.success, true);
+    assert.equal(toolResult.contentItems[0].text, "keep the legacy flag");
+    assert.deepEqual(interactions.calls[0]?.target, { kind: "orchestrator" });
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+
+  const denied = await fixture(CODEX_FIXTURE);
+  const deniedResultFile = join(denied.dir, "tool-result.json");
+  try {
+    const codexRequest = request("codex", denied.dir, {
+      ...process.env,
+      MODE: "ask-tool",
+      ASK_TOOL_NAME: "arbitrary_tool",
+      ASK_TOOL_ARGS: JSON.stringify({}),
+      TOOL_RESULT_FILE: deniedResultFile,
+    });
+    codexRequest.interactions = recordingInteractions();
+    const events: BackendEvent[] = [];
+    const run = await new CodexAppServerBackend(denied.command, { requestTimeoutMs: 5_000, inactivityTimeoutMs: 2_000 })
+      .start(codexRequest, (event) => events.push(event));
+    await run.cancel("done");
+    await run.close();
+    assert.equal(await readFile(deniedResultFile, "utf8").catch(() => ""), "", "an unsupported dynamic tool is never answered");
+  } finally { await rm(denied.dir, { recursive: true, force: true }); }
+});
+
+test("the Pi interaction bridge answers only authenticated, well-formed requests", async () => {
+  const interactions = recordingInteractions();
+  const bridge = await openInteractionBridge("job-abc", interactions);
+  try {
+    const answer = await askThroughInteractionBridge({
+      address: bridge.address,
+      token: bridge.token,
+      question: "Which flag stays?",
+      context: "tests disagree",
+      target: { type: "orchestrator" },
+    });
+    assert.equal(answer.answer, "keep the legacy flag");
+    assert.equal(interactions.calls[0]?.context, "tests disagree");
+
+    await assert.rejects(
+      askThroughInteractionBridge({ address: bridge.address, token: "wrong-token", question: "let me in", target: undefined }),
+      /Interaction bridge (?:closed before answering|is unavailable)/,
+      "an unauthenticated frame is dropped without protocol detail",
+    );
+    assert.equal(interactions.calls.length, 1, "a rejected frame never reaches the host callback");
+
+    await assert.rejects(
+      askThroughInteractionBridge({ address: bridge.address, token: bridge.token, question: "  ", target: undefined }),
+      /question must be a non-empty string/,
+    );
+  } finally {
+    await bridge.close();
+  }
+  await assert.rejects(
+    askThroughInteractionBridge({ address: bridge.address, token: bridge.token, question: "after close", target: undefined }),
+    /Interaction bridge/,
+  );
+});
+
+test("Pi loads the interaction child extension and its bridge coordinates only when authorized", async () => {
+  const fake = await fixture(PI_FIXTURE);
+  const argFile = join(fake.dir, "args.json");
+  const events: BackendEvent[] = [];
+  const interactions = recordingInteractions();
+  let openedFor: string | undefined;
+  try {
+    const piRequest = request("pi", fake.dir, { ...process.env, MODE: "complete", ARG_FILE: argFile, ENV_FILE: join(fake.dir, "env.json") });
+    piRequest.interactions = interactions;
+    piRequest.interactionTargets = ["orchestrator", "agent"];
+    const backend = new PiRpcBackend(fake.command, {
+      requestTimeoutMs: 5_000,
+      inactivityTimeoutMs: 5_000,
+      openInteractionBridge: async (jobId, handler) => {
+        openedFor = jobId;
+        return openInteractionBridge(jobId, handler);
+      },
+    });
+    const run = await backend.start(piRequest, (event) => events.push(event));
+    await run.completed;
+    await run.close();
+    assert.equal(openedFor, piRequest.jobId, "the bridge is opened per authorized job");
+    const args = JSON.parse(await readFile(argFile, "utf8")) as string[];
+    assert.ok(args.some((arg) => arg.endsWith("extensions/interactions/index.ts")), "the child extension is loaded explicitly");
+    const childEnv = JSON.parse(await readFile(join(fake.dir, "env.json"), "utf8"));
+    assert.ok(childEnv.ask.address && childEnv.ask.token, "the authorized child receives live bridge coordinates");
+    assert.equal(childEnv.ask.targets, "orchestrator,agent");
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+
+  const plain = await fixture(PI_FIXTURE);
+  const plainArgs = join(plain.dir, "args.json");
+  try {
+    const run = await new PiRpcBackend(plain.command, { requestTimeoutMs: 5_000, inactivityTimeoutMs: 5_000 })
+      .start(request("pi", plain.dir, { ...process.env, MODE: "complete", ARG_FILE: plainArgs, ENV_FILE: join(plain.dir, "env.json") }), () => {});
+    await run.completed;
+    await run.close();
+    const args = JSON.parse(await readFile(plainArgs, "utf8")) as string[];
+    assert.ok(!args.some((arg) => arg.endsWith("extensions/interactions/index.ts")), "an unauthorized child never loads the ask extension");
+    const plainEnv = JSON.parse(await readFile(join(plain.dir, "env.json"), "utf8"));
+    assert.deepEqual(plainEnv.ask, { address: null, token: null, targets: null }, "no bridge coordinates leak into an unauthorized child");
+  } finally { await rm(plain.dir, { recursive: true, force: true }); }
 });

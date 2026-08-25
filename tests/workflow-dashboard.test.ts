@@ -1300,3 +1300,58 @@ test("/workflows keeps the host overlay geometry and non-TUI summary contract", 
   } as never, summaryManager);
   assert.equal(summary, "integration completed Release integration");
 });
+
+test("a routed-question wait reads differently from a provider-quota wait in /workflows", (t) => {
+  const run = workflow("questions");
+  const planner = run.agents[0]!;
+  const implementer = run.agents[1]!;
+  planner.answering = { requestId: "req-1", sourceAgentIndex: 1, sourceName: "tests" };
+  implementer.waitingOn = {
+    ordinal: 0,
+    requestId: "req-1",
+    target: "peer",
+    sourceAgentIndex: 1,
+    sourceName: "tests",
+    targetAgentIndex: 0,
+    targetName: "review",
+    question: "Which compatibility behavior did we decide to preserve?",
+    context: "the task wording and the fixtures disagree",
+    state: "pending",
+    createdAt: 60_000,
+  };
+  run.interactions = [implementer.waitingOn];
+
+  const quota = workflow("quota");
+  quota.agents[1]!.state = "waiting";
+  quota.agents[1]!.providerWait = { provider: "codex", kind: "quota", detail: "usage limit", attempt: 1, maxAttempts: 3, retryAt: 125_000 };
+
+  const state = harness([run, quota], 30, () => {}, { fullscreen: true, focusRunId: run.runId });
+  t.after(() => state.overlay.dispose());
+
+  const overview = state.overlay.render(120);
+  assertPanel(overview, 120, 30);
+  const overviewText = overview.join("\n");
+  assert.match(overviewText, /\? 1 need input/, "the run row aggregates blocked agents in words and a glyph");
+  assert.match(overviewText, /Questions · 1 need input/);
+  assert.match(overviewText, /waiting for review/, "the wait names the peer that owes the answer");
+  assert.match(overviewText, /Which compatibility behavi/, "the bounded question rides along with the wait");
+  assert.match(overviewText, /unanswered/);
+  assert.match(overviewText, /answering peer/, "the target lineage shows the answer turn it is producing");
+
+  state.overlay.handleInput("\t");
+  state.overlay.handleInput(ENTER);
+  const inspector = state.overlay.render(120).join("\n");
+  assert.match(inspector, /agent · tests/);
+  assert.match(inspector, /Question · waiting for review/);
+  assert.match(inspector, /Question context · the task wording and the fixtures disagree/);
+  assert.doesNotMatch(inspector, /Provider wait/, "an interaction wait is never reported as a provider-quota wait");
+
+  const quotaState = harness([quota], 30, () => {}, { fullscreen: true, focusRunId: quota.runId });
+  t.after(() => quotaState.overlay.dispose());
+  quotaState.overlay.render(120);
+  quotaState.overlay.handleInput("\t");
+  quotaState.overlay.handleInput(ENTER);
+  const quotaText = quotaState.overlay.render(120).join("\n");
+  assert.match(quotaText, /Provider wait · codex quota/);
+  assert.doesNotMatch(quotaText, /need input|Question ·/, "a provider wait never borrows the interaction vocabulary");
+});

@@ -44,6 +44,8 @@ import {
   formatEffort,
   formatElapsed,
   formatUsage,
+  interactionWaitLabel,
+  pendingInteraction,
   sanitizeInline,
   sanitizeText,
   shortId,
@@ -59,9 +61,10 @@ import { DEFAULT_TOOL_DISPLAY, type ToolDisplayMode } from "../tool-summary.ts";
 import type { JobSnapshot, SendBehavior } from "../../src/types.ts";
 
 /*
- * `/subagents` is one panel with two modes. Browse mode selects a job and reads
+ * `/subagents` is one panel with three modes. Browse mode selects a job and reads
  * its normalized transcript; takeover mode keeps the same selection and scroll
- * position and adds a composer for steering or queuing a follow-up. The panel
+ * position and adds a composer for steering or queuing a follow-up; answer mode
+ * reuses that composer to resolve one routed question a job is parked on. The panel
  * takes the whole screen when Pi runs its fullscreen TUI and keeps Pi's 80%
  * overlay otherwise, so overlay geometry stays percentage-based and survives
  * resize. Layout adapts to the terminal it is given — see `dashboardLayout`.
@@ -73,6 +76,8 @@ export interface SubagentsDashboardManager {
   subscribe(listener: (job: JobSnapshot) => void): () => void;
   send(id: string, message: string, behavior?: SendBehavior): Promise<JobSnapshot>;
   cancel(id: string, reason?: string): Promise<JobSnapshot>;
+  /** Resolves one pending routed question. Deliberately not `send`: it settles a provider tool call, not a user turn. */
+  answerInteraction?(requestId: string, answer: string, route?: "orchestrator-model" | "human"): unknown;
   /** Global concurrent-job budget, when the manager reports one. */
   readonly concurrency?: number;
 }
@@ -92,7 +97,7 @@ export interface DashboardOverlayOptions {
   fullscreen?: boolean;
 }
 
-export type DashboardMode = "browse" | "takeover";
+export type DashboardMode = "browse" | "takeover" | "answer";
 export type { DashboardLayout, DashboardLayoutKind } from "../dashboard-style.ts";
 
 export function createDashboardOverlay(
@@ -130,6 +135,8 @@ class DashboardOverlay implements Focusable {
   #notice = "";
   #behavior: SendBehavior | undefined;
   #pendingSend: { jobId: string; draft: string; inputRevision: number } | undefined;
+  /** Request ID the answer composer is bound to, so a changed question cannot be answered by a stale draft. */
+  #answerRequestId: string | undefined;
   #inputRevision = 0;
   #input = new Input();
   #jobs: JobSnapshot[] | undefined;
@@ -193,7 +200,7 @@ class DashboardOverlay implements Focusable {
 
   set focused(value: boolean) {
     this.#focused = value;
-    this.#input.focused = value && this.#mode === "takeover";
+    this.#input.focused = value && this.composing();
   }
 
   render(width: number): string[] {
@@ -291,7 +298,7 @@ class DashboardOverlay implements Focusable {
       return;
     }
 
-    const takeover = this.#mode === "takeover";
+    const takeover = this.composing();
 
     // The cheatsheet is a browse-only modal: `?` never reaches the takeover
     // composer, and while shown, `?` or cancel dismiss it without touching
@@ -303,7 +310,7 @@ class DashboardOverlay implements Focusable {
     }
 
     if (cancel) {
-      if (this.#mode === "takeover") this.leaveTakeover();
+      if (this.composing()) this.leaveTakeover();
       else if (this.#layout?.kind === "narrow" && this.#pane === "detail") {
         this.#pane = "list";
         this.resetScroll();
@@ -348,8 +355,8 @@ class DashboardOverlay implements Focusable {
     }
     else if (matchesKey(data, Key.shift(Key.up))) this.scroll(-1);
     else if (matchesKey(data, Key.shift(Key.down))) this.scroll(1);
-    else if (this.#mode !== "takeover" && this.#layout?.kind !== "narrow" && matchesKey(data, Key.pageUp)) this.scroll(-this.pageStep());
-    else if (this.#mode !== "takeover" && this.#layout?.kind !== "narrow" && matchesKey(data, Key.pageDown)) this.scroll(this.pageStep());
+    else if (!this.composing() && this.#layout?.kind !== "narrow" && matchesKey(data, Key.pageUp)) this.scroll(-this.pageStep());
+    else if (!this.composing() && this.#layout?.kind !== "narrow" && matchesKey(data, Key.pageDown)) this.scroll(this.pageStep());
     else if (matchesKey(data, Key.ctrl("u"))) this.scroll(-this.halfPageStep());
     else if (matchesKey(data, Key.ctrl("d"))) this.scroll(this.halfPageStep());
     else if (matchesKey(data, "g")) this.scrollTo(0);
@@ -361,6 +368,9 @@ class DashboardOverlay implements Focusable {
     }
     else if (matchesKey(data, "s") && this.steerControlVisible(job)) this.enterTakeover(job, "steer");
     else if (matchesKey(data, "f") && this.followUpControlVisible(job)) this.enterTakeover(job, "followUp");
+    // `a` reaches the composer only for a human-owned question; on a
+    // model-owned one it explains who owes the answer instead of doing nothing.
+    else if (matchesKey(data, "a") && !this.composing() && job && pendingInteraction(job)) this.enterAnswer(job);
     else if (matchesKey(data, "x") && this.cancelControlVisible(job)) this.requestCancel(job, undefined);
     else if (matchesKey(data, "t") || matchesKey(data, Key.ctrl("t"))) this.toggleToolDisplay();
     this.tui.requestRender();
@@ -428,6 +438,7 @@ class DashboardOverlay implements Focusable {
     this.#mode = "browse";
     this.#pane = "list";
     this.#behavior = undefined;
+    this.#answerRequestId = undefined;
     this.#confirmCancelId = undefined;
     this.#renderedCancelId = undefined;
     this.#renderedConfirmationId = undefined;
@@ -444,14 +455,14 @@ class DashboardOverlay implements Focusable {
   private syncSelection(jobs: JobSnapshot[]): JobSnapshot | undefined {
     if (!jobs.length) {
       this.#selectedId = undefined;
-      if (this.#mode === "takeover") this.leaveTakeover();
+      if (this.composing()) this.leaveTakeover();
       return undefined;
     }
     const chosen = jobs.find((job) => job.id === this.#selectedId) ?? defaultJob(jobs);
     if (chosen.id !== this.#selectedId) {
       // The previous selection was evicted (or this is the first render): start clean.
       this.#selectedId = chosen.id;
-      if (this.#mode === "takeover") this.leaveTakeover();
+      if (this.composing()) this.leaveTakeover();
       this.resetScroll();
     }
     return chosen;
@@ -491,13 +502,43 @@ class DashboardOverlay implements Focusable {
   private leaveTakeover(): void {
     this.#mode = "browse";
     this.#behavior = undefined;
+    this.#answerRequestId = undefined;
     this.#input.focused = false;
   }
 
+  /** True while a composer owns keyboard input, for either steering or answering. */
+  private composing(): boolean {
+    return this.#mode !== "browse";
+  }
+
+  /**
+   * Opens the inline answer composer for a human-owned question. Model-owned
+   * questions stay read-only here: their answer belongs to the parent thread,
+   * which is woken with its own `subagent_answer` call.
+   */
+  private enterAnswer(job: JobSnapshot | undefined): void {
+    const interaction = job && pendingInteraction(job);
+    if (!job || !interaction) return;
+    if (!interaction.humanVisible || interaction.target.kind !== "orchestrator") {
+      this.#notice = "This question is routed to the orchestrator; it answers from the parent thread.";
+      return;
+    }
+    if (!this.manager.answerInteraction) {
+      this.#notice = "This session cannot answer routed questions.";
+      return;
+    }
+    this.#mode = "answer";
+    this.#pane = "detail";
+    this.#behavior = undefined;
+    this.#answerRequestId = interaction.requestId;
+    this.#input.focused = this.#focused;
+  }
+
   private submit(raw: string): void {
-    if (this.#mode !== "takeover") return;
+    if (!this.composing()) return;
     const message = raw.trim();
     if (!message) return;
+    if (this.#mode === "answer") return this.submitAnswer(message, raw);
     if (this.#pendingSend) {
       this.#notice = "Previous message is still being sent; keep editing and try again when it settles.";
       this.tui.requestRender();
@@ -533,6 +574,27 @@ class DashboardOverlay implements Focusable {
         this.#notice = error instanceof Error ? error.message : String(error);
         this.tui.requestRender();
       });
+  }
+
+  /**
+   * Resolves the pinned question in place. Late, duplicate, expired, and
+   * dismissed requests fail in the manager, so the composer surfaces that
+   * message and keeps the draft instead of silently dropping the answer.
+   */
+  private submitAnswer(answer: string, raw: string): void {
+    const requestId = this.#answerRequestId;
+    const answerInteraction = this.manager.answerInteraction;
+    if (!requestId || !answerInteraction) return;
+    try {
+      answerInteraction.call(this.manager, requestId, answer, "human");
+      this.#input.setValue("");
+      this.#notice = "Answer delivered; the subagent resumed.";
+      this.leaveTakeover();
+    } catch (error) {
+      this.#notice = error instanceof Error ? error.message : String(error);
+      this.#input.setValue(raw);
+    }
+    this.tui.requestRender();
   }
 
   private requestCancel(job: JobSnapshot | undefined, armed: string | undefined): void {
@@ -696,6 +758,7 @@ class DashboardOverlay implements Focusable {
       { title: "Actions", entries: [
         ["s", "steer a running job"],
         ["f", "queue a follow-up on a finished job"],
+        ["a", "answer a question your own /subagent job asked"],
         ["x", "cancel a live job (press twice)"],
         ["t / Ctrl+T", "toggle compact/full tool display"],
       ] },
@@ -713,9 +776,11 @@ class DashboardOverlay implements Focusable {
     const running = jobs.filter((job) => job.status === "running").length;
     const queued = jobs.filter((job) => job.status === "queued").length;
     const capacity = this.manager.concurrency ?? 4;
+    const needInput = jobs.filter((job) => pendingInteraction(job)).length;
     const summary = [
       `${running}/${capacity} running`,
       queued ? `${queued} queued` : "",
+      needInput ? `${needInput} need input` : "",
       `${jobs.length} retained`,
     ].filter(Boolean).join(" · ");
     return frame.header(
@@ -736,7 +801,11 @@ class DashboardOverlay implements Focusable {
     // The tool-display mode also lives in the terse footer hint, but that hint
     // truncates first under width pressure; the title survives longer.
     if (!job) return "detail";
-    if (this.#mode !== "takeover") return `detail · ${shortId(sanitizeText(job.id))} · ${job.status} · ${this.#toolDisplay}`;
+    if (this.#mode === "answer") return `▸ answer · ${shortId(sanitizeText(job.id))} · ${this.#toolDisplay}`;
+    if (this.#mode !== "takeover") {
+      const interaction = pendingInteraction(job);
+      return `detail · ${shortId(sanitizeText(job.id))} · ${interaction ? interactionWaitLabel(interaction) : job.status} · ${this.#toolDisplay}`;
+    }
     const policy = takeoverPolicy(job);
     const behavior = this.#behavior ?? policy.behavior;
     return `▸ takeover · ${behavior === "followUp" ? "follow-up" : "steer"} · ${shortId(sanitizeText(job.id))} · ${this.#toolDisplay}`;
@@ -751,7 +820,7 @@ class DashboardOverlay implements Focusable {
   ): string[] {
     if (!jobs.length) return fitDashboardRows([this.theme.fg("muted", "No jobs in this session.")], rows);
     const lines = view.items.map((job) => {
-      const status = statusMeta(job.status, this.#now());
+      const status = pendingInteraction(job) ? { glyph: "?", color: "warning" as const } : statusMeta(job.status, this.#now());
       const selected = job.id === chosen?.id;
       const marker = dashboardSelectionMarker(this.theme, selected);
       const name = sanitizeInline(job.name);
@@ -774,7 +843,8 @@ class DashboardOverlay implements Focusable {
   }
 
   private renderJob(job: JobSnapshot, selected: boolean, width: number): string {
-    const status = statusMeta(job.status, this.#now());
+    const interaction = pendingInteraction(job);
+    const status = interaction ? { glyph: "?", color: "warning" as const } : statusMeta(job.status, this.#now());
     const marker = dashboardSelectionMarker(this.theme, selected);
     const name = this.theme.fg(selected ? "accent" : "text", sanitizeInline(job.name));
     const left = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name} ${this.theme.fg("dim", shortId(sanitizeText(job.id)))}`;
@@ -785,7 +855,7 @@ class DashboardOverlay implements Focusable {
       this.theme.fg(
         "muted",
         `${sanitizeInline(job.harness)}${owner} · ${formatElapsed(job, this.#now())}`,
-      ) + ` · ${this.theme.fg(status.color, job.status)} `;
+      ) + ` · ${this.theme.fg(status.color, interaction ? interactionWaitLabel(interaction) : job.status)} `;
     return alignDashboardRow(left, right, width);
   }
 
@@ -794,12 +864,16 @@ class DashboardOverlay implements Focusable {
     if (!job) {
       return fitDashboardRows([this.theme.fg("dim", "Select a job to inspect its route, usage, and transcript.")], rows);
     }
-    const composer = this.#mode === "takeover" ? this.renderComposer(job, width) : [];
+    const composer = this.composing() ? this.renderComposer(job, width) : [];
     const bodyRows = Math.max(1, rows - composer.length);
     return [...fitDashboardRows(this.renderDetail(job, bodyRows, width), bodyRows), ...composer].slice(0, rows);
   }
 
   private renderComposer(job: JobSnapshot, width: number): string[] {
+    if (this.#mode === "answer") {
+      const rule = dashboardScrollRule(this.theme, `answer · ${dashboardSubmitKeyLabel(this.keybindings)} sends`, width);
+      return [rule, this.#input.render(Math.max(1, width))[0] ?? ""];
+    }
     const policy = takeoverPolicy(job);
     const behavior = this.#behavior ?? policy.behavior;
     const label = policy.reusable
@@ -831,6 +905,20 @@ class DashboardOverlay implements Focusable {
       for (const line of sanitizeText(job.error).split("\n").map(sanitizeInline).filter(Boolean).slice(0, 3)) {
         pinned.push(truncate(this.theme.fg("error", `× ${line}`), width));
       }
+    }
+    // A pending question is pinned with the failure rows: it is the only thing
+    // that unblocks this job, and it must never be dropped for metadata.
+    const interaction = pendingInteraction(job);
+    if (interaction) {
+      pinned.push(truncate(this.theme.fg("warning", `? ${interactionWaitLabel(interaction)}`), width));
+      pinned.push(truncate(this.theme.fg("text", `  ${sanitizeInline(interaction.question)}`), width));
+      if (interaction.context) pinned.push(truncate(this.theme.fg("dim", `  ${sanitizeInline(interaction.context)}`), width));
+      pinned.push(truncate(this.theme.fg("dim", interaction.humanVisible
+        ? "  press a to answer inline"
+        : "  the orchestrator answers this from the parent thread"), width));
+    }
+    if (job.answeringInteraction) {
+      pinned.push(truncate(this.theme.fg("muted", `↩ answering ${sanitizeInline(job.answeringInteraction.sourceName)}`), width));
     }
 
     const optional: string[] = [];
@@ -909,7 +997,7 @@ class DashboardOverlay implements Focusable {
   }
 
   private renderHint(frame: DashboardFrame, job: JobSnapshot | undefined): string {
-    const back = this.#mode === "takeover" || (this.#layout?.kind === "narrow" && this.#pane === "detail");
+    const back = this.composing() || (this.#layout?.kind === "narrow" && this.#pane === "detail");
     const right = `· ${dashboardCancelKeyLabel(this.keybindings)} ${back ? "back" : "close"}`;
     if (this.#confirmCancelId) {
       const name = sanitizeInline(this.#jobs?.find((item) => item.id === this.#confirmCancelId)?.name ?? "job");
@@ -933,6 +1021,9 @@ class DashboardOverlay implements Focusable {
   private controls(frame: DashboardFrame, job: JobSnapshot | undefined): string {
     const scroll = "Shift+↑↓ scroll";
     const toolToggle = `t ${this.#toolDisplay === "compact" ? "full" : "compact"}`;
+    if (this.#mode === "answer") {
+      return `${dashboardSubmitKeyLabel(this.keybindings)} answer · ${dashboardCancelKeyLabel(this.keybindings)} back · ${scroll}`;
+    }
     if (this.#mode === "takeover") {
       const behavior = job ? (this.#behavior ?? takeoverPolicy(job).behavior) : "steer";
       const submit = dashboardSubmitKeyLabel(this.keybindings);
@@ -940,7 +1031,9 @@ class DashboardOverlay implements Focusable {
     }
     const confirm = dashboardConfirmKeyLabel(this.keybindings);
     const live = job && !isTerminal(job.status);
-    const sendable = job && takeoverPolicy(job).reusable;
+    // The hint mirrors the same predicate the keys use, so a parked caller
+    // never advertises a takeover its own handler refuses.
+    const sendable = this.takeoverControlVisible(job);
     if (this.#layout?.kind === "narrow" && this.#pane === "list") {
       const navigation = frame.innerWidth < 60 ? "↑↓/jk" : "↑↓/jk select";
       return [live ? "x cancel" : "", navigation, `${confirm} open`, "? help"].filter(Boolean).join(" · ");
@@ -948,6 +1041,7 @@ class DashboardOverlay implements Focusable {
     return [
       live ? "x cancel" : "",
       "↑↓/jk select",
+      this.answerControlVisible(job) ? "a answer" : "",
       sendable ? `${confirm} takeover` : "",
       sendable && live ? "s steer" : "",
       sendable && !live ? "f follow-up" : "",
@@ -958,10 +1052,21 @@ class DashboardOverlay implements Focusable {
   }
 
   private takeoverControlVisible(job: JobSnapshot | undefined): boolean {
-    return this.#mode !== "takeover"
+    return !this.composing()
       && !(this.#layout?.kind === "narrow" && this.#pane === "list")
       && !!job
+      // A parked caller is waiting on a provider tool result: a steer or
+      // follow-up would start a competing user turn, so those controls are
+      // withdrawn until the question settles. Cancellation stays available.
+      && !pendingInteraction(job)
       && takeoverPolicy(job).reusable;
+  }
+
+  private answerControlVisible(job: JobSnapshot | undefined): boolean {
+    if (this.composing() || !job || !this.manager.answerInteraction) return false;
+    if (this.#layout?.kind === "narrow" && this.#pane === "list") return false;
+    const interaction = pendingInteraction(job);
+    return !!interaction && !!interaction.humanVisible && interaction.target.kind === "orchestrator";
   }
 
   private steerControlVisible(job: JobSnapshot | undefined): boolean {
@@ -978,7 +1083,7 @@ class DashboardOverlay implements Focusable {
   }
 
   private cancelableJob(job: JobSnapshot | undefined): job is JobSnapshot {
-    return this.#mode !== "takeover"
+    return !this.composing()
       && this.#layout !== undefined
       && !!job
       && !isTerminal(job.status);

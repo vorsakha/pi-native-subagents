@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { emptyUsage, MAX_OUTPUT_BYTES, reduceJob } from "../src/reducer.ts";
 import type { JobSnapshot } from "../src/types.ts";
+import { interactionSnapshot } from "./helpers.ts";
 
 function job(): JobSnapshot {
   return { id: "j", name: "worker", access: "full", independent: false, harness: "codex", model: "m", task: "t", cwd: "/tmp", status: "queued", generation: 0, createdAt: 1, output: "", truncated: false, usage: emptyUsage(), tools: [], transcript: [], liveThinking: "", queuedMessages: [] };
@@ -112,4 +113,27 @@ test("reducer bounds in-memory transcript output", () => {
   });
   const toolEntries = toolState.transcript.filter((entry) => entry.kind === "tool");
   assert.ok(toolEntries.every((entry) => Buffer.byteLength(JSON.stringify(entry)) <= 16 * 1024));
+});
+
+test("reducer mirrors routed-question state without letting observers read manager internals", () => {
+  const pending = interactionSnapshot({ requestId: "req-7" });
+  let state = reduceJob(job(), { type: "interaction", interaction: pending });
+  assert.equal(state.interaction?.requestId, "req-7");
+  assert.equal(state.interaction?.state, "pending");
+  assert.equal(state.interactionsAsked, 1, "opening a question counts once against the job's own history");
+  assert.notEqual(state.interaction, pending, "the snapshot never aliases the authoritative record");
+
+  state = reduceJob(state, { type: "interaction", interaction: { ...pending, state: "answered", answer: "keep it" } });
+  assert.equal(state.interactionsAsked, 1, "later transitions of the same question do not recount it");
+  assert.equal(state.interaction?.answer, "keep it");
+
+  state = reduceJob(state, { type: "interaction_cleared", requestId: "other" });
+  assert.equal(state.interaction?.requestId, "req-7", "a stale clear cannot drop the current question");
+  state = reduceJob(state, { type: "interaction_cleared", requestId: "req-7" });
+  assert.equal(state.interaction, undefined);
+
+  state = reduceJob(state, { type: "interaction_answering", answering: { requestId: "req-8", sourceJobId: "peer", sourceName: "implementer" } });
+  assert.equal(state.answeringInteraction?.sourceName, "implementer");
+  state = reduceJob(state, { type: "interaction_answering" });
+  assert.equal(state.answeringInteraction, undefined);
 });

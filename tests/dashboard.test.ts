@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { initTheme } from "@earendil-works/pi-coding-agent";
-import { ansiTheme, jobSnapshot, theme, tick } from "./helpers.ts";
+import { ansiTheme, interactionSnapshot, jobSnapshot, theme, tick } from "./helpers.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { KeybindingsManager } from "@earendil-works/pi-tui";
 import {
@@ -208,6 +208,7 @@ interface DashboardHarness {
     listeners: Set<(job: JobSnapshot) => void>;
     cancelCalls: string[];
     sendCalls: string[];
+    answerCalls: Array<[string, string, string | undefined]>;
   };
   renders: () => number;
   setRows: (rows: number) => void;
@@ -218,18 +219,37 @@ function dashboard(
   rows = 24,
   done: (value: unknown) => void = () => {},
   renderMarkdown: (text: string, width: number) => string[] = (text) => text.split("\n"),
-  options: { focusJobId?: string; fullscreen?: boolean; sendError?: string; sendPromise?: Promise<JobSnapshot>; submitKey?: string; getKeys?: (binding: string) => string[] } = {},
+  options: {
+    focusJobId?: string;
+    fullscreen?: boolean;
+    sendError?: string;
+    sendPromise?: Promise<JobSnapshot>;
+    submitKey?: string;
+    getKeys?: (binding: string) => string[];
+    answerError?: string;
+    /** Omitted entirely for a session that cannot resolve routed questions. */
+    answerable?: boolean;
+  } = {},
 ): DashboardHarness {
   let renders = 0;
   const listeners = new Set<(job: JobSnapshot) => void>();
   const cancelCalls: string[] = [];
   const sendCalls: string[] = [];
+  const answerCalls: Array<[string, string, string | undefined]> = [];
   const terminal = { rows };
   const manager = {
     listeners,
     cancelCalls,
     sendCalls,
+    answerCalls,
     concurrency: 4,
+    ...(options.answerable === false ? {} : {
+      answerInteraction(requestId: string, answer: string, route?: string) {
+        answerCalls.push([requestId, answer, route]);
+        if (options.answerError) throw new Error(options.answerError);
+        return { requestId, answer, state: "answered" };
+      },
+    }),
     list: () => jobs,
     subscribe(listener: (job: JobSnapshot) => void) {
       listeners.add(listener);
@@ -730,4 +750,94 @@ test("takeover renders normalized thinking, tools, queued messages, and closes r
   workflowView.handleInput("a");
   workflowView.handleInput("\r");
   assert.equal(workflowSends, 0, "workflow-owned takeover is read-only");
+});
+
+function parkedJob(id: string, overrides: Parameters<typeof interactionSnapshot>[0] = {}): JobSnapshot {
+  return {
+    ...job(id),
+    interaction: interactionSnapshot({ sourceJobId: id, sourceName: id, question: "Which fixture is authoritative?", ...overrides }),
+  };
+}
+
+test("a job parked on a question states the wait in words, withdraws steer/follow-up, and keeps cancel", (t) => {
+  const parked = { ...parkedJob("parked"), humanVisible: true, interaction: interactionSnapshot({ sourceJobId: "parked", humanVisible: true, question: "Which fixture is authoritative?", context: "the task and the tests disagree" }) };
+  const { overlay } = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id });
+  t.after(() => overlay.dispose());
+  overlay.focused = true;
+
+  const lines = overlay.render(120);
+  const text = lines.join("\n");
+  assert.ok(text.includes("needs your answer"), "the wait is carried by words, not colour alone");
+  assert.ok(text.includes("?"), "and by its own glyph");
+  assert.ok(text.includes("Which fixture is authoritative?"), "the pending question is pinned in the inspector");
+  assert.ok(text.includes("the task and the tests disagree"));
+  assert.ok(text.includes("1 need input"), "the panel header aggregates blocked jobs");
+  assert.ok(text.includes("a answer"), "the inline answer control is offered for a human-owned question");
+  assert.ok(!text.includes("s steer") && !text.includes("f follow-up"), "steer and follow-up are withdrawn while the caller is parked");
+  assert.ok(text.includes("x cancel"), "cancellation stays available");
+  assert.ok(lines.every((line) => visibleWidth(line) <= 120));
+
+  // The withdrawn controls are not merely hidden: the keys do nothing.
+  overlay.handleInput("s");
+  overlay.handleInput("f");
+  overlay.handleInput("\r");
+  assert.ok(!overlay.render(120).some((line) => line.includes("▸ takeover ·")), "no key opens a competing user turn while a question is pending");
+});
+
+test("the inline answer composer resolves a human-owned question and surfaces a rejected answer", async (t) => {
+  const parked = { ...parkedJob("human"), humanVisible: true, interaction: interactionSnapshot({ sourceJobId: "human", humanVisible: true, requestId: "req-9" }) };
+  const { overlay, manager } = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id, submitKey: "\u0011" });
+  t.after(() => overlay.dispose());
+  overlay.focused = true;
+  overlay.render(120);
+
+  overlay.handleInput("a");
+  assert.ok(overlay.render(120).some((line) => line.includes("▸ answer ·")), "a opens the answer composer in the same panel");
+  for (const character of "use the fixture") overlay.handleInput(character);
+  overlay.handleInput("\u0011");
+  await tick();
+  assert.deepEqual(manager.answerCalls, [["req-9", "use the fixture", "human"]]);
+  const after = overlay.render(120).join("\n");
+  assert.ok(after.includes("Answer delivered"));
+  assert.ok(!after.includes("▸ answer ·"), "a delivered answer returns to browse mode");
+
+  const rejected = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id, submitKey: "\u0011", answerError: "Question req-9 is expired and can no longer be answered" });
+  t.after(() => rejected.overlay.dispose());
+  rejected.overlay.focused = true;
+  rejected.overlay.render(120);
+  rejected.overlay.handleInput("a");
+  for (const character of "too late") rejected.overlay.handleInput(character);
+  rejected.overlay.handleInput("\u0011");
+  await tick();
+  const failed = rejected.overlay.render(120).join("\n");
+  assert.ok(failed.includes("expired and can no longer be answered"), "a late answer surfaces the manager's reason");
+  assert.ok(failed.includes("too late"), "and keeps the draft for another attempt");
+});
+
+test("a model-owned question stays read-only in /subagents and Escape leaves the composer", (t) => {
+  const parked = parkedJob("model-owned");
+  const { overlay, manager } = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id, submitKey: "\u0011" });
+  t.after(() => overlay.dispose());
+  overlay.focused = true;
+  const lines = overlay.render(120).join("\n");
+  assert.ok(lines.includes("needs orchestrator"));
+  assert.ok(lines.includes("the orchestrator answers this from the parent thread"));
+  assert.ok(!lines.includes("a answer"), "no inline composer is offered for a question the parent thread owns");
+
+  overlay.handleInput("a");
+  const notice = overlay.render(120).join("\n");
+  assert.ok(!notice.includes("▸ answer ·"));
+  assert.ok(notice.includes("routed to the orchestrator"));
+  assert.deepEqual(manager.answerCalls, []);
+
+  const human = { ...parked, humanVisible: true, interaction: interactionSnapshot({ sourceJobId: parked.id, humanVisible: true }) };
+  const composing = dashboard([human], 24, () => {}, undefined, { focusJobId: human.id, submitKey: "\u0011" });
+  t.after(() => composing.overlay.dispose());
+  composing.overlay.focused = true;
+  composing.overlay.render(120);
+  composing.overlay.handleInput("a");
+  assert.ok(composing.overlay.render(120).some((line) => line.includes("▸ answer ·")));
+  composing.overlay.handleInput("\u0003");
+  assert.ok(!composing.overlay.render(120).some((line) => line.includes("▸ answer ·")), "cancel layers back to browse without closing the panel");
+  assert.deepEqual(composing.manager.answerCalls, []);
 });

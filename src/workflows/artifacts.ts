@@ -308,6 +308,13 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
       agents: phase.agents.slice(0, 32),
       result: serializeWorkflowValue(phase.result, { maxNodes: 256, maxStringBytes: 4 * 1024, maxTotalBytes: 8 * 1024 }),
     })),
+    interactions: snapshot.interactions?.slice(-16).map((interaction) => ({
+      ...interaction,
+      question: truncateUtf8(interaction.question, 1_000),
+      context: interaction.context ? truncateUtf8(interaction.context, 1_000) : undefined,
+      answer: interaction.answer ? truncateUtf8(interaction.answer, 2_000) : undefined,
+      error: interaction.error ? truncateUtf8(interaction.error, 500) : undefined,
+    })),
     agents: snapshot.agents.slice(0, 32).map((agent) => ({
       ...agent,
       name: truncateUtf8(agent.name, 1_000),
@@ -382,7 +389,22 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || typeof record.fingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(record.fingerprint)
       || !["started", "completed", "failed"].includes(record.state ?? "")
       || typeof record.at !== "number" || !Number.isFinite(record.at)) return false;
-  if (record.kind !== undefined && record.kind !== "agent" && record.kind !== "followUp") return false;
+  if (record.kind !== undefined && !["agent", "followUp", "peerQuestion"].includes(record.kind)) return false;
+  // Every peer-question state carries the same bounded lineage provenance.
+  // Without it, a `started` record cannot prove what was in flight when a
+  // crash occurred. Other record kinds must never acquire that authority.
+  if ((record.interaction !== undefined) !== (record.kind === "peerQuestion")) return false;
+  if (record.interaction !== undefined) {
+    const detail = record.interaction;
+    if (!detail || typeof detail !== "object"
+        || !Number.isSafeInteger(detail.sourceAgentIndex) || detail.sourceAgentIndex < 0 || detail.sourceAgentIndex >= 32
+        || !Number.isSafeInteger(detail.sourceGeneration) || detail.sourceGeneration < 0 || detail.sourceGeneration >= 1_000
+        || !Number.isSafeInteger(detail.targetAgentIndex) || detail.targetAgentIndex < 0 || detail.targetAgentIndex >= 32
+        || detail.targetJobId !== undefined && (typeof detail.targetJobId !== "string" || !detail.targetJobId || detail.targetJobId.length > 200)
+        || detail.targetCallFingerprint !== undefined && (typeof detail.targetCallFingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(detail.targetCallFingerprint))
+        || detail.targetGeneration !== undefined && (!Number.isSafeInteger(detail.targetGeneration) || detail.targetGeneration < 0 || detail.targetGeneration >= 1_000)
+        || detail.route !== undefined && detail.route !== "peer" && detail.route !== "replay") return false;
+  }
   if (record.agentIndex !== undefined && (!Number.isSafeInteger(record.agentIndex) || record.agentIndex! < 0 || record.agentIndex! >= 32)) return false;
   if (record.replayedFrom !== undefined && (typeof record.replayedFrom.runId !== "string"
       || !RUN_ID_PATTERN.test(record.replayedFrom.runId) || !Number.isSafeInteger(record.replayedFrom.callIndex)
@@ -709,13 +731,20 @@ function abortStaleWorkflow(snapshot: WorkflowSnapshot, now: number, staleAfterM
         timestamps: { ...phase.timestamps, updatedAt: now, endedAt: now },
       } : phase;
     }),
-    agents: snapshot.agents.map((agent) => agent.state === "running" || agent.state === "queued" || agent.state === "waiting" ? {
-      ...agent,
-      state: "aborted",
-      error: agent.error ?? error,
-      providerWait: undefined,
-      timestamps: { ...agent.timestamps, updatedAt: now, endedAt: now },
-    } : agent),
+    interactions: snapshot.interactions?.map((interaction) =>
+      interaction.state === "pending" || interaction.state === "answering"
+        ? { ...interaction, state: "cancelled", answeredAt: now, error: interaction.error ?? error }
+        : interaction),
+    agents: snapshot.agents.map((agent) => {
+      const cleared = { ...agent, waitingOn: undefined, answering: undefined };
+      return agent.state === "running" || agent.state === "queued" || agent.state === "waiting" ? {
+        ...cleared,
+        state: "aborted",
+        error: agent.error ?? error,
+        providerWait: undefined,
+        timestamps: { ...agent.timestamps, updatedAt: now, endedAt: now },
+      } : cleared;
+    }),
   };
 }
 

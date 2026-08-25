@@ -1,5 +1,6 @@
 import { capabilityDenial, normalizeRequirements } from "./capabilities.ts";
 import { PARENT_THREAD_TOOL_NAME } from "./parent-thread-context.ts";
+import { SUBAGENT_ASK_TOOL_NAME } from "./interactions.ts";
 import type { AccessMode, HarnessName, BackendPolicy, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
 
 export function normalizeModel(value: unknown): string | undefined {
@@ -97,6 +98,9 @@ export function compilePolicy(
         ...requiredPiTools,
         ...humanPiTools,
         ...(request.parentThread ? [PARENT_THREAD_TOOL_NAME] : []),
+        // Injected only for an explicitly authorized job; never inherited from
+        // the user's own tool inventory or from a capability route.
+        ...(request.interaction ? [SUBAGENT_ASK_TOOL_NAME] : []),
       ])],
       claudeTools: readOnly
         ? ["Read", "Glob", "Grep", "WebSearch", "WebFetch"]

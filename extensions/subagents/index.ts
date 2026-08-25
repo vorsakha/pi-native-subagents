@@ -34,10 +34,20 @@ import { isTerminal, JobManager } from "../../src/manager.ts";
 import { claimExtensionInstall } from "../../src/install-guard.ts";
 import { providerFamily } from "../../src/policy.ts";
 import { captureParentThread, type ParentThreadSnapshot } from "../../src/parent-thread-context.ts";
+import {
+  MAX_ANSWER_CHARS,
+  MAX_QUESTION_CHARS,
+  renderOrchestratorQuestion,
+  SUBAGENT_ANSWER_TOOL_NAME,
+  SUBAGENT_QUESTION_MESSAGE,
+  type JobInteractionPolicy,
+  type PendingInteraction,
+} from "../../src/interactions.ts";
 import { openSubagentsDashboard } from "./dashboard.ts";
 import {
   emptyComponent,
   formatEffort,
+  renderInteractionCard,
   linesComponent,
   MAX_COLLAPSED_LINES,
   MAX_EXPANDED_LINES,
@@ -123,17 +133,21 @@ export interface SubagentActivity {
   pointers: string[];
   key: string;
   text: string;
+  /** Jobs parked on a routed question, surfaced as its own marker. */
+  needInput: number;
 }
 
 /** Buckets active jobs by ownership so the activity widget can point to the right dashboard(s) without conflating counts. */
 export function summarizeSubagentActivity(
-  jobs: ReadonlyArray<Pick<JobSnapshot, "status" | "workflow">>,
+  jobs: ReadonlyArray<Pick<JobSnapshot, "status" | "workflow" | "interaction">>,
 ): SubagentActivity {
   const counts = {
     direct: { running: 0, queued: 0 },
     workflow: { running: 0, queued: 0 },
   };
+  let needInput = 0;
   for (const job of jobs) {
+    if (job.interaction && (job.interaction.state === "pending" || job.interaction.state === "answering")) needInput++;
     if (job.status !== "running" && job.status !== "queued") continue;
     counts[job.workflow ? "workflow" : "direct"][job.status]++;
   }
@@ -161,12 +175,17 @@ export function summarizeSubagentActivity(
   });
 
   const pointers = segments.map((segment) => segment.pointer);
-  const key = `${counts.direct.running}:${counts.direct.queued}:${counts.workflow.running}:${counts.workflow.queued}`;
+  const key = `${counts.direct.running}:${counts.direct.queued}:${counts.workflow.running}:${counts.workflow.queued}:${needInput}`;
+  // A blocked question is not "activity" in the running/queued sense, so it is
+  // reported as its own marker rather than folded into either count.
+  const marker = needInput ? `${needInput} need input` : "";
   const text = segments.length
-    ? `◆ ${segments.map((segment) => `${segment.summary}${segment.breakdown}`).join(" · ")} • ${pointers.join(" · ")}${pointers.length === 1 ? " to view" : ""}`
-    : "";
+    ? `◆ ${[...segments.map((segment) => `${segment.summary}${segment.breakdown}`), marker].filter(Boolean).join(" · ")} • ${pointers.join(" · ")}${pointers.length === 1 ? " to view" : ""}`
+    : marker
+      ? `◆ ${marker} • /subagents to view`
+      : "";
 
-  return { segments, pointers, key, text };
+  return { segments, pointers, key, text, needInput };
 }
 
 interface HumanSubagentEntryData {
@@ -239,6 +258,12 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const humanEntryReady = new Set<string>();
   const humanResultsPublished = new Set<string>();
   const pendingHumanResults = new Map<string, JobSnapshot>();
+  /** Model-answerable questions waiting for a safe moment to wake the parent turn. */
+  const deferredQuestions = new Map<string, PendingInteraction>();
+  /** Request IDs already handed to the parent model, so one question wakes one turn. */
+  const deliveredQuestions = new Set<string>();
+  /** Last observed state of each routed question, so a settled transcript card reports its real outcome. */
+  const questionStates = new Map<string, PendingInteraction>();
   const hiddenLegacyHumanEntries = new Set<string>();
   const resultKey = (id: string, generation: number) => `${id}:${generation}`;
 
@@ -269,7 +294,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     if (displayedActivity === activity.key) return;
     displayedActivity = activity.key;
 
-    if (!activity.segments.length) {
+    if (!activity.segments.length && !activity.needInput) {
       ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, undefined);
       return;
     }
@@ -278,13 +303,17 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const summaries = activity.segments
         .map((segment) => theme.fg("text", segment.summary) + theme.fg("dim", segment.breakdown))
         .join(theme.fg("dim", " · "));
-      const pointers = activity.pointers.map((pointer) => theme.fg("accent", pointer)).join(theme.fg("dim", " · "));
+      // Never color alone: the marker carries its own glyph and words.
+      const marker = activity.needInput
+        ? theme.fg("warning", `? ${activity.needInput} need input`)
+        : "";
+      const pointers = (activity.pointers.length ? activity.pointers : ["/subagents"]).map((pointer) => theme.fg("accent", pointer)).join(theme.fg("dim", " · "));
       const line =
         theme.fg("accent", "◆ ") +
-        summaries +
+        [summaries, marker].filter(Boolean).join(theme.fg("dim", " · ")) +
         theme.fg("dim", " • ") +
         pointers +
-        (activity.pointers.length === 1 ? theme.fg("dim", " to view") : "");
+        (activity.pointers.length <= 1 ? theme.fg("dim", " to view") : "");
       return {
         render: (width: number) => [truncateToWidth(line, Math.max(0, width), "")],
         invalidate() {},
@@ -297,6 +326,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     signal?: AbortSignal,
     humanVisible = false,
     parentThread?: ParentThreadSnapshot,
+    interaction?: JobInteractionPolicy,
   ) => spawn(getManager(), capabilities, params, {
     parentCwd: ctx.cwd,
     trusted: ctx.isProjectTrusted(),
@@ -306,6 +336,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     humanVisible,
     humanPiTools: humanVisible ? permittedHumanPiToolNames(parentTools(pi)) : undefined,
     parentThread,
+    interaction,
     signal,
   });
   const jobCallTarget = (jobId: string): { accent: string; detail: string } => {
@@ -430,6 +461,20 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint(), standalone: true });
   });
 
+  pi.registerMessageRenderer(SUBAGENT_QUESTION_MESSAGE, (message, { expanded }, theme) => {
+    const delivered = (message.details as { interaction?: PendingInteraction } | undefined)?.interaction;
+    if (!delivered) return renderToolCallLine(theme, "Inspect", "subagent question unavailable");
+    // The message body is the question as delivered; the card reports the
+    // outcome, so an answered, dismissed, or expired question stops advertising
+    // itself as pending in the transcript.
+    const current = live(delivered.requestId) ?? questionStates.get(delivered.requestId) ?? delivered;
+    return renderInteractionCard(current, theme, { expanded, now: Date.now(), standalone: true });
+  });
+  const live = (requestId: string): PendingInteraction | undefined => {
+    try { return manager?.interaction(requestId); }
+    catch { return undefined; /* the manager may be gone after session shutdown */ }
+  };
+
   // Human-triggered jobs use durable TUI-only entries instead of custom messages,
   // so the orchestrator never receives a prompt or context update. The first entry
   // is the one visible card. Later entries persist state but render through that
@@ -474,6 +519,59 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       rememberCardSnapshot(pending);
       appendHumanEntry(pending, "update");
     }
+  };
+
+  /**
+   * Wakes the parent Pi turn with one bounded question. Questions are their own
+   * message type, not a result follow-up: the child is parked on a provider tool
+   * call and needs a correlated answer, not a summary of finished work.
+   */
+  const flushDeferredQuestions = () => {
+    const deliverable: PendingInteraction[] = [];
+    for (const requestId of [...deferredQuestions.keys()]) {
+      // A question that expired, was dismissed, or whose job settled while the
+      // parent was busy must never wake a turn for an answer nobody can use.
+      const current = manager?.interaction(requestId);
+      if (!current || current.state !== "pending") {
+        deferredQuestions.delete(requestId);
+        continue;
+      }
+      deliverable.push(current);
+    }
+    for (const [index, interaction] of deliverable.entries()) {
+      try {
+        pi.sendMessage({
+          customType: SUBAGENT_QUESTION_MESSAGE,
+          content: renderOrchestratorQuestion(interaction),
+          display: true,
+          details: { interaction },
+        }, { deliverAs: "followUp", triggerTurn: index === deliverable.length - 1 });
+      } catch {
+        // Session may be shutting down; the question stays pending and is
+        // retried on the next flush rather than being silently dropped.
+        continue;
+      }
+      // Only mark delivered once sendMessage actually returned.
+      deferredQuestions.delete(interaction.requestId);
+      deliveredQuestions.add(interaction.requestId);
+      if (deliveredQuestions.size > 200) deliveredQuestions.delete(deliveredQuestions.values().next().value!);
+    }
+  };
+  /** Bounded last-known state per request, keyed for the transcript renderer. */
+  const rememberQuestionState = (interaction: PendingInteraction) => {
+    questionStates.delete(interaction.requestId);
+    questionStates.set(interaction.requestId, interaction);
+    if (questionStates.size > 64) questionStates.delete(questionStates.keys().next().value!);
+  };
+  const deferQuestion = (interaction: PendingInteraction) => {
+    if (interaction.target.kind !== "orchestrator" || interaction.state !== "pending") return;
+    // Human `/subagent` jobs deliberately never notify the orchestrator; their
+    // question is answered inline from `/subagents` instead.
+    if (interaction.humanVisible) return;
+    if (deliveredQuestions.has(interaction.requestId) || deferredQuestions.has(interaction.requestId)) return;
+    deferredQuestions.set(interaction.requestId, interaction);
+    // Re-entering the active turn is not safe; wait for agent_settled instead.
+    if (sessionContext?.isIdle()) flushDeferredQuestions();
   };
 
   const deliverResult = (job: JobSnapshot) => {
@@ -541,6 +639,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     providerStatus.invalidate?.();
     sessionContext = ctx;
     deferredResults.clear();
+    deferredQuestions.clear();
+    deliveredQuestions.clear();
+    questionStates.clear();
     cardSnapshots.clear();
     waitInterest.clear();
     consumedResults.clear();
@@ -566,6 +667,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       rememberCardSnapshot(job);
       refreshCardBlinks();
       updateSessionUi(ctx.ui, sessionManager, activeHarness);
+      if (event.type === "interaction") {
+        rememberQuestionState(event.interaction);
+        deferQuestion(event.interaction);
+        return;
+      }
       if (event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown")) {
         if (job.humanVisible) publishHumanResult(job);
         else deferResult(job);
@@ -575,7 +681,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     workflows.sessionStart(ctx, sessionManager);
   });
 
-  pi.on("agent_settled", flushDeferredResults);
+  pi.on("agent_settled", () => {
+    flushDeferredResults();
+    flushDeferredQuestions();
+  });
 
   pi.on("session_shutdown", async () => {
     unsubscribeManager?.();
@@ -583,6 +692,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     sessionContext = undefined;
     clearCardBlinks();
     deferredResults.clear();
+    deferredQuestions.clear();
+    deliveredQuestions.clear();
+    questionStates.clear();
     cardSnapshots.clear();
     waitInterest.clear();
     consumedResults.clear();
@@ -692,7 +804,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         const params = parseHumanSubagentCommand(args);
         const messages = ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
         const parentThread = captureParentThread(messages);
-        const spawned = await spawnJob(params, ctx, undefined, true, parentThread);
+        // Human jobs never notify the orchestrator; their question is answered
+        // inline from /subagents by the person who started the job.
+        const spawned = await spawnJob(params, ctx, undefined, true, parentThread, { orchestrator: "allow" });
         await getManager().wait(spawned.id, { timeoutMs: 0 });
         appendHumanAnchor(spawned);
       } catch (error) {
@@ -796,7 +910,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     parameters: spawnParameters,
     async execute(_id, params, signal, _onUpdate, ctx) {
       rejectSchemaMismatch(params);
-      const spawned = await spawnJob(params, ctx, signal);
+      // A background job can safely wake the parent later; the parent turn that
+      // spawned it is not blocked on this tool result.
+      const spawned = await spawnJob(params, ctx, signal, false, undefined, { orchestrator: "allow" });
       const snapshot = await getManager().wait(spawned.id, { timeoutMs: 0, signal });
       return result(snapshot, `Spawned ${snapshot.id} (${snapshot.name}, ${snapshot.access}, ${snapshot.harness}/${snapshot.model}, effort ${formatEffort(snapshot.effort)}${capabilityText(snapshot)})`);
     },
@@ -914,6 +1030,39 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   });
 
   pi.registerTool({
+    name: SUBAGENT_ANSWER_TOOL_NAME,
+    renderShell: "self",
+    label: "Answer Subagent",
+    description: "Answer one pending subagent question by its requestId. The asking subagent is parked on a provider tool call and resumes with this answer. Exactly one answer resolves a request; late, duplicate, or unknown request IDs are rejected. This is not a steer or follow-up message.",
+    promptSnippet: "Answer a blocked subagent's question from this thread's own context",
+    promptGuidelines: [
+      "Answer from this conversation's context: the child asked precisely because it cannot see it.",
+      "Ask the human first with your normal user-facing question capability when the decision is theirs.",
+      "Keep the answer bounded and specific; it is reference data for the child, not a new task.",
+    ],
+    parameters: Type.Object({
+      requestId: Type.String({ minLength: 1, maxLength: 200, description: "Request ID from the subagent question message" }),
+      answer: Type.String({ minLength: 1, maxLength: MAX_ANSWER_CHARS }),
+    }),
+    async execute(_id, params) {
+      const interaction = getManager().answerInteraction(params.requestId, params.answer, "orchestrator-model");
+      deferredQuestions.delete(params.requestId);
+      return {
+        content: [{ type: "text" as const, text: `Answered ${interaction.sourceName} (${shortId(interaction.sourceJobId)}); the subagent resumed.` }],
+        details: { interaction },
+      };
+    },
+    renderCall(args, theme) {
+      return renderToolCallLine(theme, "Steer", "answer question", truncatePreview(args.answer ?? ""));
+    },
+    renderResult(res, { expanded }, theme) {
+      const interaction = (res.details as { interaction?: PendingInteraction } | undefined)?.interaction;
+      if (!interaction) return renderFailure(theme, "answer failed");
+      return renderInteractionCard(interaction, theme, { expanded, now: Date.now() });
+    },
+  });
+
+  pi.registerTool({
     name: "subagent_cancel",
     renderShell: "self",
     label: "Cancel Subagent",
@@ -979,7 +1128,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     parameters: spawnParameters,
     async execute(_id, params, signal, onUpdate, ctx) {
       rejectSchemaMismatch(params);
-      const snapshot = await spawnJob(params, ctx, signal);
+      // Foreground: this parent turn is blocked awaiting the tool result and
+      // cannot start another turn, so the ask tool is injected only to fail
+      // fast with guidance toward the background form.
+      const snapshot = await spawnJob(params, ctx, signal, false, undefined, { orchestrator: "foregroundDenied" });
       const generation = beginResultConsumption(snapshot.id);
       let consumed = false;
       const timer = setInterval(() => {
@@ -1335,6 +1487,7 @@ async function spawn(
     humanVisible?: boolean;
     humanPiTools?: string[];
     parentThread?: ParentThreadSnapshot;
+    interaction?: JobInteractionPolicy;
     signal?: AbortSignal;
   },
 ): Promise<JobSnapshot> {
@@ -1356,6 +1509,7 @@ async function spawn(
     humanVisible: context.humanVisible,
     humanPiTools: context.humanPiTools,
     parentThread: context.parentThread,
+    interaction: context.interaction,
     budget: directBudget(params),
   };
   const routing = await routeCapabilities(router, {

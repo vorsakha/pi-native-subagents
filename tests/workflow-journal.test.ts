@@ -10,8 +10,10 @@ import {
 } from "../src/workflows/artifacts.ts";
 import {
   replayableJournalCalls,
+  replayableJournalInteractions,
   workflowCallFingerprint,
   workflowDefinitionFingerprint,
+  workflowInteractionFingerprint,
 } from "../src/workflows/journal.ts";
 
 const usage = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5, turns: 1 };
@@ -101,6 +103,57 @@ test("journal loading replays valid completed calls independently across a faile
       result: { ok: true, output: "later", jobId: "job-later", usage },
       route: { jobId: "job-later", harness: "claude", model: "review-model" },
     }]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("peer-question journals require lineage provenance from started through settlement", async () => {
+  const f = await fixture();
+  const question = workflowInteractionFingerprint({ question: "Which flag stays?", context: "fixtures disagree" });
+  const target = workflowCallFingerprint("plan", { name: "planner" });
+  const detail = {
+    sourceAgentIndex: 1,
+    sourceGeneration: 0,
+    targetAgentIndex: 0,
+    targetJobId: "planner-job",
+    targetCallFingerprint: target,
+  };
+  try {
+    await assert.rejects(
+      appendWorkflowJournal(f.root, f.created.runId, {
+        version: 1, sequence: 0, callIndex: 0, fingerprint: question, kind: "peerQuestion", state: "started", at: 1,
+      }),
+      /Invalid workflow journal record/,
+      "a crash record without source and target identity is not durable replay evidence",
+    );
+    await appendWorkflowJournal(f.root, f.created.runId, {
+      version: 1, sequence: 0, callIndex: 0, fingerprint: question, kind: "peerQuestion", state: "started", at: 1,
+      agentIndex: 1,
+      interaction: detail,
+    });
+    await appendWorkflowJournal(f.root, f.created.runId, {
+      version: 1, sequence: 1, callIndex: 0, fingerprint: question, kind: "peerQuestion", state: "completed", at: 2,
+      agentIndex: 1,
+      result: { ok: true, output: "keep the legacy flag", usage },
+      interaction: { ...detail, targetGeneration: 1, route: "peer" },
+    });
+    // A second interaction has only a started record and must never replay.
+    await appendWorkflowJournal(f.root, f.created.runId, {
+      version: 1, sequence: 2, callIndex: 1, fingerprint: workflowInteractionFingerprint({ question: "unfinished" }), kind: "peerQuestion", state: "started", at: 3,
+      agentIndex: 1,
+      interaction: detail,
+    });
+
+    const records = await loadWorkflowJournal(f.root, f.created.runId);
+    assert.deepEqual(replayableJournalInteractions(records), [{
+      ordinal: 0,
+      questionFingerprint: question,
+      detail: { ...detail, targetGeneration: 1, route: "peer" },
+      answer: "keep the legacy flag",
+      usage,
+    }]);
+    assert.deepEqual(replayableJournalCalls(records), [], "interaction ordinals never enter the sandbox call replay stream");
   } finally {
     await f.cleanup();
   }
