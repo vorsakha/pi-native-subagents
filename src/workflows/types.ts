@@ -18,7 +18,8 @@ export type WorkflowAgentState =
 /**
  * `native` means a provider-native terminal structured-result channel produced
  * and validated `structured`; `portable` means the prompt/parse/validate
- * fallback did. Present only when the call requested a `schema`.
+ * fallback did. Present when the call had an effective schema; a native
+ * lineage's `followUp()` can inherit its original schema without passing one.
  */
 export type WorkflowStructuredTransport = "native" | "portable";
 
@@ -32,7 +33,7 @@ export interface WorkflowRetryPolicy {
   providerUnavailable?: "fail" | "wait";
   /** Total wait allowance for the whole workflow run, in ms. */
   maxWaitMs?: number;
-  /** Provider-wait retries allowed per logical `agent()`/`followUp()` call. */
+  /** Provider-wait retries allowed per fresh `agent()` call. */
   maxAttempts?: number;
 }
 

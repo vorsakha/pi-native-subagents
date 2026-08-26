@@ -16,6 +16,8 @@ Requires Node.js 22.19.0 or newer. Pi extensions execute with your user permissi
 pi install git:github.com/vorsakha/pi-native-subagents@main
 ```
 
+Keep exactly one package source. If Pi reports that the package loaded more than once, remove the duplicate install — to update, reinstall the same Git source at the new commit rather than adding a local checkout alongside it.
+
 ## Try it
 
 Ask Pi to delegate, and the model calls `subagent_spawn`:

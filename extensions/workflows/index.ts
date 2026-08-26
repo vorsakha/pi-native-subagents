@@ -329,7 +329,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     name: "workflow",
     renderShell: "self",
     label: "Workflow",
-    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Export a default async function and use the injected globals phase(), log(), agent(), followUp(), parallel(), pipeline(), and converge(); parallel receives deferred task functions, not already-started promises. Use exactly one source (script, workflowName, or scriptPath) and one input form (input or legacy args). isolation='worktree' runs a mutating agent in a clean Git worktree and preserves changed work with a patch. Runs are limited to 32 agent calls and four concurrent agents; resumeFromRunId replays matching completed calls from an exact interrupted run, including independent later parallel lanes.",
+    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Export a default async function and use the injected globals phase(), log(), agent(), followUp(), parallel(), pipeline(), and converge(); parallel receives deferred task functions, not already-started promises. Use exactly one source (script, workflowName, or scriptPath) and at most one input form (input or legacy args); omitting both exposes null. isolation='worktree' runs a mutating agent in a clean Git worktree and preserves changed work with a patch. Runs are limited to 32 agent calls and four concurrent agents; resumeFromRunId replays matching completed calls from an exact interrupted run, including independent later parallel lanes.",
     promptSnippet: "Run a sandboxed multi-agent workflow with phases and bounded parallelism",
     promptGuidelines: [
       "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls; use direct spawning for a small simple fan-out.",
@@ -337,7 +337,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       "Use converge({ maxRounds, implement, review }) for implement/review/fix lifecycles: it reuses both retained sessions across rounds, validates each review against convergenceReviewSchema, and returns a distinct approved, blocked, stalled, limit-reached, or failed outcome.",
       "When phases are known up front, declare meta.phases and call phase(title) to activate them in order; omit it for dynamic discovery.",
       "Use parallel only with deferred functions such as () => agent(...); never pass already-started agent promises.",
-      "Use exactly one source (script, workflowName, or scriptPath) and exactly one input form (input or legacy args).",
+      "Use exactly one source (script, workflowName, or scriptPath) and zero or one input form (input or legacy args), never both; omitting both exposes null.",
       "agent(prompt) is generic and defaults to full access after project trust; set access=readOnly for inspection.",
       "Use independent=true only for a different native provider; use independentOf=<jobId> to review with a provider different from the producer.",
       "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
@@ -375,7 +375,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       retry: Type.Optional(Type.Object({
         providerUnavailable: Type.Optional(Type.Union([Type.Literal("fail"), Type.Literal("wait")], { description: "wait opts into waiting out an authoritative provider-quota rejection instead of failing the call; default fail preserves today's behavior" })),
         maxWaitMs: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 21_600_000, description: "Total provider-wait allowance for the whole run" })),
-        maxAttempts: Type.Optional(Type.Integer({ minimum: 1, maximum: 8, description: "Provider-wait retries allowed per logical agent()/followUp() call" })),
+        maxAttempts: Type.Optional(Type.Integer({ minimum: 1, maximum: 8, description: "Provider-wait retries allowed per fresh agent() call" })),
       })),
       background: Type.Optional(Type.Boolean()),
     }),
