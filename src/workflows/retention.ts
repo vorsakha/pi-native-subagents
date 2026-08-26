@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { chmod, lstat, mkdir, open, readdir, readFile, rename, rm } from "node:fs/promises";
+import { uptime } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import {
   DEFAULT_STALE_AFTER_MS,
@@ -23,9 +24,12 @@ export const DEFAULT_WORKFLOW_RETAINED_RUNS = 64;
 const AGENT_DIRECTORY_PATTERN = /^agent-(\d+)$/;
 const LEASE_DIRECTORY_NAME = ".leases";
 const RETENTION_LOCK_NAME = ".retention.lock";
+const RETENTION_LOCK_OWNER_NAME = "owner.json";
+const RETENTION_LOCK_OWNER_TEMP_PATTERN = /^\.owner\.json\.[a-f0-9]+\.tmp$/;
 const RETENTION_STATE_SUFFIX = ".runtime";
 const RETENTION_LOCK_TIMEOUT_MS = 30_000;
 const RETENTION_LOCK_RETRY_MS = 25;
+const BOOT_TIME_TOLERANCE_MS = 5_000;
 const LEASE_HEARTBEAT_MS = 60_000;
 
 interface RetentionLockOwner {
@@ -88,23 +92,74 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-async function reclaimDeadRetentionLock(lockPath: string): Promise<boolean> {
+function parseRetentionLockOwner(serialized: string): RetentionLockOwner | undefined {
   let owner: RetentionLockOwner;
   try {
-    owner = JSON.parse(await readFile(join(lockPath, "owner.json"), "utf8")) as RetentionLockOwner;
+    owner = JSON.parse(serialized) as RetentionLockOwner;
+  } catch {
+    return undefined;
+  }
+  if (
+    !Number.isSafeInteger(owner.pid) || owner.pid <= 0
+    || typeof owner.token !== "string" || owner.token.length === 0
+    || !Number.isSafeInteger(owner.createdAt) || owner.createdAt <= 0
+  ) return undefined;
+  return owner;
+}
+
+function currentBootStartedAt(): number {
+  return Date.now() - uptime() * 1_000;
+}
+
+function retentionLockOwnerIsAlive(owner: RetentionLockOwner): boolean {
+  if (owner.createdAt < currentBootStartedAt() - BOOT_TIME_TOLERANCE_MS) return false;
+  return processIsAlive(owner.pid);
+}
+
+async function readRetentionLockOwners(lockPath: string): Promise<RetentionLockOwner[]> {
+  try {
+    const serialized = await readFile(join(lockPath, RETENTION_LOCK_OWNER_NAME), "utf8");
+    const owner = parseRetentionLockOwner(serialized);
+    return owner ? [owner] : [];
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      try { await lstat(lockPath); return false; }
-      catch (recheckError) { return (recheckError as NodeJS.ErrnoException).code === "ENOENT"; }
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return [];
+  }
+
+  let entries;
+  try {
+    entries = await readdir(lockPath, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const owners: RetentionLockOwner[] = [];
+  for (const entry of entries) {
+    if (!entry.isFile() || !RETENTION_LOCK_OWNER_TEMP_PATTERN.test(entry.name)) continue;
+    try {
+      const owner = parseRetentionLockOwner(await readFile(join(lockPath, entry.name), "utf8"));
+      if (owner) owners.push(owner);
+    } catch {
+      // A concurrent owner may still be writing its temporary file.
     }
-    return false;
   }
-  if (!Number.isSafeInteger(owner.pid) || owner.pid <= 0) return false;
-  if (!processIsAlive(owner.pid)) {
-    await rm(lockPath, { recursive: true, force: true });
-    return true;
+  return owners;
+}
+
+async function reclaimDeadRetentionLock(lockPath: string): Promise<boolean> {
+  const owners = await readRetentionLockOwners(lockPath);
+  if (owners.some(retentionLockOwnerIsAlive)) return false;
+
+  if (owners.length === 0) {
+    try {
+      const info = await lstat(lockPath);
+      if (info.mtimeMs >= currentBootStartedAt() - BOOT_TIME_TOLERANCE_MS) return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ENOENT";
+    }
   }
-  return false;
+
+  await rm(lockPath, { recursive: true, force: true });
+  return true;
 }
 
 async function acquireRetentionLock(root: string): Promise<() => Promise<void>> {
@@ -119,7 +174,7 @@ async function acquireRetentionLock(root: string): Promise<() => Promise<void>> 
     try {
       await mkdir(lockPath, { mode: 0o700 });
       created = true;
-      await atomicWriteJson(join(lockPath, "owner.json"), {
+      await atomicWriteJson(join(lockPath, RETENTION_LOCK_OWNER_NAME), {
         pid: process.pid,
         token: randomBytes(12).toString("hex"),
         createdAt: Date.now(),

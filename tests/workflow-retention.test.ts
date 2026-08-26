@@ -43,6 +43,44 @@ async function makeRun(root: string, overrides: Partial<Omit<WorkflowSnapshot, "
   });
 }
 
+test("recovers an interrupted retention lock with only a temporary owner record", { timeout: 2_000 }, async () => {
+  const { root } = await fixture();
+  const stateDirectory = `${root}.runtime`;
+  const lockPath = join(stateDirectory, ".retention.lock");
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, ".owner.json.deadcafe.tmp"), JSON.stringify({
+    pid: 2_147_483_647,
+    token: "interrupted-owner",
+    createdAt: Date.now(),
+  }), "utf8");
+
+  const lease = await openWorkflowSessionLease(root, "replacement-session");
+  try {
+    assert.ok(!(await readdir(stateDirectory)).includes(".retention.lock"));
+  } finally {
+    await lease.close();
+  }
+});
+
+test("recovers a retention lock whose reused owner pid predates this boot", { timeout: 2_000 }, async () => {
+  const { root } = await fixture();
+  const stateDirectory = `${root}.runtime`;
+  const lockPath = join(stateDirectory, ".retention.lock");
+  await mkdir(lockPath, { recursive: true });
+  await writeFile(join(lockPath, "owner.json"), JSON.stringify({
+    pid: process.pid,
+    token: "previous-boot-owner",
+    createdAt: 1,
+  }), "utf8");
+
+  const lease = await openWorkflowSessionLease(root, "replacement-session");
+  try {
+    assert.ok(!(await readdir(stateDirectory)).includes(".retention.lock"));
+  } finally {
+    await lease.close();
+  }
+});
+
 test("bounds repeated eligible terminal runs to maxRuns and stays bounded on repeated passes", async () => {
   const { root } = await fixture();
   const maxRuns = 5;
