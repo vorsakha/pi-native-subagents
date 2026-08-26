@@ -7,8 +7,10 @@ import {
   MAX_COLLAPSED_LINES,
   MAX_EXPANDED_LINES,
   buildWorkflowCardLines,
+  formatWorkflowConvergence,
   renderWorkflowCall,
   renderWorkflowCard,
+  workflowConvergenceMeta,
   workflowPhaseProgress,
 } from "../extensions/workflows/render.ts";
 import { shortId } from "../extensions/subagents/render.ts";
@@ -478,4 +480,48 @@ test("the neutral header marker and quiet rollups stay inside hard width budgets
 
   const narrow = renderWorkflowCard(snapshot, theme, { expanded: false, now: 6_000 }).render(24);
   assert.ok(narrow.every((line) => visibleWidth(line) <= 24), "no line overflows a narrow terminal width even with a long agent name");
+});
+
+test("convergence state reads without color: distinct glyphs, round position, verdict, and stopping reason", () => {
+  const base = {
+    name: "issue 24",
+    round: 2,
+    maxRounds: 3,
+    verdict: "request_changes" as const,
+    actionableCount: 2,
+    fingerprint: "abc",
+    rounds: [
+      { round: 1, verdict: "request_changes" as const, actionableCount: 2, fingerprint: "abc" },
+      { round: 2, verdict: "request_changes" as const, actionableCount: 2, fingerprint: "abc" },
+    ],
+  };
+  const states = ["running", "approved", "blocked", "stalled", "limit-reached", "failed"] as const;
+  const glyphs = states.map((state) => workflowConvergenceMeta({ state }).glyph);
+  assert.equal(new Set(glyphs).size, states.length, "every convergence state has its own glyph");
+
+  for (const state of states) {
+    const line = formatWorkflowConvergence({ ...base, state, stoppingReason: state === "running" ? undefined : `stopped: ${state}` });
+    assert.match(line, /issue 24 · round 2\/3/);
+    assert.ok(line.includes(state), `${state} is named in words, not only by color`);
+    assert.match(line, /verdict request_changes · 2 actionable findings/);
+  }
+
+  // The collapsed card keeps its line budget and truncates a long stopping reason.
+  const snapshot = workflow({
+    status: "completed",
+    convergence: { ...base, state: "stalled", stoppingReason: "z".repeat(400) },
+  });
+  const collapsed = buildWorkflowCardLines(snapshot, theme, { expanded: false, now: 6_000 });
+  const rounds = collapsed.find((line) => line.startsWith("Rounds"));
+  assert.ok(rounds, "the card reports convergence rounds");
+  assert.ok(rounds.includes("stalled") && rounds.includes("≡"), "the terminal state is shown in words and with a glyph");
+  assert.ok(rounds.length < 200, "a long stopping reason is truncated on the collapsed card");
+  assert.ok(collapsed.length <= MAX_COLLAPSED_LINES);
+  assert.ok(!CONTROL_CHARS.test(collapsed.join("\n")));
+
+  const narrow = renderWorkflowCard(snapshot, ansiTheme, { expanded: false, now: 6_000 }).render(20);
+  for (const line of narrow) assert.ok(visibleWidth(line) <= 20, `narrow line overflows: ${JSON.stringify(line)}`);
+
+  const withoutConvergence = buildWorkflowCardLines(workflow(), theme, { expanded: false, now: 6_000 });
+  assert.ok(!withoutConvergence.some((line) => line.startsWith("Rounds")), "one-shot workflows gain no convergence line");
 });

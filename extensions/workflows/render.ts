@@ -5,6 +5,7 @@ import { formatWorkflowBudget, workflowBudgetHealth } from "../../src/workflows/
 import { formatDurationLabel } from "../dashboard-style.ts";
 import type {
   WorkflowAgentRecord,
+  WorkflowConvergence,
   WorkflowInteractionSummary,
   WorkflowPhase,
   WorkflowSnapshot,
@@ -41,6 +42,33 @@ export function workflowStatusMeta(snapshot: Pick<WorkflowSnapshot, "status" | "
   return snapshot.status === "completed" && snapshot.taskOutcome === "unsuccessful"
     ? { glyph: "!", color: "warning" }
     : traceStatusMeta(snapshot.status);
+}
+
+/**
+ * Distinct glyph and word per convergence state, so the terminal outcome is
+ * readable without color: approved, blocked, stalled, limit-reached, failed,
+ * and a running loop never share a marker.
+ */
+export function workflowConvergenceMeta(convergence: Pick<WorkflowConvergence, "state">): { glyph: string; color: TraceStatusColor } {
+  switch (convergence.state) {
+    case "approved": return { glyph: "✓", color: "success" };
+    case "blocked": return { glyph: "⊘", color: "warning" };
+    case "stalled": return { glyph: "≡", color: "warning" };
+    case "limit-reached": return { glyph: "⊣", color: "warning" };
+    case "failed": return { glyph: "×", color: "error" };
+    default: return { glyph: "●", color: "accent" };
+  }
+}
+
+/** Round position, state, latest verdict, actionable count, and stopping reason in one bounded line. */
+export function formatWorkflowConvergence(convergence: WorkflowConvergence, reasonChars = 200): string {
+  const parts: string[] = [];
+  if (convergence.name) parts.push(sanitizeInline(convergence.name));
+  parts.push(`round ${convergence.round}/${convergence.maxRounds}`, convergence.state);
+  if (convergence.verdict) parts.push(`verdict ${convergence.verdict}`);
+  if (convergence.actionableCount !== undefined) parts.push(countLabel(convergence.actionableCount, "actionable finding"));
+  if (convergence.stoppingReason) parts.push(sanitizeInline(convergence.stoppingReason).slice(0, reasonChars));
+  return parts.join(" · ");
 }
 
 function taskOutcomeLabel(snapshot: Pick<WorkflowSnapshot, "status" | "taskOutcome">): string {
@@ -429,6 +457,12 @@ export function buildWorkflowCardLines(
   // Phases: bounded spine plus an authoritative current/total fraction; roster rows expand only.
   lines.push(group(theme, "Phases", phaseGroupValue(snapshot, theme, options.now)));
   if (options.expanded) for (const line of phaseRosterLines(snapshot, theme, options.now)) lines.push(line);
+
+  // Convergence: one line whenever the run drove a bounded implement/review loop.
+  if (snapshot.convergence) {
+    const meta = workflowConvergenceMeta(snapshot.convergence);
+    lines.push(group(theme, "Rounds", `${theme.fg(meta.color, meta.glyph)} ${theme.fg(isAttentionStatus(meta.color) ? meta.color : "muted", formatWorkflowConvergence(snapshot.convergence, options.expanded ? 200 : 80))}`));
+  }
 
   // Agents: collapsed is always a rollup of counts; roster rows and the live preview expand only.
   const needInput = workflowNeedsInput(snapshot);

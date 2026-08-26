@@ -13,6 +13,7 @@ import {
 import { basename, dirname, join, resolve } from "node:path";
 import type { ToolResultSnapshot, TranscriptEntry } from "../types.ts";
 import { formatWorkflowBudget } from "./budget.ts";
+import { isWorkflowConvergence, MAX_CONVERGENCE_ROUNDS } from "./convergence.ts";
 import { workflowTaskOutcome } from "./outcome.ts";
 import type { WorkflowJournalRecord, WorkflowSnapshot } from "./types.ts";
 import type { WorkflowWorktreeResult } from "./worktree.ts";
@@ -295,6 +296,12 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
     transcriptArtifact: "transcripts.json",
     reportArtifact: snapshot.reportArtifact,
     result: serializeWorkflowValue(snapshot.result, { maxNodes: 4_000, maxStringBytes: 16 * 1024, maxTotalBytes: 64 * 1024 }),
+    convergence: snapshot.convergence ? {
+      ...snapshot.convergence,
+      name: snapshot.convergence.name ? truncateUtf8(snapshot.convergence.name, 200) : undefined,
+      stoppingReason: snapshot.convergence.stoppingReason ? truncateUtf8(snapshot.convergence.stoppingReason, 2_000) : undefined,
+      rounds: snapshot.convergence.rounds.slice(-MAX_CONVERGENCE_ROUNDS),
+    } : undefined,
     logs: snapshot.logs?.slice(-128).map((entry) => ({
       index: entry.index,
       message: truncateUtf8(entry.message, 4 * 1024),
@@ -578,6 +585,16 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
     "## Phases",
     ...snapshot.phases.map((phase) => `- ${phase.name}: ${phase.status} (${phase.agents.length} agents)`),
     "",
+    ...(snapshot.convergence ? [
+      "## Convergence",
+      `- Loop: ${snapshot.convergence.name ? truncateUtf8(snapshot.convergence.name, 200) : "unnamed"}`,
+      `- State: **${snapshot.convergence.state}**`,
+      `- Rounds: ${snapshot.convergence.round}/${snapshot.convergence.maxRounds}`,
+      ...(snapshot.convergence.verdict ? [`- Latest verdict: ${snapshot.convergence.verdict} (${snapshot.convergence.actionableCount ?? 0} actionable)`] : []),
+      ...(snapshot.convergence.stoppingReason ? [`- Stopping reason: ${truncateUtf8(snapshot.convergence.stoppingReason, 2_000)}`] : []),
+      ...snapshot.convergence.rounds.map((round) => `- Round ${round.round}: ${round.verdict} · ${round.actionableCount} actionable · fingerprint ${round.fingerprint}`),
+      "",
+    ] : []),
     ...(snapshot.logs?.length ? [
       "## Progress",
       ...snapshot.logs.slice(-32).map((entry) => `- ${truncateUtf8(entry.message, 4 * 1024)}`),
@@ -684,6 +701,7 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
     && typeof candidate.timestamps.updatedAt === "number"
     && (candidate.approval === undefined || candidate.approval === "auto" || candidate.approval === "plan" || candidate.approval === "onMutate")
     && (candidate.replacementOf === undefined || validReplacementReference(candidate.replacementOf))
+    && (candidate.convergence === undefined || isWorkflowConvergence(candidate.convergence))
     && (candidate.budget === undefined || !!candidate.budget && typeof candidate.budget === "object" && !Array.isArray(candidate.budget)
       && Object.keys(candidate.budget).every((key) => ["maxAgents", "maxConcurrency", "maxTokens", "maxTokensPerAgent", "maxCost", "maxTurns"].includes(key))
       && Object.values(candidate.budget).every((item) => item === undefined || typeof item === "number" && Number.isFinite(item) && item > 0))

@@ -348,3 +348,83 @@ test("durable reports include task outcome only for completed workflows", async 
     assert.doesNotMatch(report, /Task outcome:/, `${status} report omits task outcome`);
   }
 });
+
+test("convergence state is bounded on the way to disk, restores unchanged, and stays optional", async () => {
+  const f = await fixture();
+  const now = Date.now();
+  const created = await createWorkflowArtifacts(f.root, { script: "export default async () => 'ok';\n", args: null, snapshot: snapshot("session-1", now) });
+  const rounds = Array.from({ length: 16 }, (_, index) => ({
+    round: index + 1,
+    verdict: "request_changes" as const,
+    actionableCount: index + 1,
+    fingerprint: `fp-${index}`,
+  }));
+  const converged: WorkflowSnapshot = {
+    ...created,
+    status: "completed",
+    convergence: {
+      name: "x".repeat(400),
+      round: 16,
+      maxRounds: 16,
+      state: "stalled",
+      verdict: "request_changes",
+      actionableCount: 16,
+      fingerprint: "fp-15",
+      stoppingReason: "y".repeat(4_000),
+      implementerJobId: "job-implementer",
+      reviewerJobId: "job-reviewer",
+      rounds,
+    },
+  };
+  await checkpointWorkflow(f.root, converged);
+  await writeWorkflowReport(f.root, converged);
+
+  const [restored] = await loadWorkflowSummaries(f.root, { sessionId: "session-1" });
+  const convergence = restored?.convergence;
+  assert.ok(convergence, "convergence state survives the durable summary");
+  assert.equal(convergence.state, "stalled");
+  assert.equal(convergence.rounds.length, 16, "all bounded rounds are persisted");
+  assert.equal(convergence.rounds[0]?.round, 1);
+  assert.ok(Buffer.byteLength(convergence.name!) <= 200, "the loop name is truncated");
+  assert.ok(Buffer.byteLength(convergence.stoppingReason!) <= 2_000, "the stopping reason is truncated");
+
+  const report = await readFile(join(created.artifactDir, "report.md"), "utf8");
+  assert.match(report, /- State: \*\*stalled\*\*/);
+  assert.match(report, /- Rounds: 16\/16/);
+
+  const other = await createWorkflowArtifacts(f.root, { script: "export default async () => 'ok';\n", args: null, snapshot: snapshot("session-2", now) });
+  await checkpointWorkflow(f.root, { ...other, status: "completed" });
+  const [legacy] = await loadWorkflowSummaries(f.root, { sessionId: "session-2" });
+  assert.equal(legacy?.convergence, undefined, "a snapshot written without convergence stays loadable");
+
+  const corrupted = join(f.root, other.runId, "workflow.json");
+  const raw = JSON.parse(await readFile(corrupted, "utf8")) as Record<string, unknown>;
+  const validConvergence = {
+    round: 1,
+    maxRounds: 2,
+    state: "approved",
+    verdict: "approve",
+    actionableCount: 0,
+    fingerprint: "fp-1",
+    stoppingReason: "approved",
+    rounds: [{ round: 1, verdict: "approve", actionableCount: 0, fingerprint: "fp-1" }],
+  };
+  const invalidRecords = [
+    { state: "approved" },
+    { ...validConvergence, maxRounds: 17 },
+    { ...validConvergence, round: 3 },
+    { ...validConvergence, actionableCount: -1 },
+    { ...validConvergence, rounds: [{ round: 1, verdict: "approve", actionableCount: -1, fingerprint: "fp-1" }] },
+    { ...validConvergence, fingerprint: undefined },
+    { ...validConvergence, verdict: "request_changes" },
+    { ...validConvergence, state: "stalled" },
+    { ...validConvergence, state: "running" },
+    { ...validConvergence, rounds: [{ round: 1, verdict: "approve", actionableCount: 0, fingerprint: "" }] },
+    { ...validConvergence, rounds: [{ round: 1, verdict: "request_changes", actionableCount: 0, fingerprint: "fp-1" }], verdict: "request_changes" },
+  ];
+  for (const convergenceRecord of invalidRecords) {
+    await writeFile(corrupted, JSON.stringify({ ...raw, convergence: convergenceRecord }), "utf8");
+    const remaining = await loadWorkflowSummaries(f.root, { sessionId: "session-2" });
+    assert.deepEqual(remaining, [], `an incoherent convergence record is rejected: ${JSON.stringify(convergenceRecord)}`);
+  }
+});

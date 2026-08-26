@@ -358,3 +358,48 @@ test("followUp on a native lineage: the same schema is reused validated, and a d
     assert.equal(f.claude.sends.length, 1, "the mismatched schema follow-up never dispatches a turn to the retained session");
   } finally { await f.cleanup(); }
 });
+
+const CONVERGE_NATIVE_SCRIPT = `
+  export default async () => converge({
+    maxRounds: 2,
+    implement: { prompt: "implement", options: { name: "implementer" } },
+    review: { prompt: "review", options: { name: "reviewer", harness: "claude" } },
+  });
+`;
+
+test("converge keeps a native review lineage schema-bound across rounds and never approves on an invalid payload", async () => {
+  const f = await fixture({ claudeSupport: { supported: true, mechanism: "fixture:json_schema" } });
+  try {
+    const started = await f.workflows.start(f.request(CONVERGE_NATIVE_SCRIPT));
+    await waitFor(() => f.codex.requests.length === 1, "implementer dispatched");
+    f.codex.complete(f.codex.starts[0]!, "implementation v1");
+
+    await waitFor(() => f.claude.requests.length === 1, "reviewer dispatched");
+    const reviewRequest = f.claude.requests[0]!;
+    assert.equal(reviewRequest.task, "review", "the native transport sends no JSON scaffolding");
+    const schema = (reviewRequest.policy.structuredOutput as { schema: Record<string, unknown> }).schema;
+    assert.deepEqual(schema.required, ["verdict", "summary", "findings"], "converge always binds the review schema");
+    f.claude.complete(reviewRequest.jobId, "reviewed", undefined, {
+      verdict: "request_changes",
+      summary: "one blocker remains",
+      findings: [{ id: "F1", severity: "blocker", body: "guard the null case" }],
+    });
+
+    await waitFor(() => f.codex.sends.length === 1, "fix follow-up dispatched");
+    f.codex.complete(f.codex.starts[0]!, "implementation v2");
+
+    // The retained native session stays bound to its agent() schema: converge
+    // repeats the identical schema on every re-review rather than replacing it.
+    await waitFor(() => f.claude.sends.length === 1, "re-review follow-up reuses the retained native session");
+    f.claude.complete(reviewRequest.jobId, "reviewed", undefined, { verdict: "approve", summary: 42, findings: [] });
+
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    const result = final.result as { ok: boolean; outcome: string; stoppingReason: string };
+    assert.equal(result.ok, false, "an invalid structured payload is never an implicit approval");
+    assert.equal(result.outcome, "failed");
+    assert.match(result.stoppingReason, /review call failed: .*did not match/);
+    assert.equal(final.convergence?.state, "failed");
+    assert.deepEqual(final.convergence?.rounds.map((round) => round.verdict), ["request_changes"]);
+  } finally { await f.cleanup(); }
+});

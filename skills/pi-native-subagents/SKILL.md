@@ -68,7 +68,7 @@ The `workflow` tool accepts exactly one source:
 
 Use either structured `input` or legacy JSON-string `args`, never both. The selected value is exposed to the script as the global `args` object. Workflows must be trusted and use a source contained by the trusted project rules.
 
-A workflow script must export a default async function. Workflow helpers are globals: use phase(), log(), agent(), followUp(), and parallel(). The available globals are:
+A workflow script must export a default async function. Workflow helpers are globals: use phase(), log(), agent(), followUp(), parallel(), and converge(). The available globals are:
 
 - `args` — parsed workflow input;
 - `phase(title)` — report bounded progress;
@@ -76,7 +76,9 @@ A workflow script must export a default async function. Workflow helpers are glo
 - `agent(prompt, options)` — request one generic child and return a result object;
 - `followUp(jobId, prompt, options)` — continue a completed agent() call's own retained native session and return the same result shape;
 - `parallel(tasks, { concurrency })` — run deferred tasks with a bounded worker pool;
-- `pipeline(items, ...stages)` — process independent items through ordered stages.
+- `pipeline(items, ...stages)` — process independent items through ordered stages;
+- `converge(options)` — run a bounded implement/review/fix loop over two retained sessions;
+- `convergenceReviewSchema` — the review schema `converge()` validates every verdict against.
 
 Use the globals directly. Do not write the function as if it receives a context object such as `async ({ phase, agent }) => ...`. Positional helper arguments are retained for compatibility, but the global API is the canonical form.
 
@@ -140,6 +142,53 @@ Rules:
 - Each `followUp()` call consumes its own agent-call ordinal (it counts toward the 32-call budget) and appears in `/workflows` as another bounded generation under the same agent, not a new agent card. Cumulative usage and per-agent token budgets already include every generation.
 - Await every `followUp()` call, exactly like `agent()`.
 - `followUp()` never waits out a provider-quota rejection, even when the workflow opted into `retry.providerUnavailable: "wait"`: a failed generation resumes a native session that `JobManager` has already closed, so there is nothing left to redispatch. It always fails immediately; retry with a fresh `agent()` call instead.
+
+## Bounded convergence (implement → review → fix)
+
+`converge()` runs the iterative implementation lifecycle inside one run instead of ending at the first review. It starts one mutating implementer and one read-only reviewer with `agent()`, then keeps both retained sessions alive across rounds with `followUp()`:
+
+```js
+export default async function () {
+  const result = await converge({
+    name: "issue 24",
+    maxRounds: 3,
+    implement: {
+      prompt: "Implement the plan in docs/plan.md. Report what you changed and how you verified it.",
+      options: { name: "implementer" },
+    },
+    review: {
+      prompt: "Review the working tree against docs/plan.md. Return your structured verdict.",
+      options: { name: "reviewer" },
+    },
+    independentReview: true,
+  });
+
+  phase("summarize");
+  log(`convergence ${result.outcome} after ${result.roundsAttempted} round(s)`);
+  return result;
+}
+```
+
+Options: `implement` and `review` each take a prompt string or `{ prompt, options }` (ordinary `agent()` options except `phase`); `maxRounds` is an integer from 1 to 16 (omitted, it is derived from the run's remaining agent-call budget, two calls per round); `stallTolerance` (0–4) allows that many repeated rounds before stopping; `includeSuggestions` counts `suggestion` findings as actionable; `independentReview` makes the reviewer `independentOf` the implementer's job; `fixInstructions` and `reviewInstructions` prepend bounded standing guidance; `phases: false` suppresses the helper's own phase calls.
+
+The result is `{ ok, outcome, roundsAttempted, maxRounds, implementerJobId, reviewerJobId, finalReview, implementationOutput, stoppingReason, rounds }`, where `outcome` is one of:
+
+- `approved` — the reviewer returned `approve`; the only `ok: true` outcome;
+- `blocked` — the reviewer reported an external or policy boundary;
+- `stalled` — a round repeated the previous round's actionable findings unchanged;
+- `limit-reached` — `maxRounds`, the 32-call ceiling, or a workflow budget stopped the loop; the last review is preserved;
+- `failed` — a call failed, or a review returned an unusable structured verdict.
+
+Rules and restrictions:
+
+- Every review is validated against `convergenceReviewSchema` (`verdict`, `summary`, `findings[]` with stable `id`, `severity`, `body`, and optional `filePath`/`startLine`/`endLine`). Missing, malformed, duplicate-id, `request_changes` without actionable findings, or `approve` with actionable findings ends the loop as `failed`. Suggestions count as actionable for this check when `includeSuggestions` is true.
+- The reviewer is always `access: "readOnly"`. Passing any other access, an `isolation` option, a `phase` option, or a review `schema` is rejected before dispatch. `converge()` owns the implement/review phase sequence so it can validate both activations before mutation.
+- Only bounded review evidence, the summary plus every actionable finding, is sent back to the implementer. The helper preserves every finding ID while bounding individual locations and bodies to fit the prompt limit.
+- Every implementation and review turn is an ordinary agent call: it consumes a call ordinal, counts toward every workflow and per-agent budget, is journaled and replayable, and is cancelled with the run. Cancellation, pause, and shutdown stay lifecycle states and never become a convergence outcome.
+- Stall detection is deterministic and advisory: it compares normalized actionable finding IDs and bodies between consecutive rounds. It never spends a model call and never infers progress from prose or token counts.
+- The helper emits `implement 1`, `review 1`, `fix 1`, `review 2`, … phases (prefixed with `name` when given). With a declared `meta.phases` plan, either declare those names or pass `phases: false`.
+
+Use bounded convergence when implementation is followed by a machine-verifiable review, findings can go back to the same retained implementer, and the reviewer can reassess the shared checkout without mutating it. Prefer a single `agent()` call, or a plain loop, when the work is one-shot research or synthesis, when a human must judge between rounds, when each attempt needs a clean isolated worktree (`converge()` rejects `isolation` because a finalized worktree cannot be continued), when acceptance cannot be expressed as a bounded structured verdict, or when further work would touch production or another approval-gated surface. Unless the caller explicitly asks for a one-shot review, give an implementation/review workflow at least one bounded fix round.
 
 ## Routed questions (subagent_ask / subagent_answer)
 
@@ -226,6 +275,7 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 - Workflows are deterministic: do not use `Date.now()`, zero-argument `new Date()`, or `Math.random()`.
 - Results, metadata, agent requests, logs, phases, source, and arguments are bounded and must be JSON-serializable.
 - A workflow may make at most 32 agent calls and use at most four concurrent workers; `followUp()` calls draw from the same 32-call budget as `agent()`. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
+- `converge()` is bounded by the same ceilings: at most 16 rounds and two calls per round. It preflights call and phase capacity before mutation, and returns `limit-reached` when a spend check refuses a later dispatch. No workflow runs indefinitely because a reviewer keeps requesting another round.
 - `background: true` returns a start snapshot; completion is delivered as one follow-up and remains inspectable with `/workflows`.
 - `resumeFromRunId` replays every independently matching completed call, including later calls from a parallel batch when an earlier lane failed. Failed, incomplete, duplicated, or fingerprint-mismatched ordinals rerun. Keep source, input, project, and routing context identical; only increase replay budgets when the runtime permits it. A terminal retained source can be looked up by run ID across Pi sessions; the source summary and journal are read under the retention lock before replay starts.
 - `approval: "plan"` is for read-only planning. Use `approval: "onMutate"` when a workflow may mutate and host approval is required.

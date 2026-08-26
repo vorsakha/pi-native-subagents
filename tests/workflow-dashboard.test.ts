@@ -1355,3 +1355,47 @@ test("a routed-question wait reads differently from a provider-quota wait in /wo
   assert.match(quotaText, /Provider wait · codex quota/);
   assert.doesNotMatch(quotaText, /need input|Question ·/, "a provider wait never borrows the interaction vocabulary");
 });
+
+test("the workflow inspector reports convergence round, state, verdict, and stopping reason at every width", (t) => {
+  const run = workflow("converging", "completed");
+  run.taskOutcome = "unsuccessful";
+  run.convergence = {
+    name: "issue 24",
+    round: 3,
+    maxRounds: 3,
+    state: "stalled",
+    verdict: "request_changes",
+    actionableCount: 2,
+    fingerprint: "abc123",
+    stoppingReason: "round 3 repeated the same 2 unresolved finding(s) as the round before it",
+    implementerJobId: "tests-job-0002",
+    reviewerJobId: "review-job-0001",
+    rounds: [
+      { round: 1, verdict: "request_changes", actionableCount: 2, fingerprint: "abc123" },
+      { round: 2, verdict: "request_changes", actionableCount: 2, fingerprint: "abc123" },
+      { round: 3, verdict: "request_changes", actionableCount: 2, fingerprint: "abc123" },
+    ],
+  };
+  const state = harness([run], 30, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  const wide = state.overlay.render(200);
+  assertPanel(wide, 200, 30);
+  const line = wide.find((entry) => entry.includes("Convergence · "));
+  assert.ok(line, "the inspector reports convergence state");
+  assert.ok(line.includes("≡") && line.includes("stalled"), "state is carried by a glyph and by words");
+  assert.match(line, /round 3\/3/);
+  assert.match(line, /verdict request_changes · 2 actionable findings/);
+  assert.match(line, /repeated the same 2 unresolved finding/);
+
+  // Narrow layouts show one pane at a time: drill from the run list into the overview.
+  state.overlay.render(40);
+  state.overlay.handleInput(ENTER);
+  const narrow = state.overlay.render(40);
+  assertPanel(narrow, 40, 30);
+  assert.ok(narrow.some((entry) => entry.includes("Convergence · ")), "convergence survives the narrow layout");
+
+  const plain = harness([workflow("one-shot", "completed")], 30, () => {}, { fullscreen: true });
+  t.after(() => plain.overlay.dispose());
+  assert.ok(!plain.overlay.render(200).some((entry) => entry.includes("Convergence · ")), "one-shot runs show no convergence line");
+});

@@ -11,6 +11,11 @@ const MAX_IPC_BYTES = 512 * KIB;
 const MAX_AGENT_CALLS = 32;
 const MAX_PHASE_EVENTS = 128;
 const MAX_LOG_EVENTS = 256;
+const MAX_CONVERGENCE_EVENTS = 64;
+const MAX_PHASE_CAPACITY_REQUESTS = 64;
+const MAX_PHASE_CAPACITY_TITLES = 2;
+const MAX_CONVERGENCE_ROUNDS = 16;
+const MAX_CONVERGENCE_FINDINGS = 32;
 const MAX_LOG_MESSAGE_BYTES = 4 * KIB;
 const MAX_PIPELINE_ITEMS = 4096;
 const MAX_PIPELINE_CONCURRENCY = 4;
@@ -26,9 +31,13 @@ let initialized = false;
 let finished = false;
 let nextAgentId = 1;
 let agentCalls = 0;
+let agentCallBudget = MAX_AGENT_CALLS;
 let phaseEvents = 0;
 let logEvents = 0;
+let convergenceEvents = 0;
+let nextPhaseCapacityId = 1;
 const pendingAgents = new Map();
+const pendingPhaseCapacity = new Map();
 
 function byteLength(value) {
   return Buffer.byteLength(value, "utf8");
@@ -57,8 +66,8 @@ function failure(message) {
 
 function formatWorkflowError(error) {
   const message = errorMessage(error);
-  if (/Cannot destructure property ['"](?:phase|log|agent|followUp|parallel)['"]/.test(message)) {
-    return `${message}. Workflow helpers are globals: use phase(), log(), agent(), followUp(), and parallel().`;
+  if (/Cannot destructure property ['"](?:phase|log|agent|followUp|parallel|converge)['"]/.test(message)) {
+    return `${message}. Workflow helpers are globals: use phase(), log(), agent(), followUp(), parallel(), and converge().`;
   }
   return message;
 }
@@ -70,6 +79,8 @@ function finishError(error) {
   send({ type: "error", message });
   for (const resolve of pendingAgents.values()) resolve(failure("Workflow sandbox stopped"));
   pendingAgents.clear();
+  for (const resolve of pendingPhaseCapacity.values()) resolve(JSON.stringify({ ok: false, reason: "Workflow sandbox stopped" }));
+  pendingPhaseCapacity.clear();
   if (process.connected) process.disconnect();
 }
 
@@ -96,6 +107,44 @@ function bridge(operation, payloadJson, resolve) {
     catch { return "Log message is not valid JSON"; }
     if (typeof payload.message !== "string") return "log requires a string message";
     if (!send({ type: "log", message: payload.message })) return "Unable to emit workflow log message";
+    return undefined;
+  }
+  if (operation === "limits") {
+    // Remaining sandbox capacity, so converge() can stop at a bounded
+    // limit-reached outcome instead of dispatching a call that must fail.
+    return JSON.stringify({
+      agentCalls: Math.max(0, agentCallBudget - agentCalls),
+    });
+  }
+  if (operation === "phaseCapacity") {
+    if (typeof resolve !== "function") return;
+    let payload;
+    try { payload = JSON.parse(payloadJson); }
+    catch { resolve(JSON.stringify({ ok: false, reason: "the phase preflight request is invalid" })); return; }
+    if (!payload || !Array.isArray(payload.titles) || payload.titles.length < 1 ||
+        payload.titles.length > MAX_PHASE_CAPACITY_TITLES || !payload.titles.every((item) => typeof item === "string")) {
+      resolve(JSON.stringify({ ok: false, reason: "the phase preflight request is invalid" }));
+      return;
+    }
+    if (nextPhaseCapacityId > MAX_PHASE_CAPACITY_REQUESTS) {
+      resolve(JSON.stringify({ ok: false, reason: "the workflow phase preflight limit was reached" }));
+      return;
+    }
+    const id = nextPhaseCapacityId++;
+    if (!send({ type: "phase-capacity", id, titles: payload.titles })) {
+      resolve(JSON.stringify({ ok: false, reason: "Unable to preflight workflow phase capacity" }));
+      return;
+    }
+    pendingPhaseCapacity.set(id, resolve);
+    return;
+  }
+  if (operation === "convergence") {
+    if (++convergenceEvents > MAX_CONVERGENCE_EVENTS) return `Workflow convergence event limit exceeded (${MAX_CONVERGENCE_EVENTS})`;
+    if (typeof payloadJson !== "string" || byteLength(payloadJson) > MAX_LOG_MESSAGE_BYTES) return "Convergence progress exceeds the 4 KiB limit";
+    let payload;
+    try { payload = JSON.parse(payloadJson); }
+    catch { return "Convergence progress is not valid JSON"; }
+    if (!send({ type: "convergence", progress: payload })) return "Unable to emit workflow convergence progress";
     return undefined;
   }
   if ((operation !== "agent" && operation !== "followUp") || typeof resolve !== "function") return;
@@ -264,6 +313,361 @@ function installApi(context, argsJson) {
         await Promise.all(Array.from({ length: Math.min(${MAX_PIPELINE_CONCURRENCY}, items.length) }, run));
         return results;
       };
+      // --- Bounded convergence -------------------------------------------
+      // converge() is an ordinary loop over agent()/followUp(): every call it
+      // makes is a normal workflow call subject to the same scheduler, budget,
+      // journal, replay, and cancellation rules. It adds only the contract:
+      // a validated review verdict, deterministic stall detection, explicit
+      // round bounds, and bounded progress the host can display and persist.
+      const deepFreeze = (value) => {
+        if (value && typeof value === "object") for (const item of Object.values(value)) deepFreeze(item);
+        return Object.freeze(value);
+      };
+      const CONVERGENCE_REVIEW_SCHEMA = deepFreeze({
+        type: "object",
+        required: ["verdict", "summary", "findings"],
+        properties: {
+          verdict: { type: "string", enum: ["approve", "request_changes", "blocked"] },
+          summary: { type: "string", minLength: 1, maxLength: 4000 },
+          findings: {
+            type: "array",
+            maxItems: ${MAX_CONVERGENCE_FINDINGS},
+            items: {
+              type: "object",
+              required: ["id", "severity", "body"],
+              properties: {
+                id: { type: "string", minLength: 1, maxLength: 128 },
+                severity: { type: "string", enum: ["blocker", "issue", "suggestion"] },
+                body: { type: "string", minLength: 1, maxLength: 4000 },
+                filePath: { type: "string", maxLength: 1024 },
+                startLine: { type: "integer", minimum: 0 },
+                endLine: { type: "integer", minimum: 0 },
+              },
+            },
+          },
+        },
+      });
+      const VERDICTS = ["approve", "request_changes", "blocked"];
+      const SEVERITIES = ["blocker", "issue", "suggestion"];
+      const collapse = (value) => String(value).replace(/\\s+/g, " ").trim();
+      const convergenceFingerprint = (text) => {
+        // Two FNV-1a passes: a deterministic, dependency-free round marker.
+        // Only ever used as durable evidence and for display; stall detection
+        // itself compares the full canonical string, never the hash.
+        let a = 0x811c9dc5;
+        let b = 0x01000193;
+        for (let index = 0; index < text.length; index++) {
+          const code = text.charCodeAt(index);
+          a = Math.imul(a ^ code, 16777619) >>> 0;
+          b = Math.imul(b ^ (code + index), 2166136261) >>> 0;
+        }
+        return a.toString(16).padStart(8, "0") + b.toString(16).padStart(8, "0");
+      };
+      const validateReview = (value) => {
+        if (!value || typeof value !== "object" || Array.isArray(value)) {
+          return { ok: false, error: "the review returned no structured verdict object" };
+        }
+        if (!VERDICTS.includes(value.verdict)) {
+          return { ok: false, error: "verdict must be approve, request_changes, or blocked" };
+        }
+        const summary = typeof value.summary === "string" ? collapse(value.summary) : "";
+        if (!summary) return { ok: false, error: "summary must be a non-empty string" };
+        const raw = value.findings === undefined ? [] : value.findings;
+        if (!Array.isArray(raw) || raw.length > ${MAX_CONVERGENCE_FINDINGS}) {
+          return { ok: false, error: "findings must be an array of at most " + ${MAX_CONVERGENCE_FINDINGS} + " entries" };
+        }
+        const findings = [];
+        const ids = new Set();
+        for (const item of raw) {
+          if (!item || typeof item !== "object" || Array.isArray(item)) {
+            return { ok: false, error: "every finding must be an object" };
+          }
+          const id = typeof item.id === "string" ? collapse(item.id) : "";
+          if (!id || id.length > 128) return { ok: false, error: "every finding needs a stable id of 1-128 characters" };
+          if (ids.has(id)) return { ok: false, error: "finding ids must be unique; " + id + " repeats" };
+          ids.add(id);
+          if (!SEVERITIES.includes(item.severity)) return { ok: false, error: "finding " + id + " has an unknown severity" };
+          const body = typeof item.body === "string" ? item.body.trim() : "";
+          if (!body) return { ok: false, error: "finding " + id + " needs a non-empty body" };
+          const finding = { id, severity: item.severity, body: body.slice(0, 4000) };
+          if (typeof item.filePath === "string" && item.filePath.trim()) finding.filePath = collapse(item.filePath).slice(0, 1024);
+          if (Number.isSafeInteger(item.startLine)) finding.startLine = item.startLine;
+          if (Number.isSafeInteger(item.endLine)) finding.endLine = item.endLine;
+          findings.push(finding);
+        }
+        return { ok: true, value: { verdict: value.verdict, summary: summary.slice(0, 4000), findings } };
+      };
+      const convergenceStep = (value, label) => {
+        const step = typeof value === "string" ? { prompt: value } : value;
+        if (!step || typeof step !== "object" || Array.isArray(step)) {
+          throw new TypeError("converge " + label + " must be a prompt string or a { prompt, options } object");
+        }
+        if (typeof step.prompt !== "string" || !step.prompt.trim()) {
+          throw new TypeError("converge " + label + " requires a non-empty prompt");
+        }
+        const options = step.options === undefined ? {} : step.options;
+        if (!options || typeof options !== "object" || Array.isArray(options)) {
+          throw new TypeError("converge " + label + " options must be an object");
+        }
+        if (options.isolation !== undefined) {
+          throw new TypeError("converge cannot use isolation: a worktree-isolated call is finalized when it returns and can never be continued by followUp()");
+        }
+        if (options.phase !== undefined) {
+          throw new TypeError("converge " + label + " options cannot set phase; converge owns its implement/review phase sequence");
+        }
+        if (options.schema !== undefined && label !== "review") {
+          throw new TypeError("converge does not accept an implement schema; only the review verdict is structured");
+        }
+        return { prompt: step.prompt, options: { ...options } };
+      };
+      const convergenceInstructions = (value, label) => {
+        if (value === undefined) return "";
+        if (typeof value !== "string" || value.length > 2000) {
+          throw new TypeError("converge " + label + " must be a string of at most 2000 characters");
+        }
+        return value.trim();
+      };
+      const convergeApi = async (options) => {
+        if (!options || typeof options !== "object" || Array.isArray(options)) {
+          throw new TypeError("converge requires an options object with implement and review prompts");
+        }
+        const implementSpec = convergenceStep(options.implement, "implement");
+        const reviewSpec = convergenceStep(options.review, "review");
+        if (reviewSpec.options.access !== undefined && reviewSpec.options.access !== "readOnly") {
+          throw new TypeError('converge reviewers are always access: "readOnly" and cannot mutate the checkout');
+        }
+        if (reviewSpec.options.schema !== undefined) {
+          throw new TypeError("converge always validates reviews with convergenceReviewSchema; do not pass a review schema");
+        }
+        if (options.stallTolerance !== undefined
+          && (!Number.isInteger(options.stallTolerance) || options.stallTolerance < 0 || options.stallTolerance > 4)) {
+          throw new RangeError("converge stallTolerance must be an integer from 0 to 4");
+        }
+        if (options.includeSuggestions !== undefined && typeof options.includeSuggestions !== "boolean") {
+          throw new TypeError("converge includeSuggestions must be boolean");
+        }
+        if (options.independentReview !== undefined && typeof options.independentReview !== "boolean") {
+          throw new TypeError("converge independentReview must be boolean");
+        }
+        if (options.phases !== undefined && typeof options.phases !== "boolean") {
+          throw new TypeError("converge phases must be boolean");
+        }
+        if (options.name !== undefined && (typeof options.name !== "string" || !options.name.trim())) {
+          throw new TypeError("converge name must be a non-empty string");
+        }
+        const fixInstructions = convergenceInstructions(options.fixInstructions, "fixInstructions");
+        const reviewInstructions = convergenceInstructions(options.reviewInstructions, "reviewInstructions");
+        const stallTolerance = options.stallTolerance === undefined ? 0 : options.stallTolerance;
+        const includeSuggestions = options.includeSuggestions === true;
+        const usePhases = options.phases !== false;
+        const name = options.name === undefined ? undefined : collapse(options.name).slice(0, 120);
+        const prefix = name === undefined ? "" : name + " · ";
+        const capacity = () => JSON.parse(callHost("limits"));
+        // An omitted maxRounds is still finite: it is derived from the agent
+        // calls this run has left, two per round, capped at ${MAX_CONVERGENCE_ROUNDS}.
+        let maxRounds;
+        if (options.maxRounds === undefined) {
+          maxRounds = Math.max(1, Math.min(${MAX_CONVERGENCE_ROUNDS}, Math.floor(capacity().agentCalls / 2)));
+        } else {
+          if (!Number.isInteger(options.maxRounds) || options.maxRounds < 1 || options.maxRounds > ${MAX_CONVERGENCE_ROUNDS}) {
+            throw new RangeError("converge maxRounds must be an integer from 1 to " + ${MAX_CONVERGENCE_ROUNDS});
+          }
+          maxRounds = options.maxRounds;
+        }
+
+        const rounds = [];
+        let state = "running";
+        let currentRound = 0;
+        let verdict;
+        let actionableCount;
+        let fingerprint;
+        let stoppingReason;
+        let implementerJobId;
+        let reviewerJobId;
+        let finalReview;
+        let implementationOutput;
+        const emit = () => {
+          // Progress is advisory: a rejected or dropped frame never changes the
+          // loop's outcome, which is carried by the returned result.
+          callHost("convergence", JSON.stringify({
+            name,
+            round: currentRound,
+            maxRounds,
+            state,
+            verdict,
+            actionableCount,
+            fingerprint,
+            stoppingReason,
+            implementerJobId,
+            reviewerJobId,
+            rounds: rounds.slice(-${MAX_CONVERGENCE_ROUNDS}),
+          }));
+        };
+        const finish = (outcome, reason) => {
+          state = outcome;
+          stoppingReason = reason;
+          emit();
+          return {
+            ok: outcome === "approved",
+            outcome,
+            roundsAttempted: currentRound,
+            maxRounds,
+            implementerJobId,
+            reviewerJobId,
+            finalReview,
+            implementationOutput,
+            stoppingReason: reason,
+            rounds: rounds.slice(),
+          };
+        };
+        const callOutcome = (result) => {
+          const error = String(result.error === undefined ? "" : result.error);
+          return result.limit === "budget" || error.indexOf("Agent call limit exceeded") === 0 ? "limit-reached" : "failed";
+        };
+        const callReason = (label, result) => label + " call failed: " + collapse(result.error || "no reason reported").slice(0, 500);
+        const actionableOf = (review) => review.findings.filter((item) => includeSuggestions || item.severity !== "suggestion");
+        const canonicalOf = (actionable) => actionable
+          .map((item) => [
+            item.id.toLowerCase(),
+            item.severity,
+            (item.filePath === undefined ? "" : item.filePath).toLowerCase(),
+            collapse(item.body).toLowerCase().slice(0, 512),
+          ].join("|"))
+          .sort()
+          .join("\\n");
+        const fixPrompt = (review, actionable) => {
+          const lines = [];
+          if (fixInstructions) lines.push(fixInstructions);
+          lines.push("The reviewer requested changes. Resolve every finding below in the shared checkout, then report exactly what you changed and how you verified it.");
+          lines.push("Review summary: " + collapse(review.summary).slice(0, 1000));
+          lines.push("Findings:");
+          let remaining = 8192 - lines.join("\\n").length - 1;
+          for (let index = 0; index < actionable.length; index++) {
+            const item = actionable[index];
+            const findingPrefix = "- [" + item.severity + "] " + item.id;
+            const laterMinimum = actionable.slice(index + 1)
+              .reduce((total, later) => total + ("- [" + later.severity + "] " + later.id + ": x\\n").length, 0);
+            const minimum = findingPrefix.length + 3;
+            const sharedExtra = Math.max(0, remaining - minimum - laterMinimum);
+            const allowance = minimum + Math.floor(sharedExtra / (actionable.length - index));
+            const line = item.startLine === undefined ? "" : ":" + item.startLine;
+            const location = item.filePath === undefined ? "" : " (" + item.filePath + line + ")";
+            const desiredBody = Math.min(64, collapse(item.body).length);
+            const locationBudget = Math.max(0, allowance - findingPrefix.length - desiredBody - 2);
+            const boundedLocation = location.slice(0, Math.min(location.length, locationBudget));
+            const bodyBudget = Math.max(1, allowance - findingPrefix.length - boundedLocation.length - 2);
+            const findingLine = findingPrefix + boundedLocation + ": " + collapse(item.body).slice(0, bodyBudget);
+            lines.push(findingLine);
+            remaining -= findingLine.length + 1;
+          }
+          return lines.join("\\n");
+        };
+        const reviewAgainPrompt = (round, actionable) => {
+          const lines = [];
+          if (reviewInstructions) lines.push(reviewInstructions);
+          lines.push("Round " + round + ": the implementer reported another attempt. Re-inspect the current checkout and return the same structured review verdict.");
+          if (actionable.length) lines.push("Findings you reported last round: " + actionable.map((item) => item.id).join(", ").slice(0, 1000));
+          lines.push("Approve only when every actionable finding is genuinely resolved; report blocked only for an external or policy boundary you cannot resolve here.");
+          return lines.join("\\n").slice(0, 4096);
+        };
+
+        let previousCanonical;
+        let repeats = 0;
+        let fixText = "";
+        let reviewAgainText = "";
+        try {
+          for (let round = 1; round <= maxRounds; round++) {
+            const limits = capacity();
+            if (limits.agentCalls < 2) {
+              return finish("limit-reached", "the run has fewer than two agent calls left, so another implement/review round cannot start");
+            }
+            const implementationPhase = prefix + (round === 1 ? "implement 1" : "fix " + (round - 1));
+            const reviewPhase = prefix + "review " + round;
+            const phaseTitles = usePhases ? [implementationPhase, reviewPhase] : [];
+            if (phaseTitles.length) {
+              const phaseCapacity = await new Promise((resolve) => {
+                callHost("phaseCapacity", JSON.stringify({ titles: phaseTitles }), (responseJson) => {
+                  try { resolve(JSON.parse(responseJson)); }
+                  catch { resolve({ ok: false, reason: "the phase capacity response is invalid" }); }
+                });
+              });
+              if (!phaseCapacity.ok) return finish("limit-reached", phaseCapacity.reason);
+            }
+            currentRound = round;
+            state = "running";
+            emit();
+
+            if (usePhases) phaseApi(implementationPhase);
+            const implementation = round === 1
+              ? await agentApi(implementSpec.prompt, implementSpec.options)
+              : await followUpApi(implementerJobId, fixText, {});
+            if (!implementation.ok) return finish(callOutcome(implementation), callReason("implementation", implementation));
+            if (typeof implementation.output === "string") implementationOutput = implementation.output.slice(0, 4000);
+            if (round === 1) {
+              implementerJobId = implementation.jobId;
+              if (typeof implementerJobId !== "string" || !implementerJobId) {
+                return finish("failed", "the implementation agent retained no session, so no fix round could continue it");
+              }
+            }
+
+            if (usePhases) phaseApi(reviewPhase);
+            const reviewOptions = { ...reviewSpec.options, access: "readOnly", schema: CONVERGENCE_REVIEW_SCHEMA };
+            if (options.independentReview === true) reviewOptions.independentOf = implementerJobId;
+            const reviewed = round === 1
+              ? await agentApi(reviewSpec.prompt, reviewOptions)
+              : await followUpApi(reviewerJobId, reviewAgainText, { schema: CONVERGENCE_REVIEW_SCHEMA });
+            if (!reviewed.ok) return finish(callOutcome(reviewed), callReason("review", reviewed));
+            if (round === 1) {
+              reviewerJobId = reviewed.jobId;
+              if (typeof reviewerJobId !== "string" || !reviewerJobId) {
+                return finish("failed", "the review agent retained no session, so no re-review could continue it");
+              }
+            }
+
+            const parsed = validateReview(reviewed.structured);
+            if (!parsed.ok) return finish("failed", "review " + round + " returned an unusable verdict: " + parsed.error);
+            finalReview = parsed.value;
+            const actionable = actionableOf(parsed.value);
+            const canonical = canonicalOf(actionable);
+            if (parsed.value.verdict === "approve" && actionable.length) {
+              return finish("failed", "review " + round + " approved while still reporting " + actionable.length + " actionable finding(s)");
+            }
+            if (parsed.value.verdict === "request_changes" && !actionable.length) {
+              const advisory = parsed.value.findings.length
+                ? " (its findings are all suggestions, which stay advisory unless includeSuggestions is set)"
+                : "";
+              return finish("failed", "review " + round + " requested changes without reporting an actionable finding" + advisory);
+            }
+            verdict = parsed.value.verdict;
+            actionableCount = actionable.length;
+            fingerprint = convergenceFingerprint(canonical);
+            rounds.push({ round, verdict, actionableCount, fingerprint });
+            emit();
+
+            if (verdict === "approve") return finish("approved", "the reviewer approved in round " + round);
+            if (verdict === "blocked") {
+              return finish("blocked", "the reviewer reported an external blocker: " + collapse(parsed.value.summary).slice(0, 500));
+            }
+            if (previousCanonical !== undefined && canonical === previousCanonical) {
+              repeats += 1;
+              if (repeats > stallTolerance) {
+                return finish("stalled", "round " + round + " repeated the same " + actionable.length + " unresolved finding(s) as the round before it");
+              }
+            } else {
+              repeats = 0;
+            }
+            previousCanonical = canonical;
+            if (round >= maxRounds) {
+              return finish("limit-reached", "reached the configured maximum of " + maxRounds + " round(s) with changes still requested");
+            }
+            fixText = fixPrompt(parsed.value, actionable);
+            reviewAgainText = reviewAgainPrompt(round + 1, actionable);
+          }
+          return finish("limit-reached", "reached the configured maximum of " + maxRounds + " round(s)");
+        } catch (error) {
+          return finish("failed", collapse(error && error.message ? error.message : String(error)).slice(0, 1000));
+        }
+      };
       Object.defineProperties(globalThis, {
         args: { value: workflowArgs, writable: false, configurable: false },
         Date: { value: WorkflowDate, writable: false, configurable: false },
@@ -273,6 +677,8 @@ function installApi(context, argsJson) {
         followUp: { value: followUpApi, writable: false, configurable: false },
         parallel: { value: parallelApi, writable: false, configurable: false },
         pipeline: { value: pipelineApi, writable: false, configurable: false },
+        converge: { value: convergeApi, writable: false, configurable: false },
+        convergenceReviewSchema: { value: CONVERGENCE_REVIEW_SCHEMA, writable: false, configurable: false },
       });
       for (const name of ["require", "process", "global", "module"]) {
         Object.defineProperty(globalThis, name, {
@@ -373,6 +779,16 @@ process.on("message", (message) => {
     resolve(response);
     return;
   }
+  if (message.type === "phase-capacity-result") {
+    const resolve = pendingPhaseCapacity.get(message.id);
+    if (!resolve) return;
+    pendingPhaseCapacity.delete(message.id);
+    let response;
+    try { response = JSON.stringify(message.result); }
+    catch { response = JSON.stringify({ ok: false, reason: "the phase capacity response is invalid" }); }
+    resolve(response);
+    return;
+  }
   if (message.type === "cancel") {
     finishError("Workflow sandbox cancelled");
     return;
@@ -380,9 +796,11 @@ process.on("message", (message) => {
   if (message.type !== "init" || initialized) return;
   initialized = true;
   if (typeof message.source !== "string" || byteLength(message.source) > MAX_SOURCE_BYTES ||
-      typeof message.argsJson !== "string" || byteLength(message.argsJson) > MAX_ARGS_BYTES) {
+      typeof message.argsJson !== "string" || byteLength(message.argsJson) > MAX_ARGS_BYTES ||
+      !Number.isSafeInteger(message.maxAgentCalls) || message.maxAgentCalls < 1 || message.maxAgentCalls > MAX_AGENT_CALLS) {
     finishError("Invalid or oversized workflow initialization");
     return;
   }
+  agentCallBudget = message.maxAgentCalls;
   void execute(message.source, message.argsJson).catch(finishError);
 });

@@ -236,6 +236,8 @@ export interface WorkflowJournalResult {
   usage?: Usage;
   structured?: unknown;
   transport?: WorkflowStructuredTransport;
+  /** Machine-readable marker that a workflow budget, not the provider, refused this call. */
+  limit?: "budget";
 }
 
 export interface WorkflowJournalRoute {
@@ -327,6 +329,50 @@ export interface WorkflowReplayState {
   invalidatedAt?: number;
 }
 
+/** Machine-readable review verdict a bounded convergence loop branches on. */
+export type WorkflowConvergenceVerdict = "approve" | "request_changes" | "blocked";
+
+/**
+ * Terminal reason a bounded convergence loop stopped. Lifecycle states
+ * (cancelled, aborted, paused, shut down) stay on the workflow itself and are
+ * never folded into a convergence outcome.
+ */
+export type WorkflowConvergenceOutcome = "approved" | "blocked" | "limit-reached" | "stalled" | "failed";
+
+export type WorkflowConvergenceState = "running" | WorkflowConvergenceOutcome;
+
+/** Compact per-round evidence: enough to audit progress without keeping every review body. */
+export interface WorkflowConvergenceRound {
+  round: number;
+  verdict: WorkflowConvergenceVerdict;
+  actionableCount: number;
+  /** Opaque, deterministic hash of the round's normalized actionable findings. */
+  fingerprint: string;
+}
+
+/**
+ * Live and terminal state of the run's bounded convergence loop. Optional
+ * everywhere: workflows that never call `converge()` (and every snapshot
+ * written before it existed) simply omit it.
+ */
+export interface WorkflowConvergence {
+  /** Caller-supplied loop label, when provided. */
+  name?: string;
+  /** Round currently running, or the last round attempted once terminal. */
+  round: number;
+  maxRounds: number;
+  state: WorkflowConvergenceState;
+  /** Latest structured verdict, once a review of this loop has validated. */
+  verdict?: WorkflowConvergenceVerdict;
+  actionableCount?: number;
+  fingerprint?: string;
+  /** Human-readable reason the loop stopped; present once `state` is terminal. */
+  stoppingReason?: string;
+  implementerJobId?: string;
+  reviewerJobId?: string;
+  rounds: WorkflowConvergenceRound[];
+}
+
 export interface WorkflowSnapshot {
   runId: string;
   sessionId: string;
@@ -344,6 +390,8 @@ export interface WorkflowSnapshot {
   agents: WorkflowAgentRecord[];
   /** Bounded narrator-style progress emitted by workflow log(). */
   logs?: WorkflowLogRecord[];
+  /** Present once this run's script called `converge()`; absent otherwise. */
+  convergence?: WorkflowConvergence;
   /** Hash of script, arguments, project cwd, routing context, and budget. */
   definitionFingerprint?: string;
   /** Same identity hash without budget, allowing monotonic budget increases on replay. */

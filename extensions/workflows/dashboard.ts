@@ -36,7 +36,7 @@ import type {
   WorkflowSnapshot,
 } from "../../src/workflows/types.ts";
 import { formatContext, formatUsage, sanitizeInline, sanitizeText, shortId, traceStatusMeta } from "../subagents/render.ts";
-import { formatWorkflowInteraction, workflowAgentInteraction, workflowNeedsInput, workflowPhaseProgress, workflowStatusMeta } from "./render.ts";
+import { formatWorkflowConvergence, formatWorkflowInteraction, workflowAgentInteraction, workflowConvergenceMeta, workflowNeedsInput, workflowPhaseProgress, workflowStatusMeta } from "./render.ts";
 import {
   appendBoundedSection,
   boundedHeadTailText,
@@ -1061,6 +1061,10 @@ export class WorkflowsDashboardOverlay implements Focusable {
         : this.theme.fg("dim", progress.waiting ? "Phase · waiting for the first phase" : "Phase · no phases recorded"),
     ];
     if (phase?.description) lines.push(this.theme.fg("muted", `Phase context · ${boundedInline(phase.description, 2_000)}`));
+    if (run.convergence) {
+      const meta = workflowConvergenceMeta(run.convergence);
+      lines.push(this.theme.fg(meta.color, `Convergence · ${meta.glyph} ${boundedInline(formatWorkflowConvergence(run.convergence), 1_000)}`));
+    }
     if (usage) lines.push(this.theme.fg("dim", `Usage · ${usage}`));
     if (budget) lines.push(this.theme.fg("dim", `Budget · ${budget}`));
     if (run.approval) lines.push(this.theme.fg("muted", `Approval · ${run.approval}`));

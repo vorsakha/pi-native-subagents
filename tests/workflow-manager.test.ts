@@ -2025,6 +2025,259 @@ test("followUp reuses the same jobId/native session across phases for a planner 
   }
 });
 
+const CONVERGE_REQUEST_CHANGES = JSON.stringify({
+  verdict: "request_changes",
+  summary: "one blocker remains",
+  findings: [{ id: "F1", severity: "blocker", body: "guard the null case", filePath: "src/a.ts" }],
+});
+const CONVERGE_APPROVE = JSON.stringify({ verdict: "approve", summary: "resolved", findings: [] });
+
+const CONVERGE_SCRIPT = `
+  export default async () => converge({
+    name: "issue 24",
+    maxRounds: 3,
+    implement: { prompt: "implement", options: { name: "implementer" } },
+    review: { prompt: "review", options: { name: "reviewer" } },
+    independentReview: true,
+  });
+`;
+
+test("converge drives implement/review/fix over two retained sessions and persists bounded convergence state", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(CONVERGE_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "implementer dispatched");
+    const implementerJobId = f.backend.starts[0]!;
+    f.backend.complete(implementerJobId, "implementation v1", { input: 4, output: 2 });
+
+    // independentReview pins the reviewer to the other provider, read-only.
+    await waitFor(() => f.claude.requests.length === 1, "reviewer dispatched on the independent provider");
+    const reviewerJobId = f.claude.starts[0]!;
+    assert.equal(f.claude.requests[0]?.policy.access, "readOnly");
+    assert.match(f.claude.requests[0]!.task, /Return ONLY valid JSON matching this JSON Schema/);
+    f.claude.complete(reviewerJobId, CONVERGE_REQUEST_CHANGES, { input: 3, output: 1 });
+
+    await waitFor(() => f.backend.sends.length === 1, "fix follow-up reuses the implementer session");
+    assert.equal(f.backend.sends[0]?.id, implementerJobId);
+    assert.equal(f.backend.sends[0]?.behavior, "followUp");
+    assert.match(f.backend.sends[0]!.message, /\[blocker\] F1 \(src\/a\.ts\): guard the null case/);
+    f.backend.complete(implementerJobId, "implementation v2", { input: 2, output: 1 });
+
+    await waitFor(() => f.claude.sends.length === 1, "re-review reuses the reviewer session");
+    assert.equal(f.claude.sends[0]?.id, reviewerJobId);
+    f.claude.complete(reviewerJobId, CONVERGE_APPROVE, { input: 1, output: 1 });
+
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.taskOutcome, "successful");
+    assert.equal(f.backend.requests.length + f.claude.requests.length, 2, "no round spawned a fresh child");
+    assert.equal(final.agents.length, 2);
+
+    const result = final.result as { ok: boolean; outcome: string; roundsAttempted: number; implementerJobId: string; reviewerJobId: string };
+    assert.deepEqual(
+      [result.ok, result.outcome, result.roundsAttempted, result.implementerJobId, result.reviewerJobId],
+      [true, "approved", 2, implementerJobId, reviewerJobId],
+    );
+
+    const reviewer = final.agents.find((agent) => agent.jobId === reviewerJobId)!;
+    assert.equal(reviewer.access, "readOnly", "the reviewer never gains mutation access on a later round");
+    assert.equal(reviewer.harness, "claude");
+    assert.equal(reviewer.generations?.length, 2);
+    assert.equal(final.agents.find((agent) => agent.jobId === implementerJobId)?.generations?.length, 2);
+
+    assert.deepEqual(final.phases.map((phase) => phase.name), [
+      "issue 24 · implement 1",
+      "issue 24 · review 1",
+      "issue 24 · fix 1",
+      "issue 24 · review 2",
+    ]);
+
+    const convergence = final.convergence!;
+    assert.equal(convergence.state, "approved");
+    assert.equal(convergence.verdict, "approve");
+    assert.equal(convergence.round, 2);
+    assert.equal(convergence.maxRounds, 3);
+    assert.equal(convergence.name, "issue 24");
+    assert.match(convergence.stoppingReason ?? "", /approved in round 2/);
+    assert.deepEqual(convergence.rounds.map((round) => round.verdict), ["request_changes", "approve"]);
+
+    const [restored] = await loadWorkflowSummaries(f.artifactRoot, { sessionId: "session-1" });
+    assert.deepEqual(restored?.convergence, convergence, "convergence state survives the durable checkpoint");
+    const report = await readFile(join(started.snapshot.artifactDir, "report.md"), "utf8");
+    assert.match(report, /## Convergence/);
+    assert.match(report, /- State: \*\*approved\*\*/);
+    assert.match(report, /- Round 1: request_changes/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a completed convergence run replays every round without dispatching provider work again", async () => {
+  const f = await fixture();
+  try {
+    const source = await f.workflows.start(f.request(CONVERGE_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "implementer dispatched");
+    f.backend.complete(f.backend.starts[0]!, "implementation v1", { input: 4, output: 2 });
+    await waitFor(() => f.claude.requests.length === 1, "reviewer dispatched");
+    f.claude.complete(f.claude.starts[0]!, CONVERGE_REQUEST_CHANGES, { input: 3, output: 1 });
+    await waitFor(() => f.backend.sends.length === 1, "fix follow-up dispatched");
+    f.backend.complete(f.backend.starts[0]!, "implementation v2", { input: 2, output: 1 });
+    await waitFor(() => f.claude.sends.length === 1, "re-review dispatched");
+    f.claude.complete(f.claude.starts[0]!, CONVERGE_APPROVE, { input: 1, output: 1 });
+    const sourceFinal = await source.completion;
+    assert.equal(sourceFinal.status, "completed");
+    assert.deepEqual(aggregateWorkflowUsage(sourceFinal), { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+
+    const resumed = await f.workflows.start(f.request(CONVERGE_SCRIPT, { resumeFromRunId: sourceFinal.runId }));
+    const final = await resumed.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.replay?.matchedCalls, 4, "both rounds replay from the journal");
+    assert.equal(final.replay?.invalidatedAt, undefined);
+    assert.equal(f.backend.requests.length, 1, "no fresh implementer child is spawned on replay");
+    assert.equal(f.claude.requests.length, 1);
+    assert.equal(f.backend.sends.length, 1, "no follow-up turn is charged again");
+    assert.equal(f.claude.sends.length, 1);
+    assert.deepEqual(
+      aggregateWorkflowUsage(final),
+      { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+      "replayed rounds spend nothing again",
+    );
+    assert.deepEqual((final.result as { outcome: string }).outcome, "approved");
+    assert.deepEqual(final.convergence?.rounds, sourceFinal.convergence?.rounds);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("converge preflights maxAgents before a fix round and preserves the last review", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(CONVERGE_SCRIPT, { budget: { maxAgents: 3 } }));
+    await waitFor(() => f.backend.requests.length === 1, "implementer dispatched");
+    f.backend.complete(f.backend.starts[0]!, "implementation v1");
+    await waitFor(() => f.claude.requests.length === 1, "reviewer dispatched");
+    f.claude.complete(f.claude.starts[0]!, CONVERGE_REQUEST_CHANGES);
+
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal(final.taskOutcome, "unsuccessful");
+    assert.equal(f.backend.sends.length, 0, "the third call cannot mutate without room for its matching review");
+    assert.equal(f.claude.sends.length, 0);
+
+    const result = final.result as { ok: boolean; outcome: string; stoppingReason: string; finalReview: { verdict: string; findings: Array<{ id: string }> } };
+    assert.equal(result.ok, false);
+    assert.equal(result.outcome, "limit-reached");
+    assert.match(result.stoppingReason, /fewer than two agent calls left/);
+    assert.equal(result.finalReview.verdict, "request_changes");
+    assert.deepEqual(result.finalReview.findings.map((finding) => finding.id), ["F1"]);
+    assert.equal(final.convergence?.state, "limit-reached");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("converge preflights manager phases created by mixed phase() and agent({ phase }) calls", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        for (let index = 0; index < 62; index++) phase("prior " + index);
+        await agent("prior inspection", { phase: "agent-created", access: "readOnly" });
+        return converge({ maxRounds: 2, implement: "implement", review: "review" });
+      };
+    `));
+    await waitFor(() => f.backend.requests.length === 1, "prior phase-bearing agent dispatched");
+    f.backend.completeTask("prior inspection", "done");
+
+    const final = await started.completion;
+    const result = final.result as { outcome: string; roundsAttempted: number; stoppingReason: string };
+    assert.equal(final.status, "completed");
+    assert.equal(result.outcome, "limit-reached");
+    assert.equal(result.roundsAttempted, 0);
+    assert.match(result.stoppingReason, /Workflow phase limit exceeded \(64\)/);
+    assert.equal(f.backend.requests.length, 1, "convergence does not dispatch its mutating implementation without room for review");
+    assert.equal(final.phases.length, 63);
+    assert.equal(final.phases.at(-1)?.name, "agent-created");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("converge rejects a distinct review option phase before implementation dispatch", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        return converge({
+          maxRounds: 2,
+          implement: "implement",
+          review: { prompt: "review", options: { phase: "distinct review" } },
+        });
+      };
+    `));
+
+    const final = await started.completion;
+    assert.equal(final.status, "failed");
+    assert.match(final.error ?? "", /review options cannot set phase/);
+    assert.equal(f.backend.requests.length, 0, "the mutating implementation is not dispatched");
+    assert.equal(f.claude.requests.length, 0);
+    assert.deepEqual(final.phases, []);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("converge dry-validates declared phase order before implementation dispatch", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`
+      export const meta = {
+        phases: ["issue 24 · review 1", "issue 24 · implement 1"],
+      };
+      export default async () => converge({
+        name: "issue 24",
+        maxRounds: 1,
+        implement: "implement",
+        review: "review",
+      });
+    `));
+
+    const final = await started.completion;
+    const result = final.result as { outcome: string; roundsAttempted: number; stoppingReason: string };
+    assert.equal(final.status, "completed");
+    assert.equal(result.outcome, "limit-reached");
+    assert.equal(result.roundsAttempted, 0);
+    assert.match(result.stoppingReason, /cannot move backward from "issue 24 · implement 1" to "issue 24 · review 1"/);
+    assert.equal(f.backend.requests.length, 0, "the misordered plan is rejected before implementation mutation");
+    assert.equal(f.claude.requests.length, 0);
+    assert.equal(final.currentPhase, null, "dry validation does not activate either declared phase");
+    assert.deepEqual(final.phases.map((phase) => phase.status), ["pending", "pending"]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("cancelling a converging run stays a lifecycle abort and keeps the last recorded round", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(CONVERGE_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "implementer dispatched");
+    f.backend.complete(f.backend.starts[0]!, "implementation v1");
+    await waitFor(() => f.claude.requests.length === 1, "reviewer dispatched");
+    f.claude.complete(f.claude.starts[0]!, CONVERGE_REQUEST_CHANGES);
+    await waitFor(() => f.backend.sends.length === 1, "fix follow-up dispatched");
+    await waitFor(() => f.workflows.check(started.snapshot.runId).convergence?.rounds.length === 1, "round 1 recorded");
+
+    const final = await f.workflows.cancel(started.snapshot.runId, "operator cancel");
+    assert.equal(final.status, "aborted");
+    assert.equal(final.convergence?.state, "running", "cancellation is never reported as a convergence outcome");
+    assert.equal(final.convergence?.round, 2);
+    assert.deepEqual(final.convergence?.rounds.map((round) => round.verdict), ["request_changes"]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("followUp enforces ownership and policy immutability: cross-workflow, direct, and policy-bearing targets are all rejected", async () => {
   const f = await fixture();
   try {

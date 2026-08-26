@@ -20,6 +20,7 @@ import {
   writeWorkflowReport,
   writeWorkflowResult,
 } from "./artifacts.ts";
+import { MAX_CONVERGENCE_ROUNDS } from "./convergence.ts";
 import {
   canonicalJson,
   replayableJournalCalls,
@@ -53,6 +54,7 @@ import type {
   WorkflowJournalRoute,
   WorkflowApprovalMode,
   WorkflowBudgetPolicy,
+  WorkflowConvergence,
   WorkflowInteractionJournalDetail,
   WorkflowInteractionSummary,
   WorkflowReplayInteraction,
@@ -248,6 +250,46 @@ function validateDeclaredPhasePlan(value: unknown): string[] {
     names.push(name);
   }
   return names;
+}
+
+interface PhaseActivationView {
+  declared: boolean;
+  names: string[];
+  currentPhase: number | null;
+}
+
+interface PlannedPhaseActivation {
+  index: number;
+  name: string;
+  create: boolean;
+}
+
+/**
+ * Resolves one phase activation without changing the run. Both real activation
+ * and convergence preflight use this planner, so normalization, duplicates,
+ * declared-plan order, and the phase cap cannot drift apart.
+ */
+function planPhaseActivation(view: PhaseActivationView, rawTitle: string): PlannedPhaseActivation {
+  const name = view.declared ? normalizePhaseName(rawTitle) : label(rawTitle, "Phase");
+  let index = view.names.indexOf(name);
+  const create = index < 0;
+  if (create) {
+    if (view.declared) {
+      throw new Error(`Workflow phase ${JSON.stringify(name || "<blank>")} is not declared in the workflow phase plan`);
+    }
+    if (view.names.length >= MAX_WORKFLOW_PHASES) {
+      throw new Error(`Workflow phase limit exceeded (${MAX_WORKFLOW_PHASES})`);
+    }
+    index = view.names.length;
+  }
+
+  const currentIndex = view.currentPhase !== null && view.names[view.currentPhase] !== undefined
+    ? view.currentPhase
+    : undefined;
+  if (currentIndex !== undefined && index < currentIndex) {
+    throw new Error(`Workflow phase cannot move backward from ${JSON.stringify(view.names[currentIndex])} to ${JSON.stringify(name)}`);
+  }
+  return { index, name, create };
 }
 
 function looksInstructionShaped(value: unknown): boolean {
@@ -774,9 +816,12 @@ export class WorkflowManager {
         args: request.args ?? null,
         cwd: request.cwd,
         signal: entry.controller.signal,
+        maxAgentCalls: entry.snapshot.budget?.maxAgents ?? 32,
         onMeta: (meta) => this.#applyMeta(entry, meta, true),
         onPhase: (title) => this.#activatePhase(entry, title),
+        onPhaseCapacity: (titles) => this.#phaseCapacity(entry, titles),
         onLog: (message) => this.#recordLog(entry, message),
+        onConvergence: (progress) => this.#recordConvergence(entry, progress),
         onAgent: (prompt, options, signal, callIndex) => this.#runAgent(entry, request, prompt, options, signal, callIndex),
         onFollowUp: (jobId, prompt, options, signal, callIndex) => this.#runFollowUpCall(entry, request, jobId, prompt, options, signal, callIndex),
       });
@@ -956,6 +1001,9 @@ export class WorkflowManager {
       error: result.error,
       usage: result.usage,
       structured: result.structured,
+      // Machine-readable budget marker, preserved so a bounded convergence
+      // loop reports `limit-reached` rather than parsing failure prose.
+      limit: result.limit,
     };
     await this.#appendJournal(entry, {
       callIndex,
@@ -1091,7 +1139,7 @@ export class WorkflowManager {
   ): Promise<WorkflowAgentResult & { unavailable?: ProviderUnavailability; progressed?: boolean }> {
     if (!prompt.trim()) return { ok: false, output: "", error: "agent() requires a non-empty prompt" };
     const preflightError = this.#budgetPreflight(entry);
-    if (preflightError) return { ok: false, output: "", error: preflightError };
+    if (preflightError) return { ok: false, output: "", error: preflightError, limit: "budget" };
     if (["role", "agent", "tier", "modelTier", "modelProfile", "backend"].some((key) => Object.hasOwn(options, key))) {
       return { ok: false, output: "", error: "Workflow agent() API schema mismatch: use the current task-driven schema." };
     }
@@ -1108,7 +1156,7 @@ export class WorkflowManager {
     const access = options.access === undefined ? undefined : String(options.access) as AccessMode;
     if (access && !ACCESS.has(access)) return { ok: false, output: "", error: `Unknown access: ${access}` };
     if (callIndex >= (entry.snapshot.budget?.maxAgents ?? 32)) {
-      return { ok: false, output: "", error: `Workflow agent budget exceeded (${entry.snapshot.budget?.maxAgents} calls)` };
+      return { ok: false, output: "", error: `Workflow agent budget exceeded (${entry.snapshot.budget?.maxAgents} calls)`, limit: "budget" };
     }
     if (options.independent !== undefined && typeof options.independent !== "boolean") return { ok: false, output: "", error: "independent must be boolean" };
     if (options.independentOf !== undefined && (typeof options.independentOf !== "string" || !options.independentOf.trim() || options.independentOf.trim().length > 200)) return { ok: false, output: "", error: "independentOf must be a job ID containing 1–200 characters" };
@@ -1437,10 +1485,10 @@ export class WorkflowManager {
       return { ok: false, output: "", error: `followUp() target ${jobId} used an isolated worktree that already finalized (${record.isolation.state}) and cannot continue` };
     }
     if (callIndex >= (entry.snapshot.budget?.maxAgents ?? 32)) {
-      return { ok: false, output: "", error: `Workflow agent budget exceeded (${entry.snapshot.budget?.maxAgents} calls)` };
+      return { ok: false, output: "", error: `Workflow agent budget exceeded (${entry.snapshot.budget?.maxAgents} calls)`, limit: "budget" };
     }
     const preflightError = this.#budgetPreflight(entry);
-    if (preflightError) return { ok: false, output: "", error: preflightError };
+    if (preflightError) return { ok: false, output: "", error: preflightError, limit: "budget" };
     const schema = options.schema === undefined ? undefined : workflowSchema(options.schema);
     if (options.schema !== undefined && !schema) {
       return { ok: false, output: "", error: "followUp schema must be a bounded JSON Schema object" };
@@ -2340,6 +2388,24 @@ export class WorkflowManager {
       : entry.snapshot.currentPhase ?? this.#ensurePhase(entry, "Agents");
   }
 
+  #phaseCapacity(entry: RunEntry, titles: string[]): { ok: boolean; reason?: string } {
+    const view: PhaseActivationView = {
+      declared: entry.snapshot.plannedPhaseCount !== undefined,
+      names: entry.snapshot.phases.map((phase) => phase.name),
+      currentPhase: entry.snapshot.currentPhase,
+    };
+    try {
+      for (const title of titles) {
+        const activation = planPhaseActivation(view, title);
+        if (activation.create) view.names.push(activation.name);
+        view.currentPhase = activation.index;
+      }
+      return { ok: true };
+    } catch (error) {
+      return { ok: false, reason: boundedText(error, 500) };
+    }
+  }
+
   #markPhaseRunning(entry: RunEntry, index: number): void {
     const phase = entry.snapshot.phases[index];
     if (!phase || phase.status !== "pending") return;
@@ -2390,16 +2456,40 @@ export class WorkflowManager {
     this.#touch(entry);
   }
 
+  /**
+   * Mirrors the sandbox convergence loop's bounded progress onto the snapshot.
+   * Purely projected state: the loop itself runs on ordinary agent()/followUp()
+   * calls, so scheduling, budgets, journaling, and replay are untouched.
+   */
+  #recordConvergence(entry: RunEntry, progress: WorkflowConvergence): void {
+    entry.snapshot.convergence = {
+      ...progress,
+      name: progress.name === undefined ? undefined : boundedText(progress.name, 200),
+      stoppingReason: progress.stoppingReason === undefined ? undefined : boundedText(progress.stoppingReason, 2_000),
+      rounds: progress.rounds.slice(-MAX_CONVERGENCE_ROUNDS),
+    };
+    this.#touch(entry);
+  }
+
   #activatePhase(entry: RunEntry, title: string): void {
-    const index = entry.snapshot.plannedPhaseCount === undefined
-      ? this.#ensurePhase(entry, title)
-      : this.#declaredPhaseIndex(entry, title);
+    const activation = planPhaseActivation({
+      declared: entry.snapshot.plannedPhaseCount !== undefined,
+      names: entry.snapshot.phases.map((phase) => phase.name),
+      currentPhase: entry.snapshot.currentPhase,
+    }, title);
     const now = Date.now();
+    if (activation.create) {
+      entry.snapshot.phases.push({
+        index: activation.index,
+        name: activation.name,
+        status: "pending",
+        timestamps: { createdAt: now, updatedAt: now },
+        agents: [],
+      });
+    }
+    const index = activation.index;
     const current = entry.snapshot.currentPhase === null ? undefined : entry.snapshot.phases[entry.snapshot.currentPhase];
     if (current && current.index === index) return;
-    if (current && index < current.index) {
-      throw new Error(`Workflow phase cannot move backward from ${JSON.stringify(current.name)} to ${JSON.stringify(entry.snapshot.phases[index]!.name)}`);
-    }
     if (current && current.index !== index && current.status === "running") {
       current.status = "completed";
       current.timestamps.updatedAt = now;
