@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { CapabilityRouter } from "../../src/capability-service.ts";
+import type { HarnessAvailabilityProbe } from "../../src/harness-availability.ts";
 import type { ProfileDefinition } from "../../src/types.ts";
 import { Type } from "typebox";
 import type { JobManager } from "../../src/manager.ts";
@@ -35,6 +36,7 @@ export interface RegisterWorkflowOptions {
   clearInterval?: typeof clearInterval;
   savedWorkflowRoot?: string;
   router?: CapabilityRouter;
+  availability?: HarnessAvailabilityProbe;
   resolveProfile?: (name: string) => ProfileDefinition | undefined;
 }
 
@@ -88,6 +90,11 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
       state: agent.state,
       timestamps: structuredClone(agent.timestamps),
       harness: agent.harness,
+      requestedHarness: agent.requestedHarness,
+      availability: agent.availability,
+      executableVersion: agent.executableVersion,
+      capabilityRevision: agent.capabilityRevision,
+      availabilityChecks: agent.availabilityChecks?.map((check) => ({ ...check })),
       model: agent.model,
       effort: agent.effort,
       preview: agent.preview?.slice(-500),
@@ -513,6 +520,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         artifactRoot,
         sessionId: ctx.sessionManager.getSessionId(),
         router: options.router,
+        availability: options.availability,
         resolveProfile: options.resolveProfile,
         approveMutation: async ({ workflow, agent, prompt, signal }) => {
           if (!ctx.hasUI || typeof ctx.ui.confirm !== "function") return false;

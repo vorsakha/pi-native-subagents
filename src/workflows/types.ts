@@ -1,4 +1,6 @@
 import type { AccessMode, ContextSnapshot, EffortLevel, HarnessName, ProviderFamily, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
+import type { RequestedHarness } from "../capability-routing.ts";
+import type { HarnessAvailabilityStatus } from "../harness-availability.ts";
 import type { InteractionRoute, InteractionState } from "../interactions.ts";
 import type { ProviderUnavailabilityKind } from "../provider-unavailability.ts";
 import type { WorkflowWorktreeResult } from "./worktree.ts";
@@ -174,6 +176,16 @@ export interface WorkflowAgentRecord {
   state: WorkflowAgentState;
   timestamps: WorkflowTimestamps;
   harness?: string;
+  /** Harness the caller asked for (`auto` or an explicit route), before availability resolution. */
+  requestedHarness?: RequestedHarness;
+  /** Normalized availability of the resolved route observed by the live pre-dispatch recheck. */
+  availability?: HarnessAvailabilityStatus;
+  /** Native executable version, only when the availability adapter reported one. */
+  executableVersion?: string;
+  /** Fingerprint of the live capability catalog used to resolve this route. */
+  capabilityRevision?: string;
+  /** Candidate availability observed for auto routing, including excluded routes. */
+  availabilityChecks?: WorkflowHarnessAvailabilityEvidence[];
   model?: string;
   effort?: EffortLevel;
   /** Original caller prompt, bounded before persistence; excludes schema scaffolding. */
@@ -244,10 +256,26 @@ export interface WorkflowJournalResult {
 export interface WorkflowJournalRoute {
   jobId?: string;
   harness?: HarnessName;
+  /** Harness the caller requested (`auto` or an explicit route). Additive; absent on older journals. */
+  requestedHarness?: RequestedHarness;
+  /** Normalized availability of the resolved route. Additive; absent on older journals. */
+  availability?: HarnessAvailabilityStatus;
+  /** Native executable version, only when reported by a safe probe. */
+  executableVersion?: string;
+  /** Capability catalog fingerprint used for route selection, when applicable. */
+  capabilityRevision?: string;
+  /** Candidate availability observed for auto routing. */
+  availabilityChecks?: WorkflowHarnessAvailabilityEvidence[];
   model?: string;
   /** Actual child lifecycle state and bounded failure detail for durable review. */
   status?: WorkflowAgentState;
   error?: string;
+}
+
+export interface WorkflowHarnessAvailabilityEvidence {
+  harness: HarnessName;
+  status: HarnessAvailabilityStatus;
+  executableVersion?: string;
 }
 
 /**

@@ -59,6 +59,11 @@ import {
 } from "./transcript.ts";
 import { DEFAULT_TOOL_DISPLAY, type ToolDisplayMode } from "../tool-summary.ts";
 import type { JobSnapshot, SendBehavior } from "../../src/types.ts";
+import {
+  availabilityLabel,
+  formatHarnessAvailabilityReport,
+  type HarnessActivation,
+} from "../../src/harness-availability.ts";
 
 /*
  * `/subagents` is one panel with three modes. Browse mode selects a job and reads
@@ -95,6 +100,8 @@ export interface DashboardOverlayOptions {
   mode?: DashboardMode;
   /** Forces the fullscreen height policy; defaults to Pi's renderer mode. */
   fullscreen?: boolean;
+  /** Latest bounded startup/status discovery snapshot. */
+  availability?: HarnessActivation[];
 }
 
 export type DashboardMode = "browse" | "takeover" | "answer";
@@ -155,6 +162,7 @@ class DashboardOverlay implements Focusable {
   readonly #clearTimeout: typeof clearTimeout;
   readonly #renderMarkdown: (text: string, width: number) => string[];
   readonly #forceFullscreen: boolean | undefined;
+  readonly #availability: HarnessActivation[] | undefined;
   private readonly tui: Pick<TUI, "requestRender" | "terminal">;
   private readonly theme: Theme;
   private readonly keybindings: KeybindingsManager;
@@ -181,6 +189,7 @@ class DashboardOverlay implements Focusable {
     this.#clearTimeout = options.clearTimeout ?? clearTimeout;
     this.#renderMarkdown = options.renderMarkdown ?? renderMarkdown;
     this.#forceFullscreen = options.fullscreen;
+    this.#availability = options.availability;
     this.#selectedId = options.focusJobId;
     this.#mode = options.mode ?? "browse";
     if (this.#mode === "takeover") this.#pane = "detail";
@@ -783,8 +792,9 @@ class DashboardOverlay implements Focusable {
       needInput ? `${needInput} need input` : "",
       `${jobs.length} retained`,
     ].filter(Boolean).join(" · ");
+    const availability = formatDashboardAvailability(this.#availability);
     return frame.header(
-      this.theme.fg("accent", this.theme.bold("Native subagents")),
+      this.theme.fg("accent", this.theme.bold(`Native subagents${availability ? ` · ${availability}` : ""}`)),
       this.theme.fg("muted", summary),
     );
   }
@@ -1110,11 +1120,14 @@ function defaultJob(jobs: JobSnapshot[]): JobSnapshot {
 export async function openSubagentsDashboard(
   ctx: ExtensionCommandContext,
   manager: SubagentsDashboardManager,
-  options: { focusJobId?: string; mode?: DashboardMode } = {},
+  options: { focusJobId?: string; mode?: DashboardMode; availability?: HarnessActivation[] } = {},
 ): Promise<void> {
   if (ctx.mode !== "tui") {
     const jobs = manager.list();
-    ctx.ui.notify(jobs.length ? jobs.map(statusLine).join("\n") : "No subagent jobs in this session.", "info");
+    const availability = options.availability
+      ? `${formatHarnessAvailabilityReport(options.availability, Date.now())}\n\n`
+      : "";
+    ctx.ui.notify(`${availability}${jobs.length ? jobs.map(statusLine).join("\n") : "No subagent jobs in this session."}`, "info");
     return;
   }
   await ctx.ui.custom<null>(
@@ -1122,6 +1135,7 @@ export async function openSubagentsDashboard(
       createDashboardOverlay(tui, theme, keybindings, manager, done, {
         focusJobId: options.focusJobId,
         mode: options.mode,
+        availability: options.availability,
       }),
     {
       overlay: true,
@@ -1131,6 +1145,15 @@ export async function openSubagentsDashboard(
       overlayOptions: { width: "100%", minWidth: 40, maxHeight: "100%", anchor: "center" },
     },
   );
+}
+
+/** Compact, non-color-only route state used in the dashboard header. */
+export function formatDashboardAvailability(activations: HarnessActivation[] | undefined): string {
+  if (!activations?.length) return "routes status unknown";
+  return activations.map((activation) => {
+    const state = activation.enabled ? availabilityLabel(activation.availability.status) : "disabled by user";
+    return `${activation.harness} ${state}`;
+  }).join(" · ");
 }
 
 export function renderMarkdown(text: string, width: number): string[] {

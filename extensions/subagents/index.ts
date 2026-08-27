@@ -30,6 +30,14 @@ import {
   ProviderStatusService,
   type ProviderStatusReader,
 } from "../../src/provider-status.ts";
+import {
+  availabilityLabel,
+  formatHarnessAvailabilityReport,
+  harnessActivations,
+  HarnessAvailabilityService,
+  type HarnessActivation,
+  type HarnessAvailabilityProbe,
+} from "../../src/harness-availability.ts";
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { claimExtensionInstall } from "../../src/install-guard.ts";
 import { providerFamily } from "../../src/policy.ts";
@@ -249,7 +257,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   let sessionContext: { isIdle(): boolean } | undefined;
   let sessionUi: ExtensionUIContext | undefined;
   let displayedHarness: HarnessName | undefined;
+  let displayedHarnessAvailability: string | undefined;
   let displayedActivity: string | undefined;
+  let availabilityGeneration = 0;
+  let startupAvailabilityController: AbortController | undefined;
+  let currentHarnessActivations: HarnessActivation[] | undefined;
   const deferredResults = new Map<string, JobSnapshot>();
   const cardSnapshots = new Map<string, JobSnapshot>();
   const liveCardBlinks = new Set<LiveCardBlink>();
@@ -275,9 +287,14 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     new CodexAppServerBackend(),
   ];
   const capabilities = new CapabilityService({ backends, env });
+  const supportedHarnesses = capabilities.harnesses;
   // Pi readiness reuses the zero-turn capability catalog; Claude and Codex are
   // probed through their own account surfaces, never through a model request.
   const providerStatus = options.providerStatus ?? new ProviderStatusService({ piReadiness: capabilities, env });
+  // Read-only, zero-model-turn availability discovery layered on the existing
+  // provider-status probes. Dispatch revalidates the selected harness through
+  // this before a job is created; startup warms it best-effort.
+  const availability = new HarnessAvailabilityService(providerStatus, { harnesses: supportedHarnesses });
   const createManager = () => new JobManager({
     profiles: profileCatalog.profiles,
     concurrency: 4,
@@ -285,9 +302,14 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   });
   const getManager = () => manager ??= createManager();
   const updateSessionUi = (ui: ExtensionUIContext, sessionManager: JobManager, harness: HarnessName) => {
-    if (displayedHarness !== harness) {
+    const activation = currentHarnessActivations?.find((candidate) => candidate.harness === harness);
+    const availabilityText = activation
+      ? activation.enabled ? availabilityLabel(activation.availability.status) : "disabled by user"
+      : "status unknown";
+    if (displayedHarness !== harness || displayedHarnessAvailability !== availabilityText) {
       displayedHarness = harness;
-      ui.setStatus("native-subagents", `subagents:${harness}`);
+      displayedHarnessAvailability = availabilityText;
+      ui.setStatus("native-subagents", `subagents:${harness}:${availabilityText}`);
     }
 
     const activity = summarizeSubagentActivity(sessionManager.list());
@@ -330,6 +352,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   ) => spawn(getManager(), capabilities, params, {
     parentCwd: ctx.cwd,
     trusted: ctx.isProjectTrusted(),
+    availability,
     defaultHarness: activeHarness,
     parentProvider: providerFamily(ctx.model?.provider),
     profile: params.profile ? profileCatalog.profiles.get(params.profile.trim()) : undefined,
@@ -450,6 +473,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     savedWorkflowRoot: options.savedWorkflowRoot,
     defaultHarness: () => activeHarness,
     router: capabilities,
+    availability,
     resolveProfile: (name) => profileCatalog.profiles.get(name),
     setInterval: options.setInterval,
     clearInterval: options.clearInterval,
@@ -627,6 +651,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   pi.on("session_start", (_event, ctx) => {
     clearCardBlinks();
     displayedHarness = undefined;
+    displayedHarnessAvailability = undefined;
     displayedActivity = undefined;
     sessionUi = ctx.ui;
     profileCatalog = loadProfiles(
@@ -637,6 +662,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     // A new session may open a different project or follow a configuration change.
     capabilities.invalidate();
     providerStatus.invalidate?.();
+    startupAvailabilityController?.abort(new Error("Session changed"));
+    const discoveryGeneration = ++availabilityGeneration;
+    currentHarnessActivations = undefined;
     sessionContext = ctx;
     deferredResults.clear();
     deferredQuestions.clear();
@@ -679,6 +707,17 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     });
     updateSessionUi(ctx.ui, sessionManager, activeHarness);
     workflows.sessionStart(ctx, sessionManager);
+    if (ctx.isProjectTrusted()) {
+      const controller = new AbortController();
+      startupAvailabilityController = controller;
+      void availability.activations({ cwd: ctx.cwd, harnesses: supportedHarnesses, signal: controller.signal })
+        .then((activations) => {
+          if (controller.signal.aborted || discoveryGeneration !== availabilityGeneration || manager !== sessionManager) return;
+          currentHarnessActivations = activations;
+          updateSessionUi(ctx.ui, sessionManager, activeHarness);
+        })
+        .catch(() => undefined);
+    }
   });
 
   pi.on("agent_settled", () => {
@@ -687,6 +726,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   });
 
   pi.on("session_shutdown", async () => {
+    availabilityGeneration++;
+    startupAvailabilityController?.abort(new Error("Session shutdown"));
+    startupAvailabilityController = undefined;
+    currentHarnessActivations = undefined;
     unsubscribeManager?.();
     unsubscribeManager = undefined;
     sessionContext = undefined;
@@ -708,6 +751,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     } catch { /* UI may already be unavailable during teardown. */ }
     sessionUi = undefined;
     displayedHarness = undefined;
+    displayedHarnessAvailability = undefined;
     displayedActivity = undefined;
     try {
       await workflows.sessionShutdown();
@@ -748,7 +792,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       updateSessionUi(ctx.ui, getManager(), activeHarness);
       ctx.ui.notify(`Default subagent harness: ${selected}`, "info");
     } else if (value === "status") {
-      ctx.ui.notify(`Default harness: ${activeHarness}\nProfiles: ${profileCatalog.profiles.size}\nModels: caller-selected or native harness default`, "info");
+      const activation = currentHarnessActivations?.find((candidate) => candidate.harness === activeHarness);
+      const state = activation
+        ? activation.enabled ? availabilityLabel(activation.availability.status) : "disabled by user"
+        : "status unknown";
+      ctx.ui.notify(`Default harness: ${activeHarness} (${state})\nProfiles: ${profileCatalog.profiles.size}\nModels: caller-selected or native harness default`, "info");
     } else if (value === "profiles") {
       const resolved = [...profileCatalog.profiles.values()]
         .sort((a, b) => a.name.localeCompare(b.name))
@@ -773,8 +821,15 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
       const refresh = value.slice("providers".length).trim() === "refresh";
       try {
-        const statuses = await providerStatus.statuses({ cwd: ctx.cwd, refresh });
-        ctx.ui.notify(formatProviderStatusReport(statuses, Date.now()), statuses.some((status) => status.ready) ? "info" : "warning");
+        const now = Date.now();
+        const statuses = (await providerStatus.statuses({ cwd: ctx.cwd, refresh, harnesses: supportedHarnesses }))
+          .filter((status) => supportedHarnesses.includes(status.harness));
+        // Derive normalized availability from the same probe — no second scan.
+        const activations = harnessActivations(statuses);
+        currentHarnessActivations = activations;
+        updateSessionUi(ctx.ui, getManager(), activeHarness);
+        const report = `${formatHarnessAvailabilityReport(activations, now)}\n\n${formatProviderStatusReport(statuses, now)}`;
+        ctx.ui.notify(report, activations.some((activation) => activation.active) ? "info" : "warning");
       } catch (error) {
         ctx.ui.notify(`Provider status failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
       }
@@ -788,7 +843,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     getArgumentCompletions: (prefix) => ["status", "profiles", "providers", "providers refresh", "capabilities", "capabilities refresh", ...HARNESSES, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (args.trim()) await configure(args, ctx);
-      else await openSubagentsDashboard(ctx, getManager());
+      else await openSubagentsDashboard(ctx, getManager(), { availability: currentHarnessActivations });
     },
   });
 
@@ -1481,6 +1536,7 @@ async function spawn(
   context: {
     parentCwd: string;
     trusted: boolean;
+    availability?: HarnessAvailabilityProbe;
     defaultHarness?: HarnessName;
     parentProvider?: ProviderFamily;
     profile?: ProfileDefinition;
@@ -1517,6 +1573,7 @@ async function spawn(
     profile: context.profile,
     independentOfProvider: independenceProvider(manager, params.independentOf),
     preference: context.defaultHarness ? [context.defaultHarness] : undefined,
+    availability: context.availability,
     signal: context.signal,
   });
   return manager.spawn({

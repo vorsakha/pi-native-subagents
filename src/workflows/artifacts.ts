@@ -388,6 +388,15 @@ async function requireRunDirectory(root: string, runId: string): Promise<string>
   return directory;
 }
 
+function isAvailabilityEvidence(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const evidence = value as { harness?: unknown; status?: unknown; executableVersion?: unknown };
+  return ["pi", "claude", "codex"].includes(String(evidence.harness ?? ""))
+    && ["ready", "missing", "unauthenticated", "incompatible", "unhealthy", "unknown"].includes(String(evidence.status ?? ""))
+    && (evidence.executableVersion === undefined
+      || typeof evidence.executableVersion === "string" && !!evidence.executableVersion && evidence.executableVersion.length <= 120);
+}
+
 function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord {
   if (!value || typeof value !== "object") return false;
   const record = value as Partial<WorkflowJournalRecord>;
@@ -418,6 +427,13 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || record.replayedFrom.callIndex < 0 || record.replayedFrom.callIndex >= 32)) return false;
   if (record.route !== undefined && (record.route === null || typeof record.route !== "object"
       || record.route.harness !== undefined && !["pi", "claude", "codex"].includes(record.route.harness)
+      || record.route.requestedHarness !== undefined && !["pi", "claude", "codex", "auto"].includes(record.route.requestedHarness)
+      || record.route.availability !== undefined && !["ready", "missing", "unauthenticated", "incompatible", "unhealthy", "unknown"].includes(record.route.availability)
+      || record.route.executableVersion !== undefined && (typeof record.route.executableVersion !== "string" || !record.route.executableVersion || record.route.executableVersion.length > 120)
+      || record.route.capabilityRevision !== undefined && (typeof record.route.capabilityRevision !== "string" || !record.route.capabilityRevision || record.route.capabilityRevision.length > 200)
+      || record.route.availabilityChecks !== undefined && (!Array.isArray(record.route.availabilityChecks)
+        || record.route.availabilityChecks.length > 3
+        || record.route.availabilityChecks.some((check) => !isAvailabilityEvidence(check)))
       || record.route.jobId !== undefined && (typeof record.route.jobId !== "string" || !record.route.jobId || record.route.jobId.length > 200)
       || record.route.model !== undefined && (typeof record.route.model !== "string" || record.route.model.length > 256)
       || record.route.status !== undefined && !["queued", "running", "completed", "failed", "cancelled", "aborted"].includes(record.route.status)

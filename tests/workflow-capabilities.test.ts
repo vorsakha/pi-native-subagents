@@ -4,8 +4,9 @@ import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { CapabilityService } from "../src/capability-service.ts";
 import { JobManager } from "../src/manager.ts";
-import { DiscoverableBackend, tempDir } from "./helpers.ts";
+import { availabilityFixture, DiscoverableBackend, ScriptedHarnessAvailability, tempDir } from "./helpers.ts";
 import { WorkflowManager } from "../src/workflows/manager.ts";
+import { loadWorkflowJournal } from "../src/workflows/artifacts.ts";
 
 async function fixture() {
   const parent = await tempDir("workflow-capabilities");
@@ -65,6 +66,95 @@ test("workflow agent() with an explicit harness that cannot satisfy requires fai
     assert.equal(f.codex.requests.length, 0, "an unsatisfied capability route never reaches the backend");
   } finally {
     await f.cleanup();
+  }
+});
+
+test("a workflow agent revalidates the resolved harness at dispatch and records its availability as journal evidence", async () => {
+  const parent = await tempDir("workflow-availability");
+  const cwd = join(parent, "cwd");
+  await mkdir(cwd);
+  const artifactRoot = join(parent, "artifacts");
+  const codex = new DiscoverableBackend("codex", []);
+  const claude = new DiscoverableBackend("claude", [{ kind: "tool", name: "lint", effect: "inspect" }]);
+  const jobs = new JobManager({ backends: [codex, claude] });
+  const router = new CapabilityService({ backends: [codex, claude], fingerprint: () => "stable" });
+  // Claude is installed but not logged in; codex is ready; pi is absent here.
+  const availability = new ScriptedHarnessAvailability({
+    claude: { authenticated: false, ready: false, detail: "Claude Code is not logged in" },
+    codex: { version: "1.2.3" },
+  });
+  const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1", router, availability });
+  try {
+    // Explicit unauthenticated harness fails closed without dispatch and never reroutes.
+    const explicit = await workflows.start({
+      sessionId: "session-1", name: "explicit", cwd, trusted: true, defaultHarness: "codex",
+      script: `export default async () => agent("do the thing", { name: "worker", harness: "claude" });`,
+    });
+    const explicitFinal = await explicit.completion;
+    assert.equal((explicitFinal.result as { ok: boolean }).ok, false);
+    const explicitAgent = explicitFinal.agents[0]!;
+    assert.equal(explicitAgent.state, "failed");
+    assert.equal(explicitAgent.requestedHarness, "claude");
+    assert.equal(explicitAgent.availability, "unauthenticated");
+    assert.equal(claude.requests.length, 0, "a fail-closed explicit route never reaches the backend");
+    const explicitJournal = await loadWorkflowJournal(artifactRoot, explicitFinal.runId);
+    const failedRoute = explicitJournal.map((record) => record.route).find((route) => route?.availability);
+    assert.equal(failedRoute?.requestedHarness, "claude");
+    assert.equal(failedRoute?.availability, "unauthenticated");
+
+    // harness:auto excludes the unauthenticated claude and dispatches to ready codex.
+    const auto = await workflows.start({
+      sessionId: "session-1", name: "auto", cwd, trusted: true, defaultHarness: "codex",
+      script: `export default async () => agent("do the thing", { name: "worker", harness: "auto" });`,
+    });
+    const autoFinal = await auto.completion;
+    assert.equal(autoFinal.status, "completed");
+    const autoAgent = autoFinal.agents[0]!;
+    assert.equal(autoAgent.harness, "codex", "auto routes to the one ready harness");
+    assert.equal(autoAgent.requestedHarness, "auto");
+    assert.equal(autoAgent.availability, "ready", "the resolved auto route records its observed availability");
+    assert.equal(autoAgent.executableVersion, "1.2.3");
+    assert.match(autoAgent.capabilityRevision ?? "", /^sha256:/, "the selected live capability catalog is fingerprinted");
+    assert.deepEqual(autoAgent.availabilityChecks?.map((check) => [check.harness, check.status]), [
+      ["claude", "unauthenticated"],
+      ["codex", "ready"],
+    ]);
+    assert.equal(claude.requests.length, 0);
+    assert.equal(codex.requests.length, 1);
+    const autoJournal = await loadWorkflowJournal(artifactRoot, autoFinal.runId);
+    const resolvedRoute = autoJournal.map((record) => record.route).find((route) => route?.availability === "ready");
+    assert.equal(resolvedRoute?.requestedHarness, "auto");
+    assert.equal(resolvedRoute?.harness, "codex");
+    assert.equal(resolvedRoute?.executableVersion, "1.2.3");
+    assert.match(resolvedRoute?.capabilityRevision ?? "", /^sha256:/);
+    assert.deepEqual(resolvedRoute?.availabilityChecks?.map((check) => [check.harness, check.status]), [
+      ["claude", "unauthenticated"],
+      ["codex", "ready"],
+    ]);
+
+    // When every auto candidate becomes unavailable, the failed journal route
+    // still carries normalized evidence for each exclusion.
+    availability.states.set("codex", availabilityFixture("codex", {
+      authenticated: false,
+      ready: false,
+      detail: "Codex is not logged in",
+    }));
+    const failedAuto = await workflows.start({
+      sessionId: "session-1", name: "auto failure", cwd, trusted: true, defaultHarness: "codex",
+      script: `export default async () => agent("do the thing", { name: "worker", harness: "auto" });`,
+    });
+    const failedAutoFinal = await failedAuto.completion;
+    assert.equal((failedAutoFinal.result as { ok: boolean }).ok, false);
+    const failedAutoJournal = await loadWorkflowJournal(artifactRoot, failedAutoFinal.runId);
+    const failedAutoRoute = failedAutoJournal.map((record) => record.route).find((route) => route?.availabilityChecks?.length);
+    assert.deepEqual(failedAutoRoute?.availabilityChecks?.map((check) => [check.harness, check.status]), [
+      ["claude", "unauthenticated"],
+      ["codex", "unauthenticated"],
+    ]);
+  } finally {
+    await workflows.shutdown(200).catch(() => undefined);
+    await jobs.shutdown(200).catch(() => undefined);
+    await rm(parent, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 

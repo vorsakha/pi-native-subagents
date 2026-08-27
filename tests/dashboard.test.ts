@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { initTheme } from "@earendil-works/pi-coding-agent";
-import { ansiTheme, interactionSnapshot, jobSnapshot, theme, tick } from "./helpers.ts";
+import { ansiTheme, availabilityFixture, interactionSnapshot, jobSnapshot, theme, tick } from "./helpers.ts";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import type { KeybindingsManager } from "@earendil-works/pi-tui";
 import {
@@ -12,6 +12,7 @@ import { alignDashboardRow, createDashboardFrame, dashboardLayout } from "../ext
 import { TakeoverView, buildTranscript } from "../extensions/subagents/takeover.ts";
 import { renderAssistantMarkdown } from "../extensions/subagents/transcript.ts";
 import type { JobSnapshot } from "../src/types.ts";
+import { harnessActivation, type HarnessActivation } from "../src/harness-availability.ts";
 
 initTheme("dark", false);
 
@@ -229,6 +230,7 @@ function dashboard(
     answerError?: string;
     /** Omitted entirely for a session that cannot resolve routed questions. */
     answerable?: boolean;
+    availability?: HarnessActivation[];
   } = {},
 ): DashboardHarness {
   let renders = 0;
@@ -289,7 +291,13 @@ function dashboard(
     } as unknown as KeybindingsManager,
     manager,
     done as never,
-    { now: () => 65_000, renderMarkdown, focusJobId: options.focusJobId, fullscreen: options.fullscreen },
+    {
+      now: () => 65_000,
+      renderMarkdown,
+      focusJobId: options.focusJobId,
+      fullscreen: options.fullscreen,
+      availability: options.availability,
+    },
   );
   return {
     overlay,
@@ -351,6 +359,28 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
   overlay.handleInput("\x1b");
   assert.deepEqual(closed, [null]);
   assert.equal(manager.listeners.size, 0, "closing the dashboard unsubscribes from manager updates");
+});
+
+test("dashboard header exposes normalized harness states in text, not color alone", (t) => {
+  const availability = [
+    harnessActivation(availabilityFixture("pi"), true),
+    harnessActivation(availabilityFixture("claude", {
+      authenticated: false,
+      ready: false,
+      detail: "Claude Code is not logged in",
+    }), true),
+    harnessActivation(availabilityFixture("codex", {
+      installed: false,
+      authenticated: false,
+      ready: false,
+    }), false),
+  ];
+  const { overlay } = dashboard([job("status")], 24, () => {}, undefined, { availability });
+  t.after(() => overlay.dispose());
+  const header = overlay.render(180)[0] ?? "";
+  assert.match(header, /pi ready/);
+  assert.match(header, /claude login required/);
+  assert.match(header, /codex disabled by user/);
 });
 
 test("dashboard pins errors and exposes queued empty states", (t) => {

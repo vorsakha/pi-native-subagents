@@ -29,6 +29,7 @@ import {
 import type { DashboardFrame, DashboardKeyGroup, DashboardLayout } from "../dashboard-style.ts";
 import { aggregateWorkflowUsage, workflowIsTerminal } from "../../src/workflows/manager.ts";
 import { isTranscriptTruncationEntry } from "../../src/workflows/artifacts.ts";
+import { availabilityLabel } from "../../src/harness-availability.ts";
 import { formatWorkflowBudget } from "../../src/workflows/budget.ts";
 import type {
   WorkflowAgentRecord,
@@ -1149,6 +1150,18 @@ export class WorkflowsDashboardOverlay implements Focusable {
       this.theme.fg("dim", `${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}`),
       this.theme.fg("dim", `${phase ? `${boundedInline(run.name, 1_000)} · ${boundedInline(phase.name, 1_000)}` : boundedInline(run.name, 1_000)}${usage ? ` · ${usage}` : ""}`),
     ];
+    if (agent.availability || agent.requestedHarness || agent.executableVersion || agent.capabilityRevision || agent.availabilityChecks?.length) {
+      const evidence = [
+        agent.requestedHarness ? `requested ${agent.requestedHarness}` : "",
+        agent.availability ? availabilityLabel(agent.availability) : "",
+        agent.executableVersion ? `CLI ${agent.executableVersion}` : "",
+        agent.capabilityRevision ? `capabilities ${shortId(agent.capabilityRevision)}` : "",
+        agent.availabilityChecks?.length
+          ? `checks ${agent.availabilityChecks.map((check) => `${check.harness} ${availabilityLabel(check.status)}`).join(", ")}`
+          : "",
+      ].filter(Boolean).join(" · ");
+      metadata.push(this.theme.fg("dim", `Resolution · ${evidence}`));
+    }
     const context = formatContext(agent.context);
     if (context) metadata.push(this.theme.fg("dim", `Context · ${context}`));
     if (agent.isolation) metadata.push(this.theme.fg("dim", `Isolation · worktree ${agent.isolation.state} · branch ${boundedInline(agent.isolation.branch, 1_000)}${agent.isolation.patchArtifact ? ` · patch ${boundedInline(agent.isolation.patchArtifact, 1_000)}` : ""}`));

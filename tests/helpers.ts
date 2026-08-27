@@ -22,6 +22,12 @@ import type {
 import type { ProviderUnavailability } from "../src/provider-unavailability.ts";
 import { normalizeTarget, type InteractionAskResult, type PendingInteraction } from "../src/interactions.ts";
 import type { InteractionDeadlineClock } from "../src/manager.ts";
+import type { ProviderStatus, ProviderStatusReader, ProviderStatusRequest } from "../src/provider-status.ts";
+import {
+  harnessAvailability,
+  type HarnessAvailability,
+  type HarnessAvailabilityProbe,
+} from "../src/harness-availability.ts";
 
 /* ── async utilities ─────────────────────────────────────────────────────── */
 
@@ -77,6 +83,102 @@ export async function waitFor(
 /** Creates a unique temp directory. Callers are responsible for cleanup. */
 export function tempDir(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), `${prefix}-`));
+}
+
+export interface HarnessAvailabilityFacts {
+  installed: boolean;
+  authenticated: boolean;
+  ready: boolean;
+  detail: string;
+  probeFailed: boolean;
+  compatible: boolean;
+  version: string;
+}
+
+/** Scripted live availability shared by direct-routing and workflow tests. */
+export class ScriptedHarnessAvailability implements HarnessAvailabilityProbe {
+  readonly asked: Array<{ harness: HarnessName; refresh?: boolean }> = [];
+  readonly states: Map<HarnessName, HarnessAvailability>;
+
+  constructor(states: Partial<Record<HarnessName, Partial<HarnessAvailabilityFacts> | HarnessAvailability>>) {
+    this.states = new Map((Object.entries(states) as Array<[HarnessName, Partial<HarnessAvailabilityFacts> | HarnessAvailability]>).map(([harness, state]) => [
+      harness,
+      "status" in state
+        ? state
+        : availabilityFixture(harness, state),
+    ]));
+  }
+
+  get harnesses(): HarnessName[] {
+    return [...this.states.keys()];
+  }
+
+  async availability(harness: HarnessName, request: { refresh?: boolean }): Promise<HarnessAvailability> {
+    this.asked.push({ harness, refresh: request.refresh });
+    const state = this.states.get(harness);
+    if (!state) throw new Error(`no scripted availability for ${harness}`);
+    return state;
+  }
+}
+
+export function availabilityFixture(
+  harness: HarnessName,
+  overrides: Partial<HarnessAvailabilityFacts> = {},
+): HarnessAvailability {
+  return harnessAvailability({
+    harness,
+    installed: overrides.installed ?? true,
+    authenticated: overrides.authenticated ?? true,
+    ready: overrides.ready ?? true,
+    detail: overrides.detail,
+    probeFailed: overrides.probeFailed,
+    compatible: overrides.compatible,
+    version: overrides.version,
+    checkedAt: 1_000,
+    probe: "test",
+  });
+}
+
+/** Turn-free reader for extension tests that are unrelated to login discovery. */
+export function readyProviderStatusReader(): ProviderStatusReader {
+  return {
+    async statuses(request) {
+      const harnesses = request.harnesses ?? ["pi", "claude", "codex"];
+      return harnesses.map((harness) => ({
+        harness,
+        installed: true,
+        authenticated: true,
+        ready: true,
+        checkedAt: 1_000,
+        probe: "test ready provider",
+      }));
+    },
+  };
+}
+
+/** Provider-status reader with per-harness queues, used to exercise stale revalidation. */
+export class ScriptedProviderStatusReader implements ProviderStatusReader {
+  readonly requests: ProviderStatusRequest[] = [];
+  readonly script: Map<HarnessName, ProviderStatus[]>;
+  invalidated = 0;
+
+  constructor(script: Map<HarnessName, ProviderStatus[]>) {
+    this.script = script;
+  }
+
+  async statuses(request: ProviderStatusRequest): Promise<ProviderStatus[]> {
+    this.requests.push({ ...request });
+    const wanted = request.harnesses ?? [...this.script.keys()];
+    return wanted.map((harness) => {
+      const queue = this.script.get(harness);
+      if (!queue?.length) throw new Error(`no scripted status for ${harness}`);
+      return queue.length > 1 ? queue.shift()! : queue[0]!;
+    });
+  }
+
+  invalidate(): void {
+    this.invalidated++;
+  }
 }
 
 /* ── themes ──────────────────────────────────────────────────────────────── */

@@ -2,6 +2,7 @@ import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
 import { isRequestedHarness, routeCapabilities, type RequestedHarness } from "../capability-routing.ts";
 import type { CapabilityRouter } from "../capability-service.ts";
+import { HarnessAutoUnavailableError, HarnessUnavailableError, type HarnessAvailabilityProbe, type HarnessAvailabilityStatus } from "../harness-availability.ts";
 import type { JobManager, PeerInteractionRequest, PeerInteractionResult } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
 import { renderPeerQuestionPrompt, type PendingInteraction } from "../interactions.ts";
@@ -303,10 +304,20 @@ function journalRoute(agent?: WorkflowAgentRecord): WorkflowJournalRoute | undef
   return {
     jobId: agent.jobId,
     harness: agent.harness as HarnessName | undefined,
+    requestedHarness: isRequestedHarness(agent.requestedHarness) ? agent.requestedHarness : undefined,
+    availability: isAvailabilityStatus(agent.availability) ? agent.availability : undefined,
+    executableVersion: agent.executableVersion,
+    capabilityRevision: agent.capabilityRevision,
+    availabilityChecks: agent.availabilityChecks?.map((check) => ({ ...check })),
     model: agent.model,
     status: agent.state,
     error: agent.error ? boundedText(agent.error, 2_000) : undefined,
   };
+}
+
+const AVAILABILITY_STATUSES: HarnessAvailabilityStatus[] = ["ready", "missing", "unauthenticated", "incompatible", "unhealthy", "unknown"];
+function isAvailabilityStatus(value: unknown): value is HarnessAvailabilityStatus {
+  return typeof value === "string" && (AVAILABILITY_STATUSES as string[]).includes(value);
 }
 
 function agentState(job: JobSnapshot): WorkflowAgentState {
@@ -358,6 +369,7 @@ export class WorkflowManager {
   readonly #releasePeerRouter: () => void;
   readonly #approveMutation?: (request: { runId: string; workflow: string; agent: string; prompt: string; signal: AbortSignal }) => Promise<boolean>;
   readonly #router?: CapabilityRouter;
+  readonly #availability?: HarnessAvailabilityProbe;
   readonly #resolveProfile?: (name: string) => ProfileDefinition | undefined;
   #initializing?: Promise<void>;
   #closed = false;
@@ -374,6 +386,8 @@ export class WorkflowManager {
     approveMutation?: (request: { runId: string; workflow: string; agent: string; prompt: string; signal: AbortSignal }) => Promise<boolean>;
     /** Live capability routing for `requires`/`harness: "auto"`; absent means requirements fail closed. */
     router?: CapabilityRouter;
+    /** Read-only availability probe; revalidates the resolved harness per agent dispatch. */
+    availability?: HarnessAvailabilityProbe;
     resolveProfile?: (name: string) => ProfileDefinition | undefined;
     /** Overrides the retained-run window (default {@link DEFAULT_WORKFLOW_RETAINED_RUNS}); test-only knob, in-memory and on-disk retention always share this one bound. */
     retainedRuns?: number;
@@ -385,6 +399,7 @@ export class WorkflowManager {
     this.#sessionId = options.sessionId;
     this.#approveMutation = options.approveMutation;
     this.#router = options.router;
+    this.#availability = options.availability;
     this.#resolveProfile = options.resolveProfile;
     this.#maxRetainedRuns = Number.isSafeInteger(options.retainedRuns) && options.retainedRuns! > 0
       ? options.retainedRuns!
@@ -1196,6 +1211,10 @@ export class WorkflowManager {
       record.retryUsage = record.usage;
       record.usage = workflowUsage();
       record.providerWait = undefined;
+      record.availability = undefined;
+      record.executableVersion = undefined;
+      record.capabilityRevision = undefined;
+      record.availabilityChecks = undefined;
       record.state = "queued";
       record.jobId = undefined;
       record.error = undefined;
@@ -1284,6 +1303,9 @@ export class WorkflowManager {
       : undefined;
     let job: JobSnapshot;
     let structuredTransport: WorkflowStructuredTransport | undefined;
+    // Persist the requested harness before routing so a fail-closed availability
+    // error still records what was asked for.
+    record.requestedHarness ??= harness ?? request.defaultHarness ?? "pi";
     try {
       const routing = await routeCapabilities(this.#router, {
         request: {
@@ -1306,8 +1328,21 @@ export class WorkflowManager {
         profile: record.profile ? this.#resolveProfile?.(record.profile) : undefined,
         independentOfProvider: replayIndependenceProvider,
         preference: request.defaultHarness ? [request.defaultHarness] : undefined,
+        availability: this.#availability,
         signal,
       });
+      // Record the observed availability of the resolved route so the journal
+      // can explain and safely replay it.
+      if (routing.availability) {
+        record.availability = routing.availability.status;
+        record.executableVersion = routing.availability.version;
+      }
+      record.capabilityRevision = routing.capabilityRoute?.revision;
+      record.availabilityChecks = routing.availabilityChecks?.map((availability) => ({
+        harness: availability.harness,
+        status: availability.status,
+        executableVersion: availability.version,
+      }));
       const spawnRequest = {
         name,
         task: prompt,
@@ -1369,6 +1404,20 @@ export class WorkflowManager {
       await finishIsolation().catch(() => undefined);
       record.state = "failed";
       record.error = boundedText(error);
+      // A fail-closed availability route carries its normalized status; keep it
+      // as durable evidence for the journal beside the bounded error text.
+      if (error instanceof HarnessUnavailableError) {
+        record.harness = error.harness;
+        record.availability = error.status;
+        record.executableVersion = error.availability.version;
+      }
+      if (error instanceof HarnessAutoUnavailableError) {
+        record.availabilityChecks = error.availabilities.map((availability) => ({
+          harness: availability.harness,
+          status: availability.status,
+          executableVersion: availability.version,
+        }));
+      }
       record.timestamps.updatedAt = Date.now();
       record.timestamps.endedAt = record.timestamps.updatedAt;
       this.#touch(entry);
@@ -1676,6 +1725,11 @@ export class WorkflowManager {
       state: "completed",
       timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now },
       harness: replay.route?.harness,
+      requestedHarness: replay.route?.requestedHarness,
+      availability: replay.route?.availability,
+      executableVersion: replay.route?.executableVersion,
+      capabilityRevision: replay.route?.capabilityRevision,
+      availabilityChecks: replay.route?.availabilityChecks?.map((check) => ({ ...check })),
       model: replay.route?.model,
       effort: replayEffort,
       prompt: boundedText(prompt, 2 * 1024),

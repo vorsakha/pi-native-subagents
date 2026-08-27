@@ -247,6 +247,7 @@ test("journals failed agent routes with status and bounded error details", async
     assert.deepEqual(failed?.route, {
       jobId: final.agents[0]?.jobId,
       harness: "codex",
+      requestedHarness: "codex",
       model: "default",
       status: "failed",
       error: "provider exploded",

@@ -40,11 +40,21 @@ export interface ProviderStatus {
   installed: boolean;
   authenticated: boolean;
   ready: boolean;
+  /** Native executable version, only when the existing safe probe reports it. */
+  version?: string;
+  /** Explicit compatibility result, only when the adapter can determine it safely. */
+  compatible?: boolean;
   account?: ProviderAccount;
   /** Model the provider already reports as selected; never requested from a model. */
   model?: string;
   /** Why the provider is not ready, or another non-fatal observation. */
   detail?: string;
+  /**
+   * True when a bounded probe ran but threw (a transient/unhealthy failure)
+   * rather than reporting a clean state. Distinguishes an unhealthy CLI from a
+   * cleanly not-authenticated one when normalizing availability.
+   */
+  probeFailed?: boolean;
   checkedAt: number;
   /** Where the status came from, e.g. `claude auth status --json`. */
   probe: string;
@@ -201,6 +211,8 @@ export class ProviderStatusService implements ProviderStatusReader {
         detail: isMissingCommand(error)
           ? `${harness} CLI was not found on PATH`
           : `${harness} status probe failed: ${detail}`,
+        // A missing command is a clean "missing" signal, not a probe failure.
+        probeFailed: !isMissingCommand(error),
         checkedAt,
         probe: probeName,
       };
@@ -237,6 +249,7 @@ export class ProviderStatusService implements ProviderStatusReader {
         ready: false,
         account: { unavailable: PI_ACCOUNT_UNAVAILABLE },
         detail: `pi status probe failed: ${maskEmbeddedEmails(errorMessage(error))}`,
+        probeFailed: !isMissingCommand(error),
         checkedAt,
         probe: "pi readiness",
       };
@@ -457,6 +470,7 @@ export function formatProviderStatus(status: ProviderStatus): string {
     account.authMethod ? `auth ${account.authMethod}` : undefined,
     account.organization ? `org ${account.organization}` : undefined,
     status.model ? `model ${status.model}` : undefined,
+    status.version ? `version ${status.version}` : undefined,
     !account.email && account.unavailable ? `account email unavailable (${account.unavailable})` : undefined,
     status.detail,
   ].filter(Boolean);

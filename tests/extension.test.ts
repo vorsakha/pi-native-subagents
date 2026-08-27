@@ -8,7 +8,8 @@ import { PI_CHILD_MARKER } from "../src/backends/pi-rpc.ts";
 import { PI_PARENT_THREAD_FILE } from "../src/parent-thread-context.ts";
 import { buildCatalog } from "../src/capabilities.ts";
 import { claudeStatus, codexStatus, parseClaudeAuthStatus, parseCodexAccount, piStatusFromCatalog } from "../src/provider-status.ts";
-import { ControlledBackend, HoldingBackend, ImmediateBackend, context, fakePi, jobSnapshot, tempDir, theme, tick } from "./helpers.ts";
+import type { HarnessName } from "../src/types.ts";
+import { ControlledBackend, HoldingBackend, ImmediateBackend, context, fakePi, jobSnapshot, readyProviderStatusReader, tempDir, theme, tick } from "./helpers.ts";
 
 /** The parent session's tool inventory, including surfaces children must never inherit. */
 const PARENT_TOOLS = [
@@ -57,11 +58,11 @@ test("the subagent extension surface", async (t) => {
       return { sessionFile: "/sessions/forked.jsonl", sessionId: "forked-session" };
     },
   };
-  const providerStatusRequests: Array<{ cwd: string; refresh?: boolean }> = [];
+  const providerStatusRequests: Array<{ cwd: string; refresh?: boolean; harnesses?: HarnessName[] }> = [];
   const providerStatus = {
-    async statuses(request: { cwd: string; refresh?: boolean }) {
-      providerStatusRequests.push({ cwd: request.cwd, refresh: request.refresh });
-      return [
+    async statuses(request: { cwd: string; refresh?: boolean; harnesses?: HarnessName[] }) {
+      providerStatusRequests.push({ cwd: request.cwd, refresh: request.refresh, harnesses: request.harnesses });
+      const statuses = [
         piStatusFromCatalog(buildCatalog({
           harness: "pi", cwd: request.cwd, access: "full", discoveredAt: 1_000, capabilities: [],
           sources: [{ source: "pi-model", health: "healthy", detail: "anthropic/claude-opus-5" }],
@@ -69,19 +70,29 @@ test("the subagent extension surface", async (t) => {
         claudeStatus(parseClaudeAuthStatus(JSON.stringify({
           loggedIn: true, authMethod: "claude.ai", email: "engineer@example.com", subscriptionType: "max",
         })), 1_000),
-        codexStatus(parseCodexAccount({ account: { type: "none" } }), 1_000),
+        codexStatus(parseCodexAccount({ account: { type: "chatgpt" } }), 1_000),
       ];
+      return request.harnesses?.length
+        ? statuses.filter((status) => request.harnesses!.includes(status.harness))
+        : statuses;
     },
   };
   registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir, sessionPeerSource, providerStatus });
 
-  const { ctx, notifications } = context({ sessionId: "extension-session", branch: [
+  const { ctx, notifications, statuses } = context({ sessionId: "extension-session", branch: [
     { type: "message", message: { role: "user", content: "Discuss the parent-thread bridge", timestamp: 1_000 } },
     { type: "message", message: { role: "assistant", content: [{ type: "thinking", thinking: "hidden" }, { type: "text", text: "Use a pull-based tool." }], timestamp: 2_000 } },
     { type: "custom", customType: "native-subagents-harness", data: { harness: "pi" } },
   ] });
   ctx.cwd = extensionRoot;
   pi.handlers.get("session_start")?.({}, ctx);
+  await tick();
+  assert.deepEqual(providerStatusRequests[0], {
+    cwd: extensionRoot,
+    refresh: undefined,
+    harnesses: ["pi", "claude", "codex"],
+  }, "trusted session startup prewarms every supported harness without a model turn");
+  assert.equal(statuses.get("native-subagents"), "subagents:pi:ready", "the non-color status text reflects startup readiness");
 
   await t.test("registers the generic tool and command surface exactly once", async () => {
     assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_HARNESS: "claude" }), "claude");
@@ -149,13 +160,20 @@ test("the subagent extension surface", async (t) => {
   });
 
   await t.test("reports masked provider readiness and gates it on project trust", async () => {
+    const requestsBeforeReport = providerStatusRequests.length;
     await pi.commands.get("subagents").handler("providers", ctx);
     const report = notifications.at(-1)?.message ?? "";
     assert.match(report, /no model request was made/);
+    // Normalized, non-color-only availability precedes the raw provider readiness.
+    assert.match(report, /Native harness availability/);
+    assert.match(report, /pi\s+active\s+ready/);
+    assert.match(report, /codex\s+active\s+ready/);
+    assert.match(report, /Active harnesses: pi, claude, codex\./);
     assert.match(report, /claude\s+ready · account e\*\*\*@example\.com · plan max/);
-    assert.match(report, /codex\s+installed, not authenticated/);
+    assert.match(report, /codex\s+ready/);
     assert.ok(!report.includes("engineer@example.com"), "the command output never prints a full address");
-    assert.deepEqual(providerStatusRequests, [{ cwd: extensionRoot, refresh: false }]);
+    assert.equal(providerStatusRequests.length, requestsBeforeReport + 1);
+    assert.deepEqual(providerStatusRequests.at(-1), { cwd: extensionRoot, refresh: false, harnesses: ["pi", "claude", "codex"] });
 
     await pi.commands.get("subagents").handler("providers refresh", ctx);
     assert.equal(providerStatusRequests.at(-1)?.refresh, true, "the refresh argument bypasses the status cache");
@@ -163,7 +181,7 @@ test("the subagent extension surface", async (t) => {
     const untrusted = context({ trusted: false });
     await pi.commands.get("subagents").handler("providers", untrusted.ctx);
     assert.match(untrusted.notifications.at(-1)?.message ?? "", /disabled for untrusted projects/);
-    assert.equal(providerStatusRequests.length, 2, "an untrusted project never probes a provider");
+    assert.equal(providerStatusRequests.length, requestsBeforeReport + 2, "an untrusted project never probes a provider");
 
     const completions = pi.commands.get("subagents").getArgumentCompletions("prov").map((item: { value: string }) => item.value);
     assert.deepEqual(completions, ["providers", "providers refresh"]);
@@ -330,6 +348,7 @@ test("thread and human cards follow live job state without periodic rerenders", 
     globalProfilesDir: join(await tempDir("extension-blink-profiles"), "profiles"),
     setInterval: fakeSetInterval,
     clearInterval: fakeClearInterval,
+    providerStatus: readyProviderStatusReader(),
   });
   const { ctx: blinkCtx } = context();
   blinkPi.handlers.get("session_start")?.({}, blinkCtx);
@@ -434,6 +453,7 @@ test("routed questions wake the parent thread once and resolve through subagent_
     backends: [backend],
     workflowArtifactRoot: join(await tempDir("extension-question-workflows"), "runs"),
     globalProfilesDir: join(await tempDir("extension-question-profiles"), "profiles"),
+    providerStatus: readyProviderStatusReader(),
   });
   const { ctx } = context({ sessionId: "question-session" });
   pi.handlers.get("session_start")?.({}, ctx);
@@ -495,6 +515,7 @@ test("a wait-consumed job still delivers its question, and human jobs keep their
     backends: [backend],
     workflowArtifactRoot: join(await tempDir("extension-question2-workflows"), "runs"),
     globalProfilesDir: join(await tempDir("extension-question2-profiles"), "profiles"),
+    providerStatus: readyProviderStatusReader(),
   });
   const { ctx } = context({ sessionId: "question-session-2", idle: true });
   pi.handlers.get("session_start")?.({}, ctx);
