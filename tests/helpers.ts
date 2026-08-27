@@ -442,6 +442,12 @@ export class ControlledBackend implements Backend {
     run.settle();
   }
 
+  emit(jobId: string, event: BackendEvent): void {
+    const run = this.runs.get(jobId);
+    assert.ok(run, `backend never started job ${jobId}`);
+    run.emit(event);
+  }
+
   /** Resolves the most recent *active* run for a task, so typos fail loudly. */
   #activeRunForTask(task: string): FakeRun {
     const request = this.requestForTask(task);

@@ -565,6 +565,34 @@ test("metadata-rich agent inspectors reserve result rows at medium and short hei
   assert.match(short.overlay.render(72).join("\n"), /COMPLETED_OUTPUT_METADATA/);
 });
 
+test("provider fallback dashboard metadata sanitizes every model route", (t) => {
+  const run = workflow("fallback-sanitization", "completed");
+  const agent = run.agents[0]!;
+  agent.harness = "codex";
+  agent.model = "final\n\u001b[31mMODEL";
+  agent.requestedHarness = "codex";
+  agent.providerFallback = { harness: "codex", model: "declared\n\u001b[32mMODEL" };
+  agent.attempts = [{
+    index: 0,
+    harness: "claude",
+    requestedHarness: "claude",
+    model: "primary\n\u001b[33mMODEL",
+    disposition: "fallback",
+    trigger: { source: "provider", provider: "claude", kind: "quota", detail: "quota" },
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+  }];
+  const state = harness([run], 30, () => {}, { theme });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(100);
+  state.overlay.handleInput(ENTER);
+  const inspector = state.overlay.render(100).join("\n");
+  assert.match(inspector, /Provider fallback · used · declared codex\/declared MODEL/);
+  assert.match(inspector, /Attempt 1 · claude\/primary MODEL/);
+  assert.match(inspector, /Final route · codex\/final MODEL/);
+  assert.doesNotMatch(inspector, /\u001b\[(?:31|32|33)m/, "caller-controlled model ANSI never reaches the dashboard");
+});
+
 test("metadata-rich standalone workflow results keep a scrollable result row", (t) => {
   const standalone = workflow("metadata-standalone", "completed");
   standalone.agents = [];

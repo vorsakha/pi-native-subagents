@@ -412,6 +412,30 @@ test("a waiting agent renders distinctly from failed/queued, is excluded from th
   assert.ok(coloredAgentsLine.includes("[warning]1 waiting"), "waiting keeps an attention color distinct from failed/error");
 });
 
+test("a used provider fallback renders as a route transition, never as provider waiting", () => {
+  const snapshot = workflow({
+    status: "completed",
+    currentPhase: 0,
+    phases: [phase({ index: 0, name: "work", status: "completed", agents: [0] })],
+    agents: [agent({
+      state: "completed",
+      harness: "codex",
+      providerFallback: { harness: "codex" },
+      attempts: [{
+        index: 0,
+        harness: "claude",
+        requestedHarness: "claude",
+        disposition: "fallback",
+        trigger: { source: "provider", provider: "claude", kind: "quota", detail: "quota exhausted" },
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+      }],
+    })],
+  });
+  const rendered = buildWorkflowCardLines(snapshot, theme, { expanded: true, now: 6_000 }).join("\n");
+  assert.match(rendered, /claude → codex \(fallback\)/);
+  assert.doesNotMatch(rendered, /waiting for .*quota/i);
+});
+
 test("Latest identifies the focused agent by name plus its activity, without a status glyph, and never just repeats the word running", () => {
   const withPreview = workflow({
     agents: [

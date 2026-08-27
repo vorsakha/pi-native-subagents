@@ -27,6 +27,8 @@ export interface CapabilityRoutingRequest {
    * keeps only currently-ready harnesses.
    */
   availability?: HarnessAvailabilityProbe;
+  /** Fail closed unless the resolved explicit route receives a fresh ready result. */
+  requireAvailability?: boolean;
   signal?: AbortSignal;
 }
 
@@ -72,6 +74,9 @@ export async function routeCapabilities(
   // that exact route. This covers implicit defaults as well as caller-named
   // harnesses. Every non-ready state, including unknown, fails closed.
   let explicitAvailability: HarnessAvailability | undefined;
+  if (input.requireAvailability && !auto && explicit && !input.availability) {
+    throw new Error(`Live availability validation is required for explicit ${explicit} dispatch`);
+  }
   if (input.availability && !auto && explicit) {
     explicitAvailability = await input.availability.availability(explicit, { cwd: request.cwd, refresh: true, signal: input.signal });
     if (explicitBlocked(explicitAvailability.status)) throw new HarnessUnavailableError(explicitAvailability);

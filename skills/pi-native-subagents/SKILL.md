@@ -16,7 +16,7 @@ Paths are relative to this file. Read the reference **before** you write the cal
 | write or edit a workflow script, call a saved `workflowName`, declare `meta.phases`, call `followUp()`, or set `approval`/`background`/`pipeline` | `references/workflow-authoring.md` |
 | call `converge()` | `references/convergence.md` |
 | let a child use `subagent_ask`, or answer with `subagent_answer` | `references/routed-questions.md` |
-| set direct `maxTokens`/`maxCost`/`maxTurns`, send a retained direct follow-up under a spend limit, set a workflow `budget`, use `resumeFromRunId`, or opt into `retry` | `references/budgets-replay-and-provider-waits.md` |
+| set spend limits, send a limited retained follow-up, set a workflow `budget`, use `resumeFromRunId`, `providerFallback`, or `retry` | `references/budgets-replay-and-provider-waits.md` |
 | use `isolation: "worktree"`, or run `/workflows reclaim` | `references/worktrees-and-retention.md` |
 | run `/subagents providers` or `/subagents providers refresh`, report on a running job, or interpret usage and model numbers | `references/supervision-and-telemetry.md` |
 
@@ -41,7 +41,7 @@ Usage rules:
 
 - Use `access: "readOnly"` for inspection, review, and planning. Request `full` only when mutation is required and the project is trusted. Read-only children are sandboxed by construction, not by instruction.
 - Omit `model` unless a concrete harness-local override is needed. A model name is not a cross-harness tier, and `harness: "auto"` rejects harness-local model overrides.
-- `harness: "auto"` is **initial route selection, not post-inference failover.** Before dispatch it considers only *active* harnesses — installed, enabled, and currently ready — and live-checks native capability and model readiness among them; a harness that is missing, unauthenticated, incompatible, unhealthy, or of unknown readiness is excluded. An explicit harness is instead revalidated and stays fail-closed: if it is not ready, the call fails with a specific reason such as "not logged in" and never silently reroutes. Availability discovery is read-only — it never installs, logs in, or changes configuration. Once a job starts, nothing reroutes it to another provider — not a failure, and not a provider-quota wait.
+- `harness: "auto"` is initial route selection, not post-inference failover. Before dispatch it considers only active harnesses that are installed, enabled, and ready. An explicit route stays fail-closed unless a fresh workflow `agent()` call declares the one eligible `providerFallback` described below. That declaration permits one opposite-provider attempt only for authoritative pre-inference unavailability. It does not permit implicit, wait-driven, ambiguous, or progressed rerouting. Availability checks are read-only and never install, log in, or change configuration.
 - Use `requires` only with IDs returned by `subagent_capabilities`; pair it with `harness: "auto"` when any capable harness is acceptable.
 - Use `independent: true` only when the child must use a different native provider from the parent. A different model on the same provider is not independent.
 - Use `independentOf: "<producer-job-id>"` when a reviewer must differ from the provider that produced the reviewed work. The target must be an existing job.
@@ -74,7 +74,20 @@ The `workflow` tool accepts exactly one source — `script` (inline JavaScript),
 
 A workflow script must export a default async function and use the injected globals: `args`, `phase()`, `log()`, `agent()`, `followUp()`, `parallel()`, `pipeline()`, `converge()`, and `convergenceReviewSchema`. Do not write it as if it receives a context object such as `async ({ phase, agent }) => ...`.
 
-Pick the right call before you write it. Use `agent(prompt, options)` for new work. Use `followUp(jobId, prompt)` — with a `jobId` from this same run's own completed `agent()` call — to return to earlier reasoning in that child's retained native session, for example asking the phase-1 planner to review phase-2's implementation. Use `converge()` when review findings should drive bounded fix rounds instead of one review.
+Pick the right call before you write it. Use `agent(prompt, options)` for new work. Use `followUp(jobId, prompt)` with a `jobId` from this run's completed `agent()` call to return to that child's retained session. Use `converge()` when findings should drive bounded fix rounds.
+
+A fresh workflow call may declare one opposite native fallback:
+
+```js
+agent("task", {
+  harness: "claude",
+  access: "readOnly",
+  model: "exact-primary-model",
+  providerFallback: { harness: "codex", model: "exact-fallback-model" },
+});
+```
+
+The primary must explicitly be Claude or Codex. The fallback must name the other and may omit `model` for its native default. No other fallback fields are accepted. After a started primary, provider-triggered fallback requires effective `readOnly` access, structured proof that rejection preceded inference, and zero usage. Full-access native hooks, plugins, or MCP may mutate before progress is visible, so a full-access provider rejection stays terminal. A safe pre-dispatch readiness failure may still use the fallback with either access mode when the primary is missing, unauthenticated, or incompatible. The runtime freshly validates the target as ready before dispatch. Fallback never applies to `followUp()`, direct subagents, ordinary failures, cancellations, unsafe worktrees, or a failed fallback. For that call it takes precedence over provider waiting. `harness: "auto"` still means initial ready-route selection. Read the budget reference before using this option.
 
 ```js
 export const meta = { name: "parallel-review" };

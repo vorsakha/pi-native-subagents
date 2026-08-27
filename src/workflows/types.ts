@@ -51,14 +51,38 @@ export interface WorkflowAgentProviderWait {
   maxAttempts: number;
 }
 
+/** One explicit, opposite native route for a fresh workflow agent call. */
+export interface WorkflowProviderFallback {
+  harness: "claude" | "codex";
+  model?: string;
+}
+
+/** Structured reason the runtime used the declared provider fallback. */
+export interface WorkflowProviderFallbackTrigger {
+  source: "readiness" | "provider";
+  provider: "claude" | "codex";
+  status?: "missing" | "unauthenticated" | "incompatible";
+  kind?: ProviderUnavailabilityKind;
+  retryAt?: number;
+  scope?: string;
+  detail: string;
+}
+
 /** Bounded provenance for one abandoned attempt of a logical call that later retried. */
 export interface WorkflowAgentAttempt {
+  index?: number;
   jobId?: string;
   harness?: string;
+  requestedHarness?: RequestedHarness;
+  availability?: HarnessAvailabilityStatus;
+  executableVersion?: string;
+  capabilityRevision?: string;
   model?: string;
   error?: string;
   usage: WorkflowUsage;
   endedAt?: number;
+  disposition?: "wait" | "fallback";
+  trigger?: WorkflowProviderFallbackTrigger;
 }
 
 export interface WorkflowTimestamps {
@@ -208,6 +232,8 @@ export interface WorkflowAgentRecord {
   retryUsage?: WorkflowUsage;
   /** Present while `state` is `"waiting"`; cleared once the call redispatches. */
   providerWait?: WorkflowAgentProviderWait;
+  /** Declared alternate native provider. Present whether or not it was used. */
+  providerFallback?: WorkflowProviderFallback;
   /** Bounded provenance for prior abandoned attempts of this logical call, oldest first. */
   attempts?: WorkflowAgentAttempt[];
   /** Latest native request occupancy, when exposed by the harness. */
@@ -270,6 +296,8 @@ export interface WorkflowJournalRoute {
   /** Actual child lifecycle state and bounded failure detail for durable review. */
   status?: WorkflowAgentState;
   error?: string;
+  providerFallback?: WorkflowProviderFallback;
+  attempts?: WorkflowAgentAttempt[];
 }
 
 export interface WorkflowHarnessAvailabilityEvidence {

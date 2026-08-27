@@ -103,6 +103,7 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
       error: agent.error,
       usage: structuredClone(agent.usage),
       providerWait: agent.providerWait ? structuredClone(agent.providerWait) : undefined,
+      providerFallback: agent.providerFallback ? structuredClone(agent.providerFallback) : undefined,
       waitingOn: agent.waitingOn ? structuredClone(agent.waitingOn) : undefined,
       answering: agent.answering ? structuredClone(agent.answering) : undefined,
       attempts: agent.attempts ? structuredClone(agent.attempts) : undefined,
@@ -360,6 +361,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       "Use workflowName for a saved user/project workflow or scriptPath for a trusted project-local script; provide exactly one script source.",
       "Use agent schema for validated JSON output when downstream phases need structure; schema cannot change access policy.",
       "Set retry={ providerUnavailable: 'wait' } to keep the workflow active and retry the same agent() call after an authoritative provider-quota rejection; default fail keeps today's immediate-failure behavior.",
+      "Inside a read-only agent() call, providerFallback={ harness: 'codex'|'claude', model?: 'exact-model' } declares one opposite native fallback after authoritative pre-inference unavailability; full-access calls may use it only for safe pre-dispatch readiness failure. It takes precedence over provider waiting for that call.",
     ],
     parameters: Type.Object({
       name: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),

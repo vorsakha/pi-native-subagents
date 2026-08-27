@@ -36,6 +36,7 @@ import type {
   SendBehavior,
   StructuredOutputSupport,
   ToolResultSnapshot,
+  Usage,
 } from "../types.ts";
 
 const READ_ONLY_DENY = ["Bash", "Edit", "Write", "NotebookEdit", "Agent"];
@@ -544,6 +545,7 @@ export class ClaudeBackend implements Backend {
           output = appendOutput(output, result.output);
           if (!result.success) {
             finish({ type: "failed", error: result.error, unavailable: result.unavailable });
+            break;
           } else if (resultCount >= expectedResults) {
             finish({ type: "completed", output, ...(result.structured !== undefined ? { structured: result.structured } : {}) });
           }
@@ -669,6 +671,22 @@ interface ClaudeResult {
   unavailable?: ProviderUnavailability;
 }
 
+function claudeUsage(value: unknown, cost?: number, turns?: number): Usage {
+  const usage = record(value);
+  const iterations = Array.isArray(usage.iterations) ? usage.iterations.map(record) : [];
+  const cumulative = (key: string) => typeof usage[key] === "number"
+    ? num(usage[key])
+    : iterations.reduce((total, iteration) => total + num(iteration[key]), 0);
+  return {
+    input: cumulative("input_tokens"),
+    output: cumulative("output_tokens"),
+    cacheRead: cumulative("cache_read_input_tokens"),
+    cacheWrite: cumulative("cache_creation_input_tokens"),
+    cost: cost ?? num(usage.total_cost_usd),
+    turns: turns ?? num(usage.num_turns),
+  };
+}
+
 function handleMessage(
   message: SDKMessage,
   emit: (event: BackendEvent) => void,
@@ -725,6 +743,7 @@ function handleMessage(
   if (message.type === "assistant") {
     const unavailable = message.error ? classifyClaudeUnavailability(message.error, telemetry.rateLimit) : undefined;
     const quotaBoilerplate = isClaudeQuotaBoilerplate(message, unavailable);
+    let terminalUsage: Usage | undefined;
     // Sidechain frames (subagent/Task output) never represent this job's own turn.
     if (!message.parent_tool_use_id) {
       const usage = record(message.message.usage);
@@ -741,7 +760,18 @@ function handleMessage(
         telemetry.tokens = num(tokenSource.input_tokens) + num(tokenSource.cache_read_input_tokens) + num(tokenSource.cache_creation_input_tokens);
       }
       emitClaudeContext(telemetry, emit);
+      if (message.error) {
+        terminalUsage = claudeUsage(usage);
+        // Assistant errors settle immediately, so account their cumulative usage
+        // before the terminal event just as a result frame does.
+        emit({ type: "usage", usage: terminalUsage });
+      }
     }
+    const classifiedUnavailable = quotaBoilerplate && unavailable
+        && terminalUsage !== undefined
+        && Object.values(terminalUsage).every((value) => value === 0)
+      ? { ...unavailable, preInference: true as const }
+      : unavailable;
     if (!quotaBoilerplate) {
       let text = "";
       for (const block of message.message.content) {
@@ -763,7 +793,7 @@ function handleMessage(
         success: false,
         output: "",
         error: `Claude assistant error: ${message.error}`,
-        unavailable,
+        unavailable: classifiedUnavailable,
       };
     }
     return;
@@ -783,12 +813,7 @@ function handleMessage(
     return;
   }
   if (message.type === "result") {
-    const usage = message.usage as unknown as Record<string, unknown>;
-    emit({ type: "usage", usage: {
-      input: num(usage.input_tokens), output: num(usage.output_tokens),
-      cacheRead: num(usage.cache_read_input_tokens), cacheWrite: num(usage.cache_creation_input_tokens),
-      cost: message.total_cost_usd, turns: message.num_turns,
-    } });
+    emit({ type: "usage", usage: claudeUsage(message.usage, message.total_cost_usd, message.num_turns) });
     // Must emit before this function returns a terminal result: the manager drops context events once the job settles.
     const contextWindow = telemetry.servingModel ? message.modelUsage[telemetry.servingModel]?.contextWindow : undefined;
     if (typeof contextWindow === "number" && Number.isFinite(contextWindow)) {

@@ -2,11 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
-import { ControlledBackend, delay, tempDir, tick, waitFor } from "./helpers.ts";
+import { availabilityFixture, ControlledBackend, delay, ScriptedHarnessAvailability, tempDir, tick, waitFor } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import { workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint } from "../src/workflows/journal.ts";
 import {
@@ -75,6 +75,7 @@ async function fixture(
   approveMutation?: ConstructorParameters<typeof WorkflowManager>[0]["approveMutation"],
   retainedRuns?: number,
   providerWaitClock?: ProviderWaitClock,
+  availability?: ScriptedHarnessAvailability,
 ) {
   const parent = await tempDir("workflow-manager");
   const cwd = join(parent, "cwd");
@@ -87,7 +88,15 @@ async function fixture(
     profiles: new Map([[reviewer.name, reviewer]]),
     concurrency,
   });
-  const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1", approveMutation, retainedRuns, providerWaitClock });
+  const workflows = new WorkflowManager({
+    jobs,
+    artifactRoot,
+    sessionId: "session-1",
+    approveMutation,
+    retainedRuns,
+    providerWaitClock,
+    availability,
+  });
   return {
     parent,
     cwd,
@@ -96,6 +105,7 @@ async function fixture(
     claude,
     jobs,
     workflows,
+    availability,
     request(script: string, overrides: Partial<Parameters<WorkflowManager["start"]>[0]> = {}) {
       return {
         sessionId: "session-1",
@@ -113,6 +123,17 @@ async function fixture(
       await rm(parent, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
     },
   };
+}
+
+function fallbackAvailability(): ScriptedHarnessAvailability {
+  return new ScriptedHarnessAvailability({
+    claude: availabilityFixture("claude"),
+    codex: availabilityFixture("codex"),
+  });
+}
+
+function fallbackFixture(providerWaitClock?: ProviderWaitClock) {
+  return fixture(4, undefined, undefined, providerWaitClock, fallbackAvailability());
 }
 
 test("rejects untrusted workflows before creating artifact storage", async () => {
@@ -1477,8 +1498,371 @@ test("aggregates usage across all workflow agents", async () => {
 });
 
 function fakeQuota(retryAt: number, provider: "codex" | "claude" = "codex") {
-  return { provider, kind: "quota" as const, authoritative: true, retryAt, detail: "quota exhausted" };
+  return { provider, kind: "quota" as const, authoritative: true, preInference: true as const, retryAt, detail: "quota exhausted" };
 }
+
+test("fresh workflow agents validate providerFallback declarations before dispatch", async () => {
+  const invalid = [
+    `{ harness: "auto", providerFallback: { harness: "codex" } }`,
+    `{ providerFallback: { harness: "claude" } }`,
+    `{ harness: "pi", providerFallback: { harness: "claude" } }`,
+    `{ harness: "claude", providerFallback: { harness: "claude" } }`,
+    `{ harness: "claude", providerFallback: { harness: "pi" } }`,
+    `{ harness: "claude", providerFallback: [{ harness: "codex" }] }`,
+    `{ harness: "claude", providerFallback: { harness: "codex", fallback: { harness: "claude" } } }`,
+    `{ harness: "claude", providerFallback: { harness: "codex", effort: "high" } }`,
+  ];
+  for (const options of invalid) {
+    const f = await fixture();
+    try {
+      const started = await f.workflows.start(f.request(`export default async () => agent("invalid", ${options});`));
+      const final = await started.completion;
+      assert.equal((final.result as { ok: boolean }).ok, false, options);
+      assert.equal(f.backend.requests.length + f.claude.requests.length, 0, options);
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test("providerFallback stays unused on success and crosses providers once on authoritative pre-inference exhaustion", async () => {
+  const f = await fallbackFixture();
+  try {
+    const first = await f.workflows.start(f.request(`export default async () => agent("primary succeeds", {
+      harness: "claude", model: "primary-model", providerFallback: { harness: "codex", model: "fallback-model" }
+    });`));
+    await waitFor(() => f.claude.requests.length === 1, "successful primary");
+    f.claude.complete(f.claude.starts[0]!, "primary result");
+    const firstFinal = await first.completion;
+    assert.equal(f.backend.requests.length, 0);
+    assert.deepEqual(firstFinal.agents[0]?.providerFallback, { harness: "codex", model: "fallback-model" });
+    assert.equal(firstFinal.agents[0]?.attempts, undefined);
+
+    const fallbackScript = `export default async () => agent("fallback used", {
+      harness: "claude", access: "readOnly", model: "primary-model", providerFallback: { harness: "codex", model: "fallback-model" }
+    });`;
+    const second = await f.workflows.start(f.request(fallbackScript));
+    await waitFor(() => f.claude.requests.length === 2, "failing primary");
+    f.claude.fail(f.claude.starts[1]!, "quota", fakeQuota(Date.now() + 60_000, "claude"));
+    await waitFor(() => f.backend.requests.length === 1, "codex fallback");
+    assert.equal(f.backend.requests[0]?.policy.model, "fallback-model");
+    f.backend.complete(f.backend.starts[0]!, "fallback result", { input: 3, output: 4, turns: 1 });
+    const final = await second.completion;
+    const agent = final.agents[0]!;
+    assert.equal(agent.callIndex, 0);
+    assert.equal(agent.harness, "codex");
+    assert.equal(agent.model, "fallback-model");
+    assert.equal(agent.attempts?.length, 1);
+    assert.equal(agent.attempts?.[0]?.disposition, "fallback");
+    assert.equal(agent.attempts?.[0]?.trigger?.source, "provider");
+    assert.equal(agent.attempts?.[0]?.requestedHarness, "claude");
+    assert.deepEqual(agent.usage, { input: 3, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 });
+    assert.deepEqual(f.availability!.asked.slice(-2), [
+      { harness: "claude", refresh: true },
+      { harness: "codex", refresh: true },
+    ]);
+
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    assert.deepEqual(journal.map((entry) => entry.state), ["started", "completed"]);
+    assert.deepEqual(journal[1]?.route?.providerFallback, { harness: "codex", model: "fallback-model" });
+    assert.equal(journal[1]?.route?.attempts?.[0]?.trigger?.source, "provider");
+
+    const claudeDispatches = f.claude.requests.length;
+    const codexDispatches = f.backend.requests.length;
+    const replay = await f.workflows.start(f.request(fallbackScript, { resumeFromRunId: final.runId }));
+    const replayed = await replay.completion;
+    assert.equal(f.claude.requests.length, claudeDispatches, "exact replay does not probe or dispatch the primary");
+    assert.equal(f.backend.requests.length, codexDispatches, "exact replay does not dispatch the fallback");
+    assert.deepEqual(replayed.agents[0]?.providerFallback, agent.providerFallback);
+    assert.equal(replayed.agents[0]?.attempts?.[0]?.requestedHarness, agent.attempts?.[0]?.requestedHarness);
+    assert.equal(replayed.agents[0]?.attempts?.[0]?.disposition, "fallback");
+    assert.equal(replayed.agents[0]?.attempts?.[0]?.trigger?.source, "provider");
+    assert.deepEqual(replayed.agents[0]?.attempts?.[0]?.usage, agent.attempts?.[0]?.usage);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("providerFallback fails closed after activity and takes precedence over provider waiting", async () => {
+  const { clock } = fakeProviderWaitClock();
+  const f = await fallbackFixture(clock);
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("active primary", { harness: "claude", access: "readOnly", providerFallback: { harness: "codex" } });`,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 120_000, maxAttempts: 2 } },
+    ));
+    await waitFor(() => f.claude.requests.length === 1, "active primary");
+    f.claude.emit(f.claude.starts[0]!, { type: "message", text: "started" });
+    f.claude.fail(f.claude.starts[0]!, "quota", fakeQuota(clock.now() + 60_000, "claude"));
+    const final = await started.completion;
+    assert.equal(f.backend.requests.length, 0);
+    assert.equal(final.agents[0]?.providerWait, undefined);
+    assert.equal(final.agents[0]?.attempts, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("providerFallback never redispatches a started full-access primary without no-mutation proof", async () => {
+  const f = await fallbackFixture();
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => agent("full primary", {
+      harness: "claude", providerFallback: { harness: "codex" }
+    });`));
+    await waitFor(() => f.claude.requests.length === 1, "full-access primary");
+    f.claude.fail(f.claude.starts[0]!, "quota", fakeQuota(Date.now() + 60_000, "claude"));
+    const final = await started.completion;
+
+    assert.equal(f.backend.requests.length, 0);
+    assert.equal(final.agents[0]?.access, "full");
+    assert.equal(final.agents[0]?.attempts, undefined);
+    assert.deepEqual(final.agents[0]?.usage, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("providerFallback never replays a primary that started a tool", async () => {
+  const f = await fallbackFixture();
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => agent("tool primary", {
+      harness: "claude", access: "readOnly", providerFallback: { harness: "codex" }
+    });`));
+    await waitFor(() => f.claude.requests.length === 1, "tool-active primary");
+    f.claude.emit(f.claude.starts[0]!, { type: "tool_start", id: "tool-1", name: "Write", args: { path: "changed.txt" } });
+    f.claude.fail(f.claude.starts[0]!, "quota", fakeQuota(Date.now() + 60_000, "claude"));
+    const final = await started.completion;
+    assert.equal(f.backend.requests.length, 0);
+    assert.equal(final.agents[0]?.attempts, undefined);
+    assert.equal(final.agents[0]?.tools?.[0]?.name, "Write");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("providerFallback refuses a changed isolation worktree after authoritative unavailability", async () => {
+  const parent = await tempDir("workflow-fallback-worktree");
+  const cwd = join(parent, "repo");
+  const artifactRoot = join(parent, "artifacts");
+  await mkdir(cwd);
+  await execFileAsync("git", ["init", "-q", cwd]);
+  await execFileAsync("git", ["-C", cwd, "config", "user.email", "tests@example.invalid"]);
+  await execFileAsync("git", ["-C", cwd, "config", "user.name", "Workflow Tests"]);
+  await writeFile(join(cwd, "tracked.txt"), "base\n");
+  await execFileAsync("git", ["-C", cwd, "add", "tracked.txt"]);
+  await execFileAsync("git", ["-C", cwd, "commit", "-qm", "base"]);
+
+  const codex = new ControlledBackend("codex");
+  const claude = new ControlledBackend("claude");
+  const jobs = new JobManager({ backends: [codex, claude] });
+  const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1" });
+  try {
+    const started = await workflows.start({
+      sessionId: "session-1",
+      name: "changed worktree fallback",
+      script: `export default async () => agent("mutate then fail", {
+        harness: "claude", access: "readOnly", isolation: "worktree", providerFallback: { harness: "codex" }
+      });`,
+      cwd,
+      trusted: true,
+      defaultHarness: "claude",
+    });
+    await waitFor(() => claude.requests.length === 1, "isolated primary");
+    await writeFile(join(claude.requests[0]!.cwd, "tracked.txt"), "changed\n");
+    claude.fail(claude.starts[0]!, "quota", fakeQuota(Date.now() + 60_000, "claude"));
+    const final = await started.completion;
+    assert.equal(codex.requests.length, 0);
+    assert.equal(final.agents[0]?.isolation?.state, "preserved");
+    assert.equal(final.agents[0]?.attempts, undefined);
+  } finally {
+    await workflows.shutdown(200).catch(() => undefined);
+    await jobs.shutdown(200).catch(() => undefined);
+    await rm(parent, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("providerFallback rejects ambiguous, non-authoritative, and mismatched provider failures", async () => {
+  const failures = [
+    { error: "generic backend failure" },
+    { error: "quota prose only", unavailable: { ...fakeQuota(Date.now() + 60_000, "claude"), authoritative: false } },
+    { error: "wrong provider", unavailable: fakeQuota(Date.now() + 60_000, "codex") },
+  ];
+  for (const failure of failures) {
+    const f = await fallbackFixture();
+    try {
+      const started = await f.workflows.start(f.request(`export default async () => agent("ambiguous", {
+        harness: "claude", access: "readOnly", providerFallback: { harness: "codex" }
+      });`));
+      await waitFor(() => f.claude.requests.length === 1, failure.error);
+      f.claude.fail(f.claude.starts[0]!, failure.error, failure.unavailable);
+      const final = await started.completion;
+      assert.equal(f.backend.requests.length, 0, failure.error);
+      assert.equal(final.agents[0]?.attempts, undefined, failure.error);
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test("providerFallback requires explicit pre-inference proof and refuses any observed usage", async () => {
+  const failures = [
+    { name: "missing proof", usage: {}, unavailable: { ...fakeQuota(Date.now() + 60_000, "claude"), preInference: undefined } },
+    { name: "input usage", usage: { input: 1 }, unavailable: fakeQuota(Date.now() + 60_000, "claude") },
+    { name: "output usage", usage: { output: 1 }, unavailable: fakeQuota(Date.now() + 60_000, "claude") },
+    { name: "turn usage", usage: { turns: 1 }, unavailable: fakeQuota(Date.now() + 60_000, "claude") },
+    { name: "cost usage", usage: { cost: 0.01 }, unavailable: fakeQuota(Date.now() + 60_000, "claude") },
+  ];
+  for (const failure of failures) {
+    const f = await fallbackFixture();
+    try {
+      const started = await f.workflows.start(f.request(`export default async () => agent("proof", {
+        harness: "claude", access: "readOnly", providerFallback: { harness: "codex" }
+      });`));
+      await waitFor(() => f.claude.requests.length === 1, failure.name);
+      if (Object.keys(failure.usage).length) {
+        f.claude.emit(f.claude.starts[0]!, { type: "usage", usage: failure.usage });
+      }
+      f.claude.fail(f.claude.starts[0]!, "quota", failure.unavailable);
+      const final = await started.completion;
+      assert.equal(f.backend.requests.length, 0, failure.name);
+      assert.equal(final.agents[0]?.attempts, undefined, failure.name);
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test("quota-frame usage blocks fallback and is charged once before the next budget preflight", async () => {
+  const f = await fallbackFixture();
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => {
+      const rejected = await agent("quota usage", {
+        harness: "claude", access: "readOnly", providerFallback: { harness: "codex" }
+      });
+      const blocked = await agent("must not dispatch", { harness: "codex", access: "readOnly" });
+      return { rejected, blocked };
+    };`, { budget: { maxTokens: 9 } }));
+    await waitFor(() => f.claude.requests.length === 1, "quota usage primary");
+    f.claude.emit(f.claude.starts[0]!, {
+      type: "usage",
+      usage: { input: 7, output: 2, cacheRead: 3, cacheWrite: 1 },
+    });
+    f.claude.fail(f.claude.starts[0]!, "quota", fakeQuota(Date.now() + 60_000, "claude"));
+    const final = await started.completion;
+
+    assert.equal(f.backend.requests.length, 0, "neither fallback nor budget-blocked second call dispatches");
+    assert.equal(f.claude.requests.length, 1);
+    assert.deepEqual(final.agents[0]?.usage, { input: 7, output: 2, cacheRead: 3, cacheWrite: 1, cost: 0, turns: 0 });
+    assert.deepEqual(aggregateWorkflowUsage(final), { input: 7, output: 2, cacheRead: 3, cacheWrite: 1, cost: 0, turns: 0 });
+    assert.equal(final.agents[0]?.attempts, undefined);
+    const result = final.result as { rejected: { usage?: { input: number; output: number } }; blocked: { error?: string } };
+    assert.deepEqual(result.rejected.usage, { input: 7, output: 2, cacheRead: 3, cacheWrite: 1, cost: 0, turns: 0 });
+    assert.match(result.blocked.error ?? "", /token budget exhausted \(9\/9\)/i);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("providerFallback fails closed without a probe and when the target stops being ready", async () => {
+  {
+    const f = await fixture();
+    try {
+      const started = await f.workflows.start(f.request(`export default async () => agent("no probe", {
+        harness: "claude", access: "readOnly", providerFallback: { harness: "codex" }
+      });`));
+      await waitFor(() => f.claude.requests.length === 1, "primary without probe");
+      f.claude.fail(f.claude.starts[0]!, "quota", fakeQuota(Date.now() + 60_000, "claude"));
+      const final = await started.completion;
+      assert.equal(f.backend.requests.length, 0);
+      assert.match(final.agents[0]?.error ?? "", /live availability validation is required/i);
+      assert.equal(final.agents[0]?.attempts?.[0]?.disposition, "fallback");
+    } finally {
+      await f.cleanup();
+    }
+  }
+
+  {
+    const f = await fallbackFixture();
+    try {
+      const started = await f.workflows.start(f.request(`export default async () => agent("target changed", {
+        harness: "claude", access: "readOnly", providerFallback: { harness: "codex" }
+      });`));
+      await waitFor(() => f.claude.requests.length === 1, "validated primary");
+      f.availability!.states.set("codex", availabilityFixture("codex", {
+        authenticated: false,
+        ready: false,
+        detail: "Codex login expired",
+      }));
+      f.claude.fail(f.claude.starts[0]!, "quota", fakeQuota(Date.now() + 60_000, "claude"));
+      const final = await started.completion;
+      assert.equal(f.backend.requests.length, 0);
+      assert.equal(final.agents[0]?.availability, "unauthenticated");
+      assert.match(final.agents[0]?.error ?? "", /login required/i);
+      assert.deepEqual(f.availability!.asked.map((entry) => entry.harness), ["claude", "codex"]);
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test("a Codex providerFallback under maxCost fails before fallback dispatch", async () => {
+  const f = await fallbackFixture();
+  try {
+    const started = await f.workflows.start(f.request(
+      `export default async () => agent("cost fallback", { harness: "claude", access: "readOnly", providerFallback: { harness: "codex" } });`,
+      { budget: { maxCost: 5 } },
+    ));
+    await waitFor(() => f.claude.requests.length === 1, "cost primary");
+    f.claude.fail(f.claude.starts[0]!, "quota", fakeQuota(Date.now() + 60_000, "claude"));
+    const final = await started.completion;
+    assert.equal(f.backend.requests.length, 0);
+    assert.match(final.agents[0]?.error ?? "", /maxCost.*unsupported/i);
+    assert.equal(final.agents[0]?.attempts?.[0]?.disposition, "fallback");
+    assert.equal(final.agents[0]?.requestedHarness, "codex");
+    assert.equal(final.agents[0]?.harness, "codex");
+    assert.equal(final.agents[0]?.model, undefined, "the primary model never leaks into the fallback route");
+    assert.deepEqual(final.agents[0]?.usage, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("cancelling an active provider fallback terminates the logical call without another attempt", async () => {
+  const f = await fallbackFixture();
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => agent("cancel fallback", {
+      harness: "claude", access: "readOnly", providerFallback: { harness: "codex" }
+    });`));
+    await waitFor(() => f.claude.requests.length === 1, "primary before cancellation");
+    f.claude.fail(f.claude.starts[0]!, "quota", fakeQuota(Date.now() + 60_000, "claude"));
+    await waitFor(() => f.backend.requests.length === 1, "active fallback before cancellation");
+    await f.workflows.cancelAgent(started.snapshot.runId, 0, "operator cancel");
+    const final = await started.completion;
+    assert.equal(final.agents[0]?.state, "cancelled");
+    assert.equal(f.backend.requests.length, 1);
+    assert.equal(final.agents[0]?.providerWait, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("cancelling between a terminal primary and fallback activation prevents fallback", async () => {
+  const f = await fallbackFixture();
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => agent("cancel gap", {
+      harness: "claude", access: "readOnly", providerFallback: { harness: "codex" }
+    });`));
+    await waitFor(() => f.claude.requests.length === 1, "primary before gap cancellation");
+    f.claude.fail(f.claude.starts[0]!, "quota", fakeQuota(Date.now() + 60_000, "claude"));
+    await f.workflows.cancelAgent(started.snapshot.runId, 0, "cancel in gap");
+    const final = await started.completion;
+    assert.equal(f.backend.requests.length, 0);
+    assert.equal(final.agents[0]?.state, "cancelled");
+    assert.match(final.agents[0]?.error ?? "", /cancel in gap/);
+  } finally {
+    await f.cleanup();
+  }
+});
 
 test("a workflow without the retry option fails immediately on a classified provider-quota rejection", async () => {
   const f = await fixture();

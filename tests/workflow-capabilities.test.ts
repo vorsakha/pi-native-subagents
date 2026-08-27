@@ -158,6 +158,53 @@ test("a workflow agent revalidates the resolved harness at dispatch and records 
   }
 });
 
+test("providerFallback uses only authoritative explicit-route readiness states and revalidates the target", async () => {
+  for (const [status, eligible] of [
+    ["missing", true],
+    ["unauthenticated", true],
+    ["incompatible", true],
+    ["unknown", false],
+    ["unhealthy", false],
+  ] as const) {
+    const parent = await tempDir(`workflow-fallback-${status}`);
+    const cwd = join(parent, "cwd");
+    await mkdir(cwd);
+    const artifactRoot = join(parent, "artifacts");
+    const codex = new DiscoverableBackend("codex", []);
+    const claude = new DiscoverableBackend("claude", []);
+    const jobs = new JobManager({ backends: [codex, claude] });
+    const router = new CapabilityService({ backends: [codex, claude], fingerprint: () => "stable" });
+    const availability = new ScriptedHarnessAvailability({
+      claude: { harness: "claude", status, detected: status !== "missing", ready: false, reason: status, checkedAt: 1_000 },
+      codex: availabilityFixture("codex", { version: "2.0.0" }),
+    });
+    const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1", router, availability });
+    try {
+      const started = await workflows.start({
+        sessionId: "session-1",
+        name: `fallback ${status}`,
+        cwd,
+        trusted: true,
+        defaultHarness: "codex",
+        script: `export default async () => agent("do the thing", { harness: "claude", providerFallback: { harness: "codex" } });`,
+      });
+      const final = await started.completion;
+      assert.equal(codex.requests.length, eligible ? 1 : 0, status);
+      assert.equal(claude.requests.length, 0, status);
+      assert.equal(final.agents[0]?.attempts?.[0]?.trigger?.status, eligible ? status : undefined, status);
+      if (eligible) {
+        assert.equal(final.agents[0]?.harness, "codex");
+        assert.equal(final.agents[0]?.availability, "ready");
+        assert.deepEqual(availability.asked.map((entry) => entry.harness), ["claude", "codex"]);
+      }
+    } finally {
+      await workflows.shutdown(200).catch(() => undefined);
+      await jobs.shutdown(200).catch(() => undefined);
+      await rm(parent, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
+  }
+});
+
 test("workflow agent() with requires but no router configured fails that call instead of silently ignoring requires", async () => {
   const parent = await tempDir("workflow-capabilities-norouter");
   const cwd = join(parent, "cwd");

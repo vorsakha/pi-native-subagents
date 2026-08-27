@@ -209,6 +209,18 @@ test("an explicit no-requires route still revalidates availability and surfaces 
   assert.equal(routing.availability?.status, "ready", "the observed availability is returned as journal evidence");
 });
 
+test("a route that requires live validation fails closed when no probe exists", async () => {
+  const router = new RecordingRouter(fakeResult("codex", []));
+  await assert.rejects(
+    routeCapabilities(router, {
+      request: baseRequest({ harness: "codex" }),
+      requireAvailability: true,
+    }),
+    /live availability validation is required for explicit codex dispatch/i,
+  );
+  assert.equal(router.calls.length, 0);
+});
+
 test("an explicit route with unknown readiness fails closed without rerouting", async () => {
   const router = new RecordingRouter(fakeResult("pi", ["pi:skill:plan"]));
   const availability = new ScriptedHarnessAvailability({ pi: { authenticated: false, ready: false } });

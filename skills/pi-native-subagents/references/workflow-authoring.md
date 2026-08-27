@@ -80,6 +80,10 @@ Rules:
 - Each `followUp()` consumes its own agent-call ordinal from the same 32-call budget and appears in `/workflows` as another generation under the same agent, not a new agent card.
 - `followUp()` never waits out a provider-quota rejection, even under `retry.providerUnavailable: "wait"`. It always fails immediately; retry with a fresh `agent()` call instead.
 
+## Explicit provider fallback
+
+Only a fresh `agent()` may set `providerFallback: { harness, model? }`. Its Claude or Codex primary must name the other. Other routes, nesting, arrays, and extra fields are rejected. After dispatch, fallback requires `readOnly`, pre-inference proof, zero usage, and a `ready` target. Full-access hooks, plugins, or MCP may mutate before visible progress, so rejection stays terminal. Pre-dispatch `missing`, `unauthenticated`, or `incompatible` may fall back under either access mode.
+
 ## Sandbox limits and determinism
 
 - The sandbox allows workflow orchestration only: no imports, filesystem, network, environment variables, subprocesses, credentials, `require`, `process`, or nested delegation.

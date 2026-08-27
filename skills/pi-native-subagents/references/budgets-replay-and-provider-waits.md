@@ -1,10 +1,10 @@
 # Budgets, replay, and provider waits
 
-Read this before setting any spend limit, before using `resumeFromRunId`, and before opting into `retry`. Spend limits and replay change what gets dispatched and re-charged, so getting them wrong either stalls a run or spends twice.
+Read this before setting spend limits, replay, waiting, or fallback. These options change dispatch and accounting.
 
 ## Direct-job budgets
 
-`maxTokens`, `maxCost`, and `maxTurns` on `subagent_spawn` are optional. Omit all three for an open spend budget. They apply cumulatively to the retained native session and every follow-up, not only the current turn.
+Direct limits are optional and cumulative across the retained session and its follow-ups. Omit them for an open budget.
 
 Reaching a direct spend boundary never cancels the active turn or changes its result. The active turn finishes, usage may overshoot, and later retained follow-ups are rejected. A follow-up submitted during an active generation waits for settlement and a cumulative-budget recheck; steering the active generation stays immediate.
 
@@ -52,9 +52,20 @@ Bounds and accounting:
 - A retried call keeps its original call ordinal and never consumes another of the 32 agent calls. Usage that a retried attempt actually spent counts toward `maxTokens`/`maxCost`/`maxTurns` and per-agent budgets.
 - Waiting is session-local: a live, in-memory schedule, not a durable or detached runner. A session shutdown aborts a pending wait exactly like any other in-flight work, and cancelling a waiting agent settles it immediately as a terminal failure while the run continues.
 
+## Explicit provider fallback
+
+`providerFallback: { harness: "claude" | "codex", model?: string }` names one opposite native route for a fresh `agent()` call and overrides wait.
+
+After dispatch, fallback requires effective `readOnly` access, structured pre-inference proof, and zero usage. Full-access hooks, plugins, or MCP may mutate before visible progress, so a started full-access primary never falls back. Before dispatch, `missing`, `unauthenticated`, or `incompatible` readiness may fall back under either access mode. Other readiness, missing proof, usage, ordinary errors, cancellation, policy rejection, and unsafe worktrees stay terminal. The target must freshly report `ready`; fallback cannot wait, retry, or fall back again.
+
+Both attempts share one ordinal and cumulative usage record. Budget preflight runs again. Codex under `maxCost` fails before dispatch. Cancellation covers both jobs and their gap. Isolation must finish as `removed`.
+
+The journal stores the declaration, attempts, trigger, and final route. Exact completed replay restores it without probing; failed or incomplete replay restarts at the primary. `/workflows` shows fallback status and attempts.
+
 ## Recovery
 
 - `Workflow ... budget exhausted`: active calls have already finished. Narrow the offending lane, raise the explicit boundary, or replay with a compatible larger budget so completed calls can be reused.
 - `Budget maxCost is unsupported`: remove the cost boundary or select Pi/Claude.
 - "...already produced model or tool activity; it was not replayed automatically": a mutating (or otherwise unsafe) call was rejected for provider quota after doing observable work, so automatic retry was refused to avoid duplicating side effects. Inspect the partial result and use `resumeFromRunId` once the provider window has reset.
 - "Workflow provider wait exhausted (attempt N/M)" or "...retry window exceeds the workflow maxWaitMs allowance": the opted-in policy's attempt or wait budget ran out before the provider's reported reset time. Raise `maxAttempts`/`maxWaitMs` and use `resumeFromRunId` to continue, or fall back to `providerUnavailable: "fail"` and retry manually later.
+- A started full-access primary stays terminal even with zero visible progress. Inspect possible side effects, then retry manually after recovery. Use `readOnly` only for non-mutating work.

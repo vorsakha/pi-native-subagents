@@ -67,6 +67,8 @@ import type {
   WorkflowStatus,
   WorkflowStructuredTransport,
   WorkflowUsage,
+  WorkflowProviderFallback,
+  WorkflowProviderFallbackTrigger,
 } from "./types.ts";
 
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
@@ -147,6 +149,8 @@ interface RunEntry {
   metadataReceived: boolean;
   /** Per-call abort controllers for an in-progress provider wait, keyed by callIndex, so `cancelAgent` can end a wait with no active job. */
   providerWaits: Map<number, AbortController>;
+  /** Fresh logical calls, including the no-job gap between provider attempts. */
+  callControllers: Map<number, AbortController>;
   /** Shared, run-wide `retry.maxWaitMs` allowance. Synchronously decremented by every call (sequential or concurrent) so the total time spent waiting across the whole run never exceeds the configured budget. */
   providerWaitBudgetMs: number;
   /** Interaction ordinal assigned to each routed question, keyed by host request ID. */
@@ -312,7 +316,49 @@ function journalRoute(agent?: WorkflowAgentRecord): WorkflowJournalRoute | undef
     model: agent.model,
     status: agent.state,
     error: agent.error ? boundedText(agent.error, 2_000) : undefined,
+    providerFallback: agent.providerFallback ? {
+      harness: agent.providerFallback.harness,
+      model: agent.providerFallback.model ? boundedText(agent.providerFallback.model, 256) : undefined,
+    } : undefined,
+    attempts: agent.attempts?.slice(-4).map((attempt) => ({
+      ...attempt,
+      model: attempt.model ? boundedText(attempt.model, 256) : undefined,
+      error: attempt.error ? boundedText(attempt.error, 2_000) : undefined,
+      usage: { ...attempt.usage },
+      trigger: attempt.trigger ? {
+        ...attempt.trigger,
+        scope: attempt.trigger.scope ? boundedText(attempt.trigger.scope, 300) : undefined,
+        detail: boundedText(attempt.trigger.detail, 500),
+      } : undefined,
+    })),
   };
+}
+
+type NativeWorkflowHarness = "claude" | "codex";
+
+function parseProviderFallback(options: Record<string, unknown>):
+  | { fallback?: WorkflowProviderFallback; primary?: NativeWorkflowHarness }
+  | { error: string } {
+  if (!Object.hasOwn(options, "providerFallback")) return {};
+  const primary = options.harness;
+  if (primary !== "claude" && primary !== "codex") {
+    return { error: "providerFallback requires an explicit primary harness of claude or codex" };
+  }
+  const value = options.providerFallback;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { error: "providerFallback must be an object with harness and optional model" };
+  }
+  const candidate = value as Record<string, unknown>;
+  const unknown = Object.keys(candidate).filter((key) => key !== "harness" && key !== "model");
+  if (unknown.length) return { error: `providerFallback contains unknown field: ${unknown[0]}` };
+  if (candidate.harness !== "claude" && candidate.harness !== "codex") {
+    return { error: "providerFallback.harness must be claude or codex" };
+  }
+  if (candidate.harness === primary) return { error: "providerFallback.harness must be the opposite native provider" };
+  let model: string | undefined;
+  try { model = normalizeModel(candidate.model); }
+  catch (error) { return { error: boundedText(error) }; }
+  return { primary, fallback: { harness: candidate.harness, model } };
 }
 
 const AVAILABILITY_STATUSES: HarnessAvailabilityStatus[] = ["ready", "missing", "unauthenticated", "incompatible", "unhealthy", "unknown"];
@@ -562,6 +608,7 @@ export class WorkflowManager {
       reachedBudgetWarnings: new Set(),
       metadataReceived: false,
       providerWaits: new Map(),
+      callControllers: new Map(),
       providerWaitBudgetMs: retry?.maxWaitMs ?? 0,
       interactionOrdinals: new Map(),
     };
@@ -610,6 +657,7 @@ export class WorkflowManager {
       reachedBudgetWarnings: new Set(),
       metadataReceived: true,
       providerWaits: new Map(),
+      callControllers: new Map(),
       providerWaitBudgetMs: snapshot.retry?.maxWaitMs ?? 0,
       interactionOrdinals: new Map(),
     };
@@ -778,12 +826,26 @@ export class WorkflowManager {
     if (!entry) throw new Error(`Unknown workflow: ${runId}`);
     const agent = entry.snapshot.agents.find((candidate) => candidate.index === agentIndex);
     if (!agent) throw new Error(`Unknown workflow agent: ${agentIndex}`);
+    const callController = agent.callIndex === undefined ? undefined : entry.callControllers.get(agent.callIndex);
+    if (callController) {
+      callController.abort(new Error(reason));
+      if (agent.state === "failed") {
+        agent.state = "cancelled";
+        agent.error = boundedText(reason);
+        agent.timestamps.updatedAt = Date.now();
+        agent.timestamps.endedAt = agent.timestamps.updatedAt;
+        this.#touch(entry);
+      }
+    }
     if (agent.state === "waiting") {
       const controller = agent.callIndex === undefined ? undefined : entry.providerWaits.get(agent.callIndex);
       if (controller) controller.abort(new Error(reason));
       return this.check(runId);
     }
-    if (!agent.jobId) throw new Error(`Workflow agent ${agent.name} has not started`);
+    if (!agent.jobId) {
+      if (callController) return this.check(runId);
+      throw new Error(`Workflow agent ${agent.name} has not started`);
+    }
     if (["completed", "failed", "cancelled", "aborted"].includes(agent.state)) return this.check(runId);
     await this.#jobs.cancel(agent.jobId, reason);
     return this.check(runId);
@@ -925,23 +987,58 @@ export class WorkflowManager {
       this.#touch(entry);
     }
 
-    type Attempt = WorkflowAgentResult & { unavailable?: ProviderUnavailability; progressed?: boolean };
+    const callController = new AbortController();
+    entry.callControllers.set(callIndex, callController);
+    const bridgeCallAbort = () => callController.abort(signal.reason);
+    if (signal.aborted) bridgeCallAbort();
+    else signal.addEventListener("abort", bridgeCallAbort, { once: true });
+    const attemptSignal = callController.signal;
+
+    try {
+    type Attempt = Omit<WorkflowAgentResult, "usage"> & {
+      usage?: WorkflowUsage;
+      unavailable?: ProviderUnavailability;
+      progressed?: boolean;
+      fallbackTrigger?: WorkflowProviderFallbackTrigger;
+    };
+    const fallbackDeclaration = parseProviderFallback(options);
     let result: Attempt;
     const policy = entry.snapshot.retry;
     let record: WorkflowAgentRecord | undefined;
     let pinnedHarness: HarnessName | undefined;
     let attempt = 0;
+    let fallbackRoute: WorkflowProviderFallback | undefined;
+    let fallbackTrigger: WorkflowProviderFallbackTrigger | undefined;
+    let usedFallback = false;
     for (;;) {
       try {
-        const attemptRetry = record ? { record, attempt, pinnedHarness } : undefined;
-        const execute = () => this.#runFreshAgent(entry, request, prompt, options, signal, callIndex, fingerprint, attemptRetry);
+        const attemptRetry = record ? {
+          record,
+          attempt,
+          pinnedHarness: fallbackRoute?.harness ?? pinnedHarness,
+          model: fallbackRoute?.model,
+          disposition: usedFallback ? "fallback" as const : "wait" as const,
+          trigger: fallbackTrigger,
+        } : undefined;
+        const execute = () => this.#runFreshAgent(entry, request, prompt, options, attemptSignal, callIndex, fingerprint, attemptRetry);
         const isolated = () => options.access === "readOnly" || options.isolation === "worktree"
           ? execute()
-          : this.#withMutationLock(request.cwd, signal, execute);
-        result = await this.#withDispatchSlot(entry, signal, isolated);
+          : this.#withMutationLock(request.cwd, attemptSignal, execute);
+        result = await this.#withDispatchSlot(entry, attemptSignal, isolated);
       } catch (error) {
         const failed = { ok: false, output: "", error: boundedText(error) } satisfies WorkflowJournalResult;
         const failedRecord = record ?? entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
+        if (attemptSignal.aborted && failedRecord) {
+          failedRecord.state = "cancelled";
+          failedRecord.error = failed.error;
+          failedRecord.providerWait = undefined;
+          failedRecord.timestamps.updatedAt = Date.now();
+          failedRecord.timestamps.endedAt = failedRecord.timestamps.updatedAt;
+          this.#touch(entry);
+          record = failedRecord;
+          result = failed;
+          break;
+        }
         await this.#appendJournal(entry, {
           callIndex,
           fingerprint,
@@ -955,7 +1052,32 @@ export class WorkflowManager {
         throw error;
       }
       record ??= entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
-      if (result.ok || !policy || policy.providerUnavailable !== "wait" || !record) break;
+      if (result.ok || !record) break;
+      if (attemptSignal.aborted) {
+        record.state = "cancelled";
+        record.error = boundedText(attemptSignal.reason ?? "Workflow agent cancelled");
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt = record.timestamps.updatedAt;
+        this.#touch(entry);
+        result = { ok: false, output: result.output, jobId: result.jobId, error: record.error, usage: result.usage };
+        break;
+      }
+      if (!usedFallback && "fallback" in fallbackDeclaration && fallbackDeclaration.fallback) {
+        const trigger = this.#planProviderFallback(record, result, fallbackDeclaration.primary!, fallbackDeclaration.fallback);
+        if (trigger) {
+          if (record.jobId) this.#jobOwners.delete(record.jobId);
+          fallbackRoute = fallbackDeclaration.fallback;
+          fallbackTrigger = trigger;
+          usedFallback = true;
+          attempt++;
+          continue;
+        }
+        // Declaring a fallback takes precedence over the run-wide provider wait
+        // policy for this call, even when the failure is not fallback-eligible.
+        break;
+      }
+      if (usedFallback) break;
+      if (!policy || policy.providerUnavailable !== "wait") break;
       // `entry.providerWaitBudgetMs` is a run-wide allowance shared by every logical
       // call, including concurrent ones from `parallel()`. Reading and decrementing
       // it here happens synchronously (no `await` in between), so concurrent calls
@@ -1014,7 +1136,7 @@ export class WorkflowManager {
       output: result.output,
       jobId: result.jobId,
       error: result.error,
-      usage: result.usage,
+      usage: usedFallback && finalRecord ? clone(finalRecord.usage) : result.usage,
       structured: result.structured,
       // Machine-readable budget marker, preserved so a bounded convergence
       // loop reports `limit-reached` rather than parsing failure prose.
@@ -1032,6 +1154,10 @@ export class WorkflowManager {
       replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
     });
     return sanitized;
+    } finally {
+      entry.callControllers.delete(callIndex);
+      signal.removeEventListener("abort", bridgeCallAbort);
+    }
   }
 
   /**
@@ -1150,10 +1276,24 @@ export class WorkflowManager {
     signal: AbortSignal,
     callIndex: number,
     fingerprint: string,
-    retry?: { record: WorkflowAgentRecord; attempt: number; pinnedHarness?: HarnessName },
-  ): Promise<WorkflowAgentResult & { unavailable?: ProviderUnavailability; progressed?: boolean }> {
+    retry?: {
+      record: WorkflowAgentRecord;
+      attempt: number;
+      pinnedHarness?: HarnessName;
+      model?: string;
+      disposition: "wait" | "fallback";
+      trigger?: WorkflowProviderFallbackTrigger;
+    },
+  ): Promise<Omit<WorkflowAgentResult, "usage"> & {
+    usage?: WorkflowUsage;
+    unavailable?: ProviderUnavailability;
+    progressed?: boolean;
+    fallbackTrigger?: WorkflowProviderFallbackTrigger;
+  }> {
     if (!prompt.trim()) return { ok: false, output: "", error: "agent() requires a non-empty prompt" };
-    const preflightError = this.#budgetPreflight(entry);
+    const fallbackDeclaration = parseProviderFallback(options);
+    if ("error" in fallbackDeclaration) return { ok: false, output: "", error: fallbackDeclaration.error };
+    const preflightError = retry ? undefined : this.#budgetPreflight(entry);
     if (preflightError) return { ok: false, output: "", error: preflightError, limit: "budget" };
     if (["role", "agent", "tier", "modelTier", "modelProfile", "backend"].some((key) => Object.hasOwn(options, key))) {
       return { ok: false, output: "", error: "Workflow agent() API schema mismatch: use the current task-driven schema." };
@@ -1163,7 +1303,7 @@ export class WorkflowManager {
     const harness = retry?.pinnedHarness ?? (options.harness === undefined ? undefined : String(options.harness) as RequestedHarness);
     if (harness && !isRequestedHarness(harness)) return { ok: false, output: "", error: `Unknown harness: ${harness}` };
     let model: string | undefined;
-    try { model = normalizeModel(options.model); }
+    try { model = retry?.disposition === "fallback" ? retry.model : normalizeModel(options.model); }
     catch (error) { return { ok: false, output: "", error: boundedText(error) }; }
     const effortValue = options.effort;
     const effort = effortValue === undefined ? undefined : String(effortValue) as EffortLevel;
@@ -1195,22 +1335,35 @@ export class WorkflowManager {
       record = retry.record;
       const attempts = record.attempts ??= [];
       attempts.push({
+        index: retry.attempt - 1,
         jobId: record.jobId,
         harness: record.harness,
+        requestedHarness: record.requestedHarness,
+        availability: record.availability,
+        executableVersion: record.executableVersion,
+        capabilityRevision: record.capabilityRevision,
         model: record.model,
         error: record.error,
         // record.usage is already cumulative (prior retryUsage + this attempt's own
         // usage); isolate just this attempt's contribution for bounded provenance.
         usage: subtractWorkflowUsage(record.usage, record.retryUsage),
         endedAt: record.timestamps.endedAt,
+        disposition: retry.disposition,
+        trigger: retry.trigger ? { ...retry.trigger } : undefined,
       } satisfies WorkflowAgentAttempt);
       if (attempts.length > 4) attempts.splice(0, attempts.length - 4);
       // record.usage already includes every prior attempt (see above), so the new
       // baseline for the next attempt IS record.usage, not retryUsage + record.usage
       // — adding retryUsage again would double-count every attempt before this one.
       record.retryUsage = record.usage;
-      record.usage = workflowUsage();
+      record.usage = record.retryUsage;
       record.providerWait = undefined;
+      // The top-level route always describes the current attempt, including
+      // failures that occur before spawn during policy, budget, or readiness
+      // validation. The archived attempt above retains the primary route.
+      record.harness = harness && harness !== "auto" ? harness : undefined;
+      record.requestedHarness = harness ?? request.defaultHarness ?? "pi";
+      record.model = model;
       record.availability = undefined;
       record.executableVersion = undefined;
       record.capabilityRevision = undefined;
@@ -1222,6 +1375,9 @@ export class WorkflowManager {
       record.transcript = undefined;
       record.liveThinking = undefined;
       record.truncated = undefined;
+      record.structured = undefined;
+      record.structuredTransport = undefined;
+      record.nativeStructuredSchema = undefined;
       record.timestamps.updatedAt = now;
       record.timestamps.endedAt = undefined;
     } else {
@@ -1243,11 +1399,24 @@ export class WorkflowManager {
         effort,
         tools: [],
         usage: workflowUsage(),
+        providerFallback: fallbackDeclaration.fallback,
       };
       entry.snapshot.agents.push(record);
       entry.snapshot.phases[phase]?.agents.push(index);
     }
     this.#touch(entry);
+
+    if (retry) {
+      const retryPreflightError = this.#budgetPreflight(entry);
+      if (retryPreflightError) {
+        record.state = "failed";
+        record.error = retryPreflightError;
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt = record.timestamps.updatedAt;
+        this.#touch(entry);
+        return { ok: false, output: "", error: retryPreflightError, limit: "budget" };
+      }
+    }
 
     const schema = options.schema === undefined ? undefined : workflowSchema(options.schema);
     if (options.schema !== undefined && !schema) {
@@ -1305,7 +1474,7 @@ export class WorkflowManager {
     let structuredTransport: WorkflowStructuredTransport | undefined;
     // Persist the requested harness before routing so a fail-closed availability
     // error still records what was asked for.
-    record.requestedHarness ??= harness ?? request.defaultHarness ?? "pi";
+    record.requestedHarness = harness ?? request.defaultHarness ?? "pi";
     try {
       const routing = await routeCapabilities(this.#router, {
         request: {
@@ -1329,6 +1498,7 @@ export class WorkflowManager {
         independentOfProvider: replayIndependenceProvider,
         preference: request.defaultHarness ? [request.defaultHarness] : undefined,
         availability: this.#availability,
+        requireAvailability: retry?.disposition === "fallback",
         signal,
       });
       // Record the observed availability of the resolved route so the journal
@@ -1404,12 +1574,22 @@ export class WorkflowManager {
       await finishIsolation().catch(() => undefined);
       record.state = "failed";
       record.error = boundedText(error);
+      let fallbackTrigger: WorkflowProviderFallbackTrigger | undefined;
       // A fail-closed availability route carries its normalized status; keep it
       // as durable evidence for the journal beside the bounded error text.
       if (error instanceof HarnessUnavailableError) {
         record.harness = error.harness;
         record.availability = error.status;
         record.executableVersion = error.availability.version;
+        if ((error.harness === "claude" || error.harness === "codex")
+            && (error.status === "missing" || error.status === "unauthenticated" || error.status === "incompatible")) {
+          fallbackTrigger = {
+            source: "readiness",
+            provider: error.harness,
+            status: error.status,
+            detail: record.error,
+          };
+        }
       }
       if (error instanceof HarnessAutoUnavailableError) {
         record.availabilityChecks = error.availabilities.map((availability) => ({
@@ -1421,7 +1601,7 @@ export class WorkflowManager {
       record.timestamps.updatedAt = Date.now();
       record.timestamps.endedAt = record.timestamps.updatedAt;
       this.#touch(entry);
-      return { ok: false, output: "", error: record.error };
+      return { ok: false, output: "", error: record.error, fallbackTrigger };
     }
 
     record.jobId = job.id;
@@ -1730,6 +1910,12 @@ export class WorkflowManager {
       executableVersion: replay.route?.executableVersion,
       capabilityRevision: replay.route?.capabilityRevision,
       availabilityChecks: replay.route?.availabilityChecks?.map((check) => ({ ...check })),
+      providerFallback: replay.route?.providerFallback ? { ...replay.route.providerFallback } : undefined,
+      attempts: replay.route?.attempts?.map((attempt) => ({
+        ...attempt,
+        usage: { ...attempt.usage },
+        trigger: attempt.trigger ? { ...attempt.trigger } : undefined,
+      })),
       model: replay.route?.model,
       effort: replayEffort,
       prompt: boundedText(prompt, 2 * 1024),
@@ -1737,6 +1923,7 @@ export class WorkflowManager {
       output: replay.result.output,
       structured: replay.result.structured === undefined ? undefined : clone(replay.result.structured),
       structuredTransport: replay.result.transport,
+      // Replay restores route/attempt provenance but spends no usage again.
       usage: workflowUsage(),
     };
     entry.snapshot.agents.push(record);
@@ -2194,6 +2381,44 @@ export class WorkflowManager {
       maxAttempts: policy.maxAttempts ?? 1,
       remainingWaitMs,
     });
+  }
+
+  /**
+   * Allows one declared cross-provider attempt only for structured, authoritative
+   * pre-inference unavailability. Every ambiguous failure stays terminal.
+   */
+  #planProviderFallback(
+    record: WorkflowAgentRecord,
+    result: {
+      unavailable?: ProviderUnavailability;
+      progressed?: boolean;
+      fallbackTrigger?: WorkflowProviderFallbackTrigger;
+      usage?: WorkflowUsage;
+    },
+    primary: NativeWorkflowHarness,
+    fallback: WorkflowProviderFallback,
+  ): WorkflowProviderFallbackTrigger | undefined {
+    if (result.progressed || record.state !== "failed") return undefined;
+    if (result.usage && Object.values(result.usage).some((value) => value > 0)) return undefined;
+    if (record.isolation && record.isolation.state !== "removed") return undefined;
+    if (fallback.harness === primary || record.harness !== primary) return undefined;
+    if (result.fallbackTrigger?.source === "readiness" && result.fallbackTrigger.provider === primary) {
+      return { ...result.fallbackTrigger };
+    }
+    // A started full-access native session may run mutating hooks, plugins, or
+    // MCP before model/tool progress becomes observable. Without authoritative
+    // no-mutation evidence, only the enforced read-only policy is replay-safe.
+    if (record.access !== "readOnly") return undefined;
+    const unavailable = result.unavailable;
+    if (!unavailable || !unavailable.authoritative || unavailable.preInference !== true || unavailable.provider !== primary) return undefined;
+    return {
+      source: "provider",
+      provider: primary,
+      kind: unavailable.kind,
+      retryAt: unavailable.retryAt,
+      scope: unavailable.scope,
+      detail: unavailable.detail,
+    };
   }
 
   #beginProviderWait(
