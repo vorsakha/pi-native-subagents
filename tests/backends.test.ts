@@ -5,9 +5,9 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ClaudeBackend, CLAUDE_SUBAGENT_ASK_TOOL, forbiddenInitTools } from "../src/backends/claude.ts";
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
-import { CodexAppServerBackend, classifyCodexUnavailability } from "../src/backends/codex.ts";
+import { CodexAppServerBackend, classifyCodexUnavailability, codexExitDiagnostic } from "../src/backends/codex.ts";
 import { MAX_OUTPUT_BYTES } from "../src/reducer.ts";
-import type { BackendEvent, HarnessName, BackendRequest } from "../src/types.ts";
+import type { BackendEvent, BackendRun, HarnessName, BackendRequest } from "../src/types.ts";
 import {
   SUBAGENT_ASK_TOOL_NAME,
   type InteractionAskInput,
@@ -122,6 +122,8 @@ process.stdin.on("data", chunk => {
     }
     else if (value.method === "turn/start") {
       if (process.env.PARAM_FILE) fs.appendFileSync(process.env.PARAM_FILE, JSON.stringify(value.params) + "\\n");
+      if (process.env.STDERR_TEXT) process.stderr.write(process.env.STDERR_TEXT);
+      if (process.env.MODE === "exit-turn-start-pending") process.exit(0);
       const number = ++turns; const id = "turn-" + number;
       reply(value.id, { turn: { id } });
       if (process.env.MODE === "large-item" || process.env.MODE === "oversized") {
@@ -196,7 +198,13 @@ process.stdin.on("data", chunk => {
       if (process.env.MODE === "activity") {
         for (const delay of [80, 160, 240]) setTimeout(() => process.stdout.write(JSON.stringify({ method: "item/reasoning/summaryTextDelta", params: { delta: "." } }) + "\\n"), delay);
       }
-      if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool" && process.env.MODE !== "ask-tool") setTimeout(() => {
+      if (process.env.MODE === "exit-mid-turn") {
+        process.stdout.write(JSON.stringify({ method: "item/started", params: { item: {
+          id: "dynamic-1", type: "dynamicToolCall", tool: "fixture_tool", arguments: { value: "fixture" },
+        } } }) + "\\n");
+        setTimeout(() => process.exit(0), 30);
+      }
+      if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool" && process.env.MODE !== "ask-tool" && process.env.MODE !== "exit-mid-turn") setTimeout(() => {
         if (process.env.MODE === "tool-events") {
           process.stdout.write(JSON.stringify({ method: "item/started", params: { item: { id: "command-1", type: "commandExecution", command: "pwd" } } }) + "\\n");
           process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { id: "command-1", type: "commandExecution", command: "pwd", aggregatedOutput: "/tmp", status: "completed" } } }) + "\\n");
@@ -247,10 +255,11 @@ function contextEvents(events: BackendEvent[]): Array<Extract<BackendEvent, { ty
 test("Codex usage separates cached input and never substitutes the configured model for an unreported serving model", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
     const codexRequest = request("codex", fake.dir, { ...process.env, MODE: "usage" });
     assert.equal(codexRequest.policy.model, "fixture-model");
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
       .start(codexRequest, (event) => events.push(event));
     await run.completed;
     const usage = events.filter((event): event is Extract<BackendEvent, { type: "usage" }> => event.type === "usage")
@@ -262,15 +271,18 @@ test("Codex usage separates cached input and never substitutes the configured mo
     assert.deepEqual(usage, { input: 2_541, output: 106, cacheRead: 102_144 });
     assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 104_791, window: 258_400 });
     assert.equal(codexRequest.policy.model, "fixture-model", "the configured job model is never rewritten");
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex leaves the effective serving model unknown when thread/start reports a model but no reroute ever arrives", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
       .start(request("codex", fake.dir, { ...process.env, MODE: "usage", THREAD_MODEL: "gpt-5.6-codex" }), (event) => events.push(event));
     await run.completed;
     assert.deepEqual(
@@ -278,41 +290,50 @@ test("Codex leaves the effective serving model unknown when thread/start reports
       { tokens: 104_791, window: 258_400 },
       "thread/start's model field is configured/resolved routing state, not authoritative serving telemetry, and must never populate servingModel",
     );
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex context occupancy uses the latest-turn gauge, never thread-cumulative totals, and stays unknown without a last reading", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
       .start(request("codex", fake.dir, { ...process.env, MODE: "latest-turn" }), (event) => events.push(event));
     await run.completed;
     const contexts = contextEvents(events);
     assert.deepEqual(contexts[0]?.context, { tokens: 12_345, window: 200_000 }, "occupancy reads the latest-turn gauge, not the thread-cumulative total");
     assert.deepEqual(contexts[1]?.context, { window: 200_000 }, "tokens stay unknown, not zero, when a reading omits the latest-turn gauge");
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex model/rerouted updates the effective serving model and preserves the last occupancy reading", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
       .start(request("codex", fake.dir, { ...process.env, MODE: "reroute", THREAD_MODEL: "gpt-5.6-codex" }), (event) => events.push(event));
     await run.completed;
     assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 1_010, window: 200_000, servingModel: "gpt-5.6-codex-mini" });
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex clears its private occupancy cache at a retained follow-up's generation boundary instead of re-emitting the prior generation's gauge", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 2_000 })
       .start(request("codex", fake.dir, { ...process.env, MODE: "retained-generation" }), (event) => events.push(event));
     await run.completed;
     assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 1_010, window: 200_000 }, "generation one's own telemetry reports occupancy");
@@ -326,20 +347,25 @@ test("Codex clears its private occupancy cache at a retained follow-up's generat
       { servingModel: "gen-2-model" },
       "the retained generation's own turn only reports a reroute, never a fresh occupancy reading; the prior generation's lastOccupancy cache must not be re-emitted alongside it",
     );
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex ignores thread-scoped telemetry whose threadId or turnId does not match the current turn", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
       .start(request("codex", fake.dir, { ...process.env, MODE: "stale-scope" }), (event) => events.push(event));
     await run.completed;
     assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 4_242, window: 100_000 }, "only telemetry scoped to this job's current threadId/turnId is accepted");
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex normalizes a valid 1.1 MB tool-result notification with no pending request instead of masquerading as an app-server exit", async () => {
@@ -1177,6 +1203,51 @@ test("Codex never copies error.message credentials or identifiers into detail, e
   assert.ok(!usageLimitExceeded?.detail.includes("sk-live-"), "the other allowlisted exhaustion code must also strip raw error.message");
 });
 
+test("codexExitDiagnostic distinguishes lifecycle stages instead of always reporting a bare exit code", () => {
+  const base = { code: 0, signal: null, threadStarted: false, turnState: "idle" as const, turnOutputLength: 0, toolCallCount: 0 };
+
+  assert.equal(codexExitDiagnostic(base), "Codex app-server exited (0) before starting a Codex thread");
+
+  assert.equal(
+    codexExitDiagnostic({ ...base, threadStarted: true }),
+    "Codex app-server exited (0) between turns, with no turn in progress",
+  );
+
+  assert.equal(
+    codexExitDiagnostic({ ...base, threadStarted: true, turnState: "starting" }),
+    "Codex app-server exited (0) while turn/start was pending with no terminal result — no tool calls started, no assistant output was delivered",
+  );
+
+  assert.equal(
+    codexExitDiagnostic({ ...base, threadStarted: true, turnState: "inProgress" }),
+    "Codex app-server exited (0) during an in-progress turn with no terminal result — no tool calls started, no assistant output was delivered",
+  );
+
+  assert.equal(
+    codexExitDiagnostic({ ...base, threadStarted: true, turnState: "inProgress", toolCallCount: 2, turnOutputLength: 40 }),
+    "Codex app-server exited (0) during an in-progress turn with no terminal result — 2 tool call(s) started, partial assistant output was streaming",
+  );
+
+  const withRequires = codexExitDiagnostic({
+    ...base, threadStarted: true, turnState: "inProgress", toolCallCount: 1, requires: ["codex:skill:imagegen"],
+  });
+  assert.match(withRequires, /\(requires: codex:skill:imagegen\)$/);
+  assert.doesNotMatch(withRequires, /unsupported|not supported|unavailable/i, "the diagnostic never diagnoses the required capability as the cause");
+
+  // Signal-only exits (no numeric code) still resolve to a readable label.
+  assert.match(codexExitDiagnostic({ ...base, code: null, signal: "SIGKILL" }), /^Codex app-server exited \(SIGKILL\)/);
+});
+
+test("codexExitDiagnostic keeps capability context and the complete diagnostic strictly bounded", () => {
+  const base = { code: 1, signal: null, threadStarted: true, turnState: "inProgress" as const, turnOutputLength: 0, toolCallCount: 0 };
+  const manyRequirements = Array.from({ length: 16 }, (_, index) => `codex:skill:tool-${index}`);
+  const withManyRequirements = codexExitDiagnostic({ ...base, requires: manyRequirements });
+  const requiresSegment = withManyRequirements.match(/\(requires: (.*)\)$/)?.[1] ?? "";
+  assert.equal(requiresSegment.split(", ").length, 4, "at most the first few capability requirements are echoed back, never the full bounded list");
+  const withLongRequirements = codexExitDiagnostic({ ...base, requires: Array(16).fill("x".repeat(10_000)) });
+  assert.ok(withLongRequirements.length < 900, `defense-in-depth bounds the complete diagnostic (got ${withLongRequirements.length} chars)`);
+});
+
 test("Pi reports the concrete responseModel over the requested alias and totalTokens as occupancy", async () => {
   const fake = await fixture(PI_FIXTURE);
   const events: BackendEvent[] = [];
@@ -1302,6 +1373,77 @@ test("Codex startup timeout and early exit both settle clearly", async (t) => {
       } finally { await rm(fake.dir, { recursive: true, force: true }); }
     });
   }
+});
+
+test("Codex reports bounded active-turn context after generic tool activity without claiming a required capability ran (issue #22)", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  const stderrSecrets = [
+    "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+    "password=hunter2",
+    "token=punc!#$%^&*()[]{}",
+    "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+    "contact=user@example.com",
+    "opaque_id=req_7F3a-91.Zq",
+    "n".repeat(400),
+    "fatal: trailing crash reason",
+  ];
+  try {
+    const codexRequest = request("codex", fake.dir, {
+      ...process.env,
+      MODE: "exit-mid-turn",
+      STDERR_TEXT: stderrSecrets.join("\n"),
+    });
+    codexRequest.policy.requires = ["codex:skill:imagegen"];
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 5_000 })
+      .start(codexRequest, (event) => events.push(event));
+    await run.completed;
+    const event = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+    assert.equal(event.type, "failed");
+    // Not just the bare generic exit summary from before this fix.
+    assert.notEqual(event.error, "Codex app-server exited (0)");
+    assert.match(event.error, /Codex app-server exited \(0\) during an in-progress turn with no terminal result/);
+    assert.match(event.error, /1 tool call\(s\) started/);
+    assert.match(event.error, /no assistant output was delivered/);
+    // The requirement is dispatch context only. The fixture emitted a
+    // protocol-realistic generic dynamicToolCall, not a native imagegen call.
+    assert.match(event.error, /requires: codex:skill:imagegen/);
+    assert.doesNotMatch(event.error, /unsupported|not supported|does not support/i);
+    const toolStart = events.find((item): item is Extract<BackendEvent, { type: "tool_start" }> => item.type === "tool_start");
+    assert.equal(toolStart?.name, "fixture_tool");
+    assert.ok(!events.some((item) => item.type === "completed"), "a clean mid-turn exit must never be reported as completed");
+
+    const serializedEvents = JSON.stringify(events);
+    for (const stderrValue of stderrSecrets) {
+      assert.ok(!serializedEvents.includes(stderrValue), `provider stderr must be omitted from terminal-event serialization: ${stderrValue.slice(0, 40)}`);
+    }
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex settles a close during pending turn/start once with pending-request context", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const turnParamFile = join(fake.dir, "turn-params.jsonl");
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 5_000 })
+      .start(request("codex", fake.dir, {
+        ...process.env,
+        MODE: "exit-turn-start-pending",
+        PARAM_FILE: turnParamFile,
+      }), (event) => events.push(event));
+    await run.completed;
+    await delay(20);
+
+    assert.match(await readFile(turnParamFile, "utf8"), /fixture task/, "the fixture received turn/start before exiting without a reply");
+    const terminalEvents = events.filter((event) => event.type === "completed" || event.type === "failed" || event.type === "cancelled");
+    assert.deepEqual(terminalEvents, [{
+      type: "failed",
+      error: "Codex app-server exited (0) while turn/start was pending with no terminal result — no tool calls started, no assistant output was delivered",
+    }]);
+    assert.doesNotMatch(JSON.stringify(events), /JSON-RPC process exited/, "the rejected turn/start catch cannot override close settlement");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
 
 

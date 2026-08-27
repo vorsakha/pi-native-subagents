@@ -136,6 +136,55 @@ export function classifyCodexUnavailability(turnError: unknown, now: number): Pr
 }
 
 /**
+ * Bounded lifecycle state captured at the moment the app-server process
+ * closed with no protocol failure recorded. Every field is a count, fixed
+ * state, boolean, or a capability ID that already passed `normalizeRequirements`
+ * (at most `MAX_REQUIREMENTS` entries of at most `MAX_REQUIREMENT_LENGTH`
+ * characters each) — never raw protocol payloads, tool arguments, or
+ * credentials. Provider stderr is omitted because it has no safe schema.
+ */
+export interface CodexExitContext {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  /** Whether `thread/start` had returned a thread ID before the process closed. */
+  threadStarted: boolean;
+  /** Whether no turn exists, `turn/start` is pending, or a returned turn has not completed. */
+  turnState: "idle" | "starting" | "inProgress";
+  /** Characters of assistant text streamed for the in-progress turn, if any. */
+  turnOutputLength: number;
+  /** `item/started` notifications observed for the in-progress turn. */
+  toolCallCount: number;
+  requires?: string[];
+}
+
+/**
+ * Builds the diagnostic for a Codex app-server process that closed before this
+ * backend saw a terminal `turn/completed`, `failed`, or `cancelled` outcome,
+ * with no protocol failure recorded (a protocol failure always takes
+ * precedence over this path — see the `close` handler in `start`).
+ *
+ * This reports only what the lifecycle state on this side of the protocol
+ * observed. It never asserts a cause, and in particular never claims a
+ * `requires` capability was the reason: live capability revalidation before
+ * dispatch (`routeCapabilities`/`resolveRequirements`) only proves a
+ * capability was discovered and reported healthy at that moment — it cannot
+ * prove the runtime would actually exercise it, or exercise it successfully,
+ * during a turn that never reached a terminal event. `requires` is included
+ * only as bounded context for the caller, not as a diagnosis.
+ */
+export function codexExitDiagnostic(context: CodexExitContext): string {
+  const exit = `Codex app-server exited (${context.code ?? context.signal ?? "signal"})`;
+  if (!context.threadStarted) return `${exit} before starting a Codex thread`;
+  if (context.turnState === "idle") return `${exit} between turns, with no turn in progress`;
+  const activity = context.toolCallCount > 0 ? `${context.toolCallCount} tool call(s) started` : "no tool calls started";
+  const output = context.turnOutputLength > 0 ? "partial assistant output was streaming" : "no assistant output was delivered";
+  const boundedRequirements = context.requires?.slice(0, 4).map((requirement) => requirement.slice(0, 160));
+  const requires = boundedRequirements?.length ? ` (requires: ${boundedRequirements.join(", ")})` : "";
+  const stage = context.turnState === "starting" ? "while turn/start was pending" : "during an in-progress turn";
+  return `${exit} ${stage} with no terminal result — ${activity}, ${output}${requires}`;
+}
+
+/**
  * Thread config overrides applied on top of the user's native Codex setup.
  * Full-access children keep native parity; read-only children lose the surfaces
  * that could mutate outside the sandbox.
@@ -334,12 +383,14 @@ export class CodexAppServerBackend implements Backend {
     });
     let threadId = "";
     let turnId = "";
+    let turnState: CodexExitContext["turnState"] = "idle";
     let turnOutput = "";
+    /** `item/started` notifications seen for the turn currently in progress; reset at the start of each turn. */
+    let turnItemCount = 0;
     let output = "";
     let settled = false;
     let closing = false;
     let cancellingReason: string | undefined;
-    let stderr = "";
     let protocolFailure: string | undefined;
     let previousTokenTotals: CodexTokenTotals | undefined;
     /** Model identity reported by the runtime; never seeded from configured policy. */
@@ -373,6 +424,8 @@ export class CodexAppServerBackend implements Backend {
     const input = (text: string) => [{ type: "text", text }];
     const startTurn = async (text: string): Promise<void> => {
       turnOutput = "";
+      turnItemCount = 0;
+      turnState = "starting";
       watchdog.arm();
       emit({ type: "user_message", text });
       const turnResult = asObject(await peer.request("turn/start", {
@@ -386,6 +439,7 @@ export class CodexAppServerBackend implements Backend {
       watchdog.touch();
       turnId = String(asObject(turnResult.turn).id ?? "");
       if (!turnId) throw new Error("Codex turn/start returned no turn id");
+      turnState = "inProgress";
     };
 
     peer = new JsonRpcPeer({
@@ -443,7 +497,9 @@ export class CodexAppServerBackend implements Backend {
         } else if (method === "item/started") {
           const item = asObject(params.item);
           const type = String(item.type ?? "item");
-          if (type !== "agentMessage" && type !== "reasoning") emit({
+          if (type === "agentMessage" || type === "reasoning") return;
+          turnItemCount++;
+          emit({
             type: "tool_start",
             id: String(item.id ?? type),
             name: itemToolName(item),
@@ -507,6 +563,7 @@ export class CodexAppServerBackend implements Backend {
           const turn = asObject(params.turn);
           const status = String(turn.status ?? "failed");
           turnId = "";
+          turnState = "idle";
           if (cancellingReason) return;
           if (status === "completed") {
             output = appendTurn(output, turnOutput);
@@ -536,7 +593,6 @@ export class CodexAppServerBackend implements Backend {
     };
     request.signal.addEventListener("abort", abortStartup, { once: true });
 
-    managed.child.stderr.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-16_384); });
     managed.child.on("error", (error) => {
       if (!settled) finish({ type: "failed", error: `Codex app-server failed: ${error.message}` });
     });
@@ -546,7 +602,15 @@ export class CodexAppServerBackend implements Backend {
           type: "failed",
           error: protocolFailure
             ? `Codex app-server protocol failure: ${protocolFailure}`
-            : `Codex app-server exited (${code ?? signal ?? "signal"})${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
+            : codexExitDiagnostic({
+                code,
+                signal,
+                threadStarted: Boolean(threadId),
+                turnState,
+                turnOutputLength: turnOutput.length,
+                toolCallCount: turnItemCount,
+                requires: request.policy.requires,
+              }),
         });
       }
     });

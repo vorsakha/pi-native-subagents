@@ -17,9 +17,10 @@ export class JsonRpcPeer {
   readonly #onRequest: (id: JsonRpcId, method: string, params: Record<string, unknown>) => unknown | Promise<unknown>;
   readonly #requestId: () => JsonRpcId;
   readonly #onProtocolError: (error: Error) => void;
+  readonly #records: string[] = [];
   #nextId = 1;
   #closed = false;
-  #stderr = "";
+  #receiving = false;
 
   constructor(options: {
     process: ManagedProcess;
@@ -37,16 +38,15 @@ export class JsonRpcPeer {
     this.#requestId = options.requestId ?? (() => this.#nextId++);
     this.#onProtocolError = options.onProtocolError ?? (() => undefined);
     const framer = new JsonlFramer(options.maxFrameBytes);
-    const receive = (records: string[]) => { for (const record of records) this.#receive(record); };
     this.#process.child.stdout.on("data", (chunk: Buffer) => {
-      try { receive(framer.push(chunk)); } catch (error) { this.#protocolFailure(error); }
+      try { this.#enqueue(framer.push(chunk)); } catch (error) { this.#protocolFailure(error); }
     });
     this.#process.child.stdout.on("end", () => {
-      try { receive(framer.end()); } catch (error) { this.#protocolFailure(error); }
+      try { this.#enqueue(framer.end()); } catch (error) { this.#protocolFailure(error); }
     });
-    this.#process.child.stderr.on("data", (chunk: Buffer) => {
-      this.#stderr = (this.#stderr + chunk.toString()).slice(-16_384);
-    });
+    // Provider stderr has no safe schema and may contain credentials. Drain it
+    // so a noisy child cannot block, but never retain it in transport errors.
+    this.#process.child.stderr.resume();
     this.#process.child.stdin.on("error", (error) => {
       this.#closed = true;
       this.#failPending(new Error(`JSON-RPC stdin failed: ${error.message}`));
@@ -58,7 +58,7 @@ export class JsonRpcPeer {
     });
     this.#process.child.on("close", (code, signal) => {
       this.#closed = true;
-      const error = new Error(`JSON-RPC process exited (${code ?? signal ?? "signal"})${this.#stderr.trim() ? `: ${this.#stderr.trim()}` : ""}`);
+      const error = new Error(`JSON-RPC process exited (${code ?? signal ?? "signal"})`);
       this.#failPending(error);
     });
   }
@@ -109,6 +109,33 @@ export class JsonRpcPeer {
       pending.reject(error);
     }
     this.#pending.clear();
+  }
+
+  /**
+   * Process one framed record per microtask. A response settles its request
+   * promise before the next wire-ordered notification runs, even when the OS
+   * delivered both records in one stdout chunk.
+   */
+  #enqueue(records: string[]): void {
+    this.#records.push(...records);
+    if (this.#receiving || this.#records.length === 0) return;
+    this.#receiving = true;
+    this.#receiveNext();
+  }
+
+  #receiveNext(): void {
+    const record = this.#records.shift();
+    if (record === undefined || this.#closed) {
+      this.#records.length = 0;
+      this.#receiving = false;
+      return;
+    }
+    this.#receive(record);
+    if (this.#records.length === 0) {
+      this.#receiving = false;
+      return;
+    }
+    queueMicrotask(() => this.#receiveNext());
   }
 
   #receive(record: string): void {

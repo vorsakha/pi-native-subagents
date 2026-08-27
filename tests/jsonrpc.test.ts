@@ -23,7 +23,7 @@ function fakeManaged() {
       }
     },
   };
-  return { managed, child, stdin, stdout, get terminated() { return terminated; } };
+  return { managed, child, stdin, stdout, stderr, get terminated() { return terminated; } };
 }
 
 test("JSON-RPC peer correlates chunked numeric and string-ID responses", async () => {
@@ -48,6 +48,34 @@ test("JSON-RPC peer correlates chunked numeric and string-ID responses", async (
   const stringIdPeer = new JsonRpcPeer({ process: fake.managed, requestId: () => "request-one" });
   assert.equal(await stringIdPeer.request("echo"), "string-ok");
   await stringIdPeer.close();
+});
+
+test("JSON-RPC settles a response before a following notification from the same stdout chunk", async () => {
+  const fake = fakeManaged();
+  let requestSettled = false;
+  let notificationObserved = false;
+  const peer = new JsonRpcPeer({
+    process: fake.managed,
+    onNotification() {
+      assert.equal(requestSettled, true, "the response continuation runs before the next wire-ordered record");
+      notificationObserved = true;
+    },
+  });
+  fake.stdin.on("data", (chunk) => {
+    const request = JSON.parse(chunk.toString());
+    queueMicrotask(() => {
+      fake.stdout.write([
+        JSON.stringify({ id: request.id, result: { turn: { id: "turn-1" } } }),
+        JSON.stringify({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } }),
+        "",
+      ].join("\n"));
+    });
+  });
+
+  await peer.request("turn/start").then(() => { requestSettled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(notificationObserved, true);
+  await peer.close();
 });
 
 test("JSON-RPC awaits handlers and fails closed for approval requests", async () => {
@@ -116,4 +144,31 @@ test("JSON-RPC close and stdin failures reject pending requests with teardown", 
   stdinFake.stdin.emit("error", new Error("EPIPE"));
   await assert.rejects(stdinPending, /stdin failed: EPIPE/);
   assert.equal(stdinFake.terminated, true);
+});
+
+test("JSON-RPC process-exit errors omit arbitrary provider stderr", async () => {
+  const fake = fakeManaged();
+  const peer = new JsonRpcPeer({ process: fake.managed });
+  const pending = peer.request("turn/start", {}, 60_000);
+  const stderr = [
+    "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+    "password=hunter2",
+    "token=punc!#$%^&*()[]{}",
+    "Authorization: Bearer opaque.header.value",
+    "contact=user@example.com",
+    "opaque_id=req_7F3a-91.Zq",
+    "n".repeat(400),
+    "fatal: trailing crash reason",
+  ].join("\n");
+
+  fake.stderr.write(stderr);
+  fake.child.emit("close", 7, null);
+
+  await assert.rejects(pending, (error: Error) => {
+    assert.equal(error.message, "JSON-RPC process exited (7)");
+    const serializedFailure = JSON.stringify({ type: "failed", error: error.message });
+    assert.ok(!stderr.split("\n").some((value) => serializedFailure.includes(value)), "no stderr excerpt reaches a serialized failure");
+    return true;
+  });
+  await peer.close();
 });
