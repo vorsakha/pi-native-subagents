@@ -136,54 +136,25 @@ export function classifyCodexUnavailability(turnError: unknown, now: number): Pr
 }
 
 /**
- * Bounded, sanitized lifecycle state captured at the moment the app-server
- * process closed with no protocol failure recorded. Every field is a count,
- * boolean, or a capability ID that already passed `normalizeRequirements`
+ * Bounded lifecycle state captured at the moment the app-server process
+ * closed with no protocol failure recorded. Every field is a count, fixed
+ * state, boolean, or a capability ID that already passed `normalizeRequirements`
  * (at most `MAX_REQUIREMENTS` entries of at most `MAX_REQUIREMENT_LENGTH`
  * characters each) — never raw protocol payloads, tool arguments, or
- * credentials. `stderr` is the raw bounded tail already collected for the
- * legacy exit message; it is untrusted, provider-controlled text and is
- * sanitized by `codexExitDiagnostic` itself before ever reaching a caller.
+ * credentials. Provider stderr is omitted because it has no safe schema.
  */
 export interface CodexExitContext {
   code: number | null;
   signal: NodeJS.Signals | null;
-  stderr: string;
   /** Whether `thread/start` had returned a thread ID before the process closed. */
   threadStarted: boolean;
-  /** Whether a `turn/start` had returned a turn ID with no `turn/completed` yet observed for it. */
-  turnInProgress: boolean;
+  /** Whether no turn exists, `turn/start` is pending, or a returned turn has not completed. */
+  turnState: "idle" | "starting" | "inProgress";
   /** Characters of assistant text streamed for the in-progress turn, if any. */
   turnOutputLength: number;
   /** `item/started` notifications observed for the in-progress turn. */
   toolCallCount: number;
   requires?: string[];
-}
-
-/** Final length ceiling for the sanitized stderr excerpt folded into a diagnostic message; far below the internal 16 KB capture window. */
-const STDERR_EXCERPT_LENGTH = 300;
-
-/**
- * Stderr is untrusted, provider-controlled, unbounded-shape text — the same
- * category of data `classifyCodexUnavailability` above refuses to copy
- * verbatim into `detail`. Unlike that path, this diagnostic's whole purpose is
- * to surface operator-useful process output, so instead of excluding it
- * outright this strips raw terminal control/escape sequences, redacts the
- * shapes credentials commonly take (bearer/JWT tokens, `sk-`/`pk-`-style API
- * keys, `org_`/`acct_`-style identifiers, and other long opaque tokens), masks
- * embedded emails via the same helper used for provider error text, and caps
- * the result well below the raw capture window. This is a fixed, allowlisted
- * transform, not a guarantee that every possible secret shape is caught.
- */
-function sanitizeStderrExcerpt(stderr: string): string {
-  const withoutControlChars = stderr.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, " ");
-  const withoutSecrets = withoutControlChars
-    .replace(/bearer\s+[a-z0-9._-]+/gi, "Bearer [redacted]")
-    .replace(/\bey[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+\b/gi, "[redacted-jwt]")
-    .replace(/\b(?:sk|pk|rk)-[a-z0-9_-]{6,}\b/gi, "[redacted-key]")
-    .replace(/\b(?:org|acct|account|user)[_-][a-z0-9]{4,}\b/gi, "[redacted-id]")
-    .replace(/\b[a-z0-9]{24,}\b/gi, "[redacted-token]");
-  return providerUnavailabilityDetail(withoutSecrets, STDERR_EXCERPT_LENGTH);
 }
 
 /**
@@ -203,14 +174,14 @@ function sanitizeStderrExcerpt(stderr: string): string {
  */
 export function codexExitDiagnostic(context: CodexExitContext): string {
   const exit = `Codex app-server exited (${context.code ?? context.signal ?? "signal"})`;
-  const stderrTail = sanitizeStderrExcerpt(context.stderr);
-  const suffix = stderrTail ? `: ${stderrTail}` : "";
-  if (!context.threadStarted) return `${exit} before starting a Codex thread${suffix}`;
-  if (!context.turnInProgress) return `${exit} between turns, with no turn in progress${suffix}`;
+  if (!context.threadStarted) return `${exit} before starting a Codex thread`;
+  if (context.turnState === "idle") return `${exit} between turns, with no turn in progress`;
   const activity = context.toolCallCount > 0 ? `${context.toolCallCount} tool call(s) started` : "no tool calls started";
   const output = context.turnOutputLength > 0 ? "partial assistant output was streaming" : "no assistant output was delivered";
-  const requires = context.requires?.length ? ` (requires: ${context.requires.slice(0, 4).join(", ")})` : "";
-  return `${exit} during an in-progress turn with no terminal result — ${activity}, ${output}${requires}${suffix}`;
+  const boundedRequirements = context.requires?.slice(0, 4).map((requirement) => requirement.slice(0, 160));
+  const requires = boundedRequirements?.length ? ` (requires: ${boundedRequirements.join(", ")})` : "";
+  const stage = context.turnState === "starting" ? "while turn/start was pending" : "during an in-progress turn";
+  return `${exit} ${stage} with no terminal result — ${activity}, ${output}${requires}`;
 }
 
 /**
@@ -412,6 +383,7 @@ export class CodexAppServerBackend implements Backend {
     });
     let threadId = "";
     let turnId = "";
+    let turnState: CodexExitContext["turnState"] = "idle";
     let turnOutput = "";
     /** `item/started` notifications seen for the turn currently in progress; reset at the start of each turn. */
     let turnItemCount = 0;
@@ -419,7 +391,6 @@ export class CodexAppServerBackend implements Backend {
     let settled = false;
     let closing = false;
     let cancellingReason: string | undefined;
-    let stderr = "";
     let protocolFailure: string | undefined;
     let previousTokenTotals: CodexTokenTotals | undefined;
     /** Model identity reported by the runtime; never seeded from configured policy. */
@@ -454,6 +425,7 @@ export class CodexAppServerBackend implements Backend {
     const startTurn = async (text: string): Promise<void> => {
       turnOutput = "";
       turnItemCount = 0;
+      turnState = "starting";
       watchdog.arm();
       emit({ type: "user_message", text });
       const turnResult = asObject(await peer.request("turn/start", {
@@ -467,6 +439,7 @@ export class CodexAppServerBackend implements Backend {
       watchdog.touch();
       turnId = String(asObject(turnResult.turn).id ?? "");
       if (!turnId) throw new Error("Codex turn/start returned no turn id");
+      turnState = "inProgress";
     };
 
     peer = new JsonRpcPeer({
@@ -590,6 +563,7 @@ export class CodexAppServerBackend implements Backend {
           const turn = asObject(params.turn);
           const status = String(turn.status ?? "failed");
           turnId = "";
+          turnState = "idle";
           if (cancellingReason) return;
           if (status === "completed") {
             output = appendTurn(output, turnOutput);
@@ -619,7 +593,6 @@ export class CodexAppServerBackend implements Backend {
     };
     request.signal.addEventListener("abort", abortStartup, { once: true });
 
-    managed.child.stderr.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-16_384); });
     managed.child.on("error", (error) => {
       if (!settled) finish({ type: "failed", error: `Codex app-server failed: ${error.message}` });
     });
@@ -632,9 +605,8 @@ export class CodexAppServerBackend implements Backend {
             : codexExitDiagnostic({
                 code,
                 signal,
-                stderr,
                 threadStarted: Boolean(threadId),
-                turnInProgress: Boolean(turnId),
+                turnState,
                 turnOutputLength: turnOutput.length,
                 toolCallCount: turnItemCount,
                 requires: request.policy.requires,

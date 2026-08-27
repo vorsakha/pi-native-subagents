@@ -23,7 +23,7 @@ function fakeManaged() {
       }
     },
   };
-  return { managed, child, stdin, stdout, get terminated() { return terminated; } };
+  return { managed, child, stdin, stdout, stderr, get terminated() { return terminated; } };
 }
 
 test("JSON-RPC peer correlates chunked numeric and string-ID responses", async () => {
@@ -116,4 +116,31 @@ test("JSON-RPC close and stdin failures reject pending requests with teardown", 
   stdinFake.stdin.emit("error", new Error("EPIPE"));
   await assert.rejects(stdinPending, /stdin failed: EPIPE/);
   assert.equal(stdinFake.terminated, true);
+});
+
+test("JSON-RPC process-exit errors omit arbitrary provider stderr", async () => {
+  const fake = fakeManaged();
+  const peer = new JsonRpcPeer({ process: fake.managed });
+  const pending = peer.request("turn/start", {}, 60_000);
+  const stderr = [
+    "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+    "password=hunter2",
+    "token=punc!#$%^&*()[]{}",
+    "Authorization: Bearer opaque.header.value",
+    "contact=user@example.com",
+    "opaque_id=req_7F3a-91.Zq",
+    "n".repeat(400),
+    "fatal: trailing crash reason",
+  ].join("\n");
+
+  fake.stderr.write(stderr);
+  fake.child.emit("close", 7, null);
+
+  await assert.rejects(pending, (error: Error) => {
+    assert.equal(error.message, "JSON-RPC process exited (7)");
+    const serializedFailure = JSON.stringify({ type: "failed", error: error.message });
+    assert.ok(!stderr.split("\n").some((value) => serializedFailure.includes(value)), "no stderr excerpt reaches a serialized failure");
+    return true;
+  });
+  await peer.close();
 });

@@ -19,7 +19,6 @@ export class JsonRpcPeer {
   readonly #onProtocolError: (error: Error) => void;
   #nextId = 1;
   #closed = false;
-  #stderr = "";
 
   constructor(options: {
     process: ManagedProcess;
@@ -44,9 +43,9 @@ export class JsonRpcPeer {
     this.#process.child.stdout.on("end", () => {
       try { receive(framer.end()); } catch (error) { this.#protocolFailure(error); }
     });
-    this.#process.child.stderr.on("data", (chunk: Buffer) => {
-      this.#stderr = (this.#stderr + chunk.toString()).slice(-16_384);
-    });
+    // Provider stderr has no safe schema and may contain credentials. Drain it
+    // so a noisy child cannot block, but never retain it in transport errors.
+    this.#process.child.stderr.resume();
     this.#process.child.stdin.on("error", (error) => {
       this.#closed = true;
       this.#failPending(new Error(`JSON-RPC stdin failed: ${error.message}`));
@@ -58,7 +57,7 @@ export class JsonRpcPeer {
     });
     this.#process.child.on("close", (code, signal) => {
       this.#closed = true;
-      const error = new Error(`JSON-RPC process exited (${code ?? signal ?? "signal"})${this.#stderr.trim() ? `: ${this.#stderr.trim()}` : ""}`);
+      const error = new Error(`JSON-RPC process exited (${code ?? signal ?? "signal"})`);
       this.#failPending(error);
     });
   }

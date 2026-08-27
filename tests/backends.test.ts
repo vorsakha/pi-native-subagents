@@ -122,6 +122,8 @@ process.stdin.on("data", chunk => {
     }
     else if (value.method === "turn/start") {
       if (process.env.PARAM_FILE) fs.appendFileSync(process.env.PARAM_FILE, JSON.stringify(value.params) + "\\n");
+      if (process.env.STDERR_TEXT) process.stderr.write(process.env.STDERR_TEXT);
+      if (process.env.MODE === "exit-turn-start-pending") process.exit(0);
       const number = ++turns; const id = "turn-" + number;
       reply(value.id, { turn: { id } });
       if (process.env.MODE === "large-item" || process.env.MODE === "oversized") {
@@ -197,7 +199,9 @@ process.stdin.on("data", chunk => {
         for (const delay of [80, 160, 240]) setTimeout(() => process.stdout.write(JSON.stringify({ method: "item/reasoning/summaryTextDelta", params: { delta: "." } }) + "\\n"), delay);
       }
       if (process.env.MODE === "exit-mid-turn") {
-        process.stdout.write(JSON.stringify({ method: "item/started", params: { item: { id: "img-1", type: "toolCall", name: "imagegen" } } }) + "\\n");
+        process.stdout.write(JSON.stringify({ method: "item/started", params: { item: {
+          id: "dynamic-1", type: "dynamicToolCall", tool: "fixture_tool", arguments: { value: "fixture" },
+        } } }) + "\\n");
         setTimeout(() => process.exit(0), 30);
       }
       if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool" && process.env.MODE !== "ask-tool" && process.env.MODE !== "exit-mid-turn") setTimeout(() => {
@@ -1182,7 +1186,7 @@ test("Codex never copies error.message credentials or identifiers into detail, e
 });
 
 test("codexExitDiagnostic distinguishes lifecycle stages instead of always reporting a bare exit code", () => {
-  const base = { code: 0, signal: null, stderr: "", threadStarted: false, turnInProgress: false, turnOutputLength: 0, toolCallCount: 0 };
+  const base = { code: 0, signal: null, threadStarted: false, turnState: "idle" as const, turnOutputLength: 0, toolCallCount: 0 };
 
   assert.equal(codexExitDiagnostic(base), "Codex app-server exited (0) before starting a Codex thread");
 
@@ -1192,17 +1196,22 @@ test("codexExitDiagnostic distinguishes lifecycle stages instead of always repor
   );
 
   assert.equal(
-    codexExitDiagnostic({ ...base, threadStarted: true, turnInProgress: true }),
+    codexExitDiagnostic({ ...base, threadStarted: true, turnState: "starting" }),
+    "Codex app-server exited (0) while turn/start was pending with no terminal result — no tool calls started, no assistant output was delivered",
+  );
+
+  assert.equal(
+    codexExitDiagnostic({ ...base, threadStarted: true, turnState: "inProgress" }),
     "Codex app-server exited (0) during an in-progress turn with no terminal result — no tool calls started, no assistant output was delivered",
   );
 
   assert.equal(
-    codexExitDiagnostic({ ...base, threadStarted: true, turnInProgress: true, toolCallCount: 2, turnOutputLength: 40 }),
+    codexExitDiagnostic({ ...base, threadStarted: true, turnState: "inProgress", toolCallCount: 2, turnOutputLength: 40 }),
     "Codex app-server exited (0) during an in-progress turn with no terminal result — 2 tool call(s) started, partial assistant output was streaming",
   );
 
   const withRequires = codexExitDiagnostic({
-    ...base, threadStarted: true, turnInProgress: true, toolCallCount: 1, requires: ["codex:skill:imagegen"],
+    ...base, threadStarted: true, turnState: "inProgress", toolCallCount: 1, requires: ["codex:skill:imagegen"],
   });
   assert.match(withRequires, /\(requires: codex:skill:imagegen\)$/);
   assert.doesNotMatch(withRequires, /unsupported|not supported|unavailable/i, "the diagnostic never diagnoses the required capability as the cause");
@@ -1211,51 +1220,14 @@ test("codexExitDiagnostic distinguishes lifecycle stages instead of always repor
   assert.match(codexExitDiagnostic({ ...base, code: null, signal: "SIGKILL" }), /^Codex app-server exited \(SIGKILL\)/);
 });
 
-test("codexExitDiagnostic bounds and never widens the exposure of stderr or capability requirements", () => {
-  const base = { code: 1, signal: null, threadStarted: true, turnInProgress: true, turnOutputLength: 0, toolCallCount: 0 };
-
-  const withStderr = codexExitDiagnostic({ ...base, stderr: "  fatal: disk full  \n" });
-  assert.match(withStderr, /: fatal: disk full$/, "stderr is trimmed, not reproduced with its surrounding whitespace");
-
+test("codexExitDiagnostic keeps capability context and the complete diagnostic strictly bounded", () => {
+  const base = { code: 1, signal: null, threadStarted: true, turnState: "inProgress" as const, turnOutputLength: 0, toolCallCount: 0 };
   const manyRequirements = Array.from({ length: 16 }, (_, index) => `codex:skill:tool-${index}`);
-  const withManyRequirements = codexExitDiagnostic({ ...base, stderr: "", requires: manyRequirements });
+  const withManyRequirements = codexExitDiagnostic({ ...base, requires: manyRequirements });
   const requiresSegment = withManyRequirements.match(/\(requires: (.*)\)$/)?.[1] ?? "";
   assert.equal(requiresSegment.split(", ").length, 4, "at most the first few capability requirements are echoed back, never the full bounded list");
-});
-
-test("codexExitDiagnostic redacts credential-shaped stderr, strips control characters, and stays within a strict bound", () => {
-  const base = { code: 1, signal: null, threadStarted: true, turnInProgress: true, turnOutputLength: 0, toolCallCount: 0 };
-
-  const secretStderr = [
-    "fatal: auth failed",
-    "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
-    "api key sk-proj-aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV",
-    "org-4f9a8b7c6d5e acct_9z8y7x6w5v",
-    "contact user@example.com for help",
-    "session token 4f9a8b7c6d5e3210deadbeefcafebabe1234567890",
-  ].join("\n");
-  const diagnostic = codexExitDiagnostic({ ...base, stderr: secretStderr });
-
-  assert.doesNotMatch(diagnostic, /eyJhbGciOiJIUzI1NiJ9/, "JWT-shaped tokens must never survive sanitization");
-  assert.doesNotMatch(diagnostic, /sk-proj-/, "API keys must never survive sanitization");
-  assert.doesNotMatch(diagnostic, /org-4f9a8b7c6d5e/, "organization ids must never survive sanitization");
-  assert.doesNotMatch(diagnostic, /acct_9z8y7x6w5v/, "account ids must never survive sanitization");
-  assert.doesNotMatch(diagnostic, /Bearer\s+ey/i, "bearer token values must never survive sanitization");
-  assert.doesNotMatch(diagnostic, /user@example\.com/, "emails must never survive sanitization unmasked");
-  assert.doesNotMatch(diagnostic, /4f9a8b7c6d5e3210deadbeefcafebabe1234567890/, "long opaque tokens must never survive sanitization");
-  assert.match(diagnostic, /fatal: auth failed/, "non-secret diagnostic text is preserved");
-
-  const controlCharStderr = "line one\x00\x01\x1b[31mred\x1b[0m\x07bell\x7fdel line two";
-  const withControlChars = codexExitDiagnostic({ ...base, stderr: controlCharStderr });
-  for (let code = 0; code <= 0x1f; code++) {
-    if (code === 0x09 || code === 0x0a || code === 0x0d) continue; // legitimate, already-handled whitespace
-    assert.ok(!withControlChars.includes(String.fromCharCode(code)), `control byte 0x${code.toString(16)} must never survive sanitization`);
-  }
-  assert.ok(!withControlChars.includes("\x7f"), "DEL must never survive sanitization");
-
-  const hugeStderr = `${"secret-looking-but-not-".repeat(50)}${"x".repeat(20_000)}`;
-  const withHugeStderr = codexExitDiagnostic({ ...base, stderr: hugeStderr });
-  assert.ok(withHugeStderr.length < 500, `the whole diagnostic stays tightly bounded regardless of stderr size (got ${withHugeStderr.length} chars)`);
+  const withLongRequirements = codexExitDiagnostic({ ...base, requires: Array(16).fill("x".repeat(10_000)) });
+  assert.ok(withLongRequirements.length < 900, `defense-in-depth bounds the complete diagnostic (got ${withLongRequirements.length} chars)`);
 });
 
 test("Pi reports the concrete responseModel over the requested alias and totalTokens as occupancy", async () => {
@@ -1385,11 +1357,25 @@ test("Codex startup timeout and early exit both settle clearly", async (t) => {
   }
 });
 
-test("Codex reports actionable in-progress-turn context, not a bare exit code, when the app-server exits cleanly mid-turn with no assistant result (issue #22)", async () => {
+test("Codex reports bounded active-turn context after generic tool activity without claiming a required capability ran (issue #22)", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  const stderrSecrets = [
+    "AWS_ACCESS_KEY_ID=AKIAIOSFODNN7EXAMPLE",
+    "password=hunter2",
+    "token=punc!#$%^&*()[]{}",
+    "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+    "contact=user@example.com",
+    "opaque_id=req_7F3a-91.Zq",
+    "n".repeat(400),
+    "fatal: trailing crash reason",
+  ];
   try {
-    const codexRequest = request("codex", fake.dir, { ...process.env, MODE: "exit-mid-turn" });
+    const codexRequest = request("codex", fake.dir, {
+      ...process.env,
+      MODE: "exit-mid-turn",
+      STDERR_TEXT: stderrSecrets.join("\n"),
+    });
     codexRequest.policy.requires = ["codex:skill:imagegen"];
     const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 5_000 })
       .start(codexRequest, (event) => events.push(event));
@@ -1401,12 +1387,43 @@ test("Codex reports actionable in-progress-turn context, not a bare exit code, w
     assert.match(event.error, /Codex app-server exited \(0\) during an in-progress turn with no terminal result/);
     assert.match(event.error, /1 tool call\(s\) started/);
     assert.match(event.error, /no assistant output was delivered/);
-    // Bounded context only, never a claim that the required capability caused the failure.
+    // The requirement is dispatch context only. The fixture emitted a
+    // protocol-realistic generic dynamicToolCall, not a native imagegen call.
     assert.match(event.error, /requires: codex:skill:imagegen/);
     assert.doesNotMatch(event.error, /unsupported|not supported|does not support/i);
     const toolStart = events.find((item): item is Extract<BackendEvent, { type: "tool_start" }> => item.type === "tool_start");
-    assert.equal(toolStart?.name, "imagegen");
+    assert.equal(toolStart?.name, "fixture_tool");
     assert.ok(!events.some((item) => item.type === "completed"), "a clean mid-turn exit must never be reported as completed");
+
+    const serializedEvents = JSON.stringify(events);
+    for (const stderrValue of stderrSecrets) {
+      assert.ok(!serializedEvents.includes(stderrValue), `provider stderr must be omitted from terminal-event serialization: ${stderrValue.slice(0, 40)}`);
+    }
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex settles a close during pending turn/start once with pending-request context", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const turnParamFile = join(fake.dir, "turn-params.jsonl");
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 5_000 })
+      .start(request("codex", fake.dir, {
+        ...process.env,
+        MODE: "exit-turn-start-pending",
+        PARAM_FILE: turnParamFile,
+      }), (event) => events.push(event));
+    await run.completed;
+    await delay(20);
+
+    assert.match(await readFile(turnParamFile, "utf8"), /fixture task/, "the fixture received turn/start before exiting without a reply");
+    const terminalEvents = events.filter((event) => event.type === "completed" || event.type === "failed" || event.type === "cancelled");
+    assert.deepEqual(terminalEvents, [{
+      type: "failed",
+      error: "Codex app-server exited (0) while turn/start was pending with no terminal result — no tool calls started, no assistant output was delivered",
+    }]);
+    assert.doesNotMatch(JSON.stringify(events), /JSON-RPC process exited/, "the rejected turn/start catch cannot override close settlement");
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
