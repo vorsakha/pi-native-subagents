@@ -124,6 +124,7 @@ export function classifyCodexUnavailability(turnError: unknown, now: number): Pr
     kind: "quota",
     retryAt,
     authoritative: retryAt !== undefined,
+    preInference: true,
     // No verified schema constrains `error.window` or `error.message` (see the
     // alias comment above); unlike Claude's typed `rateLimitType` enum, they are
     // unbounded, provider-controlled text that could carry API keys, bearer

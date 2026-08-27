@@ -1053,12 +1053,63 @@ test("Claude classifies an authoritative rate_limit rejection into structured un
   assert.equal(failed.unavailable?.provider, "claude");
   assert.equal(failed.unavailable?.kind, "quota");
   assert.equal(failed.unavailable?.authoritative, true);
+  assert.equal(failed.unavailable?.preInference, true);
   assert.equal(failed.unavailable?.scope, "five_hour");
   assert.ok(failed.unavailable!.retryAt! > Date.now());
   assert.ok(!failed.unavailable?.detail.includes("@"), "detail must never include a raw email address");
   assert.equal(events.some((event) => event.type === "message"), false, "Claude quota boilerplate is refusal metadata, not model output");
   assert.equal(events.some((event) => event.type === "thinking_message"), false);
   assert.equal(events.some((event) => event.type === "tool_start"), false);
+  await run.close();
+});
+
+test("Claude accounts terminal quota-frame usage before failure and withholds pre-inference proof", async () => {
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield {
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: Math.floor((Date.now() + 5 * 60_000) / 1000), rateLimitType: "five_hour" },
+    };
+    yield {
+      type: "assistant",
+      parent_tool_use_id: null,
+      message: {
+        content: [{ type: "text", text: "You've hit your session limit · resets 12pm (America/Sao_Paulo)" }],
+        usage: {
+          input_tokens: 7,
+          output_tokens: 2,
+          cache_read_input_tokens: 3,
+          cache_creation_input_tokens: 1,
+        },
+      },
+      error: "rate_limit",
+    };
+    yield {
+      type: "result",
+      subtype: "error_during_execution",
+      errors: ["quota"],
+      usage: { input_tokens: 7, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 1 },
+      total_cost_usd: 0,
+      num_turns: 0,
+      modelUsage: {},
+    };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: (() => stream) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
+  await run.completed;
+
+  assert.deepEqual(events.filter((event) => event.type === "usage"), [{
+    type: "usage",
+    usage: { input: 7, output: 2, cacheRead: 3, cacheWrite: 1, cost: 0, turns: 0 },
+  }]);
+  const failed = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+  assert.equal(failed.unavailable?.preInference, undefined);
+  assert.ok(events.findIndex((event) => event.type === "usage") < events.findIndex((event) => event.type === "failed"));
   await run.close();
 });
 
@@ -1095,7 +1146,9 @@ test("Claude preserves mixed content on an authoritative rate_limit rejection", 
   assert.ok(events.some((event) => event.type === "message" && event.text.includes("Please save your work.")));
   assert.ok(events.some((event) => event.type === "thinking_message" && event.text === "the refusal followed model activity"));
   assert.ok(events.some((event) => event.type === "tool_start" && event.id === "write-1"));
-  assert.equal(terminal(events)?.type, "failed");
+  const failed = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+  assert.equal(failed.type, "failed");
+  assert.equal(failed.unavailable?.preInference, undefined, "mixed model or tool content disproves a pre-inference refusal");
   await run.close();
 });
 
@@ -1145,6 +1198,7 @@ test("Codex classifies a structured usage-limit error only when a plausible rese
   assert.ok(withReset);
   assert.equal(withReset?.provider, "codex");
   assert.equal(withReset?.authoritative, true);
+  assert.equal(withReset?.preInference, true);
   assert.equal(withReset?.scope, undefined, "Codex's error.window has no verified schema and must never reach scope");
   assert.ok(!withReset?.detail.includes("@"));
 

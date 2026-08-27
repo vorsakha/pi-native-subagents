@@ -60,6 +60,9 @@ export function detailSignature(run: WorkflowSnapshot, phase: WorkflowPhase | un
     agent?.replacedBy,
     agent?.truncated,
     agent?.generations,
+    agent?.attempts,
+    agent?.providerFallback,
+    agent?.providerWait,
   ];
   return pieces.map((piece) => boundedHeadTailText(serializeResult(piece), 4_096, "signature")).join("|");
 }

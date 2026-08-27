@@ -1176,6 +1176,23 @@ export class WorkflowsDashboardOverlay implements Focusable {
       const retryLabel = remaining < 60_000 ? `${Math.max(1, Math.round(remaining / 1_000))}s` : `${Math.round(remaining / 60_000)}m`;
       metadata.push(this.theme.fg("warning", `Provider wait · ${sanitizeInline(wait.provider)} ${sanitizeInline(wait.kind)} · retry in ${retryLabel} · attempt ${wait.attempt}/${wait.maxAttempts}${wait.scope ? ` · ${sanitizeInline(wait.scope)}` : ""}`));
     }
+    if (agent.providerFallback) {
+      const fallbackAttempt = agent.attempts?.find((attempt) => attempt.disposition === "fallback");
+      const target = `${sanitizeInline(agent.providerFallback.harness)}/${boundedInline(agent.providerFallback.model ?? "native default", 256)}`;
+      metadata.push(this.theme.fg(fallbackAttempt ? "warning" : "dim", `Provider fallback · ${fallbackAttempt ? "used" : "unused"} · declared ${target}`));
+      if (fallbackAttempt?.trigger) {
+        const trigger = fallbackAttempt.trigger;
+        metadata.push(this.theme.fg("warning", `Fallback trigger · ${trigger.source} · ${trigger.provider} ${trigger.status ?? trigger.kind ?? "unavailable"} · ${boundedInline(trigger.detail, 500)}`));
+      }
+    }
+    if (agent.attempts?.length) {
+      for (const attempt of agent.attempts.slice(-4)) {
+        const route = `${sanitizeInline(attempt.requestedHarness ?? attempt.harness ?? "?")}/${boundedInline(attempt.model ?? "native default", 256)}`;
+        metadata.push(this.theme.fg("dim", `Attempt ${(attempt.index ?? 0) + 1} · ${route} · ${attempt.disposition ?? "terminal"}${attempt.error ? ` · ${boundedInline(attempt.error, 500)}` : ""}`));
+      }
+      const finalRoute = `${sanitizeInline(agent.requestedHarness ?? agent.harness ?? "?")}/${boundedInline(agent.model ?? "native default", 256)}`;
+      metadata.push(this.theme.fg("dim", `Final route · ${finalRoute}`));
+    }
     const agentInteraction = workflowAgentInteraction(agent, this.#now());
     if (agentInteraction) {
       metadata.push(this.theme.fg("warning", `Question · ${boundedInline(agentInteraction, 2_000)}`));

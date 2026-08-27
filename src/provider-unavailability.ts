@@ -18,6 +18,8 @@ export interface ProviderUnavailability {
   retryAt?: number;
   /** True only when `retryAt` came from a structured provider field within sane bounds. */
   authoritative: boolean;
+  /** True only when the native backend's structured rejection proves inference did not begin. */
+  preInference?: true;
   /** Bounded provider-supplied window label. Never plan/account data. */
   scope?: string;
   /** Bounded, email-masked reason for display. */

@@ -340,9 +340,19 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
       transcript: undefined,
       error: agent.error ? truncateUtf8(agent.error, 2_000) : undefined,
       providerWait: agent.providerWait ? { ...agent.providerWait, detail: truncateUtf8(agent.providerWait.detail, 500) } : undefined,
+      providerFallback: agent.providerFallback ? {
+        harness: agent.providerFallback.harness,
+        model: agent.providerFallback.model ? truncateUtf8(agent.providerFallback.model, 256) : undefined,
+      } : undefined,
       attempts: agent.attempts?.slice(-4).map((attempt) => ({
         ...attempt,
+        model: attempt.model ? truncateUtf8(attempt.model, 256) : undefined,
         error: attempt.error ? truncateUtf8(attempt.error, 2_000) : undefined,
+        trigger: attempt.trigger ? {
+          ...attempt.trigger,
+          scope: attempt.trigger.scope ? truncateUtf8(attempt.trigger.scope, 300) : undefined,
+          detail: truncateUtf8(attempt.trigger.detail, 500),
+        } : undefined,
       })),
       generations: agent.generations?.slice(-8).map((generation) => ({
         ...generation,
@@ -397,6 +407,51 @@ function isAvailabilityEvidence(value: unknown): boolean {
       || typeof evidence.executableVersion === "string" && !!evidence.executableVersion && evidence.executableVersion.length <= 120);
 }
 
+function isProviderFallback(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const fallback = value as Record<string, unknown>;
+  return Object.keys(fallback).every((key) => key === "harness" || key === "model")
+    && (fallback.harness === "claude" || fallback.harness === "codex")
+    && (fallback.model === undefined || typeof fallback.model === "string" && !!fallback.model && fallback.model.length <= 256);
+}
+
+function isWorkflowUsage(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const usage = value as Record<string, unknown>;
+  return ["input", "output", "cacheRead", "cacheWrite", "cost", "turns"]
+    .every((key) => typeof usage[key] === "number" && Number.isFinite(usage[key]) && usage[key]! >= 0);
+}
+
+function isFallbackTrigger(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const trigger = value as Record<string, unknown>;
+  return (trigger.source === "readiness" || trigger.source === "provider")
+    && (trigger.provider === "claude" || trigger.provider === "codex")
+    && (trigger.status === undefined || ["missing", "unauthenticated", "incompatible"].includes(String(trigger.status)))
+    && (trigger.kind === undefined || trigger.kind === "quota")
+    && (trigger.retryAt === undefined || typeof trigger.retryAt === "number" && Number.isFinite(trigger.retryAt))
+    && (trigger.scope === undefined || typeof trigger.scope === "string" && trigger.scope.length <= 300)
+    && typeof trigger.detail === "string" && trigger.detail.length <= 500;
+}
+
+function isWorkflowAttempt(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const attempt = value as Record<string, unknown>;
+  return (attempt.index === undefined || Number.isSafeInteger(attempt.index) && (attempt.index as number) >= 0 && (attempt.index as number) < 8)
+    && (attempt.jobId === undefined || typeof attempt.jobId === "string" && !!attempt.jobId && attempt.jobId.length <= 200)
+    && (attempt.harness === undefined || ["pi", "claude", "codex"].includes(String(attempt.harness)))
+    && (attempt.requestedHarness === undefined || ["pi", "claude", "codex", "auto"].includes(String(attempt.requestedHarness)))
+    && (attempt.availability === undefined || ["ready", "missing", "unauthenticated", "incompatible", "unhealthy", "unknown"].includes(String(attempt.availability)))
+    && (attempt.executableVersion === undefined || typeof attempt.executableVersion === "string" && attempt.executableVersion.length <= 120)
+    && (attempt.capabilityRevision === undefined || typeof attempt.capabilityRevision === "string" && attempt.capabilityRevision.length <= 200)
+    && (attempt.model === undefined || typeof attempt.model === "string" && attempt.model.length <= 256)
+    && (attempt.error === undefined || typeof attempt.error === "string" && attempt.error.length <= 2_000)
+    && isWorkflowUsage(attempt.usage)
+    && (attempt.endedAt === undefined || typeof attempt.endedAt === "number" && Number.isFinite(attempt.endedAt))
+    && (attempt.disposition === undefined || attempt.disposition === "wait" || attempt.disposition === "fallback")
+    && (attempt.trigger === undefined || isFallbackTrigger(attempt.trigger));
+}
+
 function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord {
   if (!value || typeof value !== "object") return false;
   const record = value as Partial<WorkflowJournalRecord>;
@@ -438,6 +493,11 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || record.route.model !== undefined && (typeof record.route.model !== "string" || record.route.model.length > 256)
       || record.route.status !== undefined && !["queued", "running", "completed", "failed", "cancelled", "aborted"].includes(record.route.status)
       || record.route.error !== undefined && (typeof record.route.error !== "string" || record.route.error.length > 2_000))) return false;
+  if (record.route !== undefined && (
+      record.route.providerFallback !== undefined && !isProviderFallback(record.route.providerFallback)
+      || record.route.attempts !== undefined && (!Array.isArray(record.route.attempts)
+        || record.route.attempts.length > 4
+        || record.route.attempts.some((attempt) => !isWorkflowAttempt(attempt))))) return false;
   if (record.replacementOf !== undefined && (record.replacementOf === null || typeof record.replacementOf !== "object"
       || typeof record.replacementOf.sourceRunId !== "string" || !RUN_ID_PATTERN.test(record.replacementOf.sourceRunId)
       || !Number.isSafeInteger(record.replacementOf.sourceAgentIndex) || record.replacementOf.sourceAgentIndex < 0 || record.replacementOf.sourceAgentIndex >= 32
