@@ -50,8 +50,8 @@ export function isRequestedHarness(value: unknown): value is RequestedHarness {
 }
 
 /**
- * Resolve and live-revalidate a capability route before dispatch. Requests
- * Every selected route is revalidated when an availability probe is configured.
+ * Resolve and live-revalidate a capability route before dispatch. Every
+ * selected route is revalidated when an availability probe is configured.
  * `harness: "auto"` may omit `requires` when the caller wants readiness-based
  * provider selection.
  */
