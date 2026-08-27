@@ -50,6 +50,34 @@ test("JSON-RPC peer correlates chunked numeric and string-ID responses", async (
   await stringIdPeer.close();
 });
 
+test("JSON-RPC settles a response before a following notification from the same stdout chunk", async () => {
+  const fake = fakeManaged();
+  let requestSettled = false;
+  let notificationObserved = false;
+  const peer = new JsonRpcPeer({
+    process: fake.managed,
+    onNotification() {
+      assert.equal(requestSettled, true, "the response continuation runs before the next wire-ordered record");
+      notificationObserved = true;
+    },
+  });
+  fake.stdin.on("data", (chunk) => {
+    const request = JSON.parse(chunk.toString());
+    queueMicrotask(() => {
+      fake.stdout.write([
+        JSON.stringify({ id: request.id, result: { turn: { id: "turn-1" } } }),
+        JSON.stringify({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } }),
+        "",
+      ].join("\n"));
+    });
+  });
+
+  await peer.request("turn/start").then(() => { requestSettled = true; });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(notificationObserved, true);
+  await peer.close();
+});
+
 test("JSON-RPC awaits handlers and fails closed for approval requests", async () => {
   const fake = fakeManaged();
   const writes: Record<string, unknown>[] = [];

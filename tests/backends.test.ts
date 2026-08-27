@@ -7,7 +7,7 @@ import { ClaudeBackend, CLAUDE_SUBAGENT_ASK_TOOL, forbiddenInitTools } from "../
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
 import { CodexAppServerBackend, classifyCodexUnavailability, codexExitDiagnostic } from "../src/backends/codex.ts";
 import { MAX_OUTPUT_BYTES } from "../src/reducer.ts";
-import type { BackendEvent, HarnessName, BackendRequest } from "../src/types.ts";
+import type { BackendEvent, BackendRun, HarnessName, BackendRequest } from "../src/types.ts";
 import {
   SUBAGENT_ASK_TOOL_NAME,
   type InteractionAskInput,
@@ -255,10 +255,11 @@ function contextEvents(events: BackendEvent[]): Array<Extract<BackendEvent, { ty
 test("Codex usage separates cached input and never substitutes the configured model for an unreported serving model", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
     const codexRequest = request("codex", fake.dir, { ...process.env, MODE: "usage" });
     assert.equal(codexRequest.policy.model, "fixture-model");
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
       .start(codexRequest, (event) => events.push(event));
     await run.completed;
     const usage = events.filter((event): event is Extract<BackendEvent, { type: "usage" }> => event.type === "usage")
@@ -270,15 +271,18 @@ test("Codex usage separates cached input and never substitutes the configured mo
     assert.deepEqual(usage, { input: 2_541, output: 106, cacheRead: 102_144 });
     assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 104_791, window: 258_400 });
     assert.equal(codexRequest.policy.model, "fixture-model", "the configured job model is never rewritten");
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex leaves the effective serving model unknown when thread/start reports a model but no reroute ever arrives", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
       .start(request("codex", fake.dir, { ...process.env, MODE: "usage", THREAD_MODEL: "gpt-5.6-codex" }), (event) => events.push(event));
     await run.completed;
     assert.deepEqual(
@@ -286,41 +290,50 @@ test("Codex leaves the effective serving model unknown when thread/start reports
       { tokens: 104_791, window: 258_400 },
       "thread/start's model field is configured/resolved routing state, not authoritative serving telemetry, and must never populate servingModel",
     );
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex context occupancy uses the latest-turn gauge, never thread-cumulative totals, and stays unknown without a last reading", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
       .start(request("codex", fake.dir, { ...process.env, MODE: "latest-turn" }), (event) => events.push(event));
     await run.completed;
     const contexts = contextEvents(events);
     assert.deepEqual(contexts[0]?.context, { tokens: 12_345, window: 200_000 }, "occupancy reads the latest-turn gauge, not the thread-cumulative total");
     assert.deepEqual(contexts[1]?.context, { window: 200_000 }, "tokens stay unknown, not zero, when a reading omits the latest-turn gauge");
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex model/rerouted updates the effective serving model and preserves the last occupancy reading", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
       .start(request("codex", fake.dir, { ...process.env, MODE: "reroute", THREAD_MODEL: "gpt-5.6-codex" }), (event) => events.push(event));
     await run.completed;
     assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 1_010, window: 200_000, servingModel: "gpt-5.6-codex-mini" });
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex clears its private occupancy cache at a retained follow-up's generation boundary instead of re-emitting the prior generation's gauge", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 2_000 })
       .start(request("codex", fake.dir, { ...process.env, MODE: "retained-generation" }), (event) => events.push(event));
     await run.completed;
     assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 1_010, window: 200_000 }, "generation one's own telemetry reports occupancy");
@@ -334,20 +347,25 @@ test("Codex clears its private occupancy cache at a retained follow-up's generat
       { servingModel: "gen-2-model" },
       "the retained generation's own turn only reports a reroute, never a fresh occupancy reading; the prior generation's lastOccupancy cache must not be re-emitted alongside it",
     );
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex ignores thread-scoped telemetry whose threadId or turnId does not match the current turn", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
   try {
-    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000 })
       .start(request("codex", fake.dir, { ...process.env, MODE: "stale-scope" }), (event) => events.push(event));
     await run.completed;
     assert.deepEqual(contextEvents(events).at(-1)?.context, { tokens: 4_242, window: 100_000 }, "only telemetry scoped to this job's current threadId/turnId is accepted");
-    await run.close();
-  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex normalizes a valid 1.1 MB tool-result notification with no pending request instead of masquerading as an app-server exit", async () => {
