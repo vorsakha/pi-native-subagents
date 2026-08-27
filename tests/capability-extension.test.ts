@@ -2,11 +2,11 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
 import type { Backend } from "../src/types.ts";
-import { DiscoverableBackend, context, fakePi } from "./helpers.ts";
+import { DiscoverableBackend, context, fakePi, readyProviderStatusReader } from "./helpers.ts";
 
 function setup(backends: Backend[], legacyRoot: string | false = false) {
   const pi = fakePi();
-  registerNativeSubagents(pi.api, { registry: {}, legacyRoot, backends });
+  registerNativeSubagents(pi.api, { registry: {}, legacyRoot, backends, providerStatus: readyProviderStatusReader() });
   const { ctx } = context();
   pi.handlers.get("session_start")?.({}, ctx);
   return { pi, ctx };

@@ -158,3 +158,67 @@ test("peer-question journals require lineage provenance from started through set
     await f.cleanup();
   }
 });
+
+test("route evidence additively records requested harness and normalized availability, and rejects an invalid state", async () => {
+  const f = await fixture();
+  const fingerprint = workflowCallFingerprint("resolve", { access: "readOnly" });
+  try {
+    await appendWorkflowJournal(f.root, f.created.runId, {
+      version: 1, sequence: 0, callIndex: 0, fingerprint, state: "started", at: 1,
+    });
+    // A resolved route carries the requested harness and observed availability
+    // alongside the resolved harness, so replay can explain the decision.
+    await appendWorkflowJournal(f.root, f.created.runId, {
+      version: 1, sequence: 1, callIndex: 0, fingerprint, state: "completed", at: 2, agentIndex: 0,
+      result: { ok: true, output: "done", jobId: "job-1", usage },
+      route: {
+        jobId: "job-1",
+        requestedHarness: "auto",
+        harness: "claude",
+        availability: "ready",
+        executableVersion: "1.2.3",
+        capabilityRevision: "sha256:fixture",
+        availabilityChecks: [
+          { harness: "claude", status: "ready", executableVersion: "1.2.3" },
+          { harness: "codex", status: "unauthenticated" },
+        ],
+        model: "review-model",
+      },
+    });
+
+    const records = await loadWorkflowJournal(f.root, f.created.runId);
+    assert.equal(records.length, 2);
+    assert.deepEqual(replayableJournalCalls(records)[0]!.route, {
+      jobId: "job-1",
+      requestedHarness: "auto",
+      harness: "claude",
+      availability: "ready",
+      executableVersion: "1.2.3",
+      capabilityRevision: "sha256:fixture",
+      availabilityChecks: [
+        { harness: "claude", status: "ready", executableVersion: "1.2.3" },
+        { harness: "codex", status: "unauthenticated" },
+      ],
+      model: "review-model",
+    });
+
+    // A legacy route without the additive fields is still accepted unchanged.
+    await appendWorkflowJournal(f.root, f.created.runId, {
+      version: 1, sequence: 2, callIndex: 1, fingerprint: workflowCallFingerprint("legacy", {}), state: "completed", at: 3, agentIndex: 1,
+      result: { ok: true, output: "legacy", jobId: "job-2", usage },
+      route: { jobId: "job-2", harness: "codex" },
+    });
+
+    // An out-of-range availability value is rejected before it can corrupt the journal.
+    await assert.rejects(
+      appendWorkflowJournal(f.root, f.created.runId, {
+        version: 1, sequence: 3, callIndex: 2, fingerprint: workflowCallFingerprint("bad", {}), state: "completed", at: 4, agentIndex: 2,
+        result: { ok: true, output: "bad", jobId: "job-3", usage },
+        route: { jobId: "job-3", harness: "claude", availability: "definitely-not-a-state" as never },
+      }),
+      /Invalid workflow journal record/,
+    );
+  } finally {
+    await f.cleanup();
+  }
+});

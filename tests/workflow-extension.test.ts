@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { Check } from "typebox/value";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
 import type { Backend } from "../src/types.ts";
-import { ControlledBackend, HoldingBackend, ImmediateBackend, context, fakePi, tempDir, theme, waitFor } from "./helpers.ts";
+import { ControlledBackend, HoldingBackend, ImmediateBackend, context, fakePi, readyProviderStatusReader, tempDir, theme, waitFor } from "./helpers.ts";
 
 /** Workflow agents echo `<name>:<task>` and report usage so cards have content to render. */
 const WORKFLOW_BACKENDS = ["pi", "claude", "codex"] as const;
@@ -28,6 +28,7 @@ async function setup(options: {
   registerNativeSubagents(pi.api, {
     registry: {}, legacyRoot: false, backends, workflowArtifactRoot: root, globalProfilesDir, savedWorkflowRoot,
     setInterval: options.setInterval, clearInterval: options.clearInterval,
+    providerStatus: readyProviderStatusReader(),
   });
   return { root, savedWorkflowRoot, pi };
 }

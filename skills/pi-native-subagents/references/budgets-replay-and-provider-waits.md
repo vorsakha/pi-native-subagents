@@ -27,6 +27,7 @@ Pi and Claude report token, turn, and cost metrics. Codex reports tokens and tur
 
 - Keep source, input, project, and routing context identical; only increase replay budgets when the runtime permits it.
 - A terminal retained source can be looked up by run ID across Pi sessions; the source summary and journal are read under the retention lock before replay starts.
+- New journal records add route evidence when available: the requested and resolved harness, normalized availability checks for auto candidates, executable version, selected model, and capability-catalog fingerprint. Older journals omit these fields and still load. A matched completed call reuses its recorded result and evidence; only an explicit replay invalidation or mismatch causes a fresh dispatch that may resolve `harness: "auto"` again.
 - `retry` is not part of the replay definition fingerprint, so changing it does not invalidate a prior run for `resumeFromRunId`.
 
 ## Opt-in provider waits

@@ -41,7 +41,7 @@ Usage rules:
 
 - Use `access: "readOnly"` for inspection, review, and planning. Request `full` only when mutation is required and the project is trusted. Read-only children are sandboxed by construction, not by instruction.
 - Omit `model` unless a concrete harness-local override is needed. A model name is not a cross-harness tier, and `harness: "auto"` rejects harness-local model overrides.
-- `harness: "auto"` is **initial route selection, not post-inference failover.** It picks a harness before dispatch by live-checking native capability, model, and auth readiness, and an explicit harness stays fail-closed. Once a job starts, nothing reroutes it to another provider — not a failure, and not a provider-quota wait.
+- `harness: "auto"` is **initial route selection, not post-inference failover.** Before dispatch it considers only *active* harnesses — installed, enabled, and currently ready — and live-checks native capability and model readiness among them; a harness that is missing, unauthenticated, incompatible, unhealthy, or of unknown readiness is excluded. An explicit harness is instead revalidated and stays fail-closed: if it is not ready, the call fails with a specific reason such as "not logged in" and never silently reroutes. Availability discovery is read-only — it never installs, logs in, or changes configuration. Once a job starts, nothing reroutes it to another provider — not a failure, and not a provider-quota wait.
 - Use `requires` only with IDs returned by `subagent_capabilities`; pair it with `harness: "auto"` when any capable harness is acceptable.
 - Use `independent: true` only when the child must use a different native provider from the parent. A different model on the same provider is not independent.
 - Use `independentOf: "<producer-job-id>"` when a reviewer must differ from the provider that produced the reviewed work. The target must be an existing job.
@@ -170,7 +170,7 @@ These are enforced by the runtime. Do not design around them.
 - `Budget maxCost is unsupported`: remove the cost boundary or select Pi/Claude. Do not treat Codex's absent cost metric as zero.
 - `independent` rejected for the same provider: independence means provider diversity, not model escalation. Omit it for same-provider escalation, or route to the opposite provider.
 - Requirement rejected: rediscover capabilities with `subagent_capabilities`, use the returned ID, and keep the access ceiling consistent.
-- A harness rejected for login or readiness: check `/subagents providers` to see which provider is authenticated and ready before retrying, and switch routes rather than guessing at the account state.
+- A harness rejected for login or readiness: the error names the normalized state (missing executable, login required, incompatible, temporarily unhealthy, or status unknown). Check `/subagents providers` for the active set and each harness's actionable reason, then switch routes or use `harness: "auto"` rather than guessing at the account state. The extension never logs in or installs a CLI for you.
 - A workflow or child fails: inspect the returned `ok`, `error`, route, and job ID; use `/workflows` for durable workflow state. Do not hide a failed route behind a success-only summary.
 - A provider-quota, replay, worktree, or routed-question error: the matching reference above lists the exact message and its recovery.
 
