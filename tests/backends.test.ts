@@ -5,7 +5,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ClaudeBackend, CLAUDE_SUBAGENT_ASK_TOOL, forbiddenInitTools } from "../src/backends/claude.ts";
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
-import { CodexAppServerBackend, classifyCodexUnavailability } from "../src/backends/codex.ts";
+import { CodexAppServerBackend, classifyCodexUnavailability, codexExitDiagnostic } from "../src/backends/codex.ts";
 import { MAX_OUTPUT_BYTES } from "../src/reducer.ts";
 import type { BackendEvent, HarnessName, BackendRequest } from "../src/types.ts";
 import {
@@ -196,7 +196,11 @@ process.stdin.on("data", chunk => {
       if (process.env.MODE === "activity") {
         for (const delay of [80, 160, 240]) setTimeout(() => process.stdout.write(JSON.stringify({ method: "item/reasoning/summaryTextDelta", params: { delta: "." } }) + "\\n"), delay);
       }
-      if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool" && process.env.MODE !== "ask-tool") setTimeout(() => {
+      if (process.env.MODE === "exit-mid-turn") {
+        process.stdout.write(JSON.stringify({ method: "item/started", params: { item: { id: "img-1", type: "toolCall", name: "imagegen" } } }) + "\\n");
+        setTimeout(() => process.exit(0), 30);
+      }
+      if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool" && process.env.MODE !== "ask-tool" && process.env.MODE !== "exit-mid-turn") setTimeout(() => {
         if (process.env.MODE === "tool-events") {
           process.stdout.write(JSON.stringify({ method: "item/started", params: { item: { id: "command-1", type: "commandExecution", command: "pwd" } } }) + "\\n");
           process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { id: "command-1", type: "commandExecution", command: "pwd", aggregatedOutput: "/tmp", status: "completed" } } }) + "\\n");
@@ -1177,6 +1181,83 @@ test("Codex never copies error.message credentials or identifiers into detail, e
   assert.ok(!usageLimitExceeded?.detail.includes("sk-live-"), "the other allowlisted exhaustion code must also strip raw error.message");
 });
 
+test("codexExitDiagnostic distinguishes lifecycle stages instead of always reporting a bare exit code", () => {
+  const base = { code: 0, signal: null, stderr: "", threadStarted: false, turnInProgress: false, turnOutputLength: 0, toolCallCount: 0 };
+
+  assert.equal(codexExitDiagnostic(base), "Codex app-server exited (0) before starting a Codex thread");
+
+  assert.equal(
+    codexExitDiagnostic({ ...base, threadStarted: true }),
+    "Codex app-server exited (0) between turns, with no turn in progress",
+  );
+
+  assert.equal(
+    codexExitDiagnostic({ ...base, threadStarted: true, turnInProgress: true }),
+    "Codex app-server exited (0) during an in-progress turn with no terminal result — no tool calls started, no assistant output was delivered",
+  );
+
+  assert.equal(
+    codexExitDiagnostic({ ...base, threadStarted: true, turnInProgress: true, toolCallCount: 2, turnOutputLength: 40 }),
+    "Codex app-server exited (0) during an in-progress turn with no terminal result — 2 tool call(s) started, partial assistant output was streaming",
+  );
+
+  const withRequires = codexExitDiagnostic({
+    ...base, threadStarted: true, turnInProgress: true, toolCallCount: 1, requires: ["codex:skill:imagegen"],
+  });
+  assert.match(withRequires, /\(requires: codex:skill:imagegen\)$/);
+  assert.doesNotMatch(withRequires, /unsupported|not supported|unavailable/i, "the diagnostic never diagnoses the required capability as the cause");
+
+  // Signal-only exits (no numeric code) still resolve to a readable label.
+  assert.match(codexExitDiagnostic({ ...base, code: null, signal: "SIGKILL" }), /^Codex app-server exited \(SIGKILL\)/);
+});
+
+test("codexExitDiagnostic bounds and never widens the exposure of stderr or capability requirements", () => {
+  const base = { code: 1, signal: null, threadStarted: true, turnInProgress: true, turnOutputLength: 0, toolCallCount: 0 };
+
+  const withStderr = codexExitDiagnostic({ ...base, stderr: "  fatal: disk full  \n" });
+  assert.match(withStderr, /: fatal: disk full$/, "stderr is trimmed, not reproduced with its surrounding whitespace");
+
+  const manyRequirements = Array.from({ length: 16 }, (_, index) => `codex:skill:tool-${index}`);
+  const withManyRequirements = codexExitDiagnostic({ ...base, stderr: "", requires: manyRequirements });
+  const requiresSegment = withManyRequirements.match(/\(requires: (.*)\)$/)?.[1] ?? "";
+  assert.equal(requiresSegment.split(", ").length, 4, "at most the first few capability requirements are echoed back, never the full bounded list");
+});
+
+test("codexExitDiagnostic redacts credential-shaped stderr, strips control characters, and stays within a strict bound", () => {
+  const base = { code: 1, signal: null, threadStarted: true, turnInProgress: true, turnOutputLength: 0, toolCallCount: 0 };
+
+  const secretStderr = [
+    "fatal: auth failed",
+    "Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+    "api key sk-proj-aB1cD2eF3gH4iJ5kL6mN7oP8qR9sT0uV",
+    "org-4f9a8b7c6d5e acct_9z8y7x6w5v",
+    "contact user@example.com for help",
+    "session token 4f9a8b7c6d5e3210deadbeefcafebabe1234567890",
+  ].join("\n");
+  const diagnostic = codexExitDiagnostic({ ...base, stderr: secretStderr });
+
+  assert.doesNotMatch(diagnostic, /eyJhbGciOiJIUzI1NiJ9/, "JWT-shaped tokens must never survive sanitization");
+  assert.doesNotMatch(diagnostic, /sk-proj-/, "API keys must never survive sanitization");
+  assert.doesNotMatch(diagnostic, /org-4f9a8b7c6d5e/, "organization ids must never survive sanitization");
+  assert.doesNotMatch(diagnostic, /acct_9z8y7x6w5v/, "account ids must never survive sanitization");
+  assert.doesNotMatch(diagnostic, /Bearer\s+ey/i, "bearer token values must never survive sanitization");
+  assert.doesNotMatch(diagnostic, /user@example\.com/, "emails must never survive sanitization unmasked");
+  assert.doesNotMatch(diagnostic, /4f9a8b7c6d5e3210deadbeefcafebabe1234567890/, "long opaque tokens must never survive sanitization");
+  assert.match(diagnostic, /fatal: auth failed/, "non-secret diagnostic text is preserved");
+
+  const controlCharStderr = "line one\x00\x01\x1b[31mred\x1b[0m\x07bell\x7fdel line two";
+  const withControlChars = codexExitDiagnostic({ ...base, stderr: controlCharStderr });
+  for (let code = 0; code <= 0x1f; code++) {
+    if (code === 0x09 || code === 0x0a || code === 0x0d) continue; // legitimate, already-handled whitespace
+    assert.ok(!withControlChars.includes(String.fromCharCode(code)), `control byte 0x${code.toString(16)} must never survive sanitization`);
+  }
+  assert.ok(!withControlChars.includes("\x7f"), "DEL must never survive sanitization");
+
+  const hugeStderr = `${"secret-looking-but-not-".repeat(50)}${"x".repeat(20_000)}`;
+  const withHugeStderr = codexExitDiagnostic({ ...base, stderr: hugeStderr });
+  assert.ok(withHugeStderr.length < 500, `the whole diagnostic stays tightly bounded regardless of stderr size (got ${withHugeStderr.length} chars)`);
+});
+
 test("Pi reports the concrete responseModel over the requested alias and totalTokens as occupancy", async () => {
   const fake = await fixture(PI_FIXTURE);
   const events: BackendEvent[] = [];
@@ -1302,6 +1383,32 @@ test("Codex startup timeout and early exit both settle clearly", async (t) => {
       } finally { await rm(fake.dir, { recursive: true, force: true }); }
     });
   }
+});
+
+test("Codex reports actionable in-progress-turn context, not a bare exit code, when the app-server exits cleanly mid-turn with no assistant result (issue #22)", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const codexRequest = request("codex", fake.dir, { ...process.env, MODE: "exit-mid-turn" });
+    codexRequest.policy.requires = ["codex:skill:imagegen"];
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 2_000, inactivityTimeoutMs: 5_000 })
+      .start(codexRequest, (event) => events.push(event));
+    await run.completed;
+    const event = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+    assert.equal(event.type, "failed");
+    // Not just the bare generic exit summary from before this fix.
+    assert.notEqual(event.error, "Codex app-server exited (0)");
+    assert.match(event.error, /Codex app-server exited \(0\) during an in-progress turn with no terminal result/);
+    assert.match(event.error, /1 tool call\(s\) started/);
+    assert.match(event.error, /no assistant output was delivered/);
+    // Bounded context only, never a claim that the required capability caused the failure.
+    assert.match(event.error, /requires: codex:skill:imagegen/);
+    assert.doesNotMatch(event.error, /unsupported|not supported|does not support/i);
+    const toolStart = events.find((item): item is Extract<BackendEvent, { type: "tool_start" }> => item.type === "tool_start");
+    assert.equal(toolStart?.name, "imagegen");
+    assert.ok(!events.some((item) => item.type === "completed"), "a clean mid-turn exit must never be reported as completed");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
 
 

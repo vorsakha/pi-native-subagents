@@ -136,6 +136,84 @@ export function classifyCodexUnavailability(turnError: unknown, now: number): Pr
 }
 
 /**
+ * Bounded, sanitized lifecycle state captured at the moment the app-server
+ * process closed with no protocol failure recorded. Every field is a count,
+ * boolean, or a capability ID that already passed `normalizeRequirements`
+ * (at most `MAX_REQUIREMENTS` entries of at most `MAX_REQUIREMENT_LENGTH`
+ * characters each) — never raw protocol payloads, tool arguments, or
+ * credentials. `stderr` is the raw bounded tail already collected for the
+ * legacy exit message; it is untrusted, provider-controlled text and is
+ * sanitized by `codexExitDiagnostic` itself before ever reaching a caller.
+ */
+export interface CodexExitContext {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stderr: string;
+  /** Whether `thread/start` had returned a thread ID before the process closed. */
+  threadStarted: boolean;
+  /** Whether a `turn/start` had returned a turn ID with no `turn/completed` yet observed for it. */
+  turnInProgress: boolean;
+  /** Characters of assistant text streamed for the in-progress turn, if any. */
+  turnOutputLength: number;
+  /** `item/started` notifications observed for the in-progress turn. */
+  toolCallCount: number;
+  requires?: string[];
+}
+
+/** Final length ceiling for the sanitized stderr excerpt folded into a diagnostic message; far below the internal 16 KB capture window. */
+const STDERR_EXCERPT_LENGTH = 300;
+
+/**
+ * Stderr is untrusted, provider-controlled, unbounded-shape text — the same
+ * category of data `classifyCodexUnavailability` above refuses to copy
+ * verbatim into `detail`. Unlike that path, this diagnostic's whole purpose is
+ * to surface operator-useful process output, so instead of excluding it
+ * outright this strips raw terminal control/escape sequences, redacts the
+ * shapes credentials commonly take (bearer/JWT tokens, `sk-`/`pk-`-style API
+ * keys, `org_`/`acct_`-style identifiers, and other long opaque tokens), masks
+ * embedded emails via the same helper used for provider error text, and caps
+ * the result well below the raw capture window. This is a fixed, allowlisted
+ * transform, not a guarantee that every possible secret shape is caught.
+ */
+function sanitizeStderrExcerpt(stderr: string): string {
+  const withoutControlChars = stderr.replace(/[\x00-\x08\x0b-\x1f\x7f]/g, " ");
+  const withoutSecrets = withoutControlChars
+    .replace(/bearer\s+[a-z0-9._-]+/gi, "Bearer [redacted]")
+    .replace(/\bey[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+\b/gi, "[redacted-jwt]")
+    .replace(/\b(?:sk|pk|rk)-[a-z0-9_-]{6,}\b/gi, "[redacted-key]")
+    .replace(/\b(?:org|acct|account|user)[_-][a-z0-9]{4,}\b/gi, "[redacted-id]")
+    .replace(/\b[a-z0-9]{24,}\b/gi, "[redacted-token]");
+  return providerUnavailabilityDetail(withoutSecrets, STDERR_EXCERPT_LENGTH);
+}
+
+/**
+ * Builds the diagnostic for a Codex app-server process that closed before this
+ * backend saw a terminal `turn/completed`, `failed`, or `cancelled` outcome,
+ * with no protocol failure recorded (a protocol failure always takes
+ * precedence over this path — see the `close` handler in `start`).
+ *
+ * This reports only what the lifecycle state on this side of the protocol
+ * observed. It never asserts a cause, and in particular never claims a
+ * `requires` capability was the reason: live capability revalidation before
+ * dispatch (`routeCapabilities`/`resolveRequirements`) only proves a
+ * capability was discovered and reported healthy at that moment — it cannot
+ * prove the runtime would actually exercise it, or exercise it successfully,
+ * during a turn that never reached a terminal event. `requires` is included
+ * only as bounded context for the caller, not as a diagnosis.
+ */
+export function codexExitDiagnostic(context: CodexExitContext): string {
+  const exit = `Codex app-server exited (${context.code ?? context.signal ?? "signal"})`;
+  const stderrTail = sanitizeStderrExcerpt(context.stderr);
+  const suffix = stderrTail ? `: ${stderrTail}` : "";
+  if (!context.threadStarted) return `${exit} before starting a Codex thread${suffix}`;
+  if (!context.turnInProgress) return `${exit} between turns, with no turn in progress${suffix}`;
+  const activity = context.toolCallCount > 0 ? `${context.toolCallCount} tool call(s) started` : "no tool calls started";
+  const output = context.turnOutputLength > 0 ? "partial assistant output was streaming" : "no assistant output was delivered";
+  const requires = context.requires?.length ? ` (requires: ${context.requires.slice(0, 4).join(", ")})` : "";
+  return `${exit} during an in-progress turn with no terminal result — ${activity}, ${output}${requires}${suffix}`;
+}
+
+/**
  * Thread config overrides applied on top of the user's native Codex setup.
  * Full-access children keep native parity; read-only children lose the surfaces
  * that could mutate outside the sandbox.
@@ -335,6 +413,8 @@ export class CodexAppServerBackend implements Backend {
     let threadId = "";
     let turnId = "";
     let turnOutput = "";
+    /** `item/started` notifications seen for the turn currently in progress; reset at the start of each turn. */
+    let turnItemCount = 0;
     let output = "";
     let settled = false;
     let closing = false;
@@ -373,6 +453,7 @@ export class CodexAppServerBackend implements Backend {
     const input = (text: string) => [{ type: "text", text }];
     const startTurn = async (text: string): Promise<void> => {
       turnOutput = "";
+      turnItemCount = 0;
       watchdog.arm();
       emit({ type: "user_message", text });
       const turnResult = asObject(await peer.request("turn/start", {
@@ -443,7 +524,9 @@ export class CodexAppServerBackend implements Backend {
         } else if (method === "item/started") {
           const item = asObject(params.item);
           const type = String(item.type ?? "item");
-          if (type !== "agentMessage" && type !== "reasoning") emit({
+          if (type === "agentMessage" || type === "reasoning") return;
+          turnItemCount++;
+          emit({
             type: "tool_start",
             id: String(item.id ?? type),
             name: itemToolName(item),
@@ -546,7 +629,16 @@ export class CodexAppServerBackend implements Backend {
           type: "failed",
           error: protocolFailure
             ? `Codex app-server protocol failure: ${protocolFailure}`
-            : `Codex app-server exited (${code ?? signal ?? "signal"})${stderr.trim() ? `: ${stderr.trim()}` : ""}`,
+            : codexExitDiagnostic({
+                code,
+                signal,
+                stderr,
+                threadStarted: Boolean(threadId),
+                turnInProgress: Boolean(turnId),
+                turnOutputLength: turnOutput.length,
+                toolCallCount: turnItemCount,
+                requires: request.policy.requires,
+              }),
         });
       }
     });
