@@ -444,7 +444,7 @@ test("Latest identifies the focused agent by name plus its activity, without a s
     ],
   });
   const previewLine = buildWorkflowCardLines(withPreview, theme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("Latest"))!;
-  assert.match(previewLine, /reliability-security · scanning dependency advisories/);
+  assert.match(previewLine, /reliability-security.* · scanning dependency advisories/);
 
   const runningNoPreview = workflow({ agents: [agent({ index: 0, name: "tests", state: "running" })] });
   const runningLine = buildWorkflowCardLines(runningNoPreview, theme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("Latest"))!;
@@ -455,6 +455,53 @@ test("Latest identifies the focused agent by name plus its activity, without a s
   const queuedNoPreview = workflow({ agents: [agent({ index: 0, name: "tests", state: "queued" })] });
   const queuedLine = buildWorkflowCardLines(queuedNoPreview, theme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("Latest"))!;
   assert.match(queuedLine, /waiting to start/);
+});
+
+test("Latest renders the resolved model and explicit effort as one dim suffix after the emphasized name", () => {
+  const snapshot = workflow({
+    agents: [agent({
+      name: "tests",
+      state: "running",
+      model: "codex-fixture-model",
+      effort: "high",
+      preview: "Running targeted tests",
+    })],
+  });
+  const plainLine = buildWorkflowCardLines(snapshot, theme, { expanded: false, now: 6_000 })
+    .find((line) => line.startsWith("Latest"));
+  assert.equal(plainLine, "Latest   tests(codex-fixture-model·high) · Running targeted tests");
+
+  const styledTheme = {
+    ...theme,
+    fg: (color: string, text: string) => `<${color}>${text}</${color}>`,
+  } as unknown as Theme;
+  const styledLine = buildWorkflowCardLines(snapshot, styledTheme, { expanded: false, now: 6_000 })
+    .find((line) => line.includes("<dim>Latest"));
+  assert.equal(
+    styledLine,
+    "<dim>Latest  </dim> <toolTitle>tests</toolTitle><dim>(codex-fixture-model·high)</dim> <dim>·</dim> <muted>Running targeted tests</muted>",
+  );
+});
+
+test("Latest renders omitted effort as adaptive and truncates safely after the readable agent name", () => {
+  const snapshot = workflow({
+    agents: [agent({
+      name: "tests",
+      state: "running",
+      model: "codex-fixture-model",
+      preview: "Running targeted tests",
+    })],
+  });
+  const plainLine = buildWorkflowCardLines(snapshot, theme, { expanded: false, now: 6_000 })
+    .find((line) => line.startsWith("Latest"));
+  assert.equal(plainLine, "Latest   tests(codex-fixture-model·adaptive) · Running targeted tests");
+
+  const width = 24;
+  const narrow = renderWorkflowCard(snapshot, ansiTheme, { expanded: false, now: 6_000 }).render(width);
+  assert.ok(narrow.every((line) => visibleWidth(line) <= width));
+  const latestLine = narrow.find((line) => line.includes("Latest"));
+  assert.ok(latestLine?.includes("tests"), "the focused agent name remains readable");
+  assert.ok(latestLine?.includes("…"), "the existing truncation behavior adds an ellipsis");
 });
 
 test("expanded phase and agent rosters demote routine glyphs, keeping only current selection and failure/warning states attention-worthy", () => {
