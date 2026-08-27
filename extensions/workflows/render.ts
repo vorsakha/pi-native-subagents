@@ -11,6 +11,7 @@ import type {
   WorkflowSnapshot,
 } from "../../src/workflows/types.ts";
 import {
+  formatEffort,
   formatUsage,
   isAttentionStatus,
   linesComponent,
@@ -216,12 +217,12 @@ function agentActivity(agent: WorkflowAgentRecord, now: number): string {
   }
 }
 
-/** The focused agent's name plus its activity — no status glyph, since the header and phase
+/** The focused agent's name, routing, and activity — no status glyph, since the header and phase
  *  spine already carry the workflow's running state. */
 function latestValue(snapshot: WorkflowSnapshot, theme: Theme, now: number): string | undefined {
   const agent = focusedAgent(snapshot);
   if (!agent) return undefined;
-  return `${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", "·")} ${theme.fg("muted", agentActivity(agent, now))}`;
+  return `${theme.fg("toolTitle", sanitizeInline(agent.name))}${theme.fg("dim", `(${sanitizeInline(agent.model ?? "default")}·${formatEffort(agent.effort)})`)} ${theme.fg("dim", "·")} ${theme.fg("muted", agentActivity(agent, now))}`;
 }
 
 export interface WorkflowPhaseProgress {
