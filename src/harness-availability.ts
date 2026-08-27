@@ -335,12 +335,15 @@ export class HarnessAvailabilityService {
     request.signal?.addEventListener("abort", abort, { once: true });
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_resolve, reject) => {
+      // Keep the timer referenced: it is the only thing that can settle the race
+      // when the reader never resolves, so unref'ing it would let the event loop
+      // drain and leave this promise pending. The `finally` always clears it, so
+      // the reference is bounded by `#timeoutMs` and never leaks past the probe.
       timer = setTimeout(() => {
         const error = new Error(`${harnesses.join(", ")} availability probe timed out after ${this.#timeoutMs}ms`);
         controller.abort(error);
         reject(error);
       }, this.#timeoutMs);
-      timer.unref?.();
     });
     try {
       return await Promise.race([
