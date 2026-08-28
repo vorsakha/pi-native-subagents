@@ -4,13 +4,17 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import {
   MAX_COLLAPSED_LINES,
   MAX_EXPANDED_LINES,
+  answeredQuestionReceipt,
   buildJobCardLines,
   formatContext,
+  followThroughText,
+  renderFollowThroughCard,
   renderJobCard,
   renderJobReceipt,
   sanitizeInline,
   sanitizeText,
   statusMeta,
+  type FollowThroughCheckpoint,
 } from "../extensions/subagents/render.ts";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
 import type { ToolTrace } from "../src/types.ts";
@@ -93,6 +97,53 @@ test("renderer sanitizes output and enforces collapsed/expanded line budgets", (
   assert.ok(expandedLines.every((line) => !CONTROL_CHARS.test(line)));
   assert.ok(expandedLines.some((line) => line.includes("/subagents")));
   assert.ok(expandedLines.every((line) => !line.includes("tool-")), "expanded card no longer lists recent tool calls as primary activity");
+});
+
+test("answered-question receipts and workflow checkpoints stay live, bounded, and width-safe", () => {
+  const interaction = interactionSnapshot({
+    sourceName: "reviewer",
+    question: "Which compatibility behavior should stay?",
+    context: "Use the current public contract.",
+    state: "answered",
+    answer: "Keep the legacy flag.",
+    answeredAt: 2_000,
+    route: "orchestrator-model",
+    workflow: { runId: "run-1", agentIndex: 0, label: "review", phase: "review" },
+  });
+  const runningReceipt = answeredQuestionReceipt(interaction, job({ name: "reviewer", status: "running", liveThinking: "resumed" }), "review");
+  assert.match(runningReceipt, /answered reviewer · resumed · running/);
+  const terminalReceipt = answeredQuestionReceipt(interaction, job({ name: "reviewer", status: "completed", output: "review complete", endedAt: 3_000 }), "implement");
+  assert.match(terminalReceipt, /completed/);
+  assert.match(terminalReceipt, /workflow advanced to implement/);
+
+  const auditLines = buildJobCardLines(job({ status: "running" }), theme, { expanded: true, now: 3_000, answerAudit: interaction });
+  assert.ok(auditLines.some((line) => line.includes("Question") && line.includes("Which compatibility behavior should stay?")));
+  assert.ok(auditLines.some((line) => line.includes("Answer") && line.includes("Keep the legacy flag.")));
+
+  const checkpoint = {
+    requestId: "request-1",
+    source: {
+      name: "reviewer",
+      jobId: "job-1",
+      generation: 0,
+      status: "completed",
+      output: `${ESC}[31m${"bounded output ".repeat(300)}`,
+    },
+    workflow: {
+      runId: "run-1",
+      status: "running",
+      phase: "implement",
+      next: { name: "implementer", state: "running", jobId: "job-2" },
+    },
+  } satisfies FollowThroughCheckpoint;
+  const text = followThroughText(checkpoint);
+  assert.equal(text.includes(ESC), false);
+  assert.ok(text.length < 8_000);
+  assert.match(text, /generation 0/);
+  assert.match(text, /Next running agent: implementer/);
+  const cardLines = renderFollowThroughCard(checkpoint, ansiTheme, { expanded: true, standalone: true }).render(48);
+  assert.ok(cardLines.length <= MAX_EXPANDED_LINES);
+  assert.ok(cardLines.every((line) => visibleWidth(line) <= 48));
 });
 
 test("formatContext distinguishes the configured model from the effective serving model and never renders a zero gauge", () => {

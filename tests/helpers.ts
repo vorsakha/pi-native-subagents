@@ -33,6 +33,11 @@ import {
 
 export const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
+/** Advances only the event loop; unlike {@link waitFor}, this has no clock or sleep. */
+export async function ticks(count = 1): Promise<void> {
+  for (let index = 0; index < count; index++) await tick();
+}
+
 export const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 /** Deterministic deadline clock for interaction lifecycle tests. */
@@ -355,6 +360,8 @@ export class ControlledBackend implements Backend {
   readonly cancels: Array<{ jobId: string; reason?: string }> = [];
   readonly closes: string[] = [];
   readonly sends: Array<{ id: string; message: string; behavior: string }> = [];
+  readonly #startWaiters = new Set<() => void>();
+  readonly #sendWaiters = new Set<() => void>();
   active = 0;
   maxActive = 0;
 
@@ -371,8 +378,35 @@ export class ControlledBackend implements Backend {
     return this.requests.map((request) => request.policy);
   }
 
+  /** Resolves from the backend's start event; no wall-clock polling is involved. */
+  waitForStart(count = 1): Promise<void> {
+    if (this.requests.length >= count) return Promise.resolve();
+    return new Promise((resolve) => {
+      const check = () => {
+        if (this.requests.length < count) return;
+        this.#startWaiters.delete(check);
+        resolve();
+      };
+      this.#startWaiters.add(check);
+    });
+  }
+
+  /** Resolves from a retained-session send event; no wall-clock polling is involved. */
+  waitForSend(count = 1): Promise<void> {
+    if (this.sends.length >= count) return Promise.resolve();
+    return new Promise((resolve) => {
+      const check = () => {
+        if (this.sends.length < count) return;
+        this.#sendWaiters.delete(check);
+        resolve();
+      };
+      this.#sendWaiters.add(check);
+    });
+  }
+
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     this.requests.push(request);
+    for (const waiter of [...this.#startWaiters]) waiter();
     this.active++;
     this.maxActive = Math.max(this.maxActive, this.active);
     let finish!: () => void;
@@ -393,6 +427,7 @@ export class ControlledBackend implements Backend {
       completed,
       send: async (message: string, behavior = "steer") => {
         this.sends.push({ id: request.jobId, message, behavior });
+        for (const waiter of [...this.#sendWaiters]) waiter();
       },
       cancel: async (reason) => {
         this.cancels.push({ jobId: request.jobId, reason });
@@ -511,6 +546,11 @@ export function fakePi(options: FakePiOptions = {}) {
   const messageRenderers = new Map<string, any>();
   const entryRenderers = new Map<string, any>();
   const messages: Array<{ message: any; options: any }> = [];
+  const messageWaiters = new Set<{
+    customType?: string;
+    count: number;
+    resolve: (entry: { message: any; options: any }) => void;
+  }>();
   const entries: Array<{ id: string; customType: string; data: unknown }> = [];
   const api: Record<string, unknown> = {
     on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
@@ -525,7 +565,16 @@ export function fakePi(options: FakePiOptions = {}) {
     registerShortcut(name: string, shortcut: any) { shortcuts.set(name, shortcut); },
     registerMessageRenderer(name: string, renderer: any) { messageRenderers.set(name, renderer); },
     registerEntryRenderer(name: string, renderer: any) { entryRenderers.set(name, renderer); },
-    sendMessage(message: any, opts: any) { messages.push({ message, options: opts }); },
+    sendMessage(message: any, opts: any) {
+      const entry = { message, options: opts };
+      messages.push(entry);
+      for (const waiter of [...messageWaiters]) {
+        if (waiter.customType && message.customType !== waiter.customType) continue;
+        if (messages.filter((candidate) => !waiter.customType || candidate.message.customType === waiter.customType).length < waiter.count) continue;
+        messageWaiters.delete(waiter);
+        waiter.resolve(entry);
+      }
+    },
     appendEntry(customType: string, data: unknown) {
       entries.push({ id: `entry-${entries.length}`, customType, data });
     },
@@ -541,6 +590,20 @@ export function fakePi(options: FakePiOptions = {}) {
     entryRenderers,
     messages,
     entries,
+    waitForMessage(customType?: string) {
+      const found = messages.find((entry) => !customType || entry.message.customType === customType);
+      if (found) return Promise.resolve(found);
+      return new Promise<{ message: any; options: any }>((resolve) => {
+        messageWaiters.add({ customType, count: 1, resolve });
+      });
+    },
+    waitForMessages(customType: string, count: number) {
+      const found = messages.find((entry) => entry.message.customType === customType);
+      if (messages.filter((entry) => entry.message.customType === customType).length >= count) return Promise.resolve(found!);
+      return new Promise<{ message: any; options: any }>((resolve) => {
+        messageWaiters.add({ customType, count, resolve });
+      });
+    },
   };
 }
 

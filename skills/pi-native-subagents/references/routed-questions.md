@@ -26,6 +26,27 @@ const implementer = await agent(
 
 Resolves one pending question. It is not a steer or a follow-up: it settles a provider tool call that is already in progress. Late, duplicate, unknown, dismissed, expired, and terminal-job answers are all rejected.
 
+An accepted orchestrator answer also keeps the `subagent_answer` receipt live for
+that exact source job generation. The collapsed receipt moves from resumed/running
+to the generation's terminal status; its expanded card retains bounded question,
+context, and answer audit text. This observation is extension-owned: it does not
+occupy a scheduler slot, poll a provider, extend an interaction deadline, or
+change the job result.
+
+For a workflow-owned source, the extension may wake one parent turn with a bounded
+follow-through checkpoint after that generation settles and the workflow has
+meaningfully continued. It identifies the source job and generation, workflow run
+and current phase, bounded terminal output/error, and the next queued or running
+agent when present. The workflow's ordinary final result remains authoritative;
+no checkpoint is sent after the workflow settles. Direct jobs retain their normal
+terminal delivery only.
+
+The watch is keyed by request ID, source job ID, and source generation, is bounded,
+and is one-shot. A newer question on that source supersedes it. Stale generations,
+eviction, cancellation, session reset, shutdown, and send races are dropped; a
+busy parent defers delivery to `agent_settled`, where ready checkpoints are
+coalesced into one follow-up turn. Repeated lifecycle events cannot redeliver it.
+
 ## Where questions are allowed
 
 - Background `subagent_spawn` jobs and background workflows may ask the orchestrator. Human `/subagent` jobs may ask too; their question is answered inline in `/subagents` and never notifies the orchestrator.

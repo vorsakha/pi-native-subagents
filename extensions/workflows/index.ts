@@ -27,6 +27,8 @@ const MAX_RESULT_TEXT_BYTES = 48 * 1024;
 export interface WorkflowRegistration {
   sessionStart(ctx: ExtensionContext, jobs: JobManager): void;
   sessionShutdown(): Promise<void>;
+  /** Read-only compact lookup for extension-owned workflow observations. */
+  check(runId: string): WorkflowSnapshot | undefined;
 }
 
 export interface RegisterWorkflowOptions {
@@ -544,6 +546,11 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   });
 
   return {
+    check(runId) {
+      if (shuttingDown || !manager) return undefined;
+      try { return compactSnapshot(manager.check(runId)); }
+      catch { return undefined; }
+    },
     sessionStart(ctx, jobs) {
       const sessionGeneration = ++generation;
       shuttingDown = false;

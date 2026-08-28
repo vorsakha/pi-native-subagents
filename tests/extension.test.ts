@@ -9,7 +9,7 @@ import { PI_PARENT_THREAD_FILE } from "../src/parent-thread-context.ts";
 import { buildCatalog } from "../src/capabilities.ts";
 import { claudeStatus, codexStatus, parseClaudeAuthStatus, parseCodexAccount, piStatusFromCatalog } from "../src/provider-status.ts";
 import type { HarnessName } from "../src/types.ts";
-import { ControlledBackend, HoldingBackend, ImmediateBackend, context, fakePi, jobSnapshot, readyProviderStatusReader, tempDir, theme, tick } from "./helpers.ts";
+import { ControlledBackend, HoldingBackend, ImmediateBackend, context, fakePi, jobSnapshot, readyProviderStatusReader, tempDir, theme, tick, ticks } from "./helpers.ts";
 
 /** The parent session's tool inventory, including surfaces children must never inherit. */
 const PARENT_TOOLS = [
@@ -19,6 +19,24 @@ const PARENT_TOOLS = [
   { name: "workflow", description: "Run a nested workflow", sourceInfo: { source: "extension" } },
   { name: "ask_user", description: "Prompt the user", sourceInfo: { source: "extension" } },
 ];
+
+async function routedExtension(prefix: string, idle = false) {
+  const pi = fakePi({ allTools: PARENT_TOOLS });
+  const backend = new ControlledBackend("pi");
+  const artifactRoot = join(await tempDir(`${prefix}-artifacts`), "runs");
+  const globalProfilesDir = join(await tempDir(`${prefix}-profiles`), "profiles");
+  registerNativeSubagents(pi.api, {
+    registry: {},
+    legacyRoot: false,
+    backends: [backend],
+    workflowArtifactRoot: artifactRoot,
+    globalProfilesDir,
+    providerStatus: readyProviderStatusReader(),
+  });
+  const session = context({ sessionId: `${prefix}-session`, idle });
+  pi.handlers.get("session_start")?.({}, session.ctx);
+  return { pi, backend, ctx: session.ctx };
+}
 
 test("a Pi child with a parent snapshot registers only parent_thread_context", async (t) => {
   const root = await tempDir("parent-thread-child");
@@ -128,6 +146,7 @@ test("the subagent extension surface", async (t) => {
     assert.equal(spawnProperties.modelTier, undefined, "tier compatibility is intentionally absent");
     assert.ok(pi.messageRenderers.has("native-workflow-result"));
     assert.ok(pi.messageRenderers.has("native-subagent-result"));
+    assert.ok(pi.messageRenderers.has("native-subagent-followthrough"));
     assert.ok(pi.entryRenderers.has("native-human-subagent"));
     assert.throws(() => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }), /loaded more than once/);
   });
@@ -504,6 +523,423 @@ test("routed questions wake the parent thread once and resolve through subagent_
   await pi.handlers.get("session_shutdown")?.();
   const abandoned = await asks[1]!;
   assert.ok(!abandoned.ok && /Session shutdown/.test(abandoned.error), "shutdown rejects every still-parked tool callback");
+});
+
+test("an accepted direct answer keeps the exact generation receipt live without follow-through delivery", async () => {
+  const { pi, backend, ctx } = await routedExtension("direct-answer-receipt");
+  const spawned = await pi.tools.get("subagent_spawn").execute("spawn", {
+    name: "receipt-worker", task: "continue the receipt task",
+  }, undefined, undefined, ctx);
+  await backend.waitForStart();
+  const asking = backend.ask(spawned.details.job.id, {
+    question: "Which result should I preserve?", context: "Use the current output.",
+  });
+  await ticks(2);
+  pi.handlers.get("agent_settled")?.();
+  const question = pi.messages.find((entry) => entry.message.customType === "native-subagent-question");
+  assert.ok(question, "the routed question is visible before its answer");
+  const requestId = (question.message.details as { interaction: { requestId: string } }).interaction.requestId;
+
+  const answered = await pi.tools.get("subagent_answer").execute("answer", {
+    requestId, answer: "Preserve the current output.",
+  }, undefined, undefined, ctx);
+  assert.equal(answered.details.source.generation, 0);
+  assert.equal(answered.details.job.generation, 0);
+
+  let invalidations = 0;
+  const renderContext = { args: {}, state: {}, invalidate: () => { invalidations++; } };
+  const answerTool = pi.tools.get("subagent_answer");
+  const running = answerTool.renderResult(answered, { expanded: false, isPartial: false }, theme, renderContext).render(120).join("\n");
+  assert.match(running, /resumed · running/);
+  const expanded = answerTool.renderResult(answered, { expanded: true, isPartial: false }, theme, renderContext).render(120).join("\n");
+  assert.match(expanded, /Which result should I preserve\?/);
+  assert.match(expanded, /Preserve the current output\./);
+
+  await asking;
+  backend.emit(spawned.details.job.id, { type: "text_delta", text: "progress update" });
+  assert.ok(invalidations > 0, "the existing live-card invalidation path observes resumed output");
+  const updated = answerTool.renderResult(answered, { expanded: false, isPartial: false }, theme, renderContext).render(120).join("\n");
+  assert.match(updated, /latest: progress update/);
+
+  backend.complete(spawned.details.job.id, "preserved output");
+  const terminal = answerTool.renderResult(answered, { expanded: false, isPartial: false }, theme, renderContext).render(120).join("\n");
+  assert.match(terminal, /resumed · completed/);
+  pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-result").length, 1,
+    "direct jobs retain their existing terminal delivery");
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough").length, 0,
+    "direct jobs never receive workflow follow-through");
+  pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-result").length, 1,
+    "repeated settled events do not duplicate the direct result");
+  await pi.handlers.get("session_shutdown")?.();
+});
+
+test("a workflow answer produces one deferred checkpoint when the workflow continues, then only its final result", async (t) => {
+  const { pi, backend, ctx } = await routedExtension("workflow-answer-follow-through");
+  t.after(async () => { await pi.handlers.get("session_shutdown")?.(); });
+  const started = await pi.tools.get("workflow").execute("workflow", {
+    name: "Answered review",
+    script: `export default async () => {
+      phase("review");
+      const review = await agent("ask for the decision", { name: "reviewer", access: "readOnly" });
+      phase("implement");
+      const implementation = await agent("continue after the decision", { name: "implementer", access: "readOnly" });
+      return { review, implementation };
+    }`,
+    background: true,
+  }, new AbortController().signal, undefined, ctx);
+  const workflowRunId = started.details.workflow.runId;
+  await backend.waitForStart();
+  assert.equal(backend.requests.length, 1, "the first workflow agent starts deterministically");
+  const sourceJobId = backend.requests[0]!.jobId;
+  const asking = backend.ask(sourceJobId, {
+    question: "Which implementation path is approved?", context: "The review found two compatible paths.",
+  });
+  await ticks(2);
+  pi.handlers.get("agent_settled")?.();
+  const question = pi.messages.find((entry) => entry.message.customType === "native-subagent-question");
+  assert.ok(question);
+  const requestId = (question.message.details as { interaction: { requestId: string } }).interaction.requestId;
+  await pi.tools.get("subagent_answer").execute("answer", { requestId, answer: "Use the compatible path." }, undefined, undefined, ctx);
+  await asking;
+
+  backend.complete(sourceJobId, "review output");
+  await backend.waitForStart(2);
+  assert.equal(backend.requests.length, 2, "the workflow advances to its next agent after the resumed source settles");
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough").length, 0,
+    "a busy parent defers the checkpoint until agent_settled");
+
+  pi.handlers.get("agent_settled")?.();
+  const checkpoints = pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough");
+  assert.equal(checkpoints.length, 1);
+  assert.equal(checkpoints[0]?.options.triggerTurn, true);
+  const checkpoint = (checkpoints[0]?.message.details as { checkpoint: {
+    requestId: string;
+    source: { jobId: string; generation: number; status: string; output?: string };
+    workflow: { runId: string; status: string; phase?: string; next?: { name: string; state: string; jobId?: string } };
+  } }).checkpoint;
+  assert.deepEqual({ requestId: checkpoint.requestId, jobId: checkpoint.source.jobId, generation: checkpoint.source.generation },
+    { requestId, jobId: sourceJobId, generation: 0 });
+  assert.equal(checkpoint.source.status, "completed");
+  assert.equal(checkpoint.source.output, "review output");
+  assert.equal(checkpoint.workflow.runId, workflowRunId);
+  assert.equal(checkpoint.workflow.phase, "implement");
+  assert.deepEqual(checkpoint.workflow.next, { name: "implementer", state: "running", jobId: backend.requests[1]!.jobId });
+  assert.match(checkpoints[0]?.message.content ?? "", /bounded status data/);
+
+  const finalMessage = pi.waitForMessage("native-workflow-result");
+  backend.complete(backend.requests[1]!.jobId, "implementation output");
+  await finalMessage;
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-workflow-result").length, 1,
+    "the workflow still owns its ordinary final delivery");
+  backend.emit(backend.requests[1]!.jobId, { type: "completed", output: "duplicate event" });
+  pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough").length, 1,
+    "repeated terminal and settled events cannot redeliver a one-shot checkpoint");
+  await pi.handlers.get("session_shutdown")?.();
+});
+
+test("an idle parent flushes each ready workflow checkpoint through a fresh microtask", async (t) => {
+  const { pi, backend, ctx } = await routedExtension("workflow-follow-through-idle", true);
+  t.after(async () => { await pi.handlers.get("session_shutdown")?.(); });
+  const script = `export default async () => {
+    phase("review");
+    const review = await agent("ask for a decision", { name: "reviewer", access: "readOnly" });
+    phase("implement");
+    const implementation = await agent("continue after the decision", { name: "implementer", access: "readOnly" });
+    return { review, implementation };
+  }`;
+  const flushOneMicrotask = (): Promise<void> => new Promise((resolve) => queueMicrotask(resolve));
+
+  const runToCheckpoint = async (label: string, expectedStarts: number, questionText: string) => {
+    await pi.tools.get("workflow").execute(`workflow-${label}`, {
+      name: `${label} workflow`, script, background: true,
+    }, new AbortController().signal, undefined, ctx);
+    await backend.waitForStart(expectedStarts);
+    const sourceJobId = backend.requests[expectedStarts - 1]!.jobId;
+    const questionsBefore = pi.messages.filter((entry) => entry.message.customType === "native-subagent-question").length;
+    const asking = backend.ask(sourceJobId, { question: questionText });
+    const questions = pi.messages.filter((entry) => entry.message.customType === "native-subagent-question");
+    assert.equal(questions.length, questionsBefore + 1, "an idle parent receives the question without agent_settled");
+    const question = questions.at(-1)!;
+    const requestId = (question.message.details as { interaction: { requestId: string } }).interaction.requestId;
+    await pi.tools.get("subagent_answer").execute(`answer-${label}`, {
+      requestId, answer: `${label} answer`,
+    }, undefined, undefined, ctx);
+    await asking;
+
+    const checkpointsBefore = pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough").length;
+    backend.complete(sourceJobId, `${label} source output`);
+    assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough").length, checkpointsBefore,
+      "the checkpoint is not sent inline while the workflow is still advancing");
+    await backend.waitForStart(expectedStarts + 1);
+    await flushOneMicrotask();
+    const checkpoints = pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough");
+    assert.equal(checkpoints.length, checkpointsBefore + 1,
+      "an idle parent receives a ready checkpoint through the queued microtask without agent_settled");
+    assert.equal(checkpoints.at(-1)?.options.triggerTurn, true);
+    return {
+      nextJobId: backend.requests[expectedStarts]!.jobId,
+      workflowRunId: (checkpoints.at(-1)?.message.details as { checkpoint: { workflow: { runId: string } } }).checkpoint.workflow.runId,
+    };
+  };
+
+  const first = await runToCheckpoint("first", 1, "Which path should I use first?");
+  const firstResult = pi.waitForMessage("native-workflow-result");
+  backend.complete(first.nextJobId, "first implementation output");
+  await firstResult;
+
+  const second = await runToCheckpoint("second", 3, "Which path should I use second?");
+  assert.notEqual(second.workflowRunId, first.workflowRunId, "the later checkpoint belongs to a fresh workflow run");
+  const secondResult = pi.waitForMessages("native-workflow-result", 2);
+  backend.complete(second.nextJobId, "second implementation output");
+  await secondResult;
+});
+
+test("a second question from the same resumed generation supersedes the first follow-through watch", async (t) => {
+  const { pi, backend, ctx } = await routedExtension("workflow-second-question");
+  t.after(async () => { await pi.handlers.get("session_shutdown")?.(); });
+  await pi.tools.get("workflow").execute("workflow", {
+    name: "Superseding question",
+    script: `export default async () => {
+      phase("review");
+      await agent("ask twice", { name: "questioner", access: "readOnly" });
+      phase("next");
+      await agent("next task", { name: "next", access: "readOnly" });
+      return "done";
+    }`,
+    background: true,
+  }, new AbortController().signal, undefined, ctx);
+  await backend.waitForStart();
+  const sourceJobId = backend.requests[0]!.jobId;
+  const firstAsk = backend.ask(sourceJobId, { question: "First question" });
+  pi.handlers.get("agent_settled")?.();
+  const firstMessage = pi.messages.find((entry) => entry.message.customType === "native-subagent-question");
+  assert.ok(firstMessage);
+  const firstRequestId = (firstMessage.message.details as { interaction: { requestId: string } }).interaction.requestId;
+  await pi.tools.get("subagent_answer").execute("answer-1", { requestId: firstRequestId, answer: "First answer" }, undefined, undefined, ctx);
+  await firstAsk;
+
+  const secondAsk = backend.ask(sourceJobId, { question: "Second question" });
+  pi.handlers.get("agent_settled")?.();
+  const questionMessages = pi.messages.filter((entry) => entry.message.customType === "native-subagent-question");
+  assert.equal(questionMessages.length, 2);
+  const secondMessage = questionMessages[1]!;
+  const secondRequestId = (secondMessage.message.details as { interaction: { requestId: string } }).interaction.requestId;
+  assert.notEqual(secondRequestId, firstRequestId);
+  await pi.tools.get("subagent_answer").execute("answer-2", { requestId: secondRequestId, answer: "Second answer" }, undefined, undefined, ctx);
+  await secondAsk;
+
+  backend.complete(sourceJobId, "questioned output");
+  await backend.waitForStart(2);
+  pi.handlers.get("agent_settled")?.();
+  const checkpoints = pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough");
+  assert.equal(checkpoints.length, 1, "the superseded watch cannot produce a second checkpoint");
+  assert.equal((checkpoints[0]?.message.details as { checkpoint: { requestId: string } }).checkpoint.requestId, secondRequestId);
+
+  const finalMessage = pi.waitForMessage("native-workflow-result");
+  backend.complete(backend.requests[1]!.jobId, "next output");
+  await finalMessage;
+});
+
+test("ready workflow follow-through checkpoints batch into one parent wake-up", async (t) => {
+  const { pi, backend, ctx } = await routedExtension("workflow-follow-through-batch");
+  t.after(async () => { await pi.handlers.get("session_shutdown")?.(); });
+  const script = `export default async () => {
+    phase("review");
+    const review = await agent("ask for a decision", { name: "reviewer", access: "readOnly" });
+    phase("next");
+    const next = await agent("continue the work", { name: "implementer", access: "readOnly" });
+    return { review, next };
+  }`;
+  await pi.tools.get("workflow").execute("workflow-1", {
+    name: "First workflow", script, background: true,
+  }, new AbortController().signal, undefined, ctx);
+  await pi.tools.get("workflow").execute("workflow-2", {
+    name: "Second workflow", script, background: true,
+  }, new AbortController().signal, undefined, ctx);
+  await backend.waitForStart(2);
+  const sourceJobIds = backend.requests.slice(0, 2).map((request) => request.jobId);
+  const asks = sourceJobIds.map((jobId, index) => backend.ask(jobId, { question: `Decision ${index}` }));
+  pi.handlers.get("agent_settled")?.();
+  const questions = pi.messages.filter((entry) => entry.message.customType === "native-subagent-question");
+  assert.equal(questions.length, 2);
+  for (const [index, question] of questions.entries()) {
+    const requestId = (question.message.details as { interaction: { requestId: string } }).interaction.requestId;
+    await pi.tools.get("subagent_answer").execute(`answer-${index}`, { requestId, answer: `Answer ${index}` }, undefined, undefined, ctx);
+  }
+  await Promise.all(asks);
+
+  for (const [index, jobId] of sourceJobIds.entries()) backend.complete(jobId, `source ${index} output`);
+  await backend.waitForStart(4);
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough").length, 0);
+  pi.handlers.get("agent_settled")?.();
+  const checkpoints = pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough");
+  assert.equal(checkpoints.length, 2);
+  assert.deepEqual(checkpoints.map((entry) => entry.options.triggerTurn), [false, true]);
+  const checkpointJobIds = checkpoints.map((entry) => (entry.message.details as { checkpoint: { source: { jobId: string } } }).checkpoint.source.jobId);
+  assert.deepEqual(new Set(checkpointJobIds), new Set(sourceJobIds));
+
+  const finalMessages = pi.waitForMessages("native-workflow-result", 2);
+  for (const request of backend.requests.slice(2, 4)) backend.complete(request.jobId, "next output");
+  await finalMessages;
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-workflow-result").length, 2);
+});
+
+test("a follow-up generation makes an answered watch stale before it can deliver", async (t) => {
+  const { pi, backend, ctx } = await routedExtension("workflow-stale-generation");
+  t.after(async () => { await pi.handlers.get("session_shutdown")?.(); });
+  await pi.tools.get("workflow").execute("workflow", {
+    name: "Stale generation",
+    script: `export default async () => {
+      const first = await agent("ask once", { name: "questioner", access: "readOnly" });
+      const follow = await followUp(first.jobId, "continue the same lineage");
+      return { first, follow };
+    }`,
+    background: true,
+  }, new AbortController().signal, undefined, ctx);
+  await backend.waitForStart();
+  const sourceJobId = backend.requests[0]!.jobId;
+  const asking = backend.ask(sourceJobId, { question: "Answer before the follow-up" });
+  pi.handlers.get("agent_settled")?.();
+  const question = pi.messages.find((entry) => entry.message.customType === "native-subagent-question");
+  assert.ok(question);
+  const requestId = (question.message.details as { interaction: { requestId: string } }).interaction.requestId;
+  await pi.tools.get("subagent_answer").execute("answer", { requestId, answer: "Continue" }, undefined, undefined, ctx);
+  await asking;
+
+  backend.complete(sourceJobId, "generation zero output");
+  await backend.waitForSend();
+  pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough").length, 0,
+    "the old generation is discarded when the retained lineage advances");
+
+  const finalMessage = pi.waitForMessage("native-workflow-result");
+  backend.complete(sourceJobId, "generation one output");
+  await finalMessage;
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-workflow-result").length, 1);
+});
+
+test("workflow final delivery wins when the answered source is its last agent", async (t) => {
+  const { pi, backend, ctx } = await routedExtension("workflow-answer-final");
+  t.after(async () => { await pi.handlers.get("session_shutdown")?.(); });
+  await pi.tools.get("workflow").execute("workflow", {
+    name: "Final answered source",
+    script: `export default async () => {
+      phase("review");
+      const review = await agent("ask once", { name: "last-agent", access: "readOnly" });
+      phase("publish");
+      return review;
+    }`,
+    background: true,
+  }, new AbortController().signal, undefined, ctx);
+  await backend.waitForStart();
+  const sourceJobId = backend.requests[0]!.jobId;
+  const asking = backend.ask(sourceJobId, { question: "Final decision?" });
+  pi.handlers.get("agent_settled")?.();
+  const question = pi.messages.find((entry) => entry.message.customType === "native-subagent-question");
+  assert.ok(question);
+  const requestId = (question.message.details as { interaction: { requestId: string } }).interaction.requestId;
+  await pi.tools.get("subagent_answer").execute("answer", { requestId, answer: "Approved" }, undefined, undefined, ctx);
+  await asking;
+  const finalMessage = pi.waitForMessage("native-workflow-result");
+  backend.complete(sourceJobId, "final output");
+  await finalMessage;
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough").length, 0,
+    "a workflow's ordinary final result owns the settled last generation");
+});
+
+test("cancelling a direct resumed generation closes its follow-through watch", async (t) => {
+  const { pi, backend, ctx } = await routedExtension("direct-answer-cancel");
+  t.after(async () => { await pi.handlers.get("session_shutdown")?.(); });
+  const spawned = await pi.tools.get("subagent_spawn").execute("spawn", {
+    name: "cancelled-worker", task: "cancel after answer",
+  }, undefined, undefined, ctx);
+  await backend.waitForStart();
+  const asking = backend.ask(spawned.details.job.id, { question: "May I stop?" });
+  pi.handlers.get("agent_settled")?.();
+  const question = pi.messages.find((entry) => entry.message.customType === "native-subagent-question");
+  assert.ok(question);
+  const requestId = (question.message.details as { interaction: { requestId: string } }).interaction.requestId;
+  await pi.tools.get("subagent_answer").execute("answer", { requestId, answer: "Stop now" }, undefined, undefined, ctx);
+  await asking;
+
+  const cancelled = await pi.tools.get("subagent_cancel").execute("cancel", { jobId: spawned.details.job.id }, undefined, undefined, ctx);
+  assert.equal(cancelled.details.job.status, "cancelled");
+  pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough").length, 0);
+});
+
+test("session reset drops answered watches and ignores events from the prior manager", async (t) => {
+  const { pi, backend, ctx } = await routedExtension("answer-session-reset");
+  t.after(async () => { await pi.handlers.get("session_shutdown")?.(); });
+  const spawned = await pi.tools.get("subagent_spawn").execute("spawn", {
+    name: "reset-worker", task: "reset while resumed",
+  }, undefined, undefined, ctx);
+  await backend.waitForStart();
+  const asking = backend.ask(spawned.details.job.id, { question: "Should I resume?" });
+  pi.handlers.get("agent_settled")?.();
+  const question = pi.messages.find((entry) => entry.message.customType === "native-subagent-question");
+  assert.ok(question);
+  const requestId = (question.message.details as { interaction: { requestId: string } }).interaction.requestId;
+  await pi.tools.get("subagent_answer").execute("answer", { requestId, answer: "Resume" }, undefined, undefined, ctx);
+  await asking;
+
+  const nextSession = context({ sessionId: "answer-session-reset-next" });
+  pi.handlers.get("session_start")?.({}, nextSession.ctx);
+  backend.complete(spawned.details.job.id, "old session output");
+  await ticks(2);
+  pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough").length, 0);
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-result").length, 0,
+    "the prior manager cannot deliver a stale terminal result into the new session");
+});
+
+test("evicting a terminal source drops its pending workflow checkpoint", async (t) => {
+  const { pi, backend, ctx } = await routedExtension("workflow-follow-through-eviction");
+  t.after(async () => { await pi.handlers.get("session_shutdown")?.(); });
+  await pi.tools.get("workflow").execute("workflow", {
+    name: "Evicted source",
+    script: `export default async () => {
+      const first = await agent("ask before eviction", { name: "source", access: "readOnly" });
+      phase("next");
+      const next = await agent("hold after eviction", { name: "next", access: "readOnly" });
+      return { first, next };
+    }`,
+    background: true,
+  }, new AbortController().signal, undefined, ctx);
+  await backend.waitForStart();
+  const sourceJobId = backend.requests[0]!.jobId;
+  const asking = backend.ask(sourceJobId, { question: "Can this source be archived?" });
+  pi.handlers.get("agent_settled")?.();
+  const question = pi.messages.find((entry) => entry.message.customType === "native-subagent-question");
+  assert.ok(question);
+  const requestId = (question.message.details as { interaction: { requestId: string } }).interaction.requestId;
+  await pi.tools.get("subagent_answer").execute("answer", { requestId, answer: "Yes" }, undefined, undefined, ctx);
+  await asking;
+  backend.complete(sourceJobId, "source output");
+  await backend.waitForStart(2);
+  const nextJobId = backend.requests[1]!.jobId;
+
+  const waitTool = pi.tools.get("subagent_wait");
+  for (let index = 0; index < 99; index++) {
+    const startsBefore = backend.requests.length;
+    const direct = await pi.tools.get("subagent_spawn").execute(`direct-${index}`, {
+      name: `filler-${index}`, task: `filler ${index}`,
+    }, undefined, undefined, ctx);
+    const waiting = waitTool.execute(`wait-${index}`, { jobId: direct.details.job.id }, undefined, undefined, ctx);
+    await backend.waitForStart(startsBefore + 1);
+    backend.complete(direct.details.job.id, "filler output");
+    await waiting;
+  }
+  pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough").length, 0,
+    "the checkpoint is dropped when its exact terminal source is evicted");
+
+  const finalMessage = pi.waitForMessage("native-workflow-result");
+  backend.complete(nextJobId, "next output");
+  await finalMessage;
 });
 
 test("a wait-consumed job still delivers its question, and human jobs keep theirs off the parent thread", async () => {

@@ -54,7 +54,10 @@ import {
 import { openSubagentsDashboard } from "./dashboard.ts";
 import {
   emptyComponent,
+  answeredQuestionReceipt,
   formatEffort,
+  followThroughText,
+  renderFollowThroughCard,
   renderInteractionCard,
   linesComponent,
   MAX_COLLAPSED_LINES,
@@ -68,6 +71,7 @@ import {
   shortId,
   traceResultLine,
   truncatePreview,
+  type FollowThroughCheckpoint,
 } from "./render.ts";
 import { loadProfiles, type ProfileCatalog } from "../../src/profiles.ts";
 import {
@@ -83,6 +87,7 @@ import type { SpendBudget } from "../../src/budget.ts";
 import { formatSpendBudget } from "../../src/budget.ts";
 import { renderWorkflowActivity, WorkflowActivityStore, type WorkflowActivitySnapshot } from "../workflows/activity.ts";
 import { registerWorkflows } from "../workflows/index.ts";
+import type { WorkflowSnapshot } from "../../src/workflows/types.ts";
 
 /** Production session-peer source backed by Pi's real SessionManager. Never mutates the source session. */
 export function createRealSessionPeerSource(): SessionPeerSource {
@@ -125,8 +130,10 @@ const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 const ACCESS = ["readOnly", "full"] as const;
 const MAX_CAPABILITY_LINES = 40;
 const HUMAN_SUBAGENT_ENTRY = "native-human-subagent";
+const FOLLOW_THROUGH_MESSAGE = "native-subagent-followthrough";
 const SUBAGENT_ACTIVITY_WIDGET = "native-subagents-active";
 const HUMAN_SUBAGENT_USAGE = "/subagent [--harness pi|claude|codex] [--model ID] [--name NAME] [--effort LEVEL] [--access readOnly|full] [--max-tokens N] [--max-cost USD] [--max-turns N] [--cwd PATH] [--profile NAME] [--independent] <task>";
+const MAX_FOLLOW_THROUGH_WATCHES = 64;
 
 export interface ActivitySegment {
   owner: "direct" | "workflow";
@@ -235,6 +242,60 @@ interface LiveCardRenderContext {
   invalidate(): void;
 }
 
+interface FollowThroughWatch {
+  key: string;
+  requestId: string;
+  sourceJobId: string;
+  sourceGeneration: number;
+  workflow?: NonNullable<JobSnapshot["workflow"]>;
+  answeredAt: number;
+  settled: boolean;
+  deliverable: boolean;
+}
+
+function extractWorkflowAgentStatus(state: WorkflowSnapshot["agents"][number]["state"]): JobSnapshot["status"] {
+  switch (state) {
+    case "completed": return "completed";
+    case "failed": return "failed";
+    case "cancelled":
+    case "aborted": return "cancelled";
+    default: return "running";
+  }
+}
+
+function followThroughCheckpoint(
+  watch: FollowThroughWatch,
+  job: JobSnapshot,
+  workflow: WorkflowSnapshot,
+): FollowThroughCheckpoint {
+  const candidates = workflow.agents
+    .filter((agent) => (agent.state === "running" || agent.state === "queued") && agent.index !== watch.workflow!.agentIndex)
+    .sort((left, right) => left.index - right.index);
+  const next = candidates.find((agent) => agent.index > watch.workflow!.agentIndex) ?? candidates[0];
+  const phase = workflow.currentPhase === null ? undefined : workflow.phases[workflow.currentPhase]?.name;
+  return {
+    requestId: truncatePreview(watch.requestId, 200),
+    source: {
+      name: truncatePreview(job.name, 160),
+      jobId: truncatePreview(job.id, 200),
+      generation: watch.sourceGeneration,
+      status: job.status as Extract<JobSnapshot["status"], "completed" | "failed" | "cancelled">,
+      output: job.output ? truncatePreview(job.output, 2_000) : undefined,
+      error: job.error ? truncatePreview(job.error, 2_000) : undefined,
+    },
+    workflow: {
+      runId: truncatePreview(workflow.runId, 200),
+      status: workflow.status,
+      phase: phase ? truncatePreview(phase, 160) : undefined,
+      next: next ? {
+        name: truncatePreview(next.name, 160),
+        state: next.state as "running" | "queued",
+        jobId: next.jobId ? truncatePreview(next.jobId, 200) : undefined,
+      } : undefined,
+    },
+  };
+}
+
 export default function nativeSubagents(pi: ExtensionAPI): void {
   registerNativeSubagents(pi);
 }
@@ -280,8 +341,14 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const deliveredQuestions = new Set<string>();
   /** Last observed state of each routed question, so a settled transcript card reports its real outcome. */
   const questionStates = new Map<string, PendingInteraction>();
+  /** Post-answer observations stay extension-owned and never participate in scheduling. */
+  const followThroughWatches = new Map<string, FollowThroughWatch>();
+  let followThroughFlushQueued = false;
+  let followThroughSessionGeneration = 0;
   const hiddenLegacyHumanEntries = new Set<string>();
   const resultKey = (id: string, generation: number) => `${id}:${generation}`;
+  const followThroughKey = (requestId: string, sourceJobId: string, sourceGeneration: number) =>
+    `${requestId}:${sourceJobId}:${sourceGeneration}`;
 
   // The Pi adapter reports the parent's live tool/command inventory so Pi
   // capability discovery reflects what a child would actually load.
@@ -461,7 +528,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const renderLiveJob = (
     fallback: JobSnapshot,
     theme: Theme,
-    options: { expanded: boolean; isPartial?: boolean; lead?: string; receipt?: string | ((job: JobSnapshot) => string) },
+    options: { expanded: boolean; isPartial?: boolean; lead?: string; receipt?: string | ((job: JobSnapshot) => string); answerAudit?: PendingInteraction },
     context?: LiveCardRenderContext,
   ) => {
     const current = liveJob(fallback, context);
@@ -515,9 +582,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     clearInterval: options.clearInterval,
     onSnapshot: (snapshot) => {
       workflowActivity.observe(snapshot);
+      observeFollowThroughWorkflow(snapshot);
       if (sessionUi && manager) updateSessionUi(sessionUi, manager, activeHarness);
     },
     onResultDelivered: (runId) => {
+      clearFollowThroughWatchesForWorkflow(runId);
       workflowActivity.markDelivered(runId);
       if (sessionUi && manager) updateSessionUi(sessionUi, manager, activeHarness);
     },
@@ -537,6 +606,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     // itself as pending in the transcript.
     const current = live(delivered.requestId) ?? questionStates.get(delivered.requestId) ?? delivered;
     return renderInteractionCard(current, theme, { expanded, now: Date.now(), standalone: true });
+  });
+  pi.registerMessageRenderer(FOLLOW_THROUGH_MESSAGE, (message, { expanded }, theme) => {
+    const checkpoint = (message.details as { checkpoint?: FollowThroughCheckpoint } | undefined)?.checkpoint;
+    if (!checkpoint) return renderToolCallLine(theme, "Inspect", "subagent follow-through unavailable");
+    return renderFollowThroughCard(checkpoint, theme, { expanded, standalone: true });
   });
   const live = (requestId: string): PendingInteraction | undefined => {
     try { return manager?.interaction(requestId); }
@@ -642,6 +716,169 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     if (sessionContext?.isIdle()) flushDeferredQuestions();
   };
 
+  const isWorkflowTerminal = (status: WorkflowSnapshot["status"]): boolean =>
+    status === "completed" || status === "failed" || status === "aborted";
+  const workflowPhaseName = (snapshot: WorkflowSnapshot | undefined): string | undefined => {
+    if (!snapshot || snapshot.currentPhase === null) return undefined;
+    const phase = snapshot.phases[snapshot.currentPhase]?.name;
+    return phase ? truncatePreview(phase, 160) : undefined;
+  };
+  const exactWatchedJob = (watch: FollowThroughWatch): JobSnapshot | undefined => {
+    if (!manager) return undefined;
+    try {
+      const current = manager.check(watch.sourceJobId);
+      return current.generation === watch.sourceGeneration ? current : undefined;
+    } catch {
+      // JobManager may have evicted the terminal source while the workflow
+      // still retains its own bounded record.
+      return undefined;
+    }
+  };
+  const removeFollowThroughWatch = (watch: FollowThroughWatch): void => {
+    if (followThroughWatches.get(watch.key) === watch) followThroughWatches.delete(watch.key);
+  };
+  const clearFollowThroughWatchesForSource = (sourceJobId: string): void => {
+    for (const watch of followThroughWatches.values()) {
+      if (watch.sourceJobId === sourceJobId) removeFollowThroughWatch(watch);
+    }
+  };
+  const clearFollowThroughWatchesForWorkflow = (runId: string): void => {
+    for (const watch of followThroughWatches.values()) {
+      if (watch.workflow?.runId === runId) removeFollowThroughWatch(watch);
+    }
+  };
+  const pruneFollowThroughWatches = (): void => {
+    for (const watch of followThroughWatches.values()) {
+      if (!exactWatchedJob(watch)) removeFollowThroughWatch(watch);
+    }
+  };
+  const workflowHasContinued = (snapshot: WorkflowSnapshot, watch: FollowThroughWatch): boolean => {
+    if (!watch.workflow || isWorkflowTerminal(snapshot.status)) return false;
+    const source = snapshot.agents.find((agent) => agent.index === watch.workflow!.agentIndex);
+    if (!source || !isTerminal(extractWorkflowAgentStatus(source.state))) return false;
+    const next = snapshot.agents
+      .filter((agent) => (agent.state === "running" || agent.state === "queued") && agent.index !== source.index)
+      .sort((left, right) => left.index - right.index)[0];
+    const waitingSibling = snapshot.agents.some((agent) => agent.index !== source.index && agent.state === "waiting");
+    // A phase notification can arrive just before a workflow returns its
+    // final result. A successor still active, queued, or waiting, or an
+    // explicit pause, is observable evidence that the run meaningfully
+    // continued beyond the
+    // answered generation; this avoids racing the workflow's final delivery.
+    return !!next || waitingSibling || snapshot.status === "paused";
+  };
+  const queueFollowThroughFlush = (): void => {
+    if (followThroughFlushQueued || !sessionContext?.isIdle()) return;
+    followThroughFlushQueued = true;
+    const scheduledFor = followThroughSessionGeneration;
+    queueMicrotask(() => {
+      if (scheduledFor !== followThroughSessionGeneration) return;
+      followThroughFlushQueued = false;
+      if (!sessionContext?.isIdle()) return;
+      flushFollowThrough();
+    });
+  };
+  const observeFollowThroughWorkflow = (snapshot: WorkflowSnapshot): void => {
+    if (isWorkflowTerminal(snapshot.status)) {
+      clearFollowThroughWatchesForWorkflow(snapshot.runId);
+      return;
+    }
+    for (const watch of followThroughWatches.values()) {
+      if (watch.workflow?.runId !== snapshot.runId || !watch.settled) continue;
+      if (!exactWatchedJob(watch)) {
+        removeFollowThroughWatch(watch);
+        continue;
+      }
+      if (workflowHasContinued(snapshot, watch)) {
+        watch.deliverable = true;
+        queueFollowThroughFlush();
+      }
+    }
+  };
+  const markFollowThroughSettled = (watch: FollowThroughWatch): void => {
+    if (watch.workflow === undefined) {
+      removeFollowThroughWatch(watch);
+      return;
+    }
+    watch.settled = true;
+    const snapshot = workflows.check(watch.workflow.runId);
+    if (snapshot) observeFollowThroughWorkflow(snapshot);
+  };
+  const observeFollowThroughJob = (job: JobSnapshot, event: { type: string }): void => {
+    if (event.type !== "completed" && event.type !== "failed" && event.type !== "cancelled") return;
+    const watch = [...followThroughWatches.values()].find((candidate) =>
+      candidate.sourceJobId === job.id && candidate.sourceGeneration === job.generation,
+    );
+    if (!watch || !isTerminal(job.status)) return;
+    markFollowThroughSettled(watch);
+  };
+  const registerFollowThroughWatch = (interaction: PendingInteraction, source: JobSnapshot | undefined): void => {
+    if (!source || source.generation !== interaction.sourceGeneration) return;
+    clearFollowThroughWatchesForSource(interaction.sourceJobId);
+    const watch: FollowThroughWatch = {
+      key: followThroughKey(interaction.requestId, interaction.sourceJobId, interaction.sourceGeneration),
+      requestId: interaction.requestId,
+      sourceJobId: interaction.sourceJobId,
+      sourceGeneration: interaction.sourceGeneration,
+      workflow: interaction.workflow ? { ...interaction.workflow } : source.workflow ? { ...source.workflow } : undefined,
+      answeredAt: interaction.answeredAt ?? Date.now(),
+      settled: false,
+      deliverable: false,
+    };
+    followThroughWatches.set(watch.key, watch);
+    while (followThroughWatches.size > MAX_FOLLOW_THROUGH_WATCHES) {
+      const oldest = followThroughWatches.keys().next().value;
+      if (!oldest) break;
+      followThroughWatches.delete(oldest);
+    }
+    const current = exactWatchedJob(watch);
+    if (!current) {
+      removeFollowThroughWatch(watch);
+      return;
+    }
+    if (isTerminal(current.status)) markFollowThroughSettled(watch);
+  };
+  const flushFollowThrough = (): void => {
+    const deliverable: Array<{ checkpoint: FollowThroughCheckpoint; watch: FollowThroughWatch }> = [];
+    for (const watch of [...followThroughWatches.values()]) {
+      if (!watch.settled || !watch.deliverable) continue;
+      const current = exactWatchedJob(watch);
+      if (!current || !isTerminal(current.status)) {
+        removeFollowThroughWatch(watch);
+        continue;
+      }
+      if (!watch.workflow) {
+        removeFollowThroughWatch(watch);
+        continue;
+      }
+      const workflow = workflows.check(watch.workflow.runId);
+      if (!workflow || isWorkflowTerminal(workflow.status)) {
+        removeFollowThroughWatch(watch);
+        continue;
+      }
+      const workflowSource = workflow.agents.find((agent) => agent.index === watch.workflow!.agentIndex);
+      if (!workflowSource || !isTerminal(extractWorkflowAgentStatus(workflowSource.state))) {
+        removeFollowThroughWatch(watch);
+        continue;
+      }
+      deliverable.push({ checkpoint: followThroughCheckpoint(watch, current, workflow), watch });
+    }
+    for (const { watch } of deliverable) removeFollowThroughWatch(watch);
+    for (const [index, { checkpoint }] of deliverable.entries()) {
+      try {
+        pi.sendMessage({
+          customType: FOLLOW_THROUGH_MESSAGE,
+          content: followThroughText(checkpoint),
+          display: true,
+          details: { checkpoint },
+        }, { deliverAs: "followUp", triggerTurn: index === deliverable.length - 1 });
+      } catch {
+        // A closing parent cannot accept a follow-up. The one-shot watch was
+        // already removed, so a late event cannot redeliver it.
+      }
+    }
+  };
+
   const deliverResult = (job: JobSnapshot) => {
     const compact = compactJob(job);
     pi.sendMessage({
@@ -693,6 +930,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   };
 
   pi.on("session_start", (_event, ctx) => {
+    followThroughSessionGeneration++;
+    followThroughFlushQueued = false;
     clearCardBlinks();
     workflowActivity.reset();
     activityWidgetState = undefined;
@@ -718,6 +957,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     deferredQuestions.clear();
     deliveredQuestions.clear();
     questionStates.clear();
+    followThroughWatches.clear();
     cardSnapshots.clear();
     waitInterest.clear();
     consumedResults.clear();
@@ -740,14 +980,20 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     }
     const sessionManager = manager;
     unsubscribeManager = sessionManager.subscribe((job, event) => {
+      if (manager !== sessionManager) return;
       rememberCardSnapshot(job);
       refreshCardBlinks();
+      pruneFollowThroughWatches();
       updateSessionUi(ctx.ui, sessionManager, activeHarness);
       if (event.type === "interaction") {
+        if (event.interaction.state === "pending" || event.interaction.state === "answering") {
+          clearFollowThroughWatchesForSource(event.interaction.sourceJobId);
+        }
         rememberQuestionState(event.interaction);
         deferQuestion(event.interaction);
         return;
       }
+      observeFollowThroughJob(job, event);
       if (event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown")) {
         if (job.humanVisible) publishHumanResult(job);
         else deferResult(job);
@@ -771,9 +1017,12 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   pi.on("agent_settled", () => {
     flushDeferredResults();
     flushDeferredQuestions();
+    flushFollowThrough();
   });
 
   pi.on("session_shutdown", async () => {
+    followThroughSessionGeneration++;
+    followThroughFlushQueued = false;
     availabilityGeneration++;
     startupAvailabilityController?.abort(new Error("Session shutdown"));
     startupAvailabilityController = undefined;
@@ -786,6 +1035,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     deferredQuestions.clear();
     deliveredQuestions.clear();
     questionStates.clear();
+    followThroughWatches.clear();
     cardSnapshots.clear();
     waitInterest.clear();
     consumedResults.clear();
@@ -1151,18 +1401,38 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     async execute(_id, params) {
       const interaction = getManager().answerInteraction(params.requestId, params.answer, "orchestrator-model");
       deferredQuestions.delete(params.requestId);
+      const sourceKey = resultKey(interaction.sourceJobId, interaction.sourceGeneration);
+      let source: JobSnapshot | undefined;
+      try {
+        const current = getManager().check(interaction.sourceJobId);
+        if (current.generation === interaction.sourceGeneration) source = current;
+      } catch { /* the accepted answer still returns even if retention raced the lookup */ }
+      source ??= cardSnapshots.get(sourceKey);
+      registerFollowThroughWatch(interaction, source);
       return {
         content: [{ type: "text" as const, text: `Answered ${interaction.sourceName} (${shortId(interaction.sourceJobId)}); the subagent resumed.` }],
-        details: { interaction },
+        details: {
+          interaction,
+          source: { jobId: interaction.sourceJobId, generation: interaction.sourceGeneration },
+          ...(source ? { job: compactJob(source) } : {}),
+        },
       };
     },
     renderCall(args, theme) {
       return renderToolCallLine(theme, "Steer", "answer question", truncatePreview(args.answer ?? ""));
     },
-    renderResult(res, { expanded }, theme) {
+    renderResult(res, { expanded }, theme, context) {
       const interaction = (res.details as { interaction?: PendingInteraction } | undefined)?.interaction;
       if (!interaction) return renderFailure(theme, "answer failed");
-      return renderInteractionCard(interaction, theme, { expanded, now: Date.now() });
+      const source = jobOf(res);
+      if (!source) return renderInteractionCard(interaction, theme, { expanded, now: Date.now() });
+      const workflow = interaction.workflow ? workflows.check(interaction.workflow.runId) : undefined;
+      return renderLiveJob(source, theme, {
+        expanded,
+        lead: `answered ${truncatePreview(interaction.sourceName, 160)} · resumed`,
+        receipt: (current) => answeredQuestionReceipt(interaction, current, workflowPhaseName(workflow)),
+        answerAudit: interaction,
+      }, context as LiveCardRenderContext | undefined);
     },
   });
 
