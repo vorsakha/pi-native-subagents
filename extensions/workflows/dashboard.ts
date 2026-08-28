@@ -14,11 +14,13 @@ import {
   DASHBOARD_COMPACT_ROWS,
   dashboardCancelKeyLabel,
   dashboardConfirmKeyLabel,
+  dashboardFoldRow,
   dashboardLayout,
   dashboardListViewport,
   dashboardNestedSelectionMarker,
   dashboardOverlayRows,
   dashboardScrollRule,
+  dashboardSectionRow,
   dashboardSelectionMarker,
   dashboardSummaryColor,
   fitDashboardRows,
@@ -28,6 +30,14 @@ import {
   renderDashboardHelp,
 } from "../dashboard-style.ts";
 import type { DashboardFrame, DashboardKeyGroup, DashboardLayout } from "../dashboard-style.ts";
+import {
+  dashboardCollectionViewport,
+  groupDashboardCollection,
+  type DashboardCollection,
+  type DashboardCollectionGroupDefinition,
+  type DashboardCollectionRow,
+  type DashboardCollectionViewport,
+} from "../dashboard-collection.ts";
 import { aggregateWorkflowUsage, workflowIsTerminal } from "../../src/workflows/manager.ts";
 import { isTranscriptTruncationEntry } from "../../src/workflows/artifacts.ts";
 import { availabilityLabel } from "../../src/harness-availability.ts";
@@ -119,6 +129,15 @@ export interface WorkflowsDashboardOverlayOptions {
 type AgentFilter = "all" | "active" | "failed" | "completed";
 const AGENT_FILTERS: AgentFilter[] = ["all", "active", "failed", "completed"];
 type WorkflowPane = "list" | "overview" | "agent";
+type WorkflowDashboardGroup = "input" | "active" | "failed" | "finished";
+
+const WORKFLOW_DASHBOARD_GROUPS = [
+  { key: "input", label: "Needs input" },
+  { key: "active", label: "Active" },
+  { key: "failed", label: "Failed" },
+  { key: "finished", label: "Finished", foldLabel: "finished" },
+] as const satisfies readonly DashboardCollectionGroupDefinition<WorkflowDashboardGroup>[];
+
 type CancelTarget =
   | { type: "run"; runId: string; confirmKey: "X" }
   | { type: "agent"; runId: string; agentIndex: number; confirmKey: "x" };
@@ -237,9 +256,10 @@ export class WorkflowsDashboardOverlay implements Focusable {
     if (!rows) return [];
 
     const runs = this.manager.list();
+    const collection = workflowDashboardCollection(runs);
     this.#runs = runs;
     this.syncTicker(runs);
-    const chosen = this.resolveSelectedRun(runs);
+    const chosen = this.resolveSelectedRun(collection.items);
     if (chosen) this.#runs = runs.map((candidate) => candidate.runId === chosen.runId ? chosen : candidate);
     this.syncSelections(chosen);
 
@@ -257,9 +277,9 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const layout = dashboardLayout(width, rows);
     this.#layout = layout;
     if (this.#showHelp) return fitDashboardRows(this.renderHelp(frame, layout, runs), rows);
-    if (layout.kind === "wide") return fitDashboardRows(this.renderWide(frame, layout, runs, chosen), rows);
-    if (layout.kind === "medium") return fitDashboardRows(this.renderMedium(frame, layout, runs, chosen), rows);
-    return fitDashboardRows(this.renderNarrow(frame, layout, runs, chosen), rows);
+    if (layout.kind === "wide") return fitDashboardRows(this.renderWide(frame, layout, runs, collection, chosen), rows);
+    if (layout.kind === "medium") return fitDashboardRows(this.renderMedium(frame, layout, runs, collection, chosen), rows);
+    return fitDashboardRows(this.renderNarrow(frame, layout, runs, collection, chosen), rows);
   }
 
   invalidate(): void {
@@ -276,8 +296,9 @@ export class WorkflowsDashboardOverlay implements Focusable {
     if (this.#finished) return;
 
     const runs = this.manager.list();
+    const orderedRuns = workflowDashboardCollection(runs).items;
     this.#runs = runs;
-    const run = this.resolveSelectedRun(runs);
+    const run = this.resolveSelectedRun(orderedRuns);
     if (run) this.#runs = runs.map((candidate) => candidate.runId === run.runId ? run : candidate);
     this.syncSelections(run);
 
@@ -374,8 +395,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
       this.#pane = "overview";
       this.resetScroll();
     }
-    else if (!agentPane && (matchesKey(data, Key.up) || matchesKey(data, "k"))) this.selectRun(-1, runs);
-    else if (!agentPane && (matchesKey(data, Key.down) || matchesKey(data, "j"))) this.selectRun(1, runs);
+    else if (!agentPane && (matchesKey(data, Key.up) || matchesKey(data, "k"))) this.selectRun(-1, orderedRuns);
+    else if (!agentPane && (matchesKey(data, Key.down) || matchesKey(data, "j"))) this.selectRun(1, orderedRuns);
     else if (overviewControls && (matchesKey(data, Key.left) || matchesKey(data, "h"))) this.selectPhase(-1, run);
     else if (overviewControls && (matchesKey(data, Key.right) || matchesKey(data, "l"))) this.selectPhase(1, run);
     else if (overviewControls && data === "\t") this.selectAgent(run);
@@ -464,7 +485,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
 
   /* ── selection and actions ───────────────────────────────────────────── */
 
-  private resolveSelectedRun(runs: WorkflowSnapshot[]): WorkflowSnapshot | undefined {
+  private resolveSelectedRun(runs: readonly WorkflowSnapshot[]): WorkflowSnapshot | undefined {
     if (!runs.length) {
       this.#selectedRunId = undefined;
       this.#selectionRunId = undefined;
@@ -561,7 +582,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     return this.phaseAgents(run, phase).find((agent) => agent.index === this.#selectedAgentIndex);
   }
 
-  private selectRun(delta: number, runs: WorkflowSnapshot[]): void {
+  private selectRun(delta: number, runs: readonly WorkflowSnapshot[]): void {
     if (!runs.length) return;
     const index = runs.findIndex((run) => run.runId === this.#selectedRunId);
     const next = runs[clampDashboard(index + delta, 0, runs.length - 1)];
@@ -863,10 +884,11 @@ export class WorkflowsDashboardOverlay implements Focusable {
     frame: DashboardFrame,
     layout: DashboardLayout,
     runs: WorkflowSnapshot[],
+    collection: DashboardCollection<WorkflowSnapshot, WorkflowDashboardGroup>,
     chosen: WorkflowSnapshot | undefined,
   ): string[] {
     const { left, right } = frame.columns(layout.railWidth);
-    const view = dashboardListViewport(runs, this.selectedRunPosition(runs), layout.contentRows);
+    const view = dashboardCollectionViewport(collection, this.#selectedRunId, layout.contentRows, (run) => run.runId);
     const rail = this.renderRunRail(runs, view, chosen, layout.contentRows, Math.max(1, left - 1));
     const detail = this.renderInspector(chosen, layout.contentRows, Math.max(1, right - 1));
     const lines = [
@@ -884,9 +906,10 @@ export class WorkflowsDashboardOverlay implements Focusable {
     frame: DashboardFrame,
     layout: DashboardLayout,
     runs: WorkflowSnapshot[],
+    collection: DashboardCollection<WorkflowSnapshot, WorkflowDashboardGroup>,
     chosen: WorkflowSnapshot | undefined,
   ): string[] {
-    const view = dashboardListViewport(runs, this.selectedRunPosition(runs), layout.listRows);
+    const view = dashboardCollectionViewport(collection, this.#selectedRunId, layout.listRows, (run) => run.runId);
     const lines = [this.renderHeader(frame, runs), frame.top(this.listTitle(runs, view))];
     for (const row of this.renderRunList(runs, view, chosen, layout.listRows, frame.innerWidth)) lines.push(frame.row(row));
     lines.push(frame.divider(this.detailTitle(chosen)));
@@ -899,9 +922,10 @@ export class WorkflowsDashboardOverlay implements Focusable {
     frame: DashboardFrame,
     layout: DashboardLayout,
     runs: WorkflowSnapshot[],
+    collection: DashboardCollection<WorkflowSnapshot, WorkflowDashboardGroup>,
     chosen: WorkflowSnapshot | undefined,
   ): string[] {
-    const view = dashboardListViewport(runs, this.selectedRunPosition(runs), layout.contentRows);
+    const view = dashboardCollectionViewport(collection, this.#selectedRunId, layout.contentRows, (run) => run.runId);
     const detail = this.#pane !== "list" && chosen;
     const lines = [
       this.renderHeader(frame, runs),
@@ -1001,9 +1025,9 @@ export class WorkflowsDashboardOverlay implements Focusable {
     );
   }
 
-  private listTitle(runs: WorkflowSnapshot[], view: ListViewport<WorkflowSnapshot>): string {
+  private listTitle(runs: WorkflowSnapshot[], view: WorkflowListViewport): string {
     const active = runs.filter((run) => !workflowIsTerminal(run.status)).length;
-    const clipped = `${view.start > 0 ? "↑" : ""}${view.end < runs.length ? "↓" : ""}`;
+    const clipped = `${view.clippedBefore ? "↑" : ""}${view.clippedAfter ? "↓" : ""}`;
     return `runs · ${active} active / ${runs.length}${clipped ? ` ${clipped}` : ""}`;
   }
 
@@ -1020,14 +1044,27 @@ export class WorkflowsDashboardOverlay implements Focusable {
     return phase ? `workflow · phase ${progress?.label ?? "waiting"} · filter ${this.#agentFilter}` : "workflow";
   }
 
-  private renderRunRail(runs: WorkflowSnapshot[], view: ListViewport<WorkflowSnapshot>, chosen: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
+  private renderRunRail(runs: WorkflowSnapshot[], view: WorkflowListViewport, chosen: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
     if (!runs.length) return fitDashboardRows([this.theme.fg("muted", "No workflow runs in this session.")], rows);
-    return fitDashboardRows(view.items.map((run) => this.renderRun(run, run.runId === chosen?.runId, width, true)), rows);
+    return fitDashboardRows(view.rows.map((row) => row.kind === "item"
+      ? this.renderRun(row.item, row.item.runId === chosen?.runId, width, true)
+      : this.renderCollectionRow(row, width)), rows);
   }
 
-  private renderRunList(runs: WorkflowSnapshot[], view: ListViewport<WorkflowSnapshot>, chosen: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
+  private renderRunList(runs: WorkflowSnapshot[], view: WorkflowListViewport, chosen: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
     if (!runs.length) return fitDashboardRows([this.theme.fg("muted", "  No workflow runs in this session.")], rows);
-    return fitDashboardRows(view.items.map((run) => this.renderRun(run, run.runId === chosen?.runId, width)), rows);
+    return fitDashboardRows(view.rows.map((row) => row.kind === "item"
+      ? this.renderRun(row.item, row.item.runId === chosen?.runId, width)
+      : this.renderCollectionRow(row, width)), rows);
+  }
+
+  private renderCollectionRow(
+    row: Exclude<DashboardCollectionRow<WorkflowSnapshot, WorkflowDashboardGroup>, { kind: "item" }>,
+    width: number,
+  ): string {
+    return row.kind === "section"
+      ? dashboardSectionRow(this.theme, row.label, row.count, width)
+      : dashboardFoldRow(this.theme, row.label, row.hidden, width);
   }
 
   private renderRun(run: WorkflowSnapshot, selected: boolean, width: number, rail = false): string {
@@ -1037,16 +1074,17 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const identity = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name}`;
     const summary = workflowDashboardSummary(run, this.#now());
     const phase = workflowPhaseProgress(run).label;
-    const outcome = run.status === "completed" && run.taskOutcome ? ` · ${run.taskOutcome}` : "";
     // A blocked question is not a lifecycle state, so the run keeps its own
     // status and carries the aggregate marker beside it, in words and a glyph.
     const needInput = workflowNeedsInput(run);
-    const questions = needInput ? `${this.theme.fg("warning", `? ${needInput} need input`)} · ` : "";
     const progress = rail ? "" : `phase ${phase} · `;
-    const right = `${questions}${this.theme.fg("muted", `${progress}${formatElapsed(run, this.#now())}`)} · ${this.theme.fg(status.color, `${run.status}${outcome}`)} `;
+    const decoration = this.theme.fg(dashboardSummaryColor(summary), summary.text)
+      + this.theme.fg("muted", ` · ${formatElapsed(run, this.#now())}`);
+    const questions = needInput ? `${this.theme.fg("warning", `? ${needInput} need input`)} · ` : "";
+    const right = `${questions}${this.theme.fg("muted", progress)}${this.theme.fg(status.color, workflowRunStatusLabel(run))} `;
     return alignDashboardSummaryRow(
       identity,
-      this.theme.fg(dashboardSummaryColor(summary), summary.text),
+      decoration,
       right,
       width,
     );
@@ -1494,10 +1532,6 @@ export class WorkflowsDashboardOverlay implements Focusable {
     return "close";
   }
 
-  private selectedRunPosition(runs: WorkflowSnapshot[]): number {
-    const index = runs.findIndex((run) => run.runId === this.#selectedRunId);
-    return index < 0 ? 0 : index;
-  }
 }
 
 function cancelTargetKey(target: CancelTarget): string {
@@ -1506,9 +1540,29 @@ function cancelTargetKey(target: CancelTarget): string {
     : `agent:${target.runId}:${target.agentIndex}`;
 }
 
-type ListViewport<T> = ReturnType<typeof dashboardListViewport<T>>;
+type WorkflowListViewport = DashboardCollectionViewport<WorkflowSnapshot, WorkflowDashboardGroup>;
 
-function defaultWorkflow(runs: WorkflowSnapshot[]): WorkflowSnapshot {
+function workflowDashboardCollection(
+  runs: readonly WorkflowSnapshot[],
+): DashboardCollection<WorkflowSnapshot, WorkflowDashboardGroup> {
+  return groupDashboardCollection(runs, WORKFLOW_DASHBOARD_GROUPS, (run) => {
+    if (workflowNeedsInput(run)) return "input";
+    if (run.status === "pending" || run.status === "running" || run.status === "paused") return "active";
+    if (run.status === "failed" || (run.status === "completed" && run.taskOutcome === "unsuccessful")) return "failed";
+    return "finished";
+  });
+}
+
+function workflowRunStatusLabel(run: WorkflowSnapshot): string {
+  const providerWait = [...run.agents].reverse().find((agent) => agent.state === "waiting" && agent.providerWait)?.providerWait;
+  if (providerWait) {
+    return `${run.status} · waiting for ${sanitizeInline(providerWait.provider)} ${sanitizeInline(providerWait.kind)}`;
+  }
+  const outcome = run.status === "completed" && run.taskOutcome ? ` · ${run.taskOutcome}` : "";
+  return `${run.status}${outcome}`;
+}
+
+function defaultWorkflow(runs: readonly WorkflowSnapshot[]): WorkflowSnapshot {
   return runs.find((run) => run.status === "running" || run.status === "paused")
     ?? runs.find((run) => run.status === "pending")
     ?? runs.reduce((latest, run) => run.timestamps.createdAt >= latest.timestamps.createdAt ? run : latest);

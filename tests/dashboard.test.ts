@@ -9,6 +9,7 @@ import {
   truncateDashboardLine,
 } from "../extensions/subagents/dashboard.ts";
 import { alignDashboardRow, createDashboardFrame, dashboardLayout } from "../extensions/dashboard-style.ts";
+import { dashboardCollectionViewport, groupDashboardCollection } from "../extensions/dashboard-collection.ts";
 import { TakeoverView, buildTranscript } from "../extensions/subagents/takeover.ts";
 import { renderAssistantMarkdown } from "../extensions/subagents/transcript.ts";
 import type { JobSnapshot } from "../src/types.ts";
@@ -61,6 +62,134 @@ test("dashboard layout adapts to fullscreen terminal geometry", () => {
   assert.equal(dashboardLayout(120, 8).kind, "narrow");
 });
 
+test("grouped collection rows keep headers presentational and selected entities visible at one row", () => {
+  const definitions = [
+    { key: "active", label: "Active" },
+    { key: "finished", label: "Finished", foldLabel: "finished" },
+  ] as const;
+  const collection = groupDashboardCollection(
+    [
+      { id: "done-1", group: "finished" as const },
+      { id: "live", group: "active" as const },
+      { id: "done-2", group: "finished" as const },
+    ],
+    definitions,
+    (item) => item.group,
+  );
+
+  assert.deepEqual(collection.items.map((item) => item.id), ["live", "done-1", "done-2"]);
+  const view = dashboardCollectionViewport(collection, "done-2", 1, (item) => item.id);
+  assert.equal(view.rows.length, 1);
+  assert.equal(view.rows[0]?.kind, "item", "a section header never consumes the selected entity's only row");
+  assert.equal(view.rows[0]?.kind === "item" ? view.rows[0].item.id : undefined, "done-2");
+
+  const pressured = groupDashboardCollection(
+    [
+      { id: "live-1", group: "active" as const },
+      { id: "live-2", group: "active" as const },
+      { id: "live-3", group: "active" as const },
+      { id: "done", group: "finished" as const },
+    ],
+    definitions,
+    (item) => item.group,
+  );
+  const pressuredView = dashboardCollectionViewport(pressured, "live-1", 3, (item) => item.id);
+  assert.ok(pressuredView.rows.some((row) => row.kind === "item" && row.item.id === "live-1"));
+  assert.ok(pressuredView.rows.some((row) => row.kind === "fold" && row.hidden === 1), "folding always has a visible count when two rows fit");
+});
+
+test("direct jobs render attention groups with counts and navigate only entity rows", (t) => {
+  const blocked = {
+    ...job("blocked"),
+    name: "input-row",
+    interaction: interactionSnapshot({ sourceJobId: "blocked", sourceName: "blocked" }),
+  };
+  const working = { ...job("working"), name: "work-row" };
+  const queued = { ...job("queued", "queued"), name: "queue-row" };
+  const failed = { ...job("failed", "failed"), name: "error-row" };
+  const completed = { ...job("completed", "completed"), name: "done-row" };
+  const cancelled = { ...job("cancelled", "cancelled"), name: "cancel-row" };
+  const state = dashboard(
+    [completed, failed, cancelled, queued, working, blocked],
+    30,
+    () => {},
+    undefined,
+    { focusJobId: blocked.id, fullscreen: true },
+  );
+  t.after(() => state.overlay.dispose());
+
+  const lines = state.overlay.render(160);
+  const text = lines.join("\n");
+  for (const heading of [
+    "Needs input · 1",
+    "Working · 1",
+    "Queued or waiting · 1",
+    "Failed · 1",
+    "Finished · 2",
+  ]) assert.match(text, new RegExp(heading));
+
+  const positions = ["input-row", "work-row", "queue-row", "error-row", "done-row"]
+    .map((name) => lines.findIndex((line) => line.includes(name)));
+  assert.ok(positions.every((position) => position >= 0));
+  assert.deepEqual([...positions].sort((left, right) => left - right), positions, "rows follow attention order");
+  assert.match(lines.find((line) => line.includes("input-row") && line.includes("❯")) ?? "", /running/, "a routed question does not erase the lifecycle status");
+  assert.match(lines.find((line) => line.includes("cancel-row")) ?? "", /cancelled/);
+
+  state.overlay.handleInput("j");
+  const selected = state.overlay.render(160).find((line) => line.includes("work-row") && line.includes("❯"));
+  assert.ok(selected, "one navigation step skips the section header and selects the next entity");
+  state.overlay.handleInput("x");
+  state.overlay.render(160);
+  state.overlay.handleInput("x");
+  assert.deepEqual(state.manager.cancelCalls, ["working"], "the destructive action targets the selected entity, never a header");
+});
+
+test("direct job folding yields to live work and reveals the selected finished identity", (t) => {
+  const live = { ...job("live"), name: "live" };
+  const finished = Array.from({ length: 8 }, (_, index) => ({
+    ...job(`done-${index + 1}`, "completed"),
+    name: `done-${index + 1}`,
+  }));
+  const jobs = [live, ...finished];
+  const state = dashboard(jobs, 7, () => {}, undefined, { focusJobId: live.id, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  let lines = state.overlay.render(120);
+  assert.equal(lines.length, 7);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 120));
+  assert.ok(lines.some((line) => line.includes("live")));
+  assert.ok(lines.some((line) => line.includes("8 finished hidden")));
+
+  for (let index = 0; index < 6; index++) state.overlay.handleInput("j");
+  lines = state.overlay.render(120);
+  assert.ok(lines.some((line) => line.includes("done-6") && line.includes("❯")), "navigation reveals the selected folded job");
+  assert.ok(lines.some((line) => line.includes("7 finished hidden")));
+
+  finished[5]!.status = "running";
+  jobs.reverse();
+  lines = state.overlay.render(120);
+  assert.ok(lines.some((line) => line.includes("done-6") && line.includes("❯")), "the selected job ID survives reordering into Working");
+});
+
+test("grouped job folding stays within wide, medium, and narrow panel geometry", (t) => {
+  const jobs = [
+    { ...job("active"), name: "active" },
+    ...Array.from({ length: 30 }, (_, index) => ({
+      ...job(`history-${index}`, "completed"),
+      name: `history-${index}`,
+    })),
+  ];
+  for (const width of [120, 72, 52]) {
+    const state = dashboard(jobs, 30, () => {}, undefined, { focusJobId: "active", fullscreen: true });
+    t.after(() => state.overlay.dispose());
+    const lines = state.overlay.render(width);
+    assert.equal(lines.length, 30);
+    assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    assert.ok(lines.some((line) => line.includes("active")));
+    assert.ok(lines.some((line) => line.includes("finished hidden")), `${width}-column layout exposes the folded count`);
+  }
+});
+
 test("job summaries render in wide, medium, and narrow rows without displacing identity", (t) => {
   for (const width of [120, 72, 52]) {
     const current = jobSnapshot({
@@ -92,6 +221,7 @@ test("job summaries render in wide, medium, and narrow rows without displacing i
   })], 30, () => {}, undefined, { fullscreen: true });
   t.after(() => owned.overlay.dispose());
   assert.ok(owned.overlay.render(120).some((line) => line.includes("owned") && line.includes("workflow")));
+  assert.ok(owned.overlay.render(40).some((line) => line.includes("owned") && line.includes("workflow")), "workflow ownership survives the minimum width");
 });
 
 test("browse detail keeps Page Up and Page Down aliases in wide and medium layouts", (t) => {
@@ -375,7 +505,7 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
   assert.ok(halfPage.some((line) => line.includes("first-")));
   assert.ok(halfPage.every((line) => visibleWidth(line) <= 120));
 
-  overlay.handleInput("j");
+  overlay.handleInput("k");
   assert.ok(overlay.render(72).some((line) => line.includes("second")), "selection moves by job id");
   overlay.handleInput("x");
   assert.ok(overlay.render(72).some((line) => line.includes("Press x again")), "cancel is confirmed inline");
@@ -423,7 +553,7 @@ test("dashboard pins errors and exposes queued empty states", (t) => {
   t.after(() => overlay.dispose());
   const failedLines = overlay.render(72);
   assert.ok(failedLines.some((line) => line.includes("Harness exited before first response")));
-  overlay.handleInput("j");
+  overlay.handleInput("k");
   const queuedLines = overlay.render(72);
   assert.ok(queuedLines.some((line) => line.includes("queued")));
   assert.ok(queuedLines.some((line) => line.includes("waiting for an agent slot")));

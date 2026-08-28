@@ -263,11 +263,22 @@ export function alignDashboardSummaryRow(
   width: number,
 ): string {
   const safeWidth = Math.max(0, width);
-  const leftMax = Math.max(0, safeWidth - visibleWidth(right) - 2);
-  const fittedIdentity = truncateToWidth(identity, leftMax);
+  const gapWidth = safeWidth >= 2 ? 2 : 0;
+  const rightWidth = visibleWidth(right);
+  const minimumRight = Math.min(rightWidth, Math.min(25, Math.floor(safeWidth * 0.65)));
+  const identityMax = Math.max(0, safeWidth - minimumRight - gapWidth);
+  const fittedIdentity = truncateToWidth(identity, identityMax);
+  const fittedRight = truncateToWidth(
+    right,
+    Math.max(0, safeWidth - visibleWidth(fittedIdentity) - gapWidth),
+  );
+  const leftMax = Math.max(0, safeWidth - visibleWidth(fittedRight) - gapWidth);
   let left = fittedIdentity;
 
-  if (visibleWidth(fittedIdentity) === visibleWidth(identity)) {
+  if (
+    visibleWidth(fittedIdentity) === visibleWidth(identity)
+    && visibleWidth(fittedRight) === rightWidth
+  ) {
     const separator = " · ";
     const summaryWidth = leftMax - visibleWidth(identity) - visibleWidth(separator);
     if (summaryWidth >= 2) {
@@ -275,7 +286,7 @@ export function alignDashboardSummaryRow(
     }
   }
 
-  return alignDashboardRow(left, right, safeWidth);
+  return alignDashboardRow(left, fittedRight, safeWidth);
 }
 
 export type DashboardFrame = ReturnType<typeof createDashboardFrame>;
@@ -314,6 +325,17 @@ export function formatDurationLabel(elapsedMs: number): string {
 export function dashboardScrollRule(theme: Theme, label: string, width: number): string {
   const safeWidth = Math.max(0, width);
   return theme.fg("dim", truncateToWidth(`── ${label} ${"─".repeat(safeWidth)}`, safeWidth, ""));
+}
+
+/** Textual, non-selectable list section header with its complete entity count. */
+export function dashboardSectionRow(theme: Theme, label: string, count: number, width: number): string {
+  return dashboardScrollRule(theme, `${label} · ${count}`, width);
+}
+
+/** Width-safe notice for automatically folded low-priority entities. */
+export function dashboardFoldRow(theme: Theme, label: string, hidden: number, width: number): string {
+  const safeWidth = Math.max(0, width);
+  return theme.fg("dim", truncateToWidth(`… ${hidden} ${label} hidden`, safeWidth, ""));
 }
 
 /** Primary (run/job-level) selection marker. */

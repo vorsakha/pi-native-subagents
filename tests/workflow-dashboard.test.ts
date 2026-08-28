@@ -214,6 +214,99 @@ test("run and agent summaries render across wide, medium, and narrow dashboard r
   }
 });
 
+test("workflow runs render attention groups with counts and keep grouped states exact", (t) => {
+  const input = workflow("input");
+  input.name = "IN";
+  input.agents[1]!.waitingOn = {
+    ordinal: 0,
+    requestId: "request-input",
+    target: "orchestrator",
+    sourceAgentIndex: 1,
+    sourceName: "tests",
+    question: "Which release should proceed?",
+    state: "pending",
+    createdAt: 60_000,
+  };
+  const pending = workflow("pending", "pending");
+  pending.name = "PN";
+  const paused = workflow("paused", "paused");
+  paused.name = "PS";
+  const provider = workflow("provider");
+  provider.name = "QT";
+  provider.agents[1]!.state = "waiting";
+  provider.agents[1]!.providerWait = {
+    provider: "codex",
+    kind: "quota",
+    detail: "usage limit",
+    attempt: 1,
+    maxAttempts: 3,
+    retryAt: 125_000,
+  };
+  const failed = workflow("failed", "failed");
+  failed.name = "FL";
+  const unsuccessful = workflow("unsuccessful", "completed");
+  unsuccessful.name = "UN";
+  unsuccessful.taskOutcome = "unsuccessful";
+  const aborted = workflow("aborted", "aborted");
+  aborted.name = "AB";
+  const successful = workflow("successful", "completed");
+  successful.name = "OK";
+  successful.taskOutcome = "successful";
+  const runs = [successful, failed, pending, aborted, input, paused, provider, unsuccessful];
+  const state = harness(runs, 36, () => {}, { focusRunId: input.runId, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  const lines = state.overlay.render(180);
+  const text = lines.join("\n");
+  for (const heading of [
+    "Needs input · 1",
+    "Active · 3",
+    "Failed · 2",
+    "Finished · 2",
+  ]) assert.match(text, new RegExp(heading));
+
+  const positions = [" IN ", " PN ", " FL ", " OK "]
+    .map((name) => lines.findIndex((line) => line.includes(name)));
+  assert.ok(positions.every((position) => position >= 0));
+  assert.deepEqual([...positions].sort((left, right) => left - right), positions);
+  assert.match(lines.find((line) => line.includes(" PS ")) ?? "", /paused/);
+  assert.match(lines.find((line) => line.includes(" QT ")) ?? "", /running · waiting/);
+  assert.match(lines.find((line) => line.includes(" UN ")) ?? "", /completed · unsuccessful/);
+  assert.match(lines.find((line) => line.includes(" AB ")) ?? "", /aborted/);
+
+  state.overlay.handleInput("j");
+  assert.ok(state.overlay.render(180).some((line) => line.includes(" PN ") && line.includes("❯")), "navigation skips the Active header");
+  state.overlay.handleInput("X");
+  state.overlay.render(180);
+  state.overlay.handleInput("X");
+  assert.deepEqual(state.actions.at(-1), { type: "cancel", runId: "pending" }, "run actions target the selected identity, not a section row");
+});
+
+test("workflow finished folding reveals selection and selection survives a group move", (t) => {
+  const active = workflow("active");
+  const finished = Array.from({ length: 7 }, (_, index) => workflow(`done-${index + 1}`, "completed"));
+  const runs = [active, ...finished];
+  const state = harness(runs, 7, () => {}, { focusRunId: active.runId, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  let lines = state.overlay.render(120);
+  assertPanel(lines, 120, 7);
+  assert.ok(lines.some((line) => line.includes("7 finished hidden")));
+  for (let index = 0; index < 5; index++) state.overlay.handleInput("j");
+  lines = state.overlay.render(120);
+  assert.ok(lines.some((line) => line.includes("Release done-5") && line.includes("❯")), "a selected finished run is revealed");
+  assert.ok(lines.some((line) => line.includes("6 finished hidden")));
+
+  const selected = runs.find((run) => run.runId === "done-5")!;
+  selected.status = "running";
+  selected.taskOutcome = undefined;
+  selected.timestamps.endedAt = undefined;
+  runs.reverse();
+  state.emit(selected.runId);
+  lines = state.overlay.render(120);
+  assert.ok(lines.some((line) => line.includes("Release done-5") && line.includes("❯")), "the selected run ID survives reordering into Active");
+});
+
 test("workflow dashboard marks completed unsuccessful runs with warning color", (t) => {
   const run = workflow("unsuccessful", "completed");
   run.taskOutcome = "unsuccessful";

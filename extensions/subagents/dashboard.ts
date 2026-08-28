@@ -16,9 +16,10 @@ import {
   DASHBOARD_COMPACT_ROWS,
   dashboardCancelKeyLabel,
   dashboardConfirmKeyLabel,
+  dashboardFoldRow,
   dashboardLayout,
-  dashboardListViewport,
   dashboardScrollRule,
+  dashboardSectionRow,
   dashboardSelectionMarker,
   dashboardSubmitKeyLabel,
   dashboardSummaryColor,
@@ -29,6 +30,14 @@ import {
   renderDashboardHelp,
 } from "../dashboard-style.ts";
 import type { DashboardFrame, DashboardKeyGroup, DashboardLayout } from "../dashboard-style.ts";
+import {
+  dashboardCollectionViewport,
+  groupDashboardCollection,
+  type DashboardCollection,
+  type DashboardCollectionGroupDefinition,
+  type DashboardCollectionRow,
+  type DashboardCollectionViewport,
+} from "../dashboard-collection.ts";
 export {
   DASHBOARD_CHROME_ROWS,
   DASHBOARD_COMPACT_ROWS,
@@ -108,6 +117,16 @@ export interface DashboardOverlayOptions {
 
 export type DashboardMode = "browse" | "takeover" | "answer";
 export type { DashboardLayout, DashboardLayoutKind } from "../dashboard-style.ts";
+
+type JobDashboardGroup = "input" | "working" | "waiting" | "failed" | "finished";
+
+const JOB_DASHBOARD_GROUPS = [
+  { key: "input", label: "Needs input" },
+  { key: "working", label: "Working" },
+  { key: "waiting", label: "Queued or waiting" },
+  { key: "failed", label: "Failed" },
+  { key: "finished", label: "Finished", foldLabel: "finished" },
+] as const satisfies readonly DashboardCollectionGroupDefinition<JobDashboardGroup>[];
 
 export function createDashboardOverlay(
   tui: Pick<TUI, "requestRender" | "terminal">,
@@ -221,7 +240,8 @@ class DashboardOverlay implements Focusable {
     this.#renderedConfirmationId = undefined;
     const jobs = this.manager.list();
     this.#jobs = jobs;
-    const chosen = this.syncSelection(jobs);
+    const collection = jobDashboardCollection(jobs);
+    const chosen = this.syncSelection(collection.items);
     this.syncTicker(jobs);
 
     const rows = dashboardOverlayRows(this.tui.terminal?.rows ?? 0, this.fullscreen());
@@ -243,9 +263,9 @@ class DashboardOverlay implements Focusable {
     const layout = dashboardLayout(width, rows);
     this.#layout = layout;
     if (this.#showHelp) return this.renderHelp(frame, layout, jobs);
-    if (layout.kind === "wide") return this.renderWide(frame, layout, jobs, chosen);
-    if (layout.kind === "medium") return this.renderMedium(frame, layout, jobs, chosen);
-    return this.renderNarrow(frame, layout, jobs, chosen);
+    if (layout.kind === "wide") return this.renderWide(frame, layout, jobs, collection, chosen);
+    if (layout.kind === "medium") return this.renderMedium(frame, layout, jobs, collection, chosen);
+    return this.renderNarrow(frame, layout, jobs, collection, chosen);
   }
 
   invalidate(): void {
@@ -262,13 +282,14 @@ class DashboardOverlay implements Focusable {
     if (this.#finished) return;
     const jobs = this.manager.list();
     this.#jobs = jobs;
-    this.syncSelection(jobs);
+    const orderedJobs = jobDashboardCollection(jobs).items;
+    this.syncSelection(orderedJobs);
     // Both the cancel arm and the notice are answers to the previous keystroke.
     const compact = this.isCompactGeometry();
     const armed = compact ? undefined : this.#confirmCancelId;
     this.#confirmCancelId = undefined;
     this.#notice = "";
-    const job = this.currentJob(jobs);
+    const job = this.currentJob(orderedJobs);
     const cancel = matchesKey(data, Key.escape) || this.keybindings.matches(data, "tui.select.cancel");
 
     if (compact) {
@@ -353,8 +374,8 @@ class DashboardOverlay implements Focusable {
       }
     }
     else if (narrowList) {
-      if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectJob(-1, jobs);
-      else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(1, jobs);
+      if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectJob(-1, orderedJobs);
+      else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(1, orderedJobs);
       else if (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter)) {
         if (job) {
           this.#pane = "detail";
@@ -372,8 +393,8 @@ class DashboardOverlay implements Focusable {
     else if (matchesKey(data, Key.ctrl("d"))) this.scroll(this.halfPageStep());
     else if (matchesKey(data, "g")) this.scrollTo(0);
     else if (matchesKey(data, Key.shift("g"))) this.scrollTo(Number.MAX_SAFE_INTEGER);
-    else if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectJob(-1, jobs);
-    else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(1, jobs);
+    else if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectJob(-1, orderedJobs);
+    else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(1, orderedJobs);
     else if (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter)) {
       if (this.takeoverControlVisible(job)) this.enterTakeover(job);
     }
@@ -463,7 +484,7 @@ class DashboardOverlay implements Focusable {
 
   /* ── selection and actions ─────────────────────────────────────────────── */
 
-  private syncSelection(jobs: JobSnapshot[]): JobSnapshot | undefined {
+  private syncSelection(jobs: readonly JobSnapshot[]): JobSnapshot | undefined {
     if (!jobs.length) {
       this.#selectedId = undefined;
       if (this.composing()) this.leaveTakeover();
@@ -479,11 +500,11 @@ class DashboardOverlay implements Focusable {
     return chosen;
   }
 
-  private currentJob(jobs: JobSnapshot[]): JobSnapshot | undefined {
+  private currentJob(jobs: readonly JobSnapshot[]): JobSnapshot | undefined {
     return jobs.find((job) => job.id === this.#selectedId);
   }
 
-  private selectJob(delta: number, jobs: JobSnapshot[]): void {
+  private selectJob(delta: number, jobs: readonly JobSnapshot[]): void {
     if (!jobs.length) return;
     const index = jobs.findIndex((job) => job.id === this.#selectedId);
     const next = jobs[clampDashboard(index + delta, 0, jobs.length - 1)];
@@ -670,10 +691,11 @@ class DashboardOverlay implements Focusable {
     frame: DashboardFrame,
     layout: DashboardLayout,
     jobs: JobSnapshot[],
+    collection: DashboardCollection<JobSnapshot, JobDashboardGroup>,
     chosen: JobSnapshot | undefined,
   ): string[] {
     const { left, right } = frame.columns(layout.railWidth);
-    const view = dashboardListViewport(jobs, this.selectedIndex(jobs), layout.contentRows);
+    const view = dashboardCollectionViewport(collection, this.#selectedId, layout.contentRows, (job) => job.id);
     const rail = this.renderRail(jobs, view, chosen, layout.contentRows, Math.max(1, left - 1));
     const detail = this.renderInspector(chosen, layout.contentRows, Math.max(1, right - 1));
     const lines = [
@@ -691,9 +713,10 @@ class DashboardOverlay implements Focusable {
     frame: DashboardFrame,
     layout: DashboardLayout,
     jobs: JobSnapshot[],
+    collection: DashboardCollection<JobSnapshot, JobDashboardGroup>,
     chosen: JobSnapshot | undefined,
   ): string[] {
-    const view = dashboardListViewport(jobs, this.selectedIndex(jobs), layout.listRows);
+    const view = dashboardCollectionViewport(collection, this.#selectedId, layout.listRows, (job) => job.id);
     const lines = [this.renderHeader(frame, jobs), frame.top(this.listTitle(jobs, view))];
     for (const row of this.renderList(jobs, view, chosen, layout.listRows, frame.innerWidth)) {
       lines.push(frame.row(row));
@@ -710,10 +733,11 @@ class DashboardOverlay implements Focusable {
     frame: DashboardFrame,
     layout: DashboardLayout,
     jobs: JobSnapshot[],
+    collection: DashboardCollection<JobSnapshot, JobDashboardGroup>,
     chosen: JobSnapshot | undefined,
   ): string[] {
     const detail = this.#pane === "detail" && chosen;
-    const view = dashboardListViewport(jobs, this.selectedIndex(jobs), layout.contentRows);
+    const view = dashboardCollectionViewport(collection, this.#selectedId, layout.contentRows, (job) => job.id);
     const lines = [
       this.renderHeader(frame, jobs),
       frame.top(detail ? this.detailTitle(chosen) : this.listTitle(jobs, view)),
@@ -801,10 +825,10 @@ class DashboardOverlay implements Focusable {
     );
   }
 
-  private listTitle(jobs: JobSnapshot[], view: ListViewport): string {
+  private listTitle(jobs: JobSnapshot[], view: JobListViewport): string {
     const running = jobs.filter((job) => job.status === "running").length;
     const capacity = this.manager.concurrency ?? 4;
-    const clipped = `${view.start > 0 ? "↑" : ""}${view.end < jobs.length ? "↓" : ""}`;
+    const clipped = `${view.clippedBefore ? "↑" : ""}${view.clippedAfter ? "↓" : ""}`;
     const focus = this.#mode === "browse" ? "▸ " : "";
     return `${focus}jobs · ${Math.min(running, capacity)}/${capacity} slots${clipped ? ` ${clipped}` : ""}`;
   }
@@ -825,24 +849,28 @@ class DashboardOverlay implements Focusable {
 
   private renderRail(
     jobs: JobSnapshot[],
-    view: ListViewport,
+    view: JobListViewport,
     chosen: JobSnapshot | undefined,
     rows: number,
     width: number,
   ): string[] {
     if (!jobs.length) return fitDashboardRows([this.theme.fg("muted", "No jobs in this session.")], rows);
-    const lines = view.items.map((job) => {
+    const lines = view.rows.map((row) => {
+      if (row.kind !== "item") return this.renderCollectionRow(row, width);
+      const job = row.item;
       const status = pendingInteraction(job) ? { glyph: "?", color: "warning" as const } : statusMeta(job.status, this.#now());
       const selected = job.id === chosen?.id;
       const marker = dashboardSelectionMarker(this.theme, selected);
       const name = sanitizeInline(job.name);
       const identity = `${marker} ${this.theme.fg(status.color, status.glyph)} ${this.theme.fg(selected ? "accent" : "text", name)}`;
       const summary = jobDashboardSummary(job);
-      const owner = job.workflow ? "workflow · " : "";
-      const right = this.theme.fg("muted", `${owner}${formatElapsed(job, this.#now())}`);
+      const decoration = this.theme.fg(dashboardSummaryColor(summary), summary.text)
+        + this.theme.fg("muted", ` · ${formatElapsed(job, this.#now())}`);
+      const owner = job.workflow ? `${this.theme.fg("muted", "workflow · ")}` : "";
+      const right = `${owner}${this.theme.fg(status.color, job.status)}`;
       return alignDashboardSummaryRow(
         identity,
-        this.theme.fg(dashboardSummaryColor(summary), summary.text),
+        decoration,
         right,
         width,
       );
@@ -852,13 +880,24 @@ class DashboardOverlay implements Focusable {
 
   private renderList(
     jobs: JobSnapshot[],
-    view: ListViewport,
+    view: JobListViewport,
     chosen: JobSnapshot | undefined,
     rows: number,
     width: number,
   ): string[] {
     if (!jobs.length) return fitDashboardRows([this.theme.fg("muted", "  No jobs in this session.")], rows);
-    return fitDashboardRows(view.items.map((job) => this.renderJob(job, job.id === chosen?.id, width)), rows);
+    return fitDashboardRows(view.rows.map((row) => row.kind === "item"
+      ? this.renderJob(row.item, row.item.id === chosen?.id, width)
+      : this.renderCollectionRow(row, width)), rows);
+  }
+
+  private renderCollectionRow(
+    row: Exclude<DashboardCollectionRow<JobSnapshot, JobDashboardGroup>, { kind: "item" }>,
+    width: number,
+  ): string {
+    return row.kind === "section"
+      ? dashboardSectionRow(this.theme, row.label, row.count, width)
+      : dashboardFoldRow(this.theme, row.label, row.hidden, width);
   }
 
   private renderJob(job: JobSnapshot, selected: boolean, width: number): string {
@@ -868,17 +907,18 @@ class DashboardOverlay implements Focusable {
     const name = this.theme.fg(selected ? "accent" : "text", sanitizeInline(job.name));
     const identity = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name}`;
     const summary = jobDashboardSummary(job);
-    const owner = job.workflow ? " · workflow" : "";
-    // Stable policy metadata belongs in the inspector. Keep the row's right
-    // side compact so the job name survives narrow terminals.
-    const right =
-      this.theme.fg(
+    // Stable policy metadata belongs in the inspector. Ownership and lifecycle
+    // wording own the right edge; route and elapsed yield with the summary.
+    const decoration = this.theme.fg(dashboardSummaryColor(summary), summary.text)
+      + this.theme.fg(
         "muted",
-        `${sanitizeInline(job.harness)}${owner} · ${formatElapsed(job, this.#now())}`,
-      ) + ` · ${this.theme.fg(status.color, interaction ? interactionWaitLabel(interaction) : job.status)} `;
+        ` · ${sanitizeInline(job.harness)} · ${formatElapsed(job, this.#now())}`,
+      );
+    const owner = job.workflow ? `${this.theme.fg("muted", "workflow · ")}` : "";
+    const right = `${owner}${this.theme.fg(status.color, job.status)} `;
     return alignDashboardSummaryRow(
       identity,
-      this.theme.fg(dashboardSummaryColor(summary), summary.text),
+      decoration,
       right,
       width,
     );
@@ -1114,16 +1154,22 @@ class DashboardOverlay implements Focusable {
       && !isTerminal(job.status);
   }
 
-  private selectedIndex(jobs: JobSnapshot[]): number {
-    const index = jobs.findIndex((job) => job.id === this.#selectedId);
-    return index < 0 ? 0 : index;
-  }
 }
 
-type ListViewport = ReturnType<typeof dashboardListViewport<JobSnapshot>>;
+type JobListViewport = DashboardCollectionViewport<JobSnapshot, JobDashboardGroup>;
+
+function jobDashboardCollection(jobs: readonly JobSnapshot[]): DashboardCollection<JobSnapshot, JobDashboardGroup> {
+  return groupDashboardCollection(jobs, JOB_DASHBOARD_GROUPS, (job) => {
+    if (pendingInteraction(job)) return "input";
+    if (job.status === "running") return "working";
+    if (job.status === "queued") return "waiting";
+    if (job.status === "failed") return "failed";
+    return "finished";
+  });
+}
 
 /** Opening on a finished job while others are live buries the useful state; prefer live work. */
-function defaultJob(jobs: JobSnapshot[]): JobSnapshot {
+function defaultJob(jobs: readonly JobSnapshot[]): JobSnapshot {
   const running = jobs.find((job) => job.status === "running");
   if (running) return running;
   const queued = jobs.find((job) => job.status === "queued");
