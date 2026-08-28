@@ -355,6 +355,44 @@ test("the activity widget reflects a workflow agent still queued behind a full f
   await pi.handlers.get("session_shutdown")?.();
 });
 
+test("concurrent workflows share one session widget and open the existing workflows surface", async () => {
+  const backend = new ControlledBackend("codex");
+  const { pi } = await setup({ backends: [backend] });
+  const session = context({ hasUI: true });
+  pi.handlers.get("session_start")?.({}, session.ctx);
+
+  await pi.tools.get("workflow").execute("wf-first", {
+    name: "First workflow",
+    script: `export default async () => agent("first task", { name: "first agent", access: "readOnly", harness: "codex" })`,
+    background: true,
+  }, undefined, undefined, session.ctx);
+  await pi.tools.get("workflow").execute("wf-second", {
+    name: "Second workflow",
+    script: `export default async () => agent("second task", { name: "second agent", access: "readOnly", harness: "codex" })`,
+    background: true,
+  }, undefined, undefined, session.ctx);
+  await waitFor(() => backend.starts.length === 2, "both workflow agents dispatched");
+
+  const widgetFactory = session.widgets.get("native-subagents-active") as
+    ((tui: unknown, theme: unknown) => { render(width: number): string[] }) | undefined;
+  assert.ok(widgetFactory, "the aggregate widget is mounted once for concurrent workflows");
+  const rendered = widgetFactory(undefined, theme).render(160).join("\n");
+  assert.match(rendered, /Workflows · 2 active/);
+  assert.match(rendered, /First workflow/);
+  assert.match(rendered, /Second workflow/);
+  assert.equal((rendered.match(/[├└]─/g) ?? []).length, 2, "one row is rendered per workflow run");
+
+  await pi.shortcuts.get("ctrl+shift+w")?.handler(session.ctx);
+  assert.match(session.notifications.at(-1)?.message ?? "", /First workflow/);
+  assert.match(session.notifications.at(-1)?.message ?? "", /Second workflow/);
+
+  backend.completeTask("first task", "first result");
+  backend.completeTask("second task", "second result");
+  await waitFor(() => pi.messages.length === 2, "both workflow results delivered");
+  await waitFor(() => session.widgets.get("native-subagents-active") === undefined, "aggregate widget removed after final delivery");
+  await pi.handlers.get("session_shutdown")?.();
+});
+
 test("/workflows worktrees reports an empty inventory and reclaim refuses without host confirmation", async () => {
   const { pi } = await setup();
   const plain = context({ hasUI: true });

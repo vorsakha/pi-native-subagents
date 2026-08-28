@@ -81,6 +81,7 @@ import {
 import type { AccessMode, Backend, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SendBehavior } from "../../src/types.ts";
 import type { SpendBudget } from "../../src/budget.ts";
 import { formatSpendBudget } from "../../src/budget.ts";
+import { renderWorkflowActivity, WorkflowActivityStore, type WorkflowActivitySnapshot } from "../workflows/activity.ts";
 import { registerWorkflows } from "../workflows/index.ts";
 
 /** Production session-peer source backed by Pi's real SessionManager. Never mutates the source session. */
@@ -259,6 +260,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   let displayedHarness: HarnessName | undefined;
   let displayedHarnessAvailability: string | undefined;
   let displayedActivity: string | undefined;
+  let activityWidgetState: { direct: SubagentActivity; workflows: WorkflowActivitySnapshot } | undefined;
+  let activityWidgetRefresh: (() => void) | undefined;
+  let activityWidgetInstalled = false;
   let availabilityGeneration = 0;
   let startupAvailabilityController: AbortController | undefined;
   let currentHarnessActivations: HarnessActivation[] | undefined;
@@ -301,6 +305,33 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     backends,
   });
   const getManager = () => manager ??= createManager();
+  const workflowActivity = new WorkflowActivityStore();
+  const clearActivityWidget = (ui: ExtensionUIContext) => {
+    ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, undefined);
+    activityWidgetState = undefined;
+    activityWidgetRefresh = undefined;
+    activityWidgetInstalled = false;
+  };
+  const legacyActivityLine = (activity: SubagentActivity, theme: Theme): string => {
+    const summaries = activity.segments
+      .map((segment) => theme.fg("text", segment.summary) + theme.fg("dim", segment.breakdown))
+      .join(theme.fg("dim", " · "));
+    // Never color alone: the marker carries its own glyph and words.
+    const marker = activity.needInput
+      ? theme.fg("warning", `? ${activity.needInput} need input`)
+      : "";
+    const pointers = (activity.pointers.length ? activity.pointers : ["/subagents"]).map((pointer) => theme.fg("accent", pointer)).join(theme.fg("dim", " · "));
+    return theme.fg("accent", "◆ ") +
+      [summaries, marker].filter(Boolean).join(theme.fg("dim", " · ")) +
+      theme.fg("dim", " • ") +
+      pointers +
+      (activity.pointers.length <= 1 ? theme.fg("dim", " to view") : "");
+  };
+  const activityContext = (activity: SubagentActivity): string => [
+    ...activity.segments.map((segment) => `${segment.summary}${segment.breakdown}`),
+    ...(activity.needInput ? [`? ${activity.needInput} need input`] : []),
+    ...activity.pointers.filter((pointer) => pointer !== "/workflows"),
+  ].join(" · ");
   const updateSessionUi = (ui: ExtensionUIContext, sessionManager: JobManager, harness: HarnessName) => {
     const activation = currentHarnessActivations?.find((candidate) => candidate.harness === harness);
     const availabilityText = activation
@@ -313,34 +344,39 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     }
 
     const activity = summarizeSubagentActivity(sessionManager.list());
-    if (displayedActivity === activity.key) return;
-    displayedActivity = activity.key;
+    const workflows = workflowActivity.snapshot();
+    const key = `${activity.key}|${workflows.key}`;
+    if (displayedActivity === key) return;
+    displayedActivity = key;
 
-    if (!activity.segments.length && !activity.needInput) {
-      ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, undefined);
+    if (!activity.segments.length && !activity.needInput && !workflows.rows.length) {
+      clearActivityWidget(ui);
       return;
     }
 
-    ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, (_tui, theme) => {
-      const summaries = activity.segments
-        .map((segment) => theme.fg("text", segment.summary) + theme.fg("dim", segment.breakdown))
-        .join(theme.fg("dim", " · "));
-      // Never color alone: the marker carries its own glyph and words.
-      const marker = activity.needInput
-        ? theme.fg("warning", `? ${activity.needInput} need input`)
-        : "";
-      const pointers = (activity.pointers.length ? activity.pointers : ["/subagents"]).map((pointer) => theme.fg("accent", pointer)).join(theme.fg("dim", " · "));
-      const line =
-        theme.fg("accent", "◆ ") +
-        [summaries, marker].filter(Boolean).join(theme.fg("dim", " · ")) +
-        theme.fg("dim", " • ") +
-        pointers +
-        (activity.pointers.length <= 1 ? theme.fg("dim", " to view") : "");
-      return {
-        render: (width: number) => [truncateToWidth(line, Math.max(0, width), "")],
-        invalidate() {},
-      };
-    });
+    activityWidgetState = { direct: activity, workflows };
+    if (!activityWidgetInstalled) {
+      activityWidgetInstalled = true;
+      ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, (tui, theme) => {
+        activityWidgetRefresh = () => tui?.requestRender();
+        return {
+          render: (width: number) => {
+            const current = activityWidgetState;
+            if (!current) return [];
+            if (current.workflows.rows.length) {
+              return renderWorkflowActivity(current.workflows, theme, width, {
+                context: activityContext(current.direct),
+                openHint: "Ctrl+Shift+W",
+              });
+            }
+            return [truncateToWidth(legacyActivityLine(current.direct, theme), Math.max(0, width), "")];
+          },
+          invalidate() {},
+        };
+      });
+    } else {
+      activityWidgetRefresh?.();
+    }
   };
   const spawnJob = (
     params: SpawnToolParams,
@@ -477,6 +513,14 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     resolveProfile: (name) => profileCatalog.profiles.get(name),
     setInterval: options.setInterval,
     clearInterval: options.clearInterval,
+    onSnapshot: (snapshot) => {
+      workflowActivity.observe(snapshot);
+      if (sessionUi && manager) updateSessionUi(sessionUi, manager, activeHarness);
+    },
+    onResultDelivered: (runId) => {
+      workflowActivity.markDelivered(runId);
+      if (sessionUi && manager) updateSessionUi(sessionUi, manager, activeHarness);
+    },
   });
 
   pi.registerMessageRenderer(SUBAGENT_RESULT_MESSAGE, (message, { expanded }, theme) => {
@@ -650,6 +694,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 
   pi.on("session_start", (_event, ctx) => {
     clearCardBlinks();
+    workflowActivity.reset();
+    activityWidgetState = undefined;
+    activityWidgetRefresh = undefined;
+    activityWidgetInstalled = false;
     displayedHarness = undefined;
     displayedHarnessAvailability = undefined;
     displayedActivity = undefined;
@@ -745,9 +793,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     humanResultsPublished.clear();
     pendingHumanResults.clear();
     hiddenLegacyHumanEntries.clear();
+    workflowActivity.reset();
     try {
       sessionUi?.setStatus("native-subagents", undefined);
-      sessionUi?.setWidget(SUBAGENT_ACTIVITY_WIDGET, undefined);
+      if (sessionUi) clearActivityWidget(sessionUi);
     } catch { /* UI may already be unavailable during teardown. */ }
     sessionUi = undefined;
     displayedHarness = undefined;

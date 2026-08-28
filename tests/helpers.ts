@@ -507,6 +507,7 @@ export function fakePi(options: FakePiOptions = {}) {
   const handlers = new Map<string, (...args: any[]) => any>();
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
+  const shortcuts = new Map<string, any>();
   const messageRenderers = new Map<string, any>();
   const entryRenderers = new Map<string, any>();
   const messages: Array<{ message: any; options: any }> = [];
@@ -521,6 +522,7 @@ export function fakePi(options: FakePiOptions = {}) {
       if (commands.has(name)) throw new Error(`duplicate command: ${name}`);
       commands.set(name, command);
     },
+    registerShortcut(name: string, shortcut: any) { shortcuts.set(name, shortcut); },
     registerMessageRenderer(name: string, renderer: any) { messageRenderers.set(name, renderer); },
     registerEntryRenderer(name: string, renderer: any) { entryRenderers.set(name, renderer); },
     sendMessage(message: any, opts: any) { messages.push({ message, options: opts }); },
@@ -534,6 +536,7 @@ export function fakePi(options: FakePiOptions = {}) {
     handlers,
     tools,
     commands,
+    shortcuts,
     messageRenderers,
     entryRenderers,
     messages,

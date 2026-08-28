@@ -1,4 +1,4 @@
-import type { ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
+import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import {
   Key,
   matchesKey,
@@ -1498,7 +1498,7 @@ function defaultWorkflow(runs: WorkflowSnapshot[]): WorkflowSnapshot {
     ?? runs.reduce((latest, run) => run.timestamps.createdAt >= latest.timestamps.createdAt ? run : latest);
 }
 
-export async function openWorkflowsDashboard(ctx: ExtensionCommandContext, manager: WorkflowsDashboardManager): Promise<void> {
+export async function openWorkflowsDashboard(ctx: Pick<ExtensionContext, "mode" | "ui">, manager: WorkflowsDashboardManager): Promise<void> {
   if (ctx.mode !== "tui") {
     const runs = manager.list();
     const message = runs.length

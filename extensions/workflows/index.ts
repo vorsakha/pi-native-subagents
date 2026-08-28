@@ -38,6 +38,10 @@ export interface RegisterWorkflowOptions {
   router?: CapabilityRouter;
   availability?: HarnessAvailabilityProbe;
   resolveProfile?: (name: string) => ProfileDefinition | undefined;
+  /** Session supervision bridge; workflow cards and results remain independent. */
+  onSnapshot?: (snapshot: WorkflowSnapshot) => void;
+  /** Called after the existing foreground/background result delivery path succeeds. */
+  onResultDelivered?: (runId: string) => void;
 }
 
 interface LiveWorkflowBlink {
@@ -254,6 +258,10 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     if (!manager) throw new Error("Workflow manager is not available before session_start");
     return manager;
   };
+  const notifyResultDelivered = (runId: string) => {
+    try { options.onResultDelivered?.(runId); }
+    catch { /* activity observers cannot change workflow result semantics */ }
+  };
   const stopBlink = (blink: LiveWorkflowBlink) => {
     blink.invalidate = undefined;
     blink.runId = undefined;
@@ -330,8 +338,31 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       }, { deliverAs: "followUp", triggerTurn: true });
     } catch {
       // Parent session may already be shutting down; artifacts remain durable.
+      return;
     }
+    notifyResultDelivered(snapshot.runId);
   };
+
+  const openDashboard = async (ctx: ExtensionContext) => {
+    if (!ctx.isProjectTrusted()) {
+      ctx.ui.notify("Workflow history is unavailable for untrusted projects.", "error");
+      return;
+    }
+    const workflows = getManager();
+    await workflows.initialize();
+    await openWorkflowsDashboard(ctx, workflows);
+  };
+
+  pi.registerShortcut("ctrl+shift+w", {
+    description: "Open /workflows supervision",
+    handler: async (ctx) => {
+      try {
+        await openDashboard(ctx);
+      } catch (error) {
+        ctx.ui.notify(`Workflow dashboard unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+      }
+    },
+  });
 
   pi.registerTool({
     name: "workflow",
@@ -453,10 +484,12 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       timer.unref();
       try {
         const final = await started.completion;
-        return {
+        const result = {
           content: [{ type: "text" as const, text: resultText(final) }],
           details: { workflow: compactSnapshot(final) },
         };
+        notifyResultDelivered(final.runId);
+        return result;
       } finally {
         clearInterval(timer);
         signal?.removeEventListener("abort", abort);
@@ -495,7 +528,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       await getManager().initialize();
       const trimmed = args.trim();
       if (!trimmed) {
-        await openWorkflowsDashboard(ctx, getManager());
+        await openDashboard(ctx);
         return;
       }
       if (trimmed === "worktrees") {
@@ -512,12 +545,12 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
 
   return {
     sessionStart(ctx, jobs) {
-      generation++;
+      const sessionGeneration = ++generation;
       shuttingDown = false;
       clearBlinks();
       sessionContext = ctx;
       unsubscribe?.();
-      manager = new WorkflowManager({
+      const sessionManager = new WorkflowManager({
         jobs,
         artifactRoot,
         sessionId: ctx.sessionManager.getSessionId(),
@@ -533,11 +566,21 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
           );
         },
       });
-      unsubscribe = manager.subscribe((snapshot) => {
+      manager = sessionManager;
+      unsubscribe = sessionManager.subscribe((snapshot) => {
+        if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
         updateStatus(snapshot);
         refreshBlinks();
+        options.onSnapshot?.(snapshot);
       });
-      void manager.initialize().then(() => updateStatus()).catch((error) => {
+      void sessionManager.initialize().then(() => {
+        if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
+        updateStatus();
+        for (const snapshot of sessionManager.list()) {
+          if (!workflowIsTerminal(snapshot.status)) options.onSnapshot?.(snapshot);
+        }
+      }).catch((error) => {
+        if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
         if (ctx.hasUI) ctx.ui.notify(`Workflow history unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
       });
     },
