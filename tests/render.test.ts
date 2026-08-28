@@ -8,6 +8,7 @@ import {
   buildJobCardLines,
   formatContext,
   followThroughText,
+  jobDashboardSummary,
   renderFollowThroughCard,
   renderJobCard,
   renderJobReceipt,
@@ -27,6 +28,42 @@ const CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F-\u009F]/;
 function tool(id: string, status: ToolTrace["status"] = "completed"): ToolTrace {
   return { id, name: `tool-${id}`, summary: `summary ${id}`, status };
 }
+
+test("direct job dashboard summaries keep operator-attention priority", () => {
+  const conflicted = job({
+    status: "failed",
+    error: "provider failed",
+    output: "terminal result",
+    liveThinking: "stale thinking",
+    tools: [tool("active", "running")],
+    interaction: interactionSnapshot({ question: "Choose the compatibility mode" }),
+  });
+  assert.deepEqual(jobDashboardSummary(conflicted), {
+    kind: "input",
+    text: "needs orchestrator: Choose the compatibility mode",
+  });
+
+  assert.deepEqual(jobDashboardSummary({ ...conflicted, interaction: undefined }), {
+    kind: "failure",
+    text: "provider failed",
+  });
+  assert.deepEqual(jobDashboardSummary(job({
+    output: "older assistant text",
+    liveThinking: "checking the narrowed type",
+    tools: [tool("active", "running")],
+  })), {
+    kind: "activity",
+    text: "checking the narrowed type",
+  });
+  assert.deepEqual(jobDashboardSummary(job({ status: "queued", output: "stale output" })), {
+    kind: "wait",
+    text: "waiting for scheduler slot",
+  });
+  assert.deepEqual(jobDashboardSummary(job({ status: "completed", output: "Shipped the fix" })), {
+    kind: "result",
+    text: "Shipped the fix",
+  });
+});
 
 test("renderer sanitizes output and enforces collapsed/expanded line budgets", () => {
   const clean = sanitizeText(`${ESC}[31mred${ESC}[0m\tline1 \nline2${ESC}]0;title${ESC}\\end`);

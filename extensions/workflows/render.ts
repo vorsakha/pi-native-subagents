@@ -2,7 +2,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { aggregateWorkflowUsage } from "../../src/workflows/manager.ts";
 import { formatWorkflowBudget, workflowBudgetHealth } from "../../src/workflows/budget.ts";
-import { formatDurationLabel } from "../dashboard-style.ts";
+import { formatDurationLabel, type DashboardSummary } from "../dashboard-style.ts";
 import type {
   WorkflowAgentRecord,
   WorkflowConvergence,
@@ -129,6 +129,11 @@ function boundedResult(value: unknown): { text: string; truncated: boolean } {
   return { text: sanitizeText(raw.slice(0, MAX_RESULT_CHARS)), truncated };
 }
 
+function summaryPreview(value: unknown): string {
+  const text = boundedResult(value).text;
+  return text.split("\n").map(sanitizeInline).find(Boolean) ?? "";
+}
+
 function previewLines(value: unknown, limit: number, tail: boolean): string[] {
   const bounded = boundedResult(value);
   if (!bounded.text) return [];
@@ -200,6 +205,134 @@ export function workflowAgentInteraction(agent: WorkflowAgentRecord, now: number
 /** Agents currently blocked on a routed question; drives the `N need input` marker. */
 export function workflowNeedsInput(snapshot: Pick<WorkflowSnapshot, "agents">): number {
   return snapshot.agents.filter((agent) => agent.waitingOn).length;
+}
+
+function activeAgentSummary(agent: WorkflowAgentRecord): DashboardSummary | undefined {
+  if (agent.state !== "running") return undefined;
+  if (agent.liveThinking?.trim()) {
+    return { kind: "activity", text: sanitizeInline(agent.liveThinking.slice(-320)) };
+  }
+  const tool = [...(agent.tools ?? [])].reverse().find((candidate) => candidate.status === "running");
+  if (tool) {
+    const detail = sanitizeInline(tool.summary ?? tool.name);
+    return { kind: "activity", text: `running ${detail || "tool"}` };
+  }
+  const preview = summaryPreview(agent.preview);
+  return preview ? { kind: "activity", text: preview } : undefined;
+}
+
+/** Operator-first semantic summary for one workflow agent row. */
+export function workflowAgentDashboardSummary(agent: WorkflowAgentRecord, now: number): DashboardSummary {
+  if (agent.waitingOn) {
+    return { kind: "input", text: formatWorkflowInteraction(agent.waitingOn, now) };
+  }
+  if (agent.error || agent.state === "failed") {
+    return { kind: "failure", text: summaryPreview(agent.error) || "Agent failed" };
+  }
+  if (agent.answering) {
+    return {
+      kind: "activity",
+      text: `answering peer question from ${sanitizeInline(agent.answering.sourceName)}`,
+    };
+  }
+
+  const active = activeAgentSummary(agent);
+  if (active) return active;
+
+  if (agent.state === "waiting") {
+    return { kind: "wait", text: formatProviderWait(agent, now) ?? "waiting for provider" };
+  }
+  if (agent.state === "queued") {
+    return { kind: "wait", text: "queued for workflow dispatch" };
+  }
+  if (agent.state === "completed") {
+    const result = summaryPreview(agent.output) || summaryPreview(agent.preview);
+    return { kind: "result", text: result || "completed without a result preview" };
+  }
+  return { kind: "lifecycle", text: agent.state };
+}
+
+function latestActiveWorkflowSummary(snapshot: WorkflowSnapshot): { at: number; text: string } | undefined {
+  const hasExplicitWait = snapshot.agents.some((agent) => agent.state === "queued" || agent.state === "waiting");
+  let latest = hasExplicitWait
+    ? undefined
+    : snapshot.logs?.reduce<{ at: number; text: string } | undefined>((current, log) => {
+        const text = sanitizeInline(log.message);
+        if (!text || (current && current.at > log.at)) return current;
+        return { at: log.at, text };
+      }, undefined);
+
+  for (const agent of snapshot.agents) {
+    const summary = activeAgentSummary(agent);
+    if (!summary) continue;
+    const candidate = {
+      at: agent.timestamps.updatedAt,
+      text: summary.text,
+    };
+    if (!latest || candidate.at > latest.at) latest = candidate;
+  }
+  return latest;
+}
+
+/** Operator-first semantic summary for a workflow run dashboard row. */
+export function workflowDashboardSummary(snapshot: WorkflowSnapshot, now: number): DashboardSummary {
+  const waiting = [...snapshot.agents].reverse().find((agent) => agent.waitingOn)?.waitingOn;
+  if (waiting) {
+    const count = workflowNeedsInput(snapshot);
+    return {
+      kind: "input",
+      text: `${count} need input: ${formatWorkflowInteraction(waiting, now)}`,
+    };
+  }
+
+  const failedAgent = [...snapshot.agents].reverse().find((agent) => agent.state === "failed");
+  const failedPhase = [...snapshot.phases].reverse().find((phase) => phase.status === "failed");
+  const activeFailure = snapshot.status === "pending" || snapshot.status === "running" || snapshot.status === "paused";
+  if (snapshot.error || snapshot.status === "failed" || (activeFailure && (failedAgent || failedPhase))) {
+    const fallback = failedAgent
+      ? `${sanitizeInline(failedAgent.name)} failed`
+      : failedPhase
+        ? `${sanitizeInline(failedPhase.name)} phase failed`
+        : "Workflow failed";
+    return {
+      kind: "failure",
+      text: summaryPreview(snapshot.error ?? failedAgent?.error ?? failedPhase?.error) || fallback,
+    };
+  }
+
+  if (snapshot.status === "running") {
+    const activity = latestActiveWorkflowSummary(snapshot);
+    if (activity) return { kind: "activity", text: activity.text };
+  }
+
+  if (snapshot.status === "paused") {
+    return { kind: "wait", text: "paused by operator" };
+  }
+  const providerWait = [...snapshot.agents].reverse().find((agent) => agent.state === "waiting" && agent.providerWait);
+  if (providerWait) {
+    return {
+      kind: "wait",
+      text: `${sanitizeInline(providerWait.name)}: ${formatProviderWait(providerWait, now)}`,
+    };
+  }
+  if (snapshot.status === "pending" || snapshot.agents.some((agent) => agent.state === "queued")) {
+    return { kind: "wait", text: "queued for workflow dispatch" };
+  }
+
+  if (snapshot.status === "completed") {
+    const latestAgent = [...snapshot.agents].reverse().find((agent) => agent.state === "completed");
+    const result = summaryPreview(snapshot.result)
+      || summaryPreview(latestAgent?.output)
+      || summaryPreview(latestAgent?.preview);
+    const outcome = snapshot.taskOutcome && snapshot.taskOutcome !== "unspecified"
+      ? `task ${snapshot.taskOutcome}`
+      : "";
+    return {
+      kind: "result",
+      text: [outcome, result || "completed without a result preview"].filter(Boolean).join(": "),
+    };
+  }
+  return { kind: "lifecycle", text: snapshot.status };
 }
 
 /** Quiet fallback copy for an agent with no semantic preview yet — avoids restating "running",

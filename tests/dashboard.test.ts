@@ -61,6 +61,39 @@ test("dashboard layout adapts to fullscreen terminal geometry", () => {
   assert.equal(dashboardLayout(120, 8).kind, "narrow");
 });
 
+test("job summaries render in wide, medium, and narrow rows without displacing identity", (t) => {
+  for (const width of [120, 72, 52]) {
+    const current = jobSnapshot({
+      id: `summary-${width}`,
+      name: "worker",
+      liveThinking: "checking semantic summary",
+    });
+    const state = dashboard([current], 30, () => {}, undefined, { fullscreen: true });
+    t.after(() => state.overlay.dispose());
+    const lines = state.overlay.render(width);
+    assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    assert.ok(lines.some((line) => line.includes("worker") && line.includes("check")), `${width}-column row shows the job summary`);
+  }
+
+  const constrained = dashboard([jobSnapshot({
+    id: "identity-priority",
+    name: "identity-survives",
+    liveThinking: "SUMMARY_MUST_YIELD",
+  })], 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => constrained.overlay.dispose());
+  const text = constrained.overlay.render(40).join("\n");
+  assert.match(text, /ide/);
+  assert.doesNotMatch(text, /SUMMARY_MUST_YIELD/, "summary yields before the job name at the constrained width");
+
+  const owned = dashboard([jobSnapshot({
+    id: "workflow-owned",
+    name: "owned",
+    workflow: { runId: "run-owned", agentIndex: 0, label: "build" },
+  })], 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => owned.overlay.dispose());
+  assert.ok(owned.overlay.render(120).some((line) => line.includes("owned") && line.includes("workflow")));
+});
+
 test("browse detail keeps Page Up and Page Down aliases in wide and medium layouts", (t) => {
   const output = Array.from({ length: 80 }, (_, index) => `page ${index}`).join("\n");
   for (const width of [120, 72]) {

@@ -39,6 +39,32 @@ export const DASHBOARD_CHROME_ROWS = 4;
 
 export type DashboardLayoutKind = "wide" | "medium" | "narrow";
 
+/** One deterministic semantic sentence for a dashboard list or rail row. */
+export type DashboardSummary =
+  | { kind: "input"; text: string }
+  | { kind: "failure"; text: string }
+  | { kind: "activity"; text: string }
+  | { kind: "wait"; text: string }
+  | { kind: "result"; text: string }
+  | { kind: "lifecycle"; text: string };
+
+export function dashboardSummaryColor(
+  summary: DashboardSummary,
+): "warning" | "error" | "muted" | "dim" {
+  switch (summary.kind) {
+    case "input":
+    case "wait":
+      return "warning";
+    case "failure":
+      return "error";
+    case "activity":
+      return "muted";
+    case "result":
+    case "lifecycle":
+      return "dim";
+  }
+}
+
 export interface DashboardLayout {
   kind: DashboardLayoutKind;
   /** Total lines the panel is allowed to render. */
@@ -223,6 +249,33 @@ export function alignDashboardRow(
     leftTruncated + " ".repeat(gap) + right,
     safeWidth,
   );
+}
+
+/**
+ * Adds a semantic summary only after the complete identity fits. Elapsed time
+ * and lifecycle metadata remain right-aligned, while the summary gives way
+ * before the job/run name at constrained widths.
+ */
+export function alignDashboardSummaryRow(
+  identity: string,
+  summary: string,
+  right: string,
+  width: number,
+): string {
+  const safeWidth = Math.max(0, width);
+  const leftMax = Math.max(0, safeWidth - visibleWidth(right) - 2);
+  const fittedIdentity = truncateToWidth(identity, leftMax);
+  let left = fittedIdentity;
+
+  if (visibleWidth(fittedIdentity) === visibleWidth(identity)) {
+    const separator = " · ";
+    const summaryWidth = leftMax - visibleWidth(identity) - visibleWidth(separator);
+    if (summaryWidth >= 2) {
+      left += separator + truncateToWidth(summary, summaryWidth);
+    }
+  }
+
+  return alignDashboardRow(left, right, safeWidth);
 }
 
 export type DashboardFrame = ReturnType<typeof createDashboardFrame>;

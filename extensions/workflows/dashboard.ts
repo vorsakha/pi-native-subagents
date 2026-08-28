@@ -8,7 +8,7 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import {
-  alignDashboardRow,
+  alignDashboardSummaryRow,
   clampDashboard,
   createDashboardFrame,
   DASHBOARD_COMPACT_ROWS,
@@ -20,6 +20,7 @@ import {
   dashboardOverlayRows,
   dashboardScrollRule,
   dashboardSelectionMarker,
+  dashboardSummaryColor,
   fitDashboardRows,
   formatDurationLabel,
   isFullscreenTui,
@@ -37,7 +38,17 @@ import type {
   WorkflowSnapshot,
 } from "../../src/workflows/types.ts";
 import { formatContext, formatUsage, sanitizeInline, sanitizeText, shortId, traceStatusMeta } from "../subagents/render.ts";
-import { formatWorkflowConvergence, formatWorkflowInteraction, workflowAgentInteraction, workflowConvergenceMeta, workflowNeedsInput, workflowPhaseProgress, workflowStatusMeta } from "./render.ts";
+import {
+  formatWorkflowConvergence,
+  formatWorkflowInteraction,
+  workflowAgentDashboardSummary,
+  workflowAgentInteraction,
+  workflowConvergenceMeta,
+  workflowDashboardSummary,
+  workflowNeedsInput,
+  workflowPhaseProgress,
+  workflowStatusMeta,
+} from "./render.ts";
 import {
   appendBoundedSection,
   boundedHeadTailText,
@@ -1011,7 +1022,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
 
   private renderRunRail(runs: WorkflowSnapshot[], view: ListViewport<WorkflowSnapshot>, chosen: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
     if (!runs.length) return fitDashboardRows([this.theme.fg("muted", "No workflow runs in this session.")], rows);
-    return fitDashboardRows(view.items.map((run) => this.renderRun(run, run.runId === chosen?.runId, width)), rows);
+    return fitDashboardRows(view.items.map((run) => this.renderRun(run, run.runId === chosen?.runId, width, true)), rows);
   }
 
   private renderRunList(runs: WorkflowSnapshot[], view: ListViewport<WorkflowSnapshot>, chosen: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
@@ -1019,19 +1030,26 @@ export class WorkflowsDashboardOverlay implements Focusable {
     return fitDashboardRows(view.items.map((run) => this.renderRun(run, run.runId === chosen?.runId, width)), rows);
   }
 
-  private renderRun(run: WorkflowSnapshot, selected: boolean, width: number): string {
+  private renderRun(run: WorkflowSnapshot, selected: boolean, width: number, rail = false): string {
     const status = workflowStatusMeta(run);
     const marker = dashboardSelectionMarker(this.theme, selected);
     const name = selected ? this.theme.fg("accent", sanitizeInline(run.name)) : this.theme.fg("text", sanitizeInline(run.name));
-    const left = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name} ${this.theme.fg("dim", shortId(sanitizeText(run.runId)))}`;
+    const identity = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name}`;
+    const summary = workflowDashboardSummary(run, this.#now());
     const phase = workflowPhaseProgress(run).label;
     const outcome = run.status === "completed" && run.taskOutcome ? ` · ${run.taskOutcome}` : "";
     // A blocked question is not a lifecycle state, so the run keeps its own
     // status and carries the aggregate marker beside it, in words and a glyph.
     const needInput = workflowNeedsInput(run);
     const questions = needInput ? `${this.theme.fg("warning", `? ${needInput} need input`)} · ` : "";
-    const right = `${questions}${this.theme.fg("muted", `phase ${phase} · ${formatElapsed(run, this.#now())}`)} · ${this.theme.fg(status.color, `${run.status}${outcome}`)} `;
-    return alignDashboardRow(left, right, width);
+    const progress = rail ? "" : `phase ${phase} · `;
+    const right = `${questions}${this.theme.fg("muted", `${progress}${formatElapsed(run, this.#now())}`)} · ${this.theme.fg(status.color, `${run.status}${outcome}`)} `;
+    return alignDashboardSummaryRow(
+      identity,
+      this.theme.fg(dashboardSummaryColor(summary), summary.text),
+      right,
+      width,
+    );
   }
 
   private renderInspector(run: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
@@ -1292,13 +1310,11 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const status = agent.waitingOn ? { glyph: "?", color: "warning" as const } : traceStatusMeta(agent.state, this.#now());
     const marker = dashboardNestedSelectionMarker(this.theme, selected);
     const label = selected ? this.theme.fg("accent", boundedInline(agent.name, 1_000)) : this.theme.fg("text", boundedInline(agent.name, 1_000));
+    const summary = workflowAgentDashboardSummary(agent, this.#now());
     const route = agent.harness || agent.model ? `${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
     const usage = formatUsage(agent.usage);
     const warning = agent.instructionShaped ? " · ⚠ instruction-like output" : "";
-    const interaction = agent.waitingOn
-      ? `· ${agent.waitingOn.target === "orchestrator" ? "needs orchestrator" : `waiting for ${boundedInline(agent.waitingOn.targetName ?? "peer", 200)}`} `
-      : agent.answering ? "· answering peer " : "";
-    return `${marker} ${this.theme.fg(status.color, status.glyph)} ${label} ${this.theme.fg(agent.waitingOn ? "warning" : "muted", interaction)}${this.theme.fg("dim", `· ${agent.access}${agent.profile ? ` · profile ${boundedInline(agent.profile, 500)}` : ""}${agent.independent ? " · independent" : ""} · ${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}${usage ? ` · ${usage}` : ""}${warning}`)}`;
+    return `${marker} ${this.theme.fg(status.color, status.glyph)} ${label} ${this.theme.fg("dim", "·")} ${this.theme.fg(dashboardSummaryColor(summary), summary.text)} ${this.theme.fg("dim", `· ${agent.access}${agent.profile ? ` · profile ${boundedInline(agent.profile, 500)}` : ""}${agent.independent ? " · independent" : ""} · ${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}${usage ? ` · ${usage}` : ""}${warning}`)}`;
   }
 
   private allPhaseAgents(run: WorkflowSnapshot, phase: WorkflowPhase | undefined): WorkflowAgentRecord[] {

@@ -191,6 +191,29 @@ test("workflow dashboard uses adaptive geometry and exact fullscreen or regular 
   assert.equal(dashboardLayout(120, 8).kind, "narrow", "short screens use one predictable pane");
 });
 
+test("run and agent summaries render across wide, medium, and narrow dashboard rows", (t) => {
+  for (const width of [120, 72, 52]) {
+    const run = workflow(`summary-${width}`);
+    run.name = "run";
+    run.logs = [{ index: 0, message: "BUILDING", at: 4_000 }];
+    const active = run.agents[1]!;
+    active.name = "tests";
+    active.liveThinking = "VERIFYING";
+    active.preview = "older preview";
+    active.timestamps.updatedAt = 5_000;
+
+    const state = harness([run], 30, () => {}, { fullscreen: true });
+    t.after(() => state.overlay.dispose());
+    const listLines = state.overlay.render(width);
+    assertPanel(listLines, width, 30);
+    assert.ok(listLines.some((line) => line.includes("run") && line.includes("VE")), `${width}-column run row shows its summary`);
+    if (width === 52) state.overlay.handleInput(ENTER);
+    const lines = state.overlay.render(width);
+    assertPanel(lines, width, 30);
+    assert.ok(lines.some((line) => line.includes("tests") && line.includes("VERIFY")), `${width}-column agent row shows its summary`);
+  }
+});
+
 test("workflow dashboard marks completed unsuccessful runs with warning color", (t) => {
   const run = workflow("unsuccessful", "completed");
   run.taskOutcome = "unsuccessful";

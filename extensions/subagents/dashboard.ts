@@ -10,7 +10,7 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import {
-  alignDashboardRow,
+  alignDashboardSummaryRow,
   clampDashboard,
   createDashboardFrame,
   DASHBOARD_COMPACT_ROWS,
@@ -21,6 +21,7 @@ import {
   dashboardScrollRule,
   dashboardSelectionMarker,
   dashboardSubmitKeyLabel,
+  dashboardSummaryColor,
   fitDashboardRows,
   isFullscreenTui,
   dashboardOverlayRows,
@@ -45,6 +46,7 @@ import {
   formatElapsed,
   formatUsage,
   interactionWaitLabel,
+  jobDashboardSummary,
   pendingInteraction,
   sanitizeInline,
   sanitizeText,
@@ -834,9 +836,16 @@ class DashboardOverlay implements Focusable {
       const selected = job.id === chosen?.id;
       const marker = dashboardSelectionMarker(this.theme, selected);
       const name = sanitizeInline(job.name);
-      const left = `${marker} ${this.theme.fg(status.color, status.glyph)} ${this.theme.fg(selected ? "accent" : "text", name)}`;
-      const right = this.theme.fg("muted", formatElapsed(job, this.#now()));
-      return alignDashboardRow(left, right, width);
+      const identity = `${marker} ${this.theme.fg(status.color, status.glyph)} ${this.theme.fg(selected ? "accent" : "text", name)}`;
+      const summary = jobDashboardSummary(job);
+      const owner = job.workflow ? "workflow · " : "";
+      const right = this.theme.fg("muted", `${owner}${formatElapsed(job, this.#now())}`);
+      return alignDashboardSummaryRow(
+        identity,
+        this.theme.fg(dashboardSummaryColor(summary), summary.text),
+        right,
+        width,
+      );
     });
     return fitDashboardRows(lines, rows);
   }
@@ -857,7 +866,8 @@ class DashboardOverlay implements Focusable {
     const status = interaction ? { glyph: "?", color: "warning" as const } : statusMeta(job.status, this.#now());
     const marker = dashboardSelectionMarker(this.theme, selected);
     const name = this.theme.fg(selected ? "accent" : "text", sanitizeInline(job.name));
-    const left = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name} ${this.theme.fg("dim", shortId(sanitizeText(job.id)))}`;
+    const identity = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name}`;
+    const summary = jobDashboardSummary(job);
     const owner = job.workflow ? " · workflow" : "";
     // Stable policy metadata belongs in the inspector. Keep the row's right
     // side compact so the job name survives narrow terminals.
@@ -866,7 +876,12 @@ class DashboardOverlay implements Focusable {
         "muted",
         `${sanitizeInline(job.harness)}${owner} · ${formatElapsed(job, this.#now())}`,
       ) + ` · ${this.theme.fg(status.color, interaction ? interactionWaitLabel(interaction) : job.status)} `;
-    return alignDashboardRow(left, right, width);
+    return alignDashboardSummaryRow(
+      identity,
+      this.theme.fg(dashboardSummaryColor(summary), summary.text),
+      right,
+      width,
+    );
   }
 
   /** Job detail plus, in takeover mode, the composer. Always exactly `rows` lines. */
