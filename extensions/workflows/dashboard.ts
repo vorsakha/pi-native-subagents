@@ -16,7 +16,6 @@ import {
   dashboardConfirmKeyLabel,
   dashboardFoldRow,
   dashboardLayout,
-  dashboardListViewport,
   dashboardNestedSelectionMarker,
   dashboardOverlayRows,
   dashboardScrollRule,
@@ -70,6 +69,17 @@ import {
   serializeResult,
   truncateWorkflowDashboardLine,
 } from "./dashboard-detail.ts";
+import {
+  boundWorkflowOutline,
+  buildWorkflowOutline,
+  selectionForNode,
+  type WorkflowAgentFilter,
+  type WorkflowDashboardFocus,
+  type WorkflowOutlineAgentNode,
+  type WorkflowOutlineModel,
+  type WorkflowOutlinePhaseNode,
+  type WorkflowOutlineSelection,
+} from "./dashboard-model.ts";
 import {
   DEFAULT_TOOL_DISPLAY,
   pairToolEntries,
@@ -125,9 +135,7 @@ export interface WorkflowsDashboardOverlayOptions {
   fullscreen?: boolean;
 }
 
-type AgentFilter = "all" | "active" | "failed" | "completed";
-const AGENT_FILTERS: AgentFilter[] = ["all", "active", "failed", "completed"];
-type WorkflowPane = "list" | "overview" | "agent";
+const AGENT_FILTERS: WorkflowAgentFilter[] = ["all", "active", "failed", "completed"];
 type WorkflowDashboardGroup = "input" | "active" | "failed" | "finished";
 
 const WORKFLOW_DASHBOARD_GROUPS = [
@@ -140,6 +148,15 @@ const WORKFLOW_DASHBOARD_GROUPS = [
 type CancelTarget =
   | { type: "run"; runId: string; confirmKey: "X" }
   | { type: "agent"; runId: string; agentIndex: number; confirmKey: "x" };
+
+type AgentRenderFocus = Exclude<WorkflowDashboardFocus, "runs">;
+
+interface RenderedAgentProof {
+  runId: string;
+  phaseIndex: number | undefined;
+  agentIndex: number;
+  focus: AgentRenderFocus;
+}
 
 export function createWorkflowsDashboardOverlay(
   tui: Pick<TUI, "requestRender" | "terminal">,
@@ -154,21 +171,20 @@ export function createWorkflowsDashboardOverlay(
 
 /**
  * Workflow supervision keeps the same adaptive shell as `/subagents`, but has
- * one extra hierarchy level: runs → workflow overview → agent inspector.
+ * one extra hierarchy level: runs → phase/agent outline → agent inspector.
  * Selection is identity-based; positions are derived only for movement and
  * viewport centering. In a disappearing collection, the fallback is the first
  * active run, then the first queued run, then the newest retained run. A
- * filtered-out agent falls back to the first visible agent in that phase.
+ * filtered-out agent falls back to its containing phase.
  */
 export class WorkflowsDashboardOverlay implements Focusable {
   #focused = false;
   #finished = false;
   #selectedRunId: string | undefined;
   #selectionRunId: string | undefined;
-  #selectedPhaseIndex: number | undefined;
-  #selectedAgentIndex: number | undefined;
-  #pane: WorkflowPane = "list";
-  #agentFilter: AgentFilter = "all";
+  #outlineSelection: WorkflowOutlineSelection | undefined;
+  #focus: WorkflowDashboardFocus = "runs";
+  #agentFilter: WorkflowAgentFilter = "all";
   #scroll = 0;
   #scrollKey: string | undefined;
   #followTail = true;
@@ -177,14 +193,15 @@ export class WorkflowsDashboardOverlay implements Focusable {
   #resultRows = 0;
   #resultTotal = 0;
   #confirmCancel: CancelTarget | undefined;
-  /** `?` cheatsheet toggle; browse-only (list/overview/agent), never intercepted while armed for cancellation. */
+  /** `?` cheatsheet toggle; focus-specific and never intercepted while armed for cancellation. */
   #showHelp = false;
   #notice = "";
   #runs: WorkflowSnapshot[] = [];
   #layout: DashboardLayout | undefined;
-  #visibleAgent: { runId: string; phaseIndex: number | undefined; agentIndex: number } | undefined;
-  /** Destructive controls present in the last rendered hint. */
-  #renderedAgentCancel: { runId: string; agentIndex: number } | undefined;
+  #visibleAgent: RenderedAgentProof | undefined;
+  /** Agent controls present in the last actual dashboard render. */
+  #renderedAgentCancel: RenderedAgentProof | undefined;
+  #renderedAgentRestart: RenderedAgentProof | undefined;
   #renderedRunCancelId: string | undefined;
   #renderedConfirmationTarget: string | undefined;
   #lastRenderWidth = 0;
@@ -248,6 +265,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     this.#layout = undefined;
     this.#visibleAgent = undefined;
     this.#renderedAgentCancel = undefined;
+    this.#renderedAgentRestart = undefined;
     this.#renderedRunCancelId = undefined;
     this.#renderedConfirmationTarget = undefined;
     const rows = dashboardOverlayRows(this.tui.terminal?.rows ?? 0, this.fullscreen());
@@ -351,17 +369,12 @@ export class WorkflowsDashboardOverlay implements Focusable {
       return;
     }
 
-    // Navigation can change the selected agent between host paints. Recompute
-    // the exact control tokens that fit at the last rendered width before
-    // accepting a destructive key; clipped controls remain disabled.
-    this.refreshRenderedControls(run);
-
     if (cancel) {
-      if (this.#pane === "agent") {
-        this.#pane = "overview";
+      if (this.#focus === "agent-detail") {
+        this.#focus = "outline";
         this.resetScroll();
-      } else if (this.#layout?.kind === "narrow" && this.#pane === "overview") {
-        this.#pane = "list";
+      } else if (this.#focus === "outline") {
+        this.#focus = "runs";
         this.resetScroll();
       } else {
         this.finish();
@@ -377,35 +390,53 @@ export class WorkflowsDashboardOverlay implements Focusable {
       return;
     }
 
-    const narrowList = this.#layout?.kind === "narrow" && this.#pane === "list";
-    const agentPane = this.#pane === "agent";
-    const overviewControls = !narrowList && !agentPane;
-    const detailControls = !narrowList;
+    const confirm = this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter);
+    const forward = matchesKey(data, Key.right) || matchesKey(data, "l") || data === "\t" || confirm;
+    const back = matchesKey(data, Key.left) || matchesKey(data, "h");
 
-    if (detailControls && matchesKey(data, Key.shift(Key.up))) this.scrollResult(-1);
-    else if (detailControls && matchesKey(data, Key.shift(Key.down))) this.scrollResult(1);
-    else if (detailControls && matchesKey(data, Key.pageUp)) this.scrollResult(-this.pageStep());
-    else if (detailControls && matchesKey(data, Key.pageDown)) this.scrollResult(this.pageStep());
-    else if (detailControls && matchesKey(data, Key.ctrl("u"))) this.scrollResult(-this.halfPageStep());
-    else if (detailControls && matchesKey(data, Key.ctrl("d"))) this.scrollResult(this.halfPageStep());
-    else if (detailControls && matchesKey(data, "g")) this.scrollTo(0);
-    else if (detailControls && matchesKey(data, Key.shift("g"))) this.scrollTo(Number.MAX_SAFE_INTEGER);
-    else if (this.#pane === "agent" && (matchesKey(data, Key.left) || matchesKey(data, "h"))) {
-      this.#pane = "overview";
-      this.resetScroll();
+    if (this.#focus === "agent-detail") {
+      if (matchesKey(data, Key.up) || matchesKey(data, "k") || matchesKey(data, Key.shift(Key.up))) this.scrollResult(-1);
+      else if (matchesKey(data, Key.down) || matchesKey(data, "j") || matchesKey(data, Key.shift(Key.down))) this.scrollResult(1);
+      else if (matchesKey(data, Key.pageUp)) this.scrollResult(-this.pageStep());
+      else if (matchesKey(data, Key.pageDown)) this.scrollResult(this.pageStep());
+      else if (matchesKey(data, Key.ctrl("u"))) this.scrollResult(-this.halfPageStep());
+      else if (matchesKey(data, Key.ctrl("d"))) this.scrollResult(this.halfPageStep());
+      else if (matchesKey(data, "g")) this.scrollTo(0);
+      else if (matchesKey(data, Key.shift("g"))) this.scrollTo(Number.MAX_SAFE_INTEGER);
+      else if (back) {
+        this.#focus = "outline";
+        this.resetScroll();
+      } else if (matchesKey(data, "r")) this.restartAgent(run);
+      else if (matchesKey(data, "x")) this.requestAgentCancel(run);
+      else if (data === "X" || matchesKey(data, Key.shift("x"))) this.requestRunCancel(run);
+      else if (matchesKey(data, "t") || matchesKey(data, Key.ctrl("t"))) this.toggleToolDisplay();
+    } else if (this.#focus === "outline") {
+      if (matchesKey(data, Key.shift(Key.up))) this.scrollResult(-1);
+      else if (matchesKey(data, Key.shift(Key.down))) this.scrollResult(1);
+      else if (matchesKey(data, Key.pageUp)) this.scrollResult(-this.pageStep());
+      else if (matchesKey(data, Key.pageDown)) this.scrollResult(this.pageStep());
+      else if (matchesKey(data, Key.ctrl("u"))) this.scrollResult(-this.halfPageStep());
+      else if (matchesKey(data, Key.ctrl("d"))) this.scrollResult(this.halfPageStep());
+      else if (matchesKey(data, "g")) this.scrollTo(0);
+      else if (matchesKey(data, Key.shift("g"))) this.scrollTo(Number.MAX_SAFE_INTEGER);
+      else if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectOutlineNode(-1, run);
+      else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectOutlineNode(1, run);
+      else if (back) {
+        this.#focus = "runs";
+        this.resetScroll();
+      } else if (forward) this.advanceOutline(run);
+      else if (matchesKey(data, "f")) this.cycleAgentFilter(run);
+      else if (matchesKey(data, "p")) this.pauseOrResume(run);
+      else if (matchesKey(data, "r")) this.restartAgent(run);
+      else if (matchesKey(data, "x")) this.requestAgentCancel(run);
+      else if (data === "X" || matchesKey(data, Key.shift("x"))) this.requestRunCancel(run);
+    } else {
+      if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectRun(-1, orderedRuns);
+      else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectRun(1, orderedRuns);
+      else if (forward) this.openOutline(run);
+      else if (matchesKey(data, "p")) this.pauseOrResume(run);
+      else if (data === "X" || matchesKey(data, Key.shift("x"))) this.requestRunCancel(run);
     }
-    else if (!agentPane && (matchesKey(data, Key.up) || matchesKey(data, "k"))) this.selectRun(-1, orderedRuns);
-    else if (!agentPane && (matchesKey(data, Key.down) || matchesKey(data, "j"))) this.selectRun(1, orderedRuns);
-    else if (overviewControls && (matchesKey(data, Key.left) || matchesKey(data, "h"))) this.selectPhase(-1, run);
-    else if (overviewControls && (matchesKey(data, Key.right) || matchesKey(data, "l"))) this.selectPhase(1, run);
-    else if (overviewControls && data === "\t") this.selectAgent(run);
-    else if (overviewControls && matchesKey(data, "f")) this.cycleAgentFilter(run);
-    else if (!agentPane && (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter))) this.openSelectedPane(run);
-    else if (overviewControls && matchesKey(data, "p")) this.pauseOrResume(run);
-    else if (matchesKey(data, "r")) this.restartAgent(run);
-    else if (matchesKey(data, "x")) this.requestAgentCancel(run);
-    else if (data === "X" || matchesKey(data, Key.shift("x"))) this.requestRunCancel(run);
-    else if (agentPane && (matchesKey(data, "t") || matchesKey(data, Key.ctrl("t")))) this.toggleToolDisplay();
 
     this.tui.requestRender();
   }
@@ -465,16 +496,13 @@ export class WorkflowsDashboardOverlay implements Focusable {
   }
 
   private resetCompactHierarchy(): void {
-    this.#pane = "list";
-    this.#selectedPhaseIndex = undefined;
-    this.#selectedAgentIndex = undefined;
     this.#confirmCancel = undefined;
     this.#renderedAgentCancel = undefined;
+    this.#renderedAgentRestart = undefined;
     this.#renderedRunCancelId = undefined;
     this.#renderedConfirmationTarget = undefined;
     this.#showHelp = false;
     this.#notice = "";
-    this.resetScroll();
   }
 
   private toggleToolDisplay(): void {
@@ -488,9 +516,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
     if (!runs.length) {
       this.#selectedRunId = undefined;
       this.#selectionRunId = undefined;
-      this.#selectedPhaseIndex = undefined;
-      this.#selectedAgentIndex = undefined;
-      this.#pane = "list";
+      this.#outlineSelection = undefined;
+      this.#focus = "runs";
       this.resetScroll();
       return undefined;
     }
@@ -499,9 +526,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
     if (!selected) {
       selected = defaultWorkflow(runs);
       this.#selectedRunId = selected.runId;
-      this.#selectedPhaseIndex = undefined;
-      this.#selectedAgentIndex = undefined;
-      this.#pane = "list";
+      this.#outlineSelection = undefined;
+      this.#focus = "runs";
       this.resetScroll();
     }
 
@@ -520,65 +546,39 @@ export class WorkflowsDashboardOverlay implements Focusable {
     if (this.#selectionRunId !== run.runId) {
       this.#selectionRunId = run.runId;
       this.#selectedRunId = run.runId;
-      this.#selectedPhaseIndex = undefined;
-      this.#selectedAgentIndex = undefined;
-      this.#pane = "list";
+      this.#outlineSelection = undefined;
+      this.#focus = "runs";
       this.resetScroll();
     }
 
-    const phaseBefore = this.#selectedPhaseIndex;
-    const phase = this.resolvePhase(run);
-    if (!phase) {
-      this.#selectedAgentIndex = undefined;
-      if (this.#pane === "agent") this.#pane = "overview";
-      return;
-    }
-    if (phaseBefore !== undefined && phaseBefore !== phase.index && this.#pane === "agent") {
-      this.#pane = "overview";
-    }
-
-    const agents = this.phaseAgents(run, phase);
-    const selectedAgent = agents.find((agent) => agent.index === this.#selectedAgentIndex);
-    if (!selectedAgent) {
-      const previousAgent = this.#selectedAgentIndex;
-      const next = agents[0];
-      const changed = this.#selectedAgentIndex !== next?.index;
-      this.#selectedAgentIndex = next?.index;
-      if (changed) this.resetScroll();
-      // Do not silently redirect an agent action after a filter/state update.
-      // The fallback remains visibly selectable in the phase overview.
-      if (this.#pane === "agent" && previousAgent !== undefined && previousAgent !== next?.index) {
-        this.#pane = "overview";
+    const before = this.#outlineSelection?.key;
+    const model = this.outlineFor(run);
+    this.#outlineSelection = model.selected;
+    if (before !== this.#outlineSelection?.key) {
+      this.resetScroll();
+      if (this.#focus === "agent-detail" && this.#outlineSelection?.kind !== "agent") {
+        this.#focus = "outline";
       }
     }
   }
 
-  private resolvePhase(run: WorkflowSnapshot): WorkflowPhase | undefined {
-    if (!run.phases.length) {
-      this.#selectedPhaseIndex = undefined;
-      return undefined;
-    }
-    const selected = run.phases.find((phase) => phase.index === this.#selectedPhaseIndex);
-    if (selected) return selected;
-
-    const current = run.currentPhase === null
-      ? undefined
-      : run.phases.find((phase) => phase.index === run.currentPhase);
-    const fallback = current ?? run.phases[0]!;
-    const changed = this.#selectedPhaseIndex !== fallback.index;
-    this.#selectedPhaseIndex = fallback.index;
-    if (changed) this.resetScroll();
-    return fallback;
+  private outlineFor(run: WorkflowSnapshot): WorkflowOutlineModel {
+    return buildWorkflowOutline(run, this.#agentFilter, this.#outlineSelection, this.#now());
   }
 
   private phaseFor(run: WorkflowSnapshot | undefined): WorkflowPhase | undefined {
-    return run ? this.resolvePhase(run) : undefined;
+    if (!run) return undefined;
+    const model = this.outlineFor(run);
+    const phaseKey = model.selected?.phaseKey ?? model.expandedPhaseKey;
+    return model.phases.find((phase) => phase.key === phaseKey)?.phase;
   }
 
   private selectedAgent(run: WorkflowSnapshot | undefined): WorkflowAgentRecord | undefined {
-    if (!run) return undefined;
-    const phase = this.phaseFor(run);
-    return this.phaseAgents(run, phase).find((agent) => agent.index === this.#selectedAgentIndex);
+    if (!run || this.#outlineSelection?.kind !== "agent") return undefined;
+    const model = this.outlineFor(run);
+    const selected = model.nodes.find((node): node is WorkflowOutlineAgentNode =>
+      node.kind === "agent" && node.key === model.selected?.key);
+    return selected?.agent;
   }
 
   private selectRun(delta: number, runs: readonly WorkflowSnapshot[]): void {
@@ -587,62 +587,56 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const next = runs[clampDashboard(index + delta, 0, runs.length - 1)];
     if (!next || next.runId === this.#selectedRunId) return;
     this.#selectedRunId = next.runId;
-    this.#selectedPhaseIndex = undefined;
-    this.#selectedAgentIndex = undefined;
-    this.#pane = this.#layout?.kind === "narrow" ? "list" : "overview";
+    this.#outlineSelection = undefined;
+    this.#focus = "runs";
     this.resetScroll();
   }
 
-  private selectPhase(delta: number, run: WorkflowSnapshot | undefined): void {
-    if (!run?.phases.length) return;
-    const index = run.phases.findIndex((phase) => phase.index === this.#selectedPhaseIndex);
-    const next = run.phases[clampDashboard(index + delta, 0, run.phases.length - 1)];
-    if (!next || next.index === this.#selectedPhaseIndex) return;
-    this.#selectedPhaseIndex = next.index;
-    this.#selectedAgentIndex = undefined;
-    if (this.#pane === "agent") this.#pane = "overview";
-    this.resetScroll();
-  }
-
-  private selectAgent(run: WorkflowSnapshot | undefined): void {
+  private selectOutlineNode(delta: number, run: WorkflowSnapshot | undefined): void {
     if (!run) return;
-    const agents = this.phaseAgents(run, this.phaseFor(run));
-    if (!agents.length) return;
-    const index = agents.findIndex((agent) => agent.index === this.#selectedAgentIndex);
-    this.#selectedAgentIndex = agents[(index + 1 + agents.length) % agents.length]!.index;
+    const model = this.outlineFor(run);
+    if (!model.nodes.length) return;
+    const index = model.selectedIndex < 0 ? 0 : model.selectedIndex;
+    const next = model.nodes[clampDashboard(index + delta, 0, model.nodes.length - 1)];
+    if (!next || next.key === model.selected?.key) return;
+    this.#outlineSelection = selectionForNode(next);
     this.resetScroll();
-    this.refreshAgentVisibility(run);
   }
 
   private cycleAgentFilter(run: WorkflowSnapshot | undefined): void {
     const current = AGENT_FILTERS.indexOf(this.#agentFilter);
     this.#agentFilter = AGENT_FILTERS[(current + 1) % AGENT_FILTERS.length]!;
-    const before = this.#selectedAgentIndex;
+    const before = this.#outlineSelection?.key;
     this.syncSelections(run);
-    if (before !== this.#selectedAgentIndex || this.#pane === "agent") {
-      if (!this.selectedAgent(run)) this.#pane = "overview";
-      this.resetScroll();
-    }
+    if (before !== this.#outlineSelection?.key) this.resetScroll();
   }
 
-  private openSelectedPane(run: WorkflowSnapshot | undefined): void {
+  private openOutline(run: WorkflowSnapshot | undefined): void {
     if (!run) return;
-    if (this.#layout?.kind === "narrow" && this.#pane === "list") {
-      this.#pane = "overview";
+    this.#focus = "outline";
+    this.syncSelections(run);
+    this.resetScroll();
+  }
+
+  private advanceOutline(run: WorkflowSnapshot | undefined): void {
+    if (!run) return;
+    const model = this.outlineFor(run);
+    const selected = model.nodes[model.selectedIndex];
+    if (!selected) return;
+    if (selected.kind === "agent") {
+      this.#focus = "agent-detail";
       this.resetScroll();
-      this.refreshAgentVisibility(run);
       return;
     }
-    if (this.selectedAgent(run)) {
-      this.#pane = "agent";
-      this.resetScroll();
-      this.refreshAgentVisibility(run);
-    }
+    const next = model.nodes[model.selectedIndex + 1];
+    if (next?.kind !== "agent" || next.phaseKey !== selected.phaseKey) return;
+    this.#outlineSelection = selectionForNode(next);
+    this.resetScroll();
   }
 
   /** Applied in place: the live manager is called directly and the overlay stays mounted. */
   private pauseOrResume(run: WorkflowSnapshot | undefined): void {
-    if (!run || workflowIsTerminal(run.status) || this.#pane === "agent" || (this.#layout?.kind === "narrow" && this.#pane === "list")) return;
+    if (!run || workflowIsTerminal(run.status) || this.#focus === "agent-detail") return;
     const runId = run.runId;
     const pausing = run.status !== "paused";
     this.#notice = `${pausing ? "Pausing" : "Resuming"} ${sanitizeInline(run.name)}…`;
@@ -659,9 +653,9 @@ export class WorkflowsDashboardOverlay implements Focusable {
    * reopening the dashboard.
    */
   private restartAgent(run: WorkflowSnapshot | undefined): void {
-    if (!this.agentActionsVisible(run)) return;
     const agent = this.selectedAgent(run);
-    if (!run || agent?.callIndex === undefined) return;
+    if (!run || agent?.callIndex === undefined || !this.agentActionsVisible(run)) return;
+    if (!this.agentProofMatches(this.#renderedAgentRestart, run, agent)) return;
     const agentName = sanitizeInline(agent.name);
     const agentIndex = agent.index;
     this.#notice = `Restarting ${agentName}…`;
@@ -670,9 +664,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
         const replacementRunId = restarted.snapshot.runId;
         this.#selectedRunId = replacementRunId;
         this.#selectionRunId = replacementRunId;
-        this.#selectedPhaseIndex = undefined;
-        this.#selectedAgentIndex = undefined;
-        this.#pane = this.#layout?.kind === "narrow" ? "list" : "overview";
+        this.#outlineSelection = undefined;
+        this.#focus = "runs";
         this.resetScroll();
         this.#notice = `Restarted ${agentName} as ${sanitizeText(replacementRunId)}`;
         this.tui.requestRender();
@@ -688,16 +681,14 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const agent = this.selectedAgent(run);
     if (!run || !agent) return;
     this.#confirmCancel = { type: "agent", runId: run.runId, agentIndex: agent.index, confirmKey: "x" };
-    this.#renderedConfirmationTarget = cancelTargetKey(this.#confirmCancel);
   }
 
   private canCancelAgent(run: WorkflowSnapshot | undefined): boolean {
     const agent = this.agentCancelActionable(run);
     const rendered = this.#renderedAgentCancel;
     return !!agent
-      && !!rendered
-      && rendered.runId === run?.runId
-      && rendered.agentIndex === agent.index;
+      && !!run
+      && this.agentProofMatches(rendered, run, agent);
   }
 
   private agentCancelActionable(run: WorkflowSnapshot | undefined): WorkflowAgentRecord | undefined {
@@ -712,10 +703,12 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const agent = this.selectedAgent(run);
     const phase = this.phaseFor(run);
     const visible = this.#visibleAgent;
-    return !!run && !!agent && !!visible
+    return (this.#focus === "outline" || this.#focus === "agent-detail")
+      && !!run && !!agent && !!visible
       && visible.runId === run.runId
       && visible.phaseIndex === phase?.index
-      && visible.agentIndex === agent.index;
+      && visible.agentIndex === agent.index
+      && visible.focus === this.#focus;
   }
 
   private markVisibleAgent(
@@ -723,46 +716,30 @@ export class WorkflowsDashboardOverlay implements Focusable {
     phase: WorkflowPhase | undefined,
     agent: WorkflowAgentRecord,
   ): void {
+    if (this.#focus === "runs") return;
     this.#visibleAgent = {
       runId: run.runId,
       phaseIndex: phase?.index,
       agentIndex: agent.index,
+      focus: this.#focus,
     };
   }
 
-  private refreshAgentVisibility(run: WorkflowSnapshot | undefined): void {
-    if (!run || !this.#layout || this.isCompactGeometry() || this.#lastRenderWidth < 4) return;
-    if (this.#pane === "agent") {
-      const agent = this.selectedAgent(run);
-      if (agent) this.markVisibleAgent(run, this.phaseFor(run), agent);
-      return;
-    }
-    if (this.#pane === "list") {
-      this.#visibleAgent = undefined;
-      return;
-    }
-    const frame = createDashboardFrame(this.theme, this.#lastRenderWidth, this.#focused);
-    if (this.#layout.kind === "wide") {
-      const { right } = frame.columns(this.#layout.railWidth);
-      this.workflowOverviewViewport(run, this.#layout.contentRows, Math.max(1, right - 1));
-    } else if (this.#layout.kind === "medium") {
-      this.workflowOverviewViewport(run, this.#layout.detailRows, Math.max(1, frame.innerWidth - 1));
-    } else {
-      this.workflowOverviewViewport(run, this.#layout.contentRows, Math.max(1, frame.innerWidth - 1));
-    }
-  }
-
-  private refreshRenderedControls(run: WorkflowSnapshot | undefined): void {
-    if (!run || !this.#layout || this.isCompactGeometry() || this.#lastRenderWidth < 4 || this.#confirmCancel || this.#notice) return;
-    this.#renderedAgentCancel = undefined;
-    this.#renderedRunCancelId = undefined;
-    this.renderHint(createDashboardFrame(this.theme, this.#lastRenderWidth, this.#focused), run);
+  private agentProofMatches(
+    proof: RenderedAgentProof | undefined,
+    run: WorkflowSnapshot,
+    agent: WorkflowAgentRecord,
+  ): boolean {
+    if (!proof || this.#focus === "runs") return false;
+    return proof.runId === run.runId
+      && proof.phaseIndex === this.phaseFor(run)?.index
+      && proof.agentIndex === agent.index
+      && proof.focus === this.#focus;
   }
 
   private requestRunCancel(run: WorkflowSnapshot | undefined): void {
     if (!run || workflowIsTerminal(run.status) || this.#renderedRunCancelId !== run.runId) return;
     this.#confirmCancel = { type: "run", runId: run.runId, confirmKey: "X" };
-    this.#renderedConfirmationTarget = cancelTargetKey(this.#confirmCancel);
   }
 
   private confirmCancel(target: CancelTarget, selected: WorkflowSnapshot | undefined): void {
@@ -797,9 +774,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
       return;
     }
 
-    const visibleAgents = this.phaseAgents(run, this.phaseFor(run));
-    const agent = visibleAgents.find((candidate) => candidate.index === target.agentIndex);
-    if (this.#selectedRunId !== target.runId || this.#selectedAgentIndex !== target.agentIndex) {
+    const agent = this.selectedAgent(run);
+    if (this.#selectedRunId !== target.runId || agent?.index !== target.agentIndex) {
       this.#notice = "The selected agent changed; cancellation was dismissed.";
       this.tui.requestRender();
       return;
@@ -925,7 +901,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     chosen: WorkflowSnapshot | undefined,
   ): string[] {
     const view = dashboardCollectionViewport(collection, this.#selectedRunId, layout.contentRows, (run) => run.runId);
-    const detail = this.#pane !== "list" && chosen;
+    const detail = this.#focus !== "runs" && chosen;
     const lines = [
       this.renderHeader(frame, runs),
       frame.top(detail ? this.detailTitle(chosen) : this.listTitle(runs, view)),
@@ -956,29 +932,28 @@ export class WorkflowsDashboardOverlay implements Focusable {
     ].slice(0, rows);
   }
 
-  /** `?` cheatsheet: a grouped legend for whichever of list/overview/agent is active. */
+  /** `?` cheatsheet: a grouped legend for the active focus. */
   private renderHelp(frame: DashboardFrame, layout: DashboardLayout, runs: WorkflowSnapshot[]): string[] {
-    const narrowList = layout.kind === "narrow" && this.#pane === "list";
     return [
       this.renderHeader(frame, runs),
-      ...renderDashboardHelp(this.theme, frame, "help", this.helpGroups(narrowList, this.#pane === "agent"), layout.contentRows),
+      ...renderDashboardHelp(this.theme, frame, "help", this.helpGroups(), layout.contentRows),
       frame.hint(`? or ${dashboardCancelKeyLabel(this.keybindings)} close help`),
     ];
   }
 
-  private helpGroups(narrowList: boolean, agentPane: boolean): DashboardKeyGroup[] {
+  private helpGroups(): DashboardKeyGroup[] {
     const confirm = dashboardConfirmKeyLabel(this.keybindings);
     const cancel = dashboardCancelKeyLabel(this.keybindings);
-    if (narrowList) {
+    if (this.#focus === "runs") {
       return [
-        { title: "Navigate", entries: [["↑↓ / j k", "select run"], [confirm, "open overview"]] },
-        { title: "Actions", entries: [["X", "cancel a live run (press twice)"]] },
+        { title: "Navigate", entries: [["↑↓ / j k", "select run"], [`${confirm} / → / l / Tab`, "open outline"]] },
+        { title: "Actions", entries: [["p", "pause / resume the run"], ["X", "cancel a live run (press twice)"]] },
         { title: "Panel", entries: [[cancel, "close"], ["?", "close this help"]] },
       ];
     }
-    if (agentPane) {
+    if (this.#focus === "agent-detail") {
       return [
-        { title: "Navigate", entries: [["h / ←", "back to overview"]] },
+        { title: "Navigate", entries: [["Esc / ← / h", "back to outline"]] },
         { title: "Actions", entries: [
           ["x", "cancel this agent (press twice)"],
           ["X", "cancel the run (press twice)"],
@@ -986,7 +961,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
           ["t / Ctrl+T", "toggle compact/full tool display"],
         ] },
         { title: "Scroll", entries: [
-          ["Shift+↑↓ / PgUp/PgDn", "scroll result"],
+          ["j k / ↑↓ / PgUp/PgDn", "scroll detail"],
           ["Ctrl+U/D", "half-page scroll"],
           ["g / G", "top / bottom"],
         ] },
@@ -995,10 +970,9 @@ export class WorkflowsDashboardOverlay implements Focusable {
     }
     return [
       { title: "Navigate", entries: [
-        ["↑↓ / j k", "select run"],
-        ["←→ / h l", "select phase"],
-        ["Tab", "select agent"],
-        [confirm, "inspect agent"],
+        ["↑↓ / j k", "traverse phases and agents"],
+        [`${confirm} / → / l / Tab`, "expand phase / inspect agent"],
+        ["Esc / ← / h", "back to runs"],
       ] },
       { title: "Actions", entries: [
         ["p", "pause / resume the run"],
@@ -1008,9 +982,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
         ["f", "cycle the agent filter"],
       ] },
       { title: "Scroll", entries: [
-        ["Shift+↑↓ / PgUp/PgDn", "scroll result"],
-        ["Ctrl+U/D", "half-page scroll"],
-        ["g / G", "top / bottom"],
+        ["Shift+↑↓ / PgUp/PgDn", "scroll workflow result"],
+        ["Ctrl+U/D / g/G", "half-page / top / bottom"],
       ] },
       { title: "Panel", entries: [[cancel, "back / close"], ["?", "close this help"]] },
     ];
@@ -1027,20 +1000,21 @@ export class WorkflowsDashboardOverlay implements Focusable {
   private listTitle(runs: WorkflowSnapshot[], view: WorkflowListViewport): string {
     const active = runs.filter((run) => !workflowIsTerminal(run.status)).length;
     const clipped = `${view.clippedBefore ? "↑" : ""}${view.clippedAfter ? "↓" : ""}`;
-    return `runs · ${active} active / ${runs.length}${clipped ? ` ${clipped}` : ""}`;
+    return `runs · ${active} active / ${runs.length}${clipped ? ` ${clipped}` : ""}${this.#focus === "runs" ? " · focus" : ""}`;
   }
 
   private detailTitle(run: WorkflowSnapshot | undefined): string {
     if (!run) return "inspector";
-    if (this.#pane === "agent") {
+    if (this.#focus === "agent-detail") {
       // The tool-display mode also lives in the terse footer hint, but that
       // hint truncates first under width pressure; the title survives longer.
       const agent = this.selectedAgent(run);
-      return agent ? `agent · ${sanitizeInline(agent.name)} · ${agent.state} · ${this.#toolDisplay}` : "agent";
+      return agent ? `agent · ${sanitizeInline(agent.name)} · ${agent.state} · ${this.#toolDisplay} · focus` : "agent";
     }
-    const phase = this.phaseFor(run);
-    const progress = phase ? workflowPhaseProgress(run, phase.index) : undefined;
-    return phase ? `workflow · phase ${progress?.label ?? "waiting"} · filter ${this.#agentFilter}` : "workflow";
+    const model = this.outlineFor(run);
+    const phase = model.phases.find((candidate) => candidate.key === model.selected?.phaseKey);
+    const position = phase?.progressLabel ?? model.phaseProgress.label;
+    return `outline · phase ${position} · filter ${this.#agentFilter}${this.#focus === "outline" ? " · focus" : ""}`;
   }
 
   private renderRunRail(runs: WorkflowSnapshot[], view: WorkflowListViewport, chosen: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
@@ -1095,7 +1069,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
       this.#resultTotal = 0;
       return fitDashboardRows([this.theme.fg("dim", "Select a workflow to inspect phases, agents, and results.")], rows);
     }
-    return this.#pane === "agent" ? this.agentInspectorViewport(run, rows, width) : this.workflowOverviewViewport(run, rows, width);
+    return this.#focus === "agent-detail" ? this.agentInspectorViewport(run, rows, width) : this.workflowOutlineViewport(run, rows, width);
   }
 
   private renderQuestionPreview(interaction: NonNullable<WorkflowAgentRecord["waitingOn"]>, width: number): string[] {
@@ -1202,87 +1176,142 @@ export class WorkflowsDashboardOverlay implements Focusable {
     return [line("muted", `State · ${summary.text}`), line("muted", `Recovery · ${recovery}`)];
   }
 
-  private workflowOverviewViewport(run: WorkflowSnapshot, rows: number, width: number): string[] {
-    this.#resultRows = 0;
-    this.#resultTotal = 0;
-    const phase = this.phaseFor(run);
-    const allAgents = this.allPhaseAgents(run, phase);
-    const agents = this.phaseAgents(run, phase);
+  private workflowOutlineViewport(run: WorkflowSnapshot, rows: number, width: number): string[] {
+    const model = this.outlineFor(run);
+    const selectedPhase = model.phases.find((phase) => phase.key === model.selected?.phaseKey);
+    const phase = selectedPhase?.phase;
     const usageSnapshot = aggregateWorkflowUsage(run);
     const usage = formatUsage(usageSnapshot);
     const budget = formatWorkflowBudget(run, usageSnapshot);
     const status = workflowStatusMeta(run);
-    const progress = workflowPhaseProgress(run);
-    const lines: string[] = [
+    const essential: string[] = [
       `${this.theme.fg("accent", this.theme.bold(sanitizeInline(run.name) || "Workflow"))} ${this.theme.fg(status.color, `· ${shortId(sanitizeText(run.runId))} · ${status.glyph} ${run.status}${run.status === "completed" ? ` · task ${run.taskOutcome ?? "unspecified"}` : ""}`)} ${this.theme.fg("dim", `· ${formatElapsed(run, this.#now())}`)}`,
       ...this.renderRunStatePreview(run, width),
-      phase
-        ? this.renderPhase(run, phase)
-        : this.theme.fg("dim", progress.waiting ? "Phase · waiting for the first phase" : "Phase · no phases recorded"),
+    ];
+    const phaseLifecycle = model.phases.length && run.currentPhase === null
+      ? "Phase · no current phase"
+      : model.phaseProgress.waiting
+        ? "Phase · waiting for the first phase"
+        : model.phaseProgress.noPhases
+          ? "Phase · no phases recorded"
+          : undefined;
+    if (phaseLifecycle) essential.push(this.theme.fg("dim", phaseLifecycle));
+    const optional: string[] = [
       this.theme.fg("dim", boundedInline(run.description, 2_000) || "(no workflow description)"),
     ];
-    if (phase?.description) lines.push(this.theme.fg("muted", `Phase context · ${boundedInline(phase.description, 2_000)}`));
+    if (phase?.description) optional.push(this.theme.fg("muted", `Phase context · ${boundedInline(phase.description, 2_000)}`));
     if (run.convergence) {
       const meta = workflowConvergenceMeta(run.convergence);
-      lines.push(this.theme.fg(meta.color, `Convergence · ${meta.glyph} ${boundedInline(formatWorkflowConvergence(run.convergence), 1_000)}`));
+      optional.push(this.theme.fg(meta.color, `Convergence · ${meta.glyph} ${boundedInline(formatWorkflowConvergence(run.convergence), 1_000)}`));
     }
-    if (usage) lines.push(this.theme.fg("dim", `Usage · ${usage}`));
-    if (budget) lines.push(this.theme.fg("dim", `Budget · ${budget}`));
-    if (run.approval) lines.push(this.theme.fg("muted", `Approval · ${run.approval}`));
-    if (run.definitionFingerprint) lines.push(this.theme.fg("muted", `Provenance · definition ${shortId(run.definitionFingerprint)}`));
-    for (const warning of run.warnings?.slice(0, 2) ?? []) lines.push(this.theme.fg("warning", `⚠ ${boundedInline(warning, 1_000)}`));
+    if (usage) optional.push(this.theme.fg("dim", `Usage · ${usage}`));
+    if (budget) optional.push(this.theme.fg("dim", `Budget · ${budget}`));
+    if (run.approval) optional.push(this.theme.fg("muted", `Approval · ${run.approval}`));
+    if (run.definitionFingerprint) optional.push(this.theme.fg("muted", `Provenance · definition ${shortId(run.definitionFingerprint)}`));
+    for (const warning of run.warnings?.slice(0, 2) ?? []) optional.push(this.theme.fg("warning", `⚠ ${boundedInline(warning, 1_000)}`));
     const settledInteractions = (run.interactions ?? [])
       .filter((interaction) => interaction.state !== "pending" && interaction.state !== "answering")
       .slice(-3);
     if (settledInteractions.length) {
-      lines.push(this.theme.fg("muted", `Questions · ${settledInteractions.length} recent settled`));
+      optional.push(this.theme.fg("muted", `Questions · ${settledInteractions.length} recent settled`));
       for (const interaction of settledInteractions) {
-        lines.push(this.theme.fg("dim", `· ${boundedInline(interaction.sourceName, 500)} → ${boundedInline(formatWorkflowInteraction(interaction, this.#now()), MAX_ACTIVITY_CHARS)}`));
+        optional.push(this.theme.fg("dim", `· ${boundedInline(interaction.sourceName, 500)} → ${boundedInline(formatWorkflowInteraction(interaction, this.#now()), MAX_ACTIVITY_CHARS)}`));
       }
     }
     const activity = (run.logs ?? []).slice(-3);
     if (activity.length) {
-      lines.push(this.theme.fg("muted", `Activity · ${activity.length} recent log${activity.length === 1 ? "" : "s"}`));
-      for (const log of activity) lines.push(this.theme.fg("dim", `· ${boundedInline(log.message, MAX_ACTIVITY_CHARS)}`));
+      optional.push(this.theme.fg("muted", `Activity · ${activity.length} recent log${activity.length === 1 ? "" : "s"}`));
+      for (const log of activity) optional.push(this.theme.fg("dim", `· ${boundedInline(log.message, MAX_ACTIVITY_CHARS)}`));
     }
-    lines.push(this.theme.fg("muted", `Agents · ${agents.length}/${allAgents.length} shown · filter ${this.#agentFilter} · Tab select · ${dashboardConfirmKeyLabel(this.keybindings)} inspect`));
 
-    if (!agents.length) {
-      const noAgents = this.theme.fg("dim", allAgents.length ? "No agents match this filter." : "No agents in this phase yet.");
-      if (allAgents.length || (run.result === undefined && phase?.result === undefined && !run.logs?.length)) {
-        lines.push(noAgents);
-        return fitDashboardRows(lines, rows);
-      }
+    const hasWorkflowResult = (selectedPhase?.agentCount ?? 0) === 0
+      && (run.result !== undefined || phase?.result !== undefined || !!run.logs?.length);
+    const completeNonResultRows = essential.length + optional.length + 1 + Math.max(1, model.nodes.length);
+    const resultReserve = hasWorkflowResult && rows >= 4
+      ? Math.min(8, Math.max(MIN_SCROLLABLE_DETAIL_ROWS, rows - completeNonResultRows))
+      : 0;
+    const minimumOutline = 1;
+    const essentialBudget = Math.min(essential.length, Math.max(0, rows - minimumOutline - 1 - resultReserve));
+    const fixedRows = essentialBudget + 1 + resultReserve;
+    const available = Math.max(minimumOutline, rows - fixedRows);
+    const wantedOutlineRows = Math.max(1, Math.min(model.nodes.length || 1, available));
+    const optionalBudget = Math.min(optional.length, Math.max(0, available - wantedOutlineRows));
+    const outlineRows = Math.max(1, rows - essentialBudget - optionalBudget - 1 - resultReserve);
+    const outline = boundWorkflowOutline(model, outlineRows);
+    const lines = [
+      ...essential.slice(0, essentialBudget),
+      ...optional.slice(0, optionalBudget),
+      this.theme.fg("muted", `Outline · filter ${this.#agentFilter} · ${model.nodes.length} node${model.nodes.length === 1 ? "" : "s"}`),
+      ...(outline.length
+        ? outline.map((row) => this.renderOutlineRow(row, model, run, width))
+        : [this.theme.fg("dim", run.status === "pending" ? "No phases recorded yet." : "No recorded or planned phases.")]),
+    ];
 
-      // A standalone workflow can have enough run metadata to consume every
-      // overview row. Keep a label plus one body row for the result, and move
-      // the metadata that does not fit into the same scrollable body.
-      const metadata = [...lines, noAgents, this.theme.fg("muted", "Workflow result")];
-      const pinnedRows = Math.min(metadata.length, Math.max(0, rows - MIN_SCROLLABLE_DETAIL_ROWS));
-      const body = [
-        ...metadata.slice(pinnedRows),
-        ...this.workflowResultBody(run, phase, width),
-      ];
-      const viewport = this.renderScrollableBody(
-        body,
-        rows - pinnedRows,
+    if (hasWorkflowResult && resultReserve) {
+      lines.push(...this.renderScrollableBody(
+        this.workflowResultBody(run, phase, width),
+        resultReserve,
         `workflow:${run.runId}:${phase?.index ?? "none"}`,
         width,
-      );
-      return fitDashboardRows([...metadata.slice(0, pinnedRows), ...viewport], rows);
+      ));
+    } else {
+      this.#resultRows = 0;
+      this.#resultTotal = 0;
+    }
+    return fitDashboardRows(lines, rows);
+  }
+
+  private renderOutlineRow(
+    row: ReturnType<typeof boundWorkflowOutline>[number],
+    model: WorkflowOutlineModel,
+    run: WorkflowSnapshot,
+    width: number,
+  ): string {
+    if (row.kind === "omission") {
+      const counts = [
+        row.omittedPhases ? `${row.omittedPhases} phase${row.omittedPhases === 1 ? "" : "s"}` : "",
+        row.omittedAgents ? `${row.omittedAgents} agent${row.omittedAgents === 1 ? "" : "s"}` : "",
+      ].filter(Boolean).join(" · ");
+      return truncateWorkflowDashboardLine(this.theme.fg("muted", `  ⋯ ${counts} omitted`), width);
     }
 
-    const room = Math.max(1, rows - lines.length);
-    const selectedPosition = agents.findIndex((agent) => agent.index === this.#selectedAgentIndex);
-    const view = dashboardListViewport(agents, selectedPosition < 0 ? 0 : selectedPosition, room);
-    for (const agent of view.items) lines.push(this.renderAgentRow(agent, agent.index === this.#selectedAgentIndex));
-    const rendered = fitDashboardRows(lines, rows);
-    const selectedOffset = view.items.findIndex((agent) => agent.index === this.#selectedAgentIndex);
-    const selectedLine = lines.length - view.items.length + selectedOffset;
-    if (selectedOffset >= 0 && selectedLine < rendered.length) {
-      this.markVisibleAgent(run, phase, this.selectedAgent(run)!);
+    const selected = row.node.key === model.selected?.key;
+    if (row.node.kind === "phase") return this.renderOutlinePhase(row.node, selected, width);
+    if (selected && this.#focus === "outline") {
+      const phase = model.phases.find((candidate) => candidate.key === row.node.phaseKey)?.phase;
+      this.markVisibleAgent(run, phase, row.node.agent);
     }
-    return rendered;
+    return this.renderOutlineAgent(row.node, selected, width);
+  }
+
+  private renderOutlinePhase(node: WorkflowOutlinePhaseNode, selected: boolean, width: number): string {
+    const status = traceStatusMeta(node.status, this.#now());
+    const marker = dashboardNestedSelectionMarker(this.theme, selected);
+    const label = selected
+      ? this.theme.fg("accent", boundedInline(node.name, 1_000))
+      : this.theme.fg("text", boundedInline(node.name, 1_000));
+    const current = node.current ? " · current" : "";
+    const planned = node.recorded ? "" : " · planned";
+    const hidden = node.hiddenAgentCount ? ` · ${node.hiddenAgentCount} hidden by filter` : "";
+    const progress = `${node.completedAgents}/${node.agentCount} agents complete`;
+    return truncateWorkflowDashboardLine(
+      `${marker} ${this.theme.fg(status.color, status.glyph)} Phase ${node.progressLabel} · ${label} · ${node.status}${current}${planned} · ${progress}${hidden}`,
+      width,
+    );
+  }
+
+  private renderOutlineAgent(node: WorkflowOutlineAgentNode, selected: boolean, width: number): string {
+    const status = node.agent.waitingOn
+      ? { glyph: "?", color: "warning" as const }
+      : traceStatusMeta(node.state, this.#now());
+    const marker = dashboardNestedSelectionMarker(this.theme, selected);
+    const label = selected
+      ? this.theme.fg("accent", boundedInline(node.name, 1_000))
+      : this.theme.fg("text", boundedInline(node.name, 1_000));
+    return truncateWorkflowDashboardLine(
+      `  ${marker} ${this.theme.fg(status.color, status.glyph)} ${label} · ${node.state} · ${this.theme.fg(dashboardSummaryColor(node.summary), node.summary.text)}`,
+      width,
+    );
   }
 
   private workflowResultBody(run: WorkflowSnapshot, phase: WorkflowPhase | undefined, width: number): string[] {
@@ -1295,8 +1324,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const phase = this.phaseFor(run);
     const agent = this.selectedAgent(run);
     if (!agent) {
-      this.#pane = "overview";
-      return this.workflowOverviewViewport(run, rows, width);
+      this.#focus = "outline";
+      return this.workflowOutlineViewport(run, rows, width);
     }
     this.markVisibleAgent(run, phase, agent);
 
@@ -1421,38 +1450,6 @@ export class WorkflowsDashboardOverlay implements Focusable {
     this.#detailCache.set(key, bounded);
     if (this.#detailCache.size > 24) this.#detailCache.delete(this.#detailCache.keys().next().value as string);
     return bounded;
-  }
-
-  private renderPhase(run: WorkflowSnapshot, phase: WorkflowPhase): string {
-    const progress = workflowPhaseProgress(run, phase.index);
-    if (run.plannedPhaseCount !== undefined && run.currentPhase === null) {
-      return `${this.theme.fg("accent", `Phase ${progress.label}`)} ${this.theme.fg("dim", "no current phase · ←→")}`;
-    }
-    const status = traceStatusMeta(phase.status, this.#now());
-    return `${this.theme.fg("accent", `Phase ${progress.label}`)} ${this.theme.fg(status.color, `${status.glyph} ${boundedInline(phase.name, 1_000)}`)} ${this.theme.fg("dim", `· ${phase.status} · ←→`)}`;
-  }
-
-  private renderAgentRow(agent: WorkflowAgentRecord, selected: boolean): string {
-    // A routed-question wait is not the agent's lifecycle state: mark it with
-    // its own glyph and words so it never reads as ordinary queueing.
-    const status = agent.waitingOn ? { glyph: "?", color: "warning" as const } : traceStatusMeta(agent.state, this.#now());
-    const marker = dashboardNestedSelectionMarker(this.theme, selected);
-    const label = selected ? this.theme.fg("accent", boundedInline(agent.name, 1_000)) : this.theme.fg("text", boundedInline(agent.name, 1_000));
-    const summary = workflowAgentDashboardSummary(agent, this.#now());
-    const route = agent.harness || agent.model ? `${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
-    const usage = formatUsage(agent.usage);
-    const warning = agent.instructionShaped ? " · ⚠ instruction-like output" : "";
-    return `${marker} ${this.theme.fg(status.color, status.glyph)} ${label} ${this.theme.fg("dim", "·")} ${this.theme.fg(dashboardSummaryColor(summary), summary.text)} ${this.theme.fg("dim", `· ${agent.access}${agent.profile ? ` · profile ${boundedInline(agent.profile, 500)}` : ""}${agent.independent ? " · independent" : ""} · ${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}${usage ? ` · ${usage}` : ""}${warning}`)}`;
-  }
-
-  private allPhaseAgents(run: WorkflowSnapshot, phase: WorkflowPhase | undefined): WorkflowAgentRecord[] {
-    if (!phase) return [];
-    const indices = new Set(phase.agents);
-    return run.agents.filter((agent) => indices.has(agent.index) || agent.phase === phase.index);
-  }
-
-  private phaseAgents(run: WorkflowSnapshot, phase: WorkflowPhase | undefined): WorkflowAgentRecord[] {
-    return this.allPhaseAgents(run, phase).filter((agent) => matchesAgentFilter(agent, this.#agentFilter));
   }
 
   private renderBoundedResult(run: WorkflowSnapshot, phase: WorkflowPhase | undefined, agent: WorkflowAgentRecord | undefined, width: number): string[] {
@@ -1581,45 +1578,48 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const agentActionable = this.agentCancelActionable(run);
     const shortActions = frame.innerWidth < 60;
     const agentCancelLabel = shortActions ? "x cancel" : "x cancel agent";
+    const agentRestartLabel = "r restart agent";
     const runCancelLabel = shortActions ? "X cancel" : "X cancel run";
-    if (this.#layout?.kind === "narrow" && this.#pane === "list") {
+    if (this.#focus === "runs") {
       const navigation = shortActions ? "↑↓/jk" : "↑↓/jk select";
-      const actions = [live ? runCancelLabel : "", navigation, `${confirm} open`, "? help"].filter(Boolean).join(" · ");
+      const actions = [live ? runCancelLabel : "", `${confirm}/→ outline`, navigation, live ? `p ${run?.status === "paused" ? "resume" : "pause"}` : "", "? help"].filter(Boolean).join(" · ");
       const rendered = frame.hint(actions, back);
       if (live && rendered.includes(runCancelLabel)) this.#renderedRunCancelId = run?.runId;
       return rendered;
     }
-    const actions = this.#pane === "agent"
+    const actions = this.#focus === "agent-detail"
       ? [
         agentActionable ? agentCancelLabel : "",
         live ? runCancelLabel : "",
-        agentVisible && agent?.callIndex !== undefined ? "r restart agent" : "",
+        agentVisible && agent?.callIndex !== undefined ? agentRestartLabel : "",
         `t ${this.#toolDisplay === "compact" ? "full" : "compact"}`,
-        "h/← overview",
-        "Shift+↑↓/Pg scroll · Ctrl+U/D · g/G",
+        "Esc/← outline",
+        "jk/Pg scroll · Ctrl+U/D · g/G",
         "? help",
       ]
       : [
         agentActionable ? agentCancelLabel : "",
         live ? runCancelLabel : "",
         live ? `p ${run?.status === "paused" ? "resume" : "pause"}` : "",
-        agentVisible && agent?.callIndex !== undefined ? "r restart agent" : "",
-        this.#layout?.kind === "narrow" && this.#pane === "list" ? `↑↓/jk select · ${confirm} open` : `↑↓/jk run · ←→/hl phase · Tab agent · ${confirm} inspect · f filter`,
-        "Shift+↑↓/Pg scroll · Ctrl+U/D · g/G",
+        agentVisible && agent?.callIndex !== undefined ? agentRestartLabel : "",
+        `↑↓/jk nodes · ${confirm}/→ drill · f filter`,
+        "Esc/← runs",
         "? help",
       ];
     const rendered = frame.hint(actions.filter(Boolean).join(" · "), back);
-    if (agentActionable && rendered.includes(agentCancelLabel)) {
-      this.#renderedAgentCancel = { runId: run!.runId, agentIndex: agent!.index };
+    const proof = this.#visibleAgent;
+    if (proof && agentActionable && rendered.includes(agentCancelLabel)) {
+      this.#renderedAgentCancel = proof;
+    }
+    if (proof && agentVisible && agent?.callIndex !== undefined) {
+      this.#renderedAgentRestart = proof;
     }
     if (live && rendered.includes(runCancelLabel)) this.#renderedRunCancelId = run!.runId;
     return rendered;
   }
 
   private backHint(): string {
-    if (this.#pane === "agent") return "back";
-    if (this.#layout?.kind === "narrow" && this.#pane === "overview") return "back";
-    return "close";
+    return this.#focus === "runs" ? "close" : "back";
   }
 
 }
@@ -1674,13 +1674,6 @@ export async function openWorkflowsDashboard(ctx: Pick<ExtensionContext, "mode" 
     (tui, theme, keybindings, done) => createWorkflowsDashboardOverlay(tui, theme, keybindings, manager, done),
     { overlay: true, overlayOptions: { width: "100%", minWidth: 40, maxHeight: "100%", anchor: "center" } },
   );
-}
-
-function matchesAgentFilter(agent: WorkflowAgentRecord, filter: AgentFilter): boolean {
-  if (filter === "all") return true;
-  if (filter === "active") return agent.state === "queued" || agent.state === "running" || agent.state === "waiting";
-  if (filter === "failed") return agent.state === "failed" || agent.state === "cancelled" || agent.state === "aborted";
-  return agent.state === "completed";
 }
 
 function isCancellableAgent(agent: WorkflowAgentRecord | undefined): agent is WorkflowAgentRecord {

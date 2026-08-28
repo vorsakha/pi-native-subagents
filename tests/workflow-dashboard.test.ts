@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 import { initTheme, type Theme } from "@earendil-works/pi-coding-agent";
 import { type KeybindingsManager, visibleWidth } from "@earendil-works/pi-tui";
-import { tempDir, theme, tick } from "./helpers.ts";
+import { tempDir, theme, tick, workflowSnapshotFixture as workflow } from "./helpers.ts";
 import {
   createWorkflowsDashboardOverlay,
   openWorkflowsDashboard,
@@ -23,39 +23,8 @@ const PAGE_DOWN = "\u001b[6~";
 const CTRL_D = "\u0004";
 const CTRL_T = String.fromCharCode(20);
 const SHIFT_UP = "\u001b[1;2A";
-
-function workflow(id: string, status: WorkflowSnapshot["status"] = "running"): WorkflowSnapshot {
-  const settledAgentState = status === "pending" ? "queued" as const : status === "paused" ? "running" as const : status;
-  const terminal = status === "completed" || status === "failed" || status === "aborted";
-  return {
-    runId: id,
-    sessionId: "session",
-    name: `Release ${id}`,
-    description: "Review and verify Unicode output 你好世界",
-    background: true,
-    status,
-    timestamps: { createdAt: 1_000, updatedAt: 3_000, startedAt: 2_000, ...(status === "paused" ? { pausedAt: 3_000 } : {}), ...(terminal ? { endedAt: 4_000 } : {}) },
-    currentPhase: 0,
-    phases: [{ index: 0, name: "Verification", status, timestamps: { createdAt: 1_000, updatedAt: 3_000 }, agents: [0, 1] }],
-    agents: [
-      {
-        index: 0, callIndex: 0, name: "review", access: "readOnly", independent: false, phase: 0, state: status === "running" || status === "paused" ? "completed" : settledAgentState,
-        timestamps: { createdAt: 1_000, updatedAt: 3_000, startedAt: 2_000 }, harness: "claude", model: "claude-fixture-model", effort: "high",
-        jobId: "review-job-0001", prompt: "Review the implementation", tools: [{ id: "read-1", name: "read", summary: "src/index.ts", status: "completed" }],
-        output: "review result", preview: "review result", usage: { input: 100, output: 20, cacheRead: 0, cacheWrite: 0, cost: 0.01, turns: 1 },
-      },
-      {
-        index: 1, callIndex: 1, name: "tests", access: "full", independent: false, phase: 0, state: status === "running" || status === "paused" ? "running" : settledAgentState,
-        timestamps: { createdAt: 1_000, updatedAt: 3_000, startedAt: 2_000 }, harness: "codex", model: "codex-fixture-model", effort: "medium",
-        jobId: "tests-job-0002", prompt: "\u001b[31mRun the affected tests\u001b[0m", liveThinking: "\u001b]0;bad\u0007checking failures", tools: [{ id: "bash-1", name: "bash", summary: "npm test", status: "running" }],
-        output: Array.from({ length: 60 }, (_, index) => `test result ${index}`).join("\n"), preview: "test result 59",
-        usage: { input: 200, output: 40, cacheRead: 10, cacheWrite: 0, cost: 0.02, turns: 2 },
-      },
-    ],
-    result: "workflow result",
-    artifactDir: `/private/${id}`,
-  };
-}
+const RIGHT = "\u001b[C";
+const LEFT = "\u001b[D";
 
 interface HarnessOptions {
   fullscreen?: boolean;
@@ -168,6 +137,24 @@ function assertPanel(lines: string[], width: number, rows: number): void {
   assert.ok(lines.every((line) => visibleWidth(line) <= width), `a dashboard line exceeds ${width} columns`);
 }
 
+type DashboardDriver = Pick<ReturnType<typeof createWorkflowsDashboardOverlay>, "render" | "handleInput">;
+
+function openOutline(overlay: DashboardDriver, width: number): void {
+  overlay.render(width);
+  overlay.handleInput(ENTER);
+}
+
+function selectOutlineAgent(overlay: DashboardDriver, width: number, offset = 0): void {
+  openOutline(overlay, width);
+  overlay.handleInput(ENTER);
+  for (let index = 0; index < offset; index++) overlay.handleInput("j");
+}
+
+function openAgentDetail(overlay: DashboardDriver, width: number, offset = 0): void {
+  selectOutlineAgent(overlay, width, offset);
+  overlay.handleInput(ENTER);
+}
+
 test("workflow dashboard uses adaptive geometry and exact fullscreen or regular row budgets", (t) => {
   const fullHarness = harness([workflow("geometry")], 30, () => {}, { fullscreen: true });
   const regularHarness = harness([workflow("regular")], 30);
@@ -182,7 +169,7 @@ test("workflow dashboard uses adaptive geometry and exact fullscreen or regular 
   assertPanel(wide, 120, 30);
   assert.ok(wide.some((line) => line.includes("┬")), "wide mode has side-by-side run rail and inspector");
   assert.equal(regularHarness.overlay.render(120).length, 24, "regular overlay stays within 80% of 30 rows");
-  assert.ok(regularHarness.overlay.render(72).some((line) => line.includes("workflow")), "medium mode keeps a stacked inspector");
+  assert.ok(regularHarness.overlay.render(72).some((line) => line.includes("outline")), "medium mode keeps the short run list above the outline");
   assert.ok(!regularHarness.overlay.render(52).some((line) => line.includes("┬")), "narrow mode renders one pane");
 
   const short = harness([workflow("short")], 8, () => {}, { fullscreen: true }).overlay;
@@ -335,9 +322,7 @@ test("minimum-width live run and agent cancellation keep Unicode controls visibl
 
   const agentState = harness([workflow("cancel-agent")], 30, () => {}, { fullscreen: true });
   t.after(() => agentState.overlay.dispose());
-  agentState.overlay.render(40);
-  agentState.overlay.handleInput(ENTER);
-  agentState.overlay.handleInput("\t");
+  selectOutlineAgent(agentState.overlay, 40, 1);
   const agentHint = agentState.overlay.render(40);
   assertPanel(agentHint, 40, 30);
   assert.ok(agentHint.some((line) => line.includes("x cancel")), "the minimum-width agent hint exposes cancellation");
@@ -367,8 +352,7 @@ test("workflow results use native Markdown while transcript roles and workflow m
   });
   t.after(() => overlay.dispose());
 
-  overlay.render(72);
-  overlay.handleInput("\r");
+  openAgentDetail(overlay, 72);
   const compactLines = overlay.render(72);
   assert.ok(compactLines.some((line) => line.includes("1 tool call") && line.includes("read")), "compact mode is the default in the agent pane");
   assert.ok(!compactLines.some((line) => line.includes("file.ts")), "compact mode omits the per-tool detail row");
@@ -418,8 +402,7 @@ test("workflow results use native Markdown while transcript roles and workflow m
     },
   }).overlay;
   t.after(() => failedOverlay.dispose());
-  failedOverlay.render(72);
-  failedOverlay.handleInput("\r");
+  openAgentDetail(failedOverlay, 72);
   const failedLines = failedOverlay.render(72);
   assert.ok(failedLines.some((line) => line.includes("did not match")));
   assert.ok(failedSources.includes("```json\n{\n  \"clean\": false\n}\n```"));
@@ -440,9 +423,7 @@ test("workflow results use native Markdown while transcript roles and workflow m
     }),
   }).overlay;
   t.after(() => stressOverlay.dispose());
-  stressOverlay.render(60);
-  stressOverlay.handleInput("\r");
-  stressOverlay.handleInput("\r");
+  openAgentDetail(stressOverlay, 60);
   stressOverlay.handleInput("g");
   const seen = new Set<string>();
   for (let page = 0; page < 40; page++) {
@@ -478,8 +459,7 @@ test("agent detail activity does not duplicate tool detail already shown in the 
   const { overlay } = harness([run], 40, () => {}, { renderMarkdown: (text) => text.split("\n") });
   t.after(() => overlay.dispose());
 
-  overlay.render(72);
-  overlay.handleInput(ENTER);
+  openAgentDetail(overlay, 72);
   const compactLines = overlay.render(72);
   assert.ok(!compactLines.some((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER")), "compact mode is the default and does not surface per-tool detail anywhere, including Activity");
   assert.ok(compactLines.some((line) => line.includes("Latest") && line.includes("narrowing down the failing assertion")), "the state preview surfaces live semantic progress in compact mode");
@@ -495,33 +475,71 @@ test("agent detail activity does not duplicate tool detail already shown in the 
   assert.equal(toolMentions.length, 1, "tool detail is rendered exactly once, in the transcript, not duplicated in Activity");
 });
 
-test("narrow workflows drill from runs to overview to agent, with layered Escape and Pi cancel backtracking", (t) => {
+test("narrow workflows drill from runs to outline to agent detail with layered Escape and Pi cancel backtracking", (t) => {
   const closed: WorkflowsDashboardAction[] = [];
   const { overlay, actions } = harness([workflow("narrow")], 30, (action) => closed.push(action));
   t.after(() => overlay.dispose());
 
   overlay.render(52);
-  assert.ok(overlay.render(52).some((line) => line.includes("Enter open")));
-  for (const input of ["p", "h", "l", "f", "x", PAGE_DOWN, "r"]) overlay.handleInput(input);
-  assert.deepEqual(actions, [], "the narrow run list accepts only its displayed controls");
+  assert.ok(overlay.render(52).some((line) => line.includes("outline")));
+  for (const input of ["h", "f", "x", PAGE_DOWN, "r"]) overlay.handleInput(input);
+  assert.deepEqual(actions, [], "the narrow run list rejects outline and agent controls");
   assert.ok(overlay.render(52).some((line) => line.includes("runs ·")));
   overlay.handleInput(ENTER);
-  assert.ok(overlay.render(52).some((line) => line.includes("workflow · phase")));
+  assert.ok(overlay.render(52).some((line) => line.includes("outline · phase")));
+  overlay.handleInput(ENTER);
+  assert.ok(overlay.render(52).some((line) => line.includes("review")), "phase drill advances to its first agent without opening detail");
   overlay.handleInput(ENTER);
   assert.ok(overlay.render(52).some((line) => line.includes("agent ·")));
-  for (const input of ["p", "j", "l", "f", "\t", ENTER]) overlay.handleInput(input);
+  for (const input of ["p", "l", "f", "\t", ENTER]) overlay.handleInput(input);
   assert.deepEqual(actions, [], "the narrow agent pane accepts only its displayed controls");
   assert.ok(overlay.render(52).some((line) => line.includes("agent ·")));
 
   overlay.handleInput(ESCAPE);
-  assert.ok(overlay.render(52).some((line) => line.includes("workflow · phase")));
+  assert.ok(overlay.render(52).some((line) => line.includes("outline · phase")));
   overlay.handleInput("\u0003");
   assert.ok(overlay.render(52).some((line) => line.includes("runs ·")));
   overlay.handleInput("\u0003");
   assert.deepEqual(closed, [{ type: "close" }]);
 });
 
-test("narrow workflow overview keeps h and Left available for previous-phase navigation", (t) => {
+test("focus routing gives j/k and Right/Left one meaning in runs, outline, and agent detail", (t) => {
+  const first = workflow("focus-routing-first");
+  const second = workflow("focus-routing-second");
+  first.name = "FIRST";
+  second.name = "SECOND";
+  second.agents[0]!.output = Array.from({ length: 80 }, (_, index) => `detail ${index}`).join("\n");
+  const { overlay } = harness([first, second], 30);
+  t.after(() => overlay.dispose());
+
+  overlay.render(52);
+  overlay.handleInput("j");
+  assert.match(overlay.render(52).join("\n"), /SECOND/, "j selects a real run in runs focus");
+
+  overlay.handleInput(RIGHT);
+  assert.match(overlay.render(52).join("\n"), /outline · phase/, "Right drills into outline focus");
+  overlay.handleInput("j");
+  assert.match(overlay.render(52).join("\n"), /›.*review/, "j traverses outline nodes without changing runs");
+  overlay.handleInput(RIGHT);
+  assert.match(overlay.render(52).join("\n"), /agent · review/, "Right on an agent opens detail");
+
+  overlay.handleInput("g");
+  const top = overlay.render(52).join("\n");
+  overlay.handleInput("j");
+  const scrolled = overlay.render(52).join("\n");
+  assert.notEqual(scrolled, top, "j scrolls agent detail instead of selecting a run or outline node");
+  overlay.handleInput("k");
+  assert.equal(overlay.render(52).join("\n"), top, "k scrolls back by one detail row");
+
+  overlay.handleInput(LEFT);
+  assert.match(overlay.render(52).join("\n"), /outline · phase/, "Left restores outline with the agent identity preserved");
+  overlay.handleInput(LEFT);
+  const runs = overlay.render(52).join("\n");
+  assert.match(runs, /runs ·/);
+  assert.match(runs, /SECOND/, "Left restores runs with run identity preserved");
+});
+
+test("narrow workflow outline uses j/k for nodes and h/l as unambiguous back/drill aliases", (t) => {
   const current = workflow("narrow-phases");
   const [firstPhase] = current.phases;
   current.phases = [
@@ -536,19 +554,24 @@ test("narrow workflow overview keeps h and Left available for previous-phase nav
 
   overlay.render(52);
   overlay.handleInput(ENTER);
-  assert.match(overlay.render(52).join("\n"), /workflow · phase 1\/\?/);
+  assert.match(overlay.render(52).join("\n"), /outline · phase 1\/\?/);
   assert.match(overlay.render(52).join("\n"), /First phase/);
 
-  overlay.handleInput("l");
+  overlay.handleInput("j");
+  overlay.handleInput("j");
   const second = overlay.render(52).join("\n");
-  assert.match(second, /workflow · phase 2\/\?/);
+  assert.match(second, /outline · phase 2\/\?/);
   assert.match(second, /Second phase/);
 
-  overlay.handleInput("h");
+  overlay.handleInput("k");
+  overlay.handleInput("k");
   const first = overlay.render(52).join("\n");
-  assert.match(first, /workflow · phase 1\/\?/);
+  assert.match(first, /outline · phase 1\/\?/);
   assert.match(first, /First phase/);
-  assert.doesNotMatch(first, /Enter open/, "h navigates phases instead of returning to the hidden run list");
+  overlay.handleInput("h");
+  assert.match(overlay.render(52).join("\n"), /runs ·/);
+  overlay.handleInput("l");
+  assert.match(overlay.render(52).join("\n"), /outline · phase 1\/\?/);
 });
 
 test("workflow dashboard shares declared totals and terminal no-phase wording with inline cards", (t) => {
@@ -568,8 +591,22 @@ test("workflow dashboard shares declared totals and terminal no-phase wording wi
   declaredState.overlay.render(52);
   declaredState.overlay.handleInput(ENTER);
   const declaredText = declaredState.overlay.render(52).join("\n");
-  assert.match(declaredText, /workflow · phase 0\/6/);
-  assert.match(declaredText, /Phase 0\/6.*no current phase/);
+  assert.match(declaredText, /outline · phase 1\/6/);
+  assert.match(declaredText, /no current phase/);
+  assert.match(declaredText, /Phase 1\/6.*One.*pending/);
+  assert.match(declaredText, /Phase 6\/6.*Six.*pending/);
+
+  const waiting = workflow("waiting-for-first-phase");
+  waiting.currentPhase = null;
+  waiting.phases = [];
+  waiting.agents = [];
+  const waitingState = harness([waiting], 30);
+  t.after(() => waitingState.overlay.dispose());
+  waitingState.overlay.render(52);
+  waitingState.overlay.handleInput(ENTER);
+  const waitingText = waitingState.overlay.render(52).join("\n");
+  assert.match(waitingText, /outline · phase waiting/);
+  assert.match(waitingText, /waiting for the first phase/);
 
   const terminal = workflow("terminal-no-phase", "completed");
   terminal.currentPhase = null;
@@ -581,6 +618,7 @@ test("workflow dashboard shares declared totals and terminal no-phase wording wi
   assert.match(terminalRun, /phase no phases/);
   terminalState.overlay.handleInput(ENTER);
   const terminalText = terminalState.overlay.render(52).join("\n");
+  assert.match(terminalText, /No recorded or planned phases/);
   assert.match(terminalText, /no phases recorded/);
   assert.doesNotMatch(terminalText, /waiting for the first phase/);
 });
@@ -591,22 +629,23 @@ test("terminal dynamic dashboard selection reports selected phase positions", (t
     const template = run.phases[0]!;
     run.currentPhase = 1;
     run.phases = [
-      { ...template, index: 0, name: "First", status },
-      { ...template, index: 1, name: "Second", status },
+      { ...template, index: 0, name: "First", status, agents: [] },
+      { ...template, index: 1, name: "Second", status, agents: [] },
     ];
+    run.agents = [];
     const state = harness([run], 30);
     t.after(() => state.overlay.dispose());
     state.overlay.render(52);
     state.overlay.handleInput(ENTER);
-    assert.match(state.overlay.render(52).join("\n"), /workflow · phase 2\/2/);
-    state.overlay.handleInput("h");
-    assert.match(state.overlay.render(52).join("\n"), /workflow · phase 1\/2/);
-    state.overlay.handleInput("l");
-    assert.match(state.overlay.render(52).join("\n"), /workflow · phase 2\/2/);
+    assert.match(state.overlay.render(52).join("\n"), /outline · phase 2\/2/);
+    state.overlay.handleInput("k");
+    assert.match(state.overlay.render(52).join("\n"), /outline · phase 1\/2/);
+    state.overlay.handleInput("j");
+    assert.match(state.overlay.render(52).join("\n"), /outline · phase 2\/2/);
   }
 });
 
-test("agent actions and hints require the selected agent to survive the final overview viewport", (t) => {
+test("tiny workflow outlines keep the selected node visible and never target a selected phase", (t) => {
   const clipped = workflow("clipped-agent");
   clipped.description = "A workflow with enough metadata to clip its agent roster";
   clipped.approval = "plan";
@@ -617,16 +656,19 @@ test("agent actions and hints require the selected agent to survive the final ov
   const harnessState = harness([clipped], 10, () => {}, { fullscreen: true });
   t.after(() => harnessState.overlay.dispose());
 
-  harnessState.overlay.render(52);
-  harnessState.overlay.handleInput(ENTER);
-  harnessState.overlay.handleInput("\t");
-  const overview = harnessState.overlay.render(52).join("\n");
-  assert.doesNotMatch(overview, /r restart agent/);
-  assert.doesNotMatch(overview, /x cancel agent/);
-
+  openOutline(harnessState.overlay, 52);
+  const phase = harnessState.overlay.render(52).join("\n");
+  assert.match(phase, /Phase 1\/\?/, "the selected phase survives the one-row outline budget");
+  assert.doesNotMatch(phase, /r restart agent|x cancel agent/);
   harnessState.overlay.handleInput("r");
   harnessState.overlay.handleInput("x");
-  assert.deepEqual(harnessState.actions, [], "hidden agents cannot receive agent actions");
+  assert.deepEqual(harnessState.actions, [], "phases cannot receive agent actions");
+
+  harnessState.overlay.handleInput(ENTER);
+  harnessState.overlay.handleInput("j");
+  const agent = harnessState.overlay.render(52).join("\n");
+  assert.match(agent, /tests/, "the selected agent is never omitted under row pressure");
+  assert.match(agent, /x cancel/, "the selected visible agent retains its rendered destructive control proof");
 });
 
 test("metadata-rich agent inspectors reserve result rows at medium and short heights", (t) => {
@@ -652,8 +694,7 @@ test("metadata-rich agent inspectors reserve result rows at medium and short hei
   const short = harness([rich], 8, () => {}, { renderMarkdown });
   t.after(() => { medium.overlay.dispose(); short.overlay.dispose(); });
 
-  medium.overlay.render(72);
-  medium.overlay.handleInput(ENTER);
+  openAgentDetail(medium.overlay, 72);
   const mediumInitial = medium.overlay.render(72).join("\n");
   assert.doesNotMatch(mediumInitial, /Detail 0\//, "medium metadata leaves a result viewport");
   assert.match(mediumInitial, /COMPLETED_OUTPUT_METADATA/);
@@ -667,9 +708,7 @@ test("metadata-rich agent inspectors reserve result rows at medium and short hei
   medium.overlay.handleInput("G");
   assert.match(medium.overlay.render(72).join("\n"), /COMPLETED_OUTPUT_METADATA/);
 
-  short.overlay.render(72);
-  short.overlay.handleInput(ENTER);
-  short.overlay.handleInput(ENTER);
+  openAgentDetail(short.overlay, 72);
   const shortInitial = short.overlay.render(72).join("\n");
   assert.doesNotMatch(shortInitial, /Detail 0\//, "short metadata leaves a result viewport");
   assert.match(shortInitial, /COMPLETED_OUTPUT_METADATA/);
@@ -701,8 +740,7 @@ test("provider fallback dashboard metadata sanitizes every model route", (t) => 
   const state = harness([run], 30, () => {}, { theme });
   t.after(() => state.overlay.dispose());
 
-  state.overlay.render(100);
-  state.overlay.handleInput(ENTER);
+  openAgentDetail(state.overlay, 100);
   const inspector = state.overlay.render(100).join("\n");
   assert.match(inspector, /Provider fallback · used · declared codex\/declared MODEL/);
   assert.match(inspector, /Attempt 1 · claude\/primary MODEL/);
@@ -733,38 +771,37 @@ test("metadata-rich standalone workflow results keep a scrollable result row", (
   assert.match(tail, /standalone result 39/);
 
   state.overlay.handleInput("g");
-  assert.match(state.overlay.render(52).join("\n"), /Phase 1\/1|Verification/, "overflow metadata is reachable from the top");
+  assert.match(state.overlay.render(52).join("\n"), /Phase 1\/\?|Verification/, "overflow metadata is reachable from the top");
   state.overlay.handleInput("G");
   assert.match(state.overlay.render(52).join("\n"), /standalone result 39/, "the result tail remains reachable after scrolling");
 });
 
-test("compact resize resets hidden workflow hierarchy and keeps Escape's close contract", (t) => {
+test("compact resize hides interaction without losing workflow focus or node identity", (t) => {
   const closed: WorkflowsDashboardAction[] = [];
   const state = harness([workflow("compact-resize")], 30, (action) => closed.push(action), { fullscreen: true });
   t.after(() => state.overlay.dispose());
 
-  state.overlay.render(52);
-  state.overlay.handleInput(ENTER);
-  state.overlay.handleInput(ENTER);
+  openAgentDetail(state.overlay, 52);
   assert.match(state.overlay.render(52).join("\n"), /agent ·/);
-  state.overlay.handleInput("\t");
-  state.overlay.handleInput("x");
 
   state.setRows(5);
   const compact = state.overlay.render(52);
   assertPanel(compact, 52, 5);
   assert.match(compact.join("\n"), /Esc close/);
-  assert.doesNotMatch(compact.join("\n"), /workflow · phase|agent ·/);
+  assert.doesNotMatch(compact.join("\n"), /outline · phase|agent ·/);
 
   for (const input of [ENTER, "p", "r", "x", "X", PAGE_DOWN]) state.overlay.handleInput(input);
   assert.deepEqual(state.actions, [], "compact mode accepts only its displayed close control");
 
   state.setRows(30);
   const expanded = state.overlay.render(52).join("\n");
-  assert.match(expanded, /Enter open/);
-  assert.doesNotMatch(expanded, /workflow · phase|agent ·/);
+  assert.match(expanded, /agent · review/, "the detail focus and selected agent survive compact geometry");
   state.overlay.handleInput(ESCAPE);
-  assert.deepEqual(closed, [{ type: "close" }], "Escape closes the reset compact hierarchy");
+  assert.match(state.overlay.render(52).join("\n"), /outline · phase/);
+  state.overlay.handleInput(ESCAPE);
+  assert.match(state.overlay.render(52).join("\n"), /runs ·/);
+  state.overlay.handleInput(ESCAPE);
+  assert.deepEqual(closed, [{ type: "close" }]);
 });
 
 test("run, phase, and agent identities survive sorting, insertion, snapshots, filtering, and reordering", (t) => {
@@ -792,10 +829,11 @@ test("run, phase, and agent identities survive sorting, insertion, snapshots, fi
 
   const selected = runs.find((run) => run.runId === "second")!;
   overlay.handleInput(ENTER);
-  overlay.handleInput("l");
+  overlay.handleInput("j");
+  overlay.handleInput("j");
   const selectedPhase = overlay.render(52).join("\n");
   assert.match(selectedPhase, /Second phase/, "phase selection starts from a known phase identity");
-  overlay.handleInput("\t");
+  overlay.handleInput(ENTER);
   assert.ok(overlay.render(52).some((line) => line.includes("tests")), "agent selection starts from a known agent identity");
 
   selected.agents.reverse();
@@ -814,6 +852,7 @@ test("run, phase, and agent identities survive sorting, insertion, snapshots, fi
   overlay.handleInput(ENTER);
   assert.match(overlay.render(52).join("\n"), /agent · tests/, "the refreshed agent identity remains visible");
   overlay.handleInput("x");
+  assert.ok(overlay.render(52).some((line) => line.includes("Press x again")));
   overlay.handleInput("x");
   assert.deepEqual(actions.at(-1), { type: "cancelAgent", runId: "second", agentIndex: 1 }, "agent actions target the preserved identity");
 
@@ -836,9 +875,7 @@ test("scrolling clamps, follows live tails until unpinned, and reaches standalon
   const { overlay, emit } = harness([current], 30);
   t.after(() => overlay.dispose());
 
-  overlay.render(52);
-  overlay.handleInput(ENTER);
-  overlay.handleInput(ENTER);
+  openAgentDetail(overlay, 52);
   const tail = overlay.render(52).join("\n");
   assert.match(tail, /line 159/);
   overlay.handleInput("g");
@@ -869,18 +906,50 @@ test("scrolling clamps, follows live tails until unpinned, and reaches standalon
   assert.match(standaloneOverlay.render(52).join("\n"), /workflow line 139/);
 });
 
+test("an agentless selected phase renders its result when other phases contain agents", (t) => {
+  const mixed = workflow("mixed-phase-result", "completed");
+  const template = mixed.phases[0]!;
+  mixed.currentPhase = 0;
+  mixed.agents = [mixed.agents[0]!];
+  mixed.agents[0]!.phase = 0;
+  mixed.phases = [
+    { ...template, index: 0, name: "Agent phase", agents: [0], result: undefined },
+    { ...template, index: 1, name: "Agentless phase", agents: [], result: "agentless phase result" },
+  ];
+  const state = harness([mixed], 30);
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(52);
+  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput("j");
+  state.overlay.handleInput("j");
+  const selected = state.overlay.render(52).join("\n");
+  assert.match(selected, /Agentless phase/);
+  assert.match(selected, /agentless phase result/);
+});
+
 test("cancellation is two-step, disarms on other input, and actions use stable run and agent identities", (t) => {
   const agentRun = workflow("agent-action");
   const agentHarness = harness([agentRun], 30);
   t.after(() => agentHarness.overlay.dispose());
-  agentHarness.overlay.render(52);
-  agentHarness.overlay.handleInput(ENTER);
-  agentHarness.overlay.handleInput("\t");
+  selectOutlineAgent(agentHarness.overlay, 52, 1);
+  agentHarness.overlay.handleInput("x");
+  agentHarness.overlay.handleInput("x");
+  assert.deepEqual(agentHarness.actions, [], "navigation cannot synthesize a rendered agent-action proof");
+  assert.ok(agentHarness.overlay.render(52).some((line) => line.includes("x cancel")));
   agentHarness.overlay.handleInput("x");
   assert.ok(agentHarness.overlay.render(52).some((line) => line.includes("Press x again")));
   agentHarness.overlay.handleInput("g");
   assert.deepEqual(agentHarness.actions, [], "another key disarms agent cancellation");
+  agentHarness.overlay.handleInput("g");
+  agentHarness.overlay.render(52);
   agentHarness.overlay.handleInput("x");
+  agentHarness.overlay.handleInput("x");
+  assert.deepEqual(agentHarness.actions, [], "confirmation cannot be accepted before its prompt renders");
+  agentHarness.overlay.handleInput("g");
+  agentHarness.overlay.render(52);
+  agentHarness.overlay.handleInput("x");
+  assert.ok(agentHarness.overlay.render(52).some((line) => line.includes("Press x again")));
   agentHarness.overlay.handleInput("x");
   assert.deepEqual(agentHarness.actions.at(-1), { type: "cancelAgent", runId: "agent-action", agentIndex: 1 });
 
@@ -888,9 +957,7 @@ test("cancellation is two-step, disarms on other input, and actions use stable r
   noJobRun.agents[1]!.jobId = undefined;
   const noJobHarness = harness([noJobRun], 30);
   t.after(() => noJobHarness.overlay.dispose());
-  noJobHarness.overlay.render(52);
-  noJobHarness.overlay.handleInput(ENTER);
-  noJobHarness.overlay.handleInput("\t");
+  selectOutlineAgent(noJobHarness.overlay, 52, 1);
   assert.doesNotMatch(noJobHarness.overlay.render(52).join("\n"), /x cancel agent/);
   noJobHarness.overlay.handleInput("x");
   noJobHarness.overlay.handleInput("x");
@@ -903,7 +970,10 @@ test("cancellation is two-step, disarms on other input, and actions use stable r
   assert.ok(runHarness.overlay.render(52).some((line) => line.includes("Press X again")));
   runHarness.overlay.handleInput("x");
   assert.deepEqual(runHarness.actions, [], "a lowercase x does not confirm run cancellation");
+  runHarness.overlay.handleInput("g");
+  runHarness.overlay.render(52);
   runHarness.overlay.handleInput("X");
+  assert.ok(runHarness.overlay.render(52).some((line) => line.includes("Press X again")));
   runHarness.overlay.handleInput("X");
   assert.deepEqual(runHarness.actions.at(-1), { type: "cancel", runId: "run-action" });
 
@@ -930,34 +1000,60 @@ test("pause, resume, restart, filters, and configured cancel binding remain keyb
 
   const restart = harness([workflow("restart", "completed")], 30);
   t.after(() => restart.overlay.dispose());
+  selectOutlineAgent(restart.overlay, 72);
+  restart.overlay.handleInput("r");
+  assert.deepEqual(restart.actions, [], "navigation cannot synthesize a rendered restart proof");
   restart.overlay.render(72);
   restart.overlay.handleInput("r");
   assert.deepEqual(restart.actions.at(-1), { type: "restartAgent", runId: "restart", agentIndex: 0 });
 
   const filtered = harness([workflow("filter")], 30);
   t.after(() => filtered.overlay.dispose());
-  filtered.overlay.render(52);
-  filtered.overlay.handleInput(ENTER);
-  filtered.overlay.handleInput(ENTER);
-  filtered.overlay.handleInput("h");
+  selectOutlineAgent(filtered.overlay, 52);
   filtered.overlay.handleInput("f");
   const activeOnly = filtered.overlay.render(52);
   assert.ok(activeOnly.some((line) => line.includes("filter active")));
   assert.ok(activeOnly.some((line) => line.includes("tests")));
-  assert.ok(!activeOnly.some((line) => line.includes("agent · review")), "a filtered-out inspected agent returns to the visible overview");
+  assert.ok(!activeOnly.some((line) => line.includes("agent · review")), "a filtered-out inspected agent returns to the outline");
+  filtered.overlay.handleInput("f");
+  assert.match(filtered.overlay.render(52).join("\n"), /filter failed/);
+  filtered.overlay.handleInput("r");
+  filtered.overlay.handleInput("x");
+  filtered.overlay.handleInput("x");
+  assert.deepEqual(filtered.actions, [], "a filtered agent cannot remain an action target after fallback to its phase");
 
   const closed: WorkflowsDashboardAction[] = [];
   const bound = harness([workflow("binding")], 30, (action) => closed.push(action), { cancelBinding: "q" }).overlay;
   t.after(() => bound.dispose());
-  bound.render(52);
-  bound.handleInput(ENTER);
-  bound.handleInput(ENTER);
+  openAgentDetail(bound, 52);
   bound.handleInput("q");
-  assert.ok(bound.render(52).some((line) => line.includes("workflow · phase")));
+  assert.ok(bound.render(52).some((line) => line.includes("outline · phase")));
   bound.handleInput("q");
   assert.ok(bound.render(52).some((line) => line.includes("runs ·")));
   bound.handleInput("q");
   assert.deepEqual(closed, [{ type: "close" }]);
+});
+
+test("restart stays keyboard accessible when a narrow footer truncates its label", (t) => {
+  for (const width of [40, 52]) {
+    const state = harness([workflow(`narrow-restart-${width}`)], 30);
+    t.after(() => state.overlay.dispose());
+    selectOutlineAgent(state.overlay, width, 1);
+
+    const rendered = state.overlay.render(width);
+    assert.ok(
+      rendered.some((line) => line.includes("›") && line.includes("tests")),
+      `the selected restart target is visibly rendered at ${width} columns`,
+    );
+    assert.doesNotMatch(rendered.join("\n"), /r restart agent/, "the probe exercises a truncated footer label");
+
+    state.overlay.handleInput("r");
+    assert.deepEqual(state.actions.at(-1), {
+      type: "restartAgent",
+      runId: `narrow-restart-${width}`,
+      agentIndex: 1,
+    });
+  }
 });
 
 test("pause and resume apply in place, preserving phase, filter, and pane state without closing the dashboard", async (t) => {
@@ -974,7 +1070,7 @@ test("pause and resume apply in place, preserving phase, filter, and pane state 
   const { overlay, actions } = harness([run], 30, (action) => closed.push(action), { fullscreen: true });
   t.after(() => overlay.dispose());
 
-  overlay.render(72);
+  openOutline(overlay, 72);
   overlay.handleInput("f");
   const before = overlay.render(72).join("\n");
   assert.match(before, /filter active/);
@@ -1005,47 +1101,54 @@ test("a rejected pause, resume, restart, agent-cancel, or run-cancel shows an in
   const { overlay, manager } = harness([run], 30, (action) => closed.push(action), { fullscreen: true });
   t.after(() => overlay.dispose());
 
-  overlay.render(72);
-  overlay.handleInput("\t"); // select the running "tests" agent so restart/cancel stay actionable below
+  selectOutlineAgent(overlay, 120, 1); // select the running "tests" agent so restart/cancel stay actionable below
 
   manager.pause = (async () => { throw new Error("pause rejected"); }) as typeof manager.pause;
   overlay.handleInput("p");
   await tick();
-  let after = overlay.render(72).join("\n");
+  let after = overlay.render(120).join("\n");
   assert.match(after, /! pause rejected/);
-  assert.match(after, /workflow · phase/, "the overview pane stays open after a rejected pause");
+  assert.match(after, /outline · phase/, "the outline stays open after a rejected pause");
   assert.deepEqual(closed, []);
 
   manager.resume = (async () => { throw new Error("resume rejected"); }) as typeof manager.resume;
   run.status = "paused";
   overlay.handleInput("p");
   await tick();
-  after = overlay.render(72).join("\n");
+  after = overlay.render(120).join("\n");
   assert.match(after, /! resume rejected/);
   assert.deepEqual(closed, []);
 
   manager.restartAgent = (async () => { throw new Error("restart rejected"); }) as typeof manager.restartAgent;
+  overlay.handleInput("g");
+  overlay.render(120);
   overlay.handleInput("r");
   await tick();
-  after = overlay.render(72).join("\n");
+  after = overlay.render(120).join("\n");
   assert.match(after, /! restart rejected/);
   assert.deepEqual(closed, []);
 
   manager.cancelAgent = (async () => { throw new Error("agent cancel rejected"); }) as typeof manager.cancelAgent;
+  overlay.handleInput("g");
+  overlay.render(120);
   overlay.handleInput("x");
+  overlay.render(120);
   overlay.handleInput("x");
   await tick();
-  after = overlay.render(72).join("\n");
+  after = overlay.render(120).join("\n");
   assert.match(after, /! agent cancel rejected/);
   assert.deepEqual(closed, []);
 
   manager.cancel = (async () => { throw new Error("run cancel rejected"); }) as typeof manager.cancel;
+  overlay.handleInput("g");
+  overlay.render(120);
   overlay.handleInput("X");
+  overlay.render(120);
   overlay.handleInput("X");
   await tick();
-  after = overlay.render(72).join("\n");
+  after = overlay.render(120).join("\n");
   assert.match(after, /! run cancel rejected/);
-  assert.match(after, /workflow · phase/, "the dashboard remains open after every rejected action");
+  assert.match(after, /outline · phase/, "the dashboard remains open after every rejected action");
   assert.deepEqual(closed, [], "no rejected action closes the dashboard");
 });
 
@@ -1062,6 +1165,7 @@ test("a restarted replacement run becomes selected in place, without tearing dow
     return { snapshot: replacement };
   }) as typeof manager.restartAgent;
 
+  selectOutlineAgent(overlay, 72);
   overlay.render(72);
   overlay.handleInput("r");
   await tick();
@@ -1077,24 +1181,27 @@ test("a successful agent or run cancellation applies in place, preserving phase 
   const { overlay, actions } = harness([run], 30, (action) => closed.push(action), { fullscreen: true });
   t.after(() => overlay.dispose());
 
-  overlay.render(72);
-  overlay.handleInput("\t"); // select the running "tests" agent
+  selectOutlineAgent(overlay, 72, 1); // select the running "tests" agent
   overlay.render(72); // re-mark the newly selected agent visible before arming its cancellation
   overlay.handleInput("x");
+  overlay.render(72);
   overlay.handleInput("x");
   assert.deepEqual(actions.at(-1), { type: "cancelAgent", runId: "inplace-cancel", agentIndex: 1 });
   await tick();
   let after = overlay.render(72).join("\n");
-  assert.match(after, /workflow · phase/, "the overview pane stays open after a successful agent cancellation");
+  assert.match(after, /outline · phase/, "the outline stays open after a successful agent cancellation");
   assert.match(after, /tests/, "the cancelled agent remains selected and visible");
   assert.deepEqual(closed, []);
 
+  overlay.handleInput("g");
+  overlay.render(72);
   overlay.handleInput("X");
+  overlay.render(72);
   overlay.handleInput("X");
   assert.deepEqual(actions.at(-1), { type: "cancel", runId: "inplace-cancel" });
   await tick();
   after = overlay.render(72).join("\n");
-  assert.match(after, /workflow · phase/, "the overview pane stays open after a successful run cancellation");
+  assert.match(after, /outline · phase/, "the outline stays open after a successful run cancellation");
   assert.deepEqual(closed, [], "successful cancellation never closes or reopens the dashboard");
 });
 
@@ -1130,9 +1237,9 @@ test("Escape closes a sub-interactive-width panel, and an interactive width rest
   restoreState.overlay.render(2);
   restoreState.overlay.handleInput(ENTER);
   restoreState.overlay.render(52);
-  assert.ok(restoreState.overlay.render(52).some((line) => line.includes("Enter open")), "the panel regains its normal narrow-list hint once interactive again");
+  assert.ok(restoreState.overlay.render(52).some((line) => line.includes("runs ·")), "the panel regains its narrow run focus once interactive again");
   restoreState.overlay.handleInput(ENTER);
-  assert.ok(restoreState.overlay.render(52).some((line) => line.includes("workflow · phase")), "Enter opens the overview once the panel is interactive again");
+  assert.ok(restoreState.overlay.render(52).some((line) => line.includes("outline · phase")), "Enter opens the outline once the panel is interactive again");
 });
 
 test("focusRunId selects the requested run on the first render", (t) => {
@@ -1152,9 +1259,7 @@ test("workflow agent pane toggles between compact groups and full tool rendering
   const { overlay } = harness([current], 32, () => {}, { renderMarkdown: (text) => text.split("\n") });
   t.after(() => overlay.dispose());
 
-  overlay.render(60);
-  overlay.handleInput(ENTER);
-  overlay.handleInput(ENTER);
+  openAgentDetail(overlay, 60);
   const compact = overlay.render(60);
   assertPanel(compact, 60, 25);
   assert.ok(compact.some((line) => line.includes("1 tool call") && line.includes("read")), "agent pane defaults to compact grouping");
@@ -1183,9 +1288,7 @@ test("workflow agent pane also toggles tool rendering with the primary Ctrl+T bi
   const { overlay } = harness([current], 32, () => {}, { renderMarkdown: (text) => text.split("\n") });
   t.after(() => overlay.dispose());
 
-  overlay.render(60);
-  overlay.handleInput(ENTER);
-  overlay.handleInput(ENTER);
+  openAgentDetail(overlay, 60);
   const compact = overlay.render(60);
   assert.ok(compact.some((line) => line.includes("1 tool call")), "agent pane defaults to compact grouping");
 
@@ -1207,9 +1310,7 @@ test("a workflow tool call interrupted by an assistant entry resolves to one fai
     { kind: "tool", phase: "end", toolId: "b1", name: "bash", result: { content: [], isError: true }, error: true },
   ];
   const { overlay } = harness([current], 40, () => {}, { renderMarkdown: (text) => text.split("\n") });
-  overlay.render(72);
-  overlay.handleInput(ENTER);
-  overlay.handleInput(ENTER);
+  openAgentDetail(overlay, 72);
   const lines = overlay.render(72);
   overlay.dispose();
 
@@ -1272,9 +1373,7 @@ test("a persisted transcript truncation sentinel survives reload and presents as
 
   const { overlay } = harness([loaded!], 40, () => {}, { renderMarkdown: (text) => text.split("\n") });
   t.after(() => overlay.dispose());
-  overlay.render(100);
-  overlay.handleInput(ENTER);
-  overlay.handleInput(ENTER);
+  openAgentDetail(overlay, 100);
   const lines = overlay.render(100);
 
   assert.ok(
@@ -1295,8 +1394,7 @@ test("invalidate() clears the cached detail body so a manual refresh recomputes 
   });
   t.after(() => state.overlay.dispose());
 
-  state.overlay.render(72);
-  state.overlay.handleInput(ENTER);
+  openAgentDetail(state.overlay, 72);
   state.overlay.render(72);
   const callsAfterOpen = calls;
   assert.ok(callsAfterOpen > 0, "opening the agent pane renders the transcript once");
@@ -1326,6 +1424,8 @@ test("resizing wide, medium, narrow, and back to wide preserves run, phase, and 
   overlay.render(120);
   overlay.handleInput("j");
   overlay.handleInput(ENTER);
+  overlay.handleInput(ENTER);
+  overlay.handleInput(ENTER);
   const wide = overlay.render(120).join("\n");
   assert.match(wide, /agent · tests/, "wide selects the tests agent in the current phase");
 
@@ -1337,7 +1437,7 @@ test("resizing wide, medium, narrow, and back to wide preserves run, phase, and 
   assert.match(narrow, /tests/);
 
   overlay.handleInput(ESCAPE);
-  assert.match(overlay.render(52).join("\n"), /workflow · phase/, "the first Escape returns to the workflow overview");
+  assert.match(overlay.render(52).join("\n"), /outline · phase/, "the first Escape returns to the workflow outline");
   overlay.handleInput(ESCAPE);
   assert.match(overlay.render(52).join("\n"), /runs ·/, "the second Escape returns to the narrow run list");
 
@@ -1371,21 +1471,22 @@ test("? opens a width-safe grouped cheatsheet in every browse pane and dismisses
   }
 });
 
-test("the cheatsheet reflects the currently active pane and never closes the dashboard", (t) => {
+test("the cheatsheet reflects runs, outline, and agent-detail focus and never closes the dashboard", (t) => {
   const { overlay, actions } = harness([workflow("cheatsheet-pane")], 30, () => {}, { fullscreen: true });
   t.after(() => overlay.dispose());
 
   overlay.render(52); // narrow: starts on the run list
   overlay.handleInput("?");
-  assert.match(overlay.render(52).join("\n"), /open overview/i, "the narrow-list cheatsheet documents opening the overview");
+  assert.match(overlay.render(52).join("\n"), /open outline/i, "the runs cheatsheet documents opening the outline");
   overlay.handleInput("?");
 
-  overlay.handleInput(ENTER); // -> overview
-  overlay.handleInput(ENTER); // -> agent pane
+  overlay.handleInput(ENTER); // -> outline
+  overlay.handleInput(ENTER); // -> first agent node
+  overlay.handleInput(ENTER); // -> agent detail
   overlay.handleInput("?");
   const agentHelp = overlay.render(52).join("\n");
   assert.match(agentHelp, /restart this agent/i, "the agent-pane cheatsheet documents restart");
-  assert.doesNotMatch(agentHelp, /pause \/ resume/i, "the agent-pane cheatsheet omits overview-only actions");
+  assert.doesNotMatch(agentHelp, /pause \/ resume/i, "the agent-detail cheatsheet omits outline-only actions");
 
   for (const input of ["p", "r", "x", "X", "j", "k"]) overlay.handleInput(input);
   assert.deepEqual(actions, [], "input is inert while the cheatsheet is shown");
@@ -1397,18 +1498,17 @@ test("configurable confirm/cancel bindings render their configured key names in 
     getKeys: (binding) => binding === "tui.select.cancel" ? ["q"] : binding === "tui.select.confirm" ? ["space"] : [],
   });
   t.after(() => configured.overlay.dispose());
-  assert.match(configured.overlay.render(60).join("\n"), /Space open/i, "the narrow run-list hint reflects the configured confirm key");
-  // Medium/wide always show the overview pane's content, even while `#pane`
-  // is still "list", so no navigation is needed to reach its hint.
-  const overview = configured.overlay.render(90).join("\n");
-  assert.match(overview, /Space inspect/i);
-  assert.match(overview, /Q close/i);
-  assert.doesNotMatch(overview, /Esc close/);
+  assert.match(configured.overlay.render(60).join("\n"), /Space\/→ outli/i, "the runs hint reflects the configured confirm key");
+  configured.overlay.handleInput(ENTER);
+  const outline = configured.overlay.render(90).join("\n");
+  assert.match(outline, /Space\/→ drill/i);
+  assert.match(outline, /Q back/i);
+  assert.doesNotMatch(outline, /Esc close/);
 
   const defaulted = harness([workflow("default-keys")], 30, () => {}, { fullscreen: true });
   t.after(() => defaulted.overlay.dispose());
   const defaultHint = defaulted.overlay.render(90).join("\n");
-  assert.match(defaultHint, /Enter inspect/);
+  assert.match(defaultHint, /Enter\/→ outline/);
   assert.match(defaultHint, /Esc close/);
 });
 
@@ -1485,7 +1585,7 @@ test("a routed-question wait reads differently from a provider-quota wait in /wo
   assert.match(overviewText, /unanswered/);
   assert.match(overviewText, /answering peer/, "the target lineage shows the answer turn it is producing");
 
-  state.overlay.handleInput("\t");
+  selectOutlineAgent(state.overlay, 120, 1);
   state.overlay.handleInput(ENTER);
   const inspector = state.overlay.render(120).join("\n");
   assert.match(inspector, /agent · tests/);
@@ -1496,9 +1596,7 @@ test("a routed-question wait reads differently from a provider-quota wait in /wo
 
   const quotaState = harness([quota], 30, () => {}, { fullscreen: true, focusRunId: quota.runId });
   t.after(() => quotaState.overlay.dispose());
-  quotaState.overlay.render(120);
-  quotaState.overlay.handleInput("\t");
-  quotaState.overlay.handleInput(ENTER);
+  openAgentDetail(quotaState.overlay, 120, 1);
   const quotaText = quotaState.overlay.render(120).join("\n");
   assert.match(quotaText, /Provider wait · tests · codex · window quota/);
   assert.match(quotaText, /Retry · 1m · attempt 1\/3 · automatic; no human action required/);
@@ -1527,8 +1625,7 @@ test("workflow question previews send orchestrator answers to the parent thread,
   assert.match(overview, /parent thread: subagent_answer/);
   assert.match(overview, /do not steer/);
 
-  state.overlay.handleInput("\t");
-  state.overlay.handleInput(ENTER);
+  openAgentDetail(state.overlay, 120, 1);
   const inspector = state.overlay.render(120).join("\n");
   assert.match(inspector, /Question · Should the compatibility flag remain enabled\?/);
   assert.match(inspector, /parent orchestrator/);
@@ -1549,8 +1646,7 @@ test("workflow inspectors put state preview and real recovery before telemetry",
   assert.doesNotMatch(text, /restart (?:this )?run/);
   assert.ok(lines.findIndex((line) => line.includes("Error ·")) < lines.findIndex((line) => line.includes("Usage ·")));
 
-  failed.overlay.handleInput("\t");
-  failed.overlay.handleInput(ENTER);
+  openAgentDetail(failed.overlay, 120, 1);
   lines = failed.overlay.render(120);
   text = lines.join("\n");
   assert.match(text, /Error · agent bounded failure/);
@@ -1563,9 +1659,7 @@ test("workflow inspectors put state preview and real recovery before telemetry",
   completedAgentRun.agents[1]!.output = "completed without a restart lineage";
   const completedAgent = harness([completedAgentRun], 30, () => {}, { fullscreen: true });
   t.after(() => completedAgent.overlay.dispose());
-  completedAgent.overlay.render(120);
-  completedAgent.overlay.handleInput("\t");
-  completedAgent.overlay.handleInput(ENTER);
+  openAgentDetail(completedAgent.overlay, 120, 1);
   const completedAgentText = completedAgent.overlay.render(120).join("\n");
   assert.match(completedAgentText, /Result · completed without a restart lineage/);
   assert.match(completedAgentText, /Next · no human action required/);
@@ -1634,7 +1728,7 @@ test("the workflow inspector reports convergence round, state, verdict, and stop
   assert.match(line, /verdict request_changes · 2 actionable findings/);
   assert.match(line, /repeated the same 2 unresolved finding/);
 
-  // Narrow layouts show one pane at a time: drill from the run list into the overview.
+  // Narrow layouts show one focus layer at a time: drill from runs into the outline.
   state.overlay.render(40);
   state.overlay.handleInput(ENTER);
   const narrow = state.overlay.render(40);
