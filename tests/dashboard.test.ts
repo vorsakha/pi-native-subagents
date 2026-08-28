@@ -953,7 +953,7 @@ function parkedJob(id: string, overrides: Parameters<typeof interactionSnapshot>
 }
 
 test("a job parked on a question states the wait in words, withdraws steer/follow-up, and keeps cancel", (t) => {
-  const parked = { ...parkedJob("parked"), humanVisible: true, interaction: interactionSnapshot({ sourceJobId: "parked", humanVisible: true, question: "Which fixture is authoritative?", context: "the task and the tests disagree" }) };
+  const parked = { ...parkedJob("parked"), humanVisible: true, interaction: interactionSnapshot({ sourceJobId: "parked", sourceName: "parked", humanVisible: true, question: "Which fixture is authoritative?", context: "the task and the tests disagree" }) };
   const { overlay } = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id });
   t.after(() => overlay.dispose());
   overlay.focused = true;
@@ -963,6 +963,7 @@ test("a job parked on a question states the wait in words, withdraws steer/follo
   assert.ok(text.includes("needs your answer"), "the wait is carried by words, not colour alone");
   assert.ok(text.includes("?"), "and by its own glyph");
   assert.ok(text.includes("Which fixture is authoritative?"), "the pending question is pinned in the inspector");
+  assert.ok(text.includes("Route · parked → you · waiting 1m 04s"), "the inspector names source, owner, and elapsed wait");
   assert.ok(text.includes("the task and the tests disagree"));
   assert.ok(text.includes("1 need input"), "the panel header aggregates blocked jobs");
   assert.ok(text.includes("a answer"), "the inline answer control is offered for a human-owned question");
@@ -1014,7 +1015,8 @@ test("a model-owned question stays read-only in /subagents and Escape leaves the
   overlay.focused = true;
   const lines = overlay.render(120).join("\n");
   assert.ok(lines.includes("needs orchestrator"));
-  assert.ok(lines.includes("the orchestrator answers this from the parent thread"));
+  assert.ok(lines.includes("parent thread: subagent_answer"));
+  assert.ok(lines.includes("do not steer"));
   assert.ok(!lines.includes("a answer"), "no inline composer is offered for a question the parent thread owns");
 
   overlay.handleInput("a");
@@ -1033,4 +1035,95 @@ test("a model-owned question stays read-only in /subagents and Escape leaves the
   composing.overlay.handleInput("\u0003");
   assert.ok(!composing.overlay.render(120).some((line) => line.includes("▸ answer ·")), "cancel layers back to browse without closing the panel");
   assert.deepEqual(composing.manager.answerCalls, []);
+});
+
+test("direct question previews route peer and workflow ownership to the accurate destination", (t) => {
+  const peer = parkedJob("peer-owned", {
+    sourceName: "implementer",
+    target: { kind: "agent", jobId: "planner-job", label: "planner" },
+  });
+  const peerState = dashboard([peer], 24, () => {}, undefined, { focusJobId: peer.id });
+  t.after(() => peerState.overlay.dispose());
+  peerState.overlay.focused = true;
+  const peerText = peerState.overlay.render(120).join("\n");
+  assert.match(peerText, /Route · implementer → peer planner · waiting 1m 04s/);
+  assert.match(peerText, /no human action required; waiting for peer planner/);
+  assert.doesNotMatch(peerText, /a answer|s steer|f follow-up|subagent_answer/);
+
+  const owned = jobSnapshot({
+    id: "workflow-question",
+    name: "workflow-worker",
+    workflow: { runId: "workflow-run-1234", agentIndex: 2, label: "release-flow", phase: "verify" },
+    interaction: interactionSnapshot({
+      sourceJobId: "workflow-question",
+      sourceName: "workflow-worker",
+      workflow: { runId: "workflow-run-1234", agentIndex: 2, label: "release-flow", phase: "verify" },
+    }),
+  });
+  const ownedState = dashboard([owned], 24, () => {}, undefined, { focusJobId: owned.id });
+  t.after(() => ownedState.overlay.dispose());
+  ownedState.overlay.focused = true;
+  const ownedText = ownedState.overlay.render(120).join("\n");
+  assert.match(ownedText, /\/workflows: supervise release-flow/);
+  assert.match(ownedText, /no answer or steer here/);
+  assert.doesNotMatch(ownedText, /a answer|takeover|s steer|f follow-up/);
+
+  const human = parkedJob("human-owned", { humanVisible: true });
+  const unavailable = dashboard([human], 24, () => {}, undefined, {
+    focusJobId: human.id,
+    answerable: false,
+  });
+  t.after(() => unavailable.overlay.dispose());
+  const unavailableText = unavailable.overlay.render(120).join("\n");
+  assert.match(unavailableText, /inline answering is unavailable in this session/);
+  assert.doesNotMatch(unavailableText, /press a|a answer/);
+});
+
+test("direct inspectors prioritize activity, results, failures, and queue recovery at constrained geometry", (t) => {
+  const cases = [
+    jobSnapshot({ id: "live-preview", name: "live-preview", liveThinking: "checking the bounded state preview" }),
+    jobSnapshot({ id: "done-preview", name: "done-preview", status: "completed", output: "final concise result", endedAt: 4_000 }),
+    jobSnapshot({ id: "failed-preview", name: "failed-preview", status: "failed", error: "bounded provider failure", endedAt: 4_000 }),
+    jobSnapshot({ id: "queued-preview", name: "queued-preview", status: "queued", startedAt: undefined }),
+  ];
+
+  for (const current of cases) {
+    const state = dashboard([current], 8, () => {}, undefined, { focusJobId: current.id, fullscreen: true });
+    t.after(() => state.overlay.dispose());
+    state.overlay.render(52);
+    state.overlay.handleInput(ENTER);
+    const lines = state.overlay.render(52);
+    const text = lines.join("\n");
+    assert.ok(lines.every((line) => visibleWidth(line) <= 52));
+    assert.match(text, current.status === "running"
+      ? /Latest · checking/
+      : current.status === "completed"
+        ? /Result · final concise result/
+        : current.status === "failed"
+          ? /Error · bounded provider failure/
+          : /Waiting · waiting for scheduler slot/);
+    const previewAt = lines.findIndex((line) => /Latest ·|Result ·|Error ·|Waiting ·/.test(line));
+    const routeAt = lines.findIndex((line) => line.includes("route "));
+    assert.ok(previewAt >= 0 && (routeAt < 0 || previewAt < routeAt), "state preview precedes route telemetry");
+  }
+
+  const failedState = dashboard([cases[2]!], 24, () => {}, undefined, { focusJobId: cases[2]!.id });
+  t.after(() => failedState.overlay.dispose());
+  const failedText = failedState.overlay.render(120).join("\n");
+  assert.match(failedText, /Recovery · no recovery action is available in this pane/);
+  assert.doesNotMatch(failedText, /f follow-up|restart|takeover/);
+
+  const liveFailure = jobSnapshot({
+    id: "live-failure",
+    name: "live-failure",
+    status: "running",
+    error: "transient tool failure",
+  });
+  const liveFailureState = dashboard([liveFailure], 24, () => {}, undefined, {
+    focusJobId: liveFailure.id,
+  });
+  t.after(() => liveFailureState.overlay.dispose());
+  const liveFailureText = liveFailureState.overlay.render(120).join("\n");
+  assert.match(liveFailureText, /Recovery · press s to steer/);
+  assert.doesNotMatch(liveFailureText, /press f to follow up/);
 });

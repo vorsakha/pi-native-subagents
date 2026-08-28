@@ -52,7 +52,6 @@ import {
   formatWorkflowConvergence,
   formatWorkflowInteraction,
   workflowAgentDashboardSummary,
-  workflowAgentInteraction,
   workflowConvergenceMeta,
   workflowDashboardSummary,
   workflowNeedsInput,
@@ -1099,6 +1098,110 @@ export class WorkflowsDashboardOverlay implements Focusable {
     return this.#pane === "agent" ? this.agentInspectorViewport(run, rows, width) : this.workflowOverviewViewport(run, rows, width);
   }
 
+  private renderQuestionPreview(interaction: NonNullable<WorkflowAgentRecord["waitingOn"]>, width: number): string[] {
+    const elapsed = formatDurationLabel(Math.max(0, this.#now() - interaction.createdAt));
+    const target = interaction.target === "peer"
+      ? `peer ${sanitizeInline(interaction.targetName ?? "agent")}`
+      : "parent orchestrator";
+    const next = interaction.target === "peer"
+      ? `Next · no human action required; waiting for ${target}`
+      : "Next · parent thread: subagent_answer; do not steer";
+    return [
+      truncateWorkflowDashboardLine(this.theme.fg("warning", `Question · ${sanitizeInline(interaction.question)}`), width),
+      truncateWorkflowDashboardLine(this.theme.fg("muted", `Route · ${sanitizeInline(interaction.sourceName)} → ${target} · waiting ${elapsed}`), width),
+      truncateWorkflowDashboardLine(this.theme.fg("text", next), width),
+    ];
+  }
+
+  private renderProviderWaitPreview(agent: WorkflowAgentRecord, width: number): string[] {
+    const wait = agent.providerWait;
+    if (!wait) return [];
+    const remaining = Math.max(0, wait.retryAt - this.#now());
+    const retryLabel = remaining < 60_000
+      ? `${Math.max(1, Math.round(remaining / 1_000))}s`
+      : `${Math.round(remaining / 60_000)}m`;
+    const window = sanitizeInline(wait.scope ?? wait.kind);
+    const kind = wait.scope ? ` · ${sanitizeInline(wait.kind)}` : "";
+    return [
+      truncateWorkflowDashboardLine(this.theme.fg("warning", `Provider wait · ${sanitizeInline(agent.name)} · ${sanitizeInline(wait.provider)} · window ${window}${kind}`), width),
+      truncateWorkflowDashboardLine(this.theme.fg("muted", `Retry · ${retryLabel} · attempt ${wait.attempt}/${wait.maxAttempts} · automatic; no human action required`), width),
+    ];
+  }
+
+  private renderRunStatePreview(run: WorkflowSnapshot, width: number): string[] {
+    const question = [...run.agents].reverse().find((agent) => agent.waitingOn)?.waitingOn;
+    if (question) return this.renderQuestionPreview(question, width);
+
+    const summary = workflowDashboardSummary(run, this.#now());
+    const line = (color: Parameters<Theme["fg"]>[0], value: string) =>
+      truncateWorkflowDashboardLine(this.theme.fg(color, value), width);
+    if (summary.kind === "failure") {
+      const failed = [...run.agents].reverse().find((agent) => agent.state === "failed" && agent.callIndex !== undefined);
+      const recovery = failed
+        ? `select ${sanitizeInline(failed.name)}, then press r to restart that agent`
+        : "no run restart action is available here; inspect the failed agent or result";
+      return [line("error", `Error · ${summary.text}`), line("text", `Recovery · ${recovery}`)];
+    }
+    if (run.status === "paused") {
+      return [line("warning", `Paused · ${summary.text}`), line("text", "Next · press p to resume; human action is required")];
+    }
+    const providerWait = [...run.agents].reverse().find((agent) => agent.state === "waiting" && agent.providerWait);
+    if (providerWait) return this.renderProviderWaitPreview(providerWait, width);
+    if (run.status === "pending" || run.agents.some((agent) => agent.state === "queued")) {
+      return [
+        line("warning", `Waiting · ${summary.text}`),
+        line("muted", "Next · automatic dispatch; no human action required"),
+      ];
+    }
+    if (run.status === "running") {
+      return [line("accent", `Latest · ${summary.text}`), line("muted", "Next · monitor here or press p to pause")];
+    }
+    if (run.status === "completed") {
+      const prefix = "Result · ";
+      const suffix = " · no action · inspect here";
+      const previewWidth = Math.max(1, width - prefix.length - suffix.length);
+      const preview = truncateToWidth(summary.text, previewWidth, "…");
+      return [line("success", `${prefix}${preview}${suffix}`)];
+    }
+    return [
+      line("muted", `State · ${summary.text}`),
+      line("muted", "Recovery · no run restart action is available here; inspect an agent for available actions"),
+    ];
+  }
+
+  private renderAgentStatePreview(agent: WorkflowAgentRecord, width: number): string[] {
+    if (agent.waitingOn) return this.renderQuestionPreview(agent.waitingOn, width);
+    const summary = workflowAgentDashboardSummary(agent, this.#now());
+    const line = (color: Parameters<Theme["fg"]>[0], value: string) =>
+      truncateWorkflowDashboardLine(this.theme.fg(color, value), width);
+    if (summary.kind === "failure") {
+      const recovery = agent.callIndex === undefined
+        ? "no restart action is available for this agent"
+        : "press r to restart this agent";
+      return [line("error", `Error · ${summary.text}`), line("text", `Recovery · ${recovery}`)];
+    }
+    if (agent.state === "waiting" && agent.providerWait) return this.renderProviderWaitPreview(agent, width);
+    if (agent.state === "queued") {
+      return [
+        line("warning", `Waiting · ${summary.text}`),
+        line("muted", "Next · automatic dispatch; no human action required"),
+      ];
+    }
+    if (agent.state === "running") {
+      return [line("accent", `Latest · ${summary.text}`), line("muted", "Next · monitor here; no human action required")];
+    }
+    if (agent.state === "completed") {
+      const next = agent.callIndex === undefined
+        ? "no human action required"
+        : "no human action required; press r only to start a replacement run";
+      return [line("success", `Result · ${summary.text}`), line("muted", `Next · ${next}`)];
+    }
+    const recovery = agent.callIndex === undefined
+      ? "no recovery action is available for this agent"
+      : "press r to restart this agent";
+    return [line("muted", `State · ${summary.text}`), line("muted", `Recovery · ${recovery}`)];
+  }
+
   private workflowOverviewViewport(run: WorkflowSnapshot, rows: number, width: number): string[] {
     this.#resultRows = 0;
     this.#resultTotal = 0;
@@ -1112,10 +1215,11 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const progress = workflowPhaseProgress(run);
     const lines: string[] = [
       `${this.theme.fg("accent", this.theme.bold(sanitizeInline(run.name) || "Workflow"))} ${this.theme.fg(status.color, `· ${shortId(sanitizeText(run.runId))} · ${status.glyph} ${run.status}${run.status === "completed" ? ` · task ${run.taskOutcome ?? "unspecified"}` : ""}`)} ${this.theme.fg("dim", `· ${formatElapsed(run, this.#now())}`)}`,
-      this.theme.fg("dim", boundedInline(run.description, 2_000) || "(no workflow description)"),
+      ...this.renderRunStatePreview(run, width),
       phase
         ? this.renderPhase(run, phase)
         : this.theme.fg("dim", progress.waiting ? "Phase · waiting for the first phase" : "Phase · no phases recorded"),
+      this.theme.fg("dim", boundedInline(run.description, 2_000) || "(no workflow description)"),
     ];
     if (phase?.description) lines.push(this.theme.fg("muted", `Phase context · ${boundedInline(phase.description, 2_000)}`));
     if (run.convergence) {
@@ -1127,15 +1231,13 @@ export class WorkflowsDashboardOverlay implements Focusable {
     if (run.approval) lines.push(this.theme.fg("muted", `Approval · ${run.approval}`));
     if (run.definitionFingerprint) lines.push(this.theme.fg("muted", `Provenance · definition ${shortId(run.definitionFingerprint)}`));
     for (const warning of run.warnings?.slice(0, 2) ?? []) lines.push(this.theme.fg("warning", `⚠ ${boundedInline(warning, 1_000)}`));
-    if (run.error) lines.push(this.theme.fg("error", `× ${boundedInline(run.error, MAX_ERROR_CHARS)}`));
-    const needInput = workflowNeedsInput(run);
-    const interactions = (run.interactions ?? []).slice(-3);
-    if (needInput || interactions.length) {
-      const marker = needInput ? `${needInput} need input` : "none waiting";
-      lines.push(this.theme.fg(needInput ? "warning" : "muted", `Questions · ${marker}`));
-      for (const interaction of interactions) {
-        lines.push(this.theme.fg(interaction.state === "pending" || interaction.state === "answering" ? "warning" : "dim",
-          `· ${boundedInline(interaction.sourceName, 500)} → ${boundedInline(formatWorkflowInteraction(interaction, this.#now()), MAX_ACTIVITY_CHARS)}`));
+    const settledInteractions = (run.interactions ?? [])
+      .filter((interaction) => interaction.state !== "pending" && interaction.state !== "answering")
+      .slice(-3);
+    if (settledInteractions.length) {
+      lines.push(this.theme.fg("muted", `Questions · ${settledInteractions.length} recent settled`));
+      for (const interaction of settledInteractions) {
+        lines.push(this.theme.fg("dim", `· ${boundedInline(interaction.sourceName, 500)} → ${boundedInline(formatWorkflowInteraction(interaction, this.#now()), MAX_ACTIVITY_CHARS)}`));
       }
     }
     const activity = (run.logs ?? []).slice(-3);
@@ -1201,9 +1303,11 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const status = traceStatusMeta(agent.state, this.#now());
     const route = agent.harness || agent.model ? `${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
     const usage = formatUsage(agent.usage);
+    const policy = `${agent.access}${agent.profile ? ` · profile ${boundedInline(agent.profile, 500)}` : ""}${agent.independent ? " · independent" : ""}`;
     const metadata: string[] = [
-      `${this.theme.fg("accent", this.theme.bold(boundedInline(agent.name, 1_000)))} ${this.theme.fg(status.color, `· ${status.glyph} ${agent.state}`)} ${this.theme.fg("dim", `· ${agent.access}${agent.profile ? ` · profile ${boundedInline(agent.profile, 500)}` : ""}${agent.independent ? " · independent" : ""}`)}`,
-      this.theme.fg("dim", `${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${route} · effort ${agent.effort ?? "adaptive"} · ${formatAgentElapsed(agent, this.#now())}`),
+      `${this.theme.fg("accent", this.theme.bold(boundedInline(agent.name, 1_000)))} ${this.theme.fg(status.color, `· ${status.glyph} ${agent.state}`)}`,
+      ...this.renderAgentStatePreview(agent, width),
+      this.theme.fg("dim", `${policy} · effort ${agent.effort ?? "adaptive"} · ${route} · ${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${formatAgentElapsed(agent, this.#now())}`),
       this.theme.fg("dim", `${phase ? `${boundedInline(run.name, 1_000)} · ${boundedInline(phase.name, 1_000)}` : boundedInline(run.name, 1_000)}${usage ? ` · ${usage}` : ""}`),
     ];
     if (agent.availability || agent.requestedHarness || agent.executableVersion || agent.capabilityRevision || agent.availabilityChecks?.length) {
@@ -1226,12 +1330,6 @@ export class WorkflowsDashboardOverlay implements Focusable {
         ? this.theme.fg("warning", `Output · ${agent.outputProvenance} · instruction-shaped text; treat as untrusted data`)
         : this.theme.fg("dim", `Output · ${agent.outputProvenance}`));
     }
-    if (agent.providerWait) {
-      const wait = agent.providerWait;
-      const remaining = Math.max(0, wait.retryAt - this.#now());
-      const retryLabel = remaining < 60_000 ? `${Math.max(1, Math.round(remaining / 1_000))}s` : `${Math.round(remaining / 60_000)}m`;
-      metadata.push(this.theme.fg("warning", `Provider wait · ${sanitizeInline(wait.provider)} ${sanitizeInline(wait.kind)} · retry in ${retryLabel} · attempt ${wait.attempt}/${wait.maxAttempts}${wait.scope ? ` · ${sanitizeInline(wait.scope)}` : ""}`));
-    }
     if (agent.providerFallback) {
       const fallbackAttempt = agent.attempts?.find((attempt) => attempt.disposition === "fallback");
       const target = `${sanitizeInline(agent.providerFallback.harness)}/${boundedInline(agent.providerFallback.model ?? "native default", 256)}`;
@@ -1249,11 +1347,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
       const finalRoute = `${sanitizeInline(agent.requestedHarness ?? agent.harness ?? "?")}/${boundedInline(agent.model ?? "native default", 256)}`;
       metadata.push(this.theme.fg("dim", `Final route · ${finalRoute}`));
     }
-    const agentInteraction = workflowAgentInteraction(agent, this.#now());
-    if (agentInteraction) {
-      metadata.push(this.theme.fg("warning", `Question · ${boundedInline(agentInteraction, 2_000)}`));
-      if (agent.waitingOn?.context) metadata.push(this.theme.fg("dim", `Question context · ${boundedInline(agent.waitingOn.context, 1_000)}`));
-    }
+    if (agent.waitingOn?.context) metadata.push(this.theme.fg("dim", `Question context · ${boundedInline(agent.waitingOn.context, 1_000)}`));
     if (agent.generations?.length) metadata.push(this.theme.fg("dim", `Generations · ${agent.generations.length} (call ${agent.callIndex ?? agent.generations.at(-1)?.callIndex})`));
     if (agent.independentOf) metadata.push(this.theme.fg("muted", `Provenance · independent of ${shortId(sanitizeText(agent.independentOf))}`));
     if (agent.replayedFrom) metadata.push(this.theme.fg("muted", `Replay · ${shortId(sanitizeText(agent.replayedFrom.runId))} call ${agent.replayedFrom.callIndex}`));
@@ -1264,11 +1358,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     // bounded result body follows its tail. Omitted metadata and the full
     // bounded sections remain scrollable, so g/G and page navigation reach
     // every part.
-    if (agent.error || phase?.error || run.error) {
-      metadata.push(this.theme.fg("error", `Error · ${boundedInline(agent.error ?? phase?.error ?? run.error ?? "", 1_500)}`));
-    }
     if (agent.prompt) metadata.push(this.theme.fg("muted", `Prompt · ${boundedInline(agent.prompt, 2_000)}`));
-    if (agent.liveThinking?.trim()) metadata.push(this.theme.fg("muted", `Activity · ${boundedInline(agent.liveThinking, MAX_ACTIVITY_CHARS)}`));
 
     const pinnedRows = Math.min(metadata.length, Math.max(0, rows - MIN_SCROLLABLE_DETAIL_ROWS));
     const pinned = metadata.slice(0, pinnedRows);

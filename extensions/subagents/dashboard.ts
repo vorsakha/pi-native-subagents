@@ -24,6 +24,7 @@ import {
   dashboardSubmitKeyLabel,
   dashboardSummaryColor,
   fitDashboardRows,
+  formatDurationLabel,
   isFullscreenTui,
   dashboardOverlayRows,
   renderDashboardConfirmHint,
@@ -96,6 +97,95 @@ export interface SubagentsDashboardManager {
   answerInteraction?(requestId: string, answer: string, route?: "orchestrator-model" | "human"): unknown;
   /** Global concurrent-job budget, when the manager reports one. */
   readonly concurrency?: number;
+}
+
+/** State story for the selected direct job. Routine route and usage rows follow it. */
+function directJobStatePreview(
+  job: JobSnapshot,
+  now: number,
+  theme: Theme,
+  width: number,
+  canAnswerInline: boolean,
+): string[] {
+  const line = (color: Parameters<Theme["fg"]>[0], value: string) =>
+    truncate(theme.fg(color, value), width);
+  const interaction = pendingInteraction(job);
+
+  if (interaction) {
+    const elapsed = formatDurationLabel(now - interaction.createdAt);
+    const target = interaction.target.kind === "agent"
+      ? `peer ${sanitizeInline(interaction.target.label ?? shortId(interaction.target.jobId ?? "peer"))}`
+      : interaction.humanVisible ? "you" : "parent orchestrator";
+    const owner = interaction.workflow
+      ? ` · workflow ${sanitizeInline(interaction.workflow.label)} ${shortId(sanitizeText(interaction.workflow.runId))}`
+      : "";
+    let next: string;
+    if (interaction.workflow) {
+      next = `Next · /workflows: supervise ${sanitizeInline(interaction.workflow.label)}; no answer or steer here`;
+    } else if (interaction.target.kind === "agent") {
+      next = `Next · no human action required; waiting for ${target}`;
+    } else if (interaction.humanVisible) {
+      next = canAnswerInline
+        ? "Next · press a to answer inline"
+        : "Next · inline answering is unavailable in this session";
+    } else {
+      next = "Next · parent thread: subagent_answer; do not steer";
+    }
+    const rows = [
+      line("warning", `Question · ${sanitizeInline(interaction.question)}`),
+      line("muted", `Route · ${sanitizeInline(interaction.sourceName)} → ${target} · waiting ${elapsed}${owner}`),
+    ];
+    rows.push(line("text", next));
+    if (interaction.context) rows.push(line("dim", `Context · ${sanitizeInline(interaction.context)}`));
+    return rows;
+  }
+
+  const summary = jobDashboardSummary(job);
+  const workflowDestination = job.workflow
+    ? `supervise ${sanitizeInline(job.workflow.label)} in /workflows`
+    : undefined;
+  if (summary.kind === "failure") {
+    const recovery = workflowDestination
+      ?? (!takeoverPolicy(job).reusable
+        ? "no recovery action is available in this pane"
+        : isTerminal(job.status) ? "press f to follow up" : "press s to steer");
+    return [
+      line("error", `Error · ${summary.text}`),
+      line("text", `Recovery · ${recovery}`),
+    ];
+  }
+  if (job.status === "queued") {
+    return [
+      line("warning", `Waiting · ${summary.text}`),
+      line("muted", `Next · ${workflowDestination ?? "automatic dispatch; no human action required"}`),
+    ];
+  }
+  if (job.status === "running") {
+    if (!workflowDestination && width >= 40) {
+      const prefix = "Latest · ";
+      const suffix = " · Next · s steer";
+      const previewWidth = Math.max(1, width - visibleWidth(prefix) - visibleWidth(suffix));
+      const preview = truncateToWidth(summary.text, previewWidth, "…");
+      return [line("accent", `${prefix}${preview}${suffix}`)];
+    }
+    return [
+      line("accent", `Latest · ${summary.text}`),
+      line("muted", `Next · ${workflowDestination ?? "monitor here or press s to steer"}`),
+    ];
+  }
+  if (job.status === "completed") {
+    return [
+      line("success", `Result · ${summary.text}`),
+      line("muted", `Next · ${workflowDestination ?? "press f to follow up if more work is needed"}`),
+    ];
+  }
+
+  const recovery = workflowDestination
+    ?? (takeoverPolicy(job).reusable ? "continue in this inspector" : "no recovery action is available in this pane");
+  return [
+    line("muted", `State · ${summary.text}`),
+    line("muted", `Next · ${recovery}`),
+  ];
 }
 
 export interface DashboardOverlayOptions {
@@ -960,28 +1050,20 @@ class DashboardOverlay implements Focusable {
     const now = this.#now();
     const status = statusMeta(job.status, now);
     const pinned = [this.renderTitle(job, width)];
-    const queueNote = job.status === "queued" ? this.queueNote(job) : "";
     const generation = job.generation ? ` · turn ${job.generation + 1}` : "";
-    pinned.push(truncate(
-      `${this.theme.fg(status.color, `${status.glyph} ${job.status}`)}${this.theme.fg("dim", ` · ${formatElapsed(job, now)}${generation}${queueNote}`)}`,
+    const statusLine = truncate(
+      `${this.theme.fg(status.color, `${status.glyph} ${job.status}`)}${this.theme.fg("dim", ` · ${formatElapsed(job, now)}${generation}`)}`,
       width,
-    ));
-    if (job.error) {
-      for (const line of sanitizeText(job.error).split("\n").map(sanitizeInline).filter(Boolean).slice(0, 3)) {
-        pinned.push(truncate(this.theme.fg("error", `× ${line}`), width));
-      }
-    }
-    // A pending question is pinned with the failure rows: it is the only thing
-    // that unblocks this job, and it must never be dropped for metadata.
-    const interaction = pendingInteraction(job);
-    if (interaction) {
-      pinned.push(truncate(this.theme.fg("warning", `? ${interactionWaitLabel(interaction)}`), width));
-      pinned.push(truncate(this.theme.fg("text", `  ${sanitizeInline(interaction.question)}`), width));
-      if (interaction.context) pinned.push(truncate(this.theme.fg("dim", `  ${sanitizeInline(interaction.context)}`), width));
-      pinned.push(truncate(this.theme.fg("dim", interaction.humanVisible
-        ? "  press a to answer inline"
-        : "  the orchestrator answers this from the parent thread"), width));
-    }
+    );
+    const statePreview = directJobStatePreview(
+      job,
+      now,
+      this.theme,
+      width,
+      !!this.manager.answerInteraction,
+    );
+    if (pendingInteraction(job)) pinned.push(...statePreview, statusLine);
+    else pinned.push(statusLine, ...statePreview);
     if (job.answeringInteraction) {
       pinned.push(truncate(this.theme.fg("muted", `↩ answering ${sanitizeInline(job.answeringInteraction.sourceName)}`), width));
     }
@@ -1005,6 +1087,7 @@ class DashboardOverlay implements Focusable {
       const phase = job.workflow.phase ? ` · ${sanitizeInline(job.workflow.phase)}` : "";
       optional.push(truncate(this.theme.fg("muted", `flow  ${shortId(sanitizeText(job.workflow.runId))} · ${sanitizeInline(job.workflow.label)}${phase}`), width));
     }
+    if (job.status === "queued") optional.push(truncate(this.theme.fg("dim", `queue ${this.queueNote()}`), width));
     for (const warning of (job.warnings ?? []).slice(-2)) {
       optional.push(truncate(this.theme.fg("warning", `!  ${sanitizeInline(warning)}`), width));
     }
@@ -1014,8 +1097,10 @@ class DashboardOverlay implements Focusable {
     // a second recent-tools list here duplicates the same calls and steals rows
     // from the more legible call/result presentation below.
 
-    // Reserve the transcript label plus one transcript row before spending rows on metadata.
-    const budget = Math.max(0, rows - pinned.length - 2);
+    // Full Pi tool shells can need a call row plus a result row. Let routine
+    // metadata yield that second transcript row when full detail is selected.
+    const minimumTranscriptRows = this.#toolDisplay === "full" ? 2 : 1;
+    const budget = Math.max(0, rows - pinned.length - 1 - minimumTranscriptRows);
     const head = [...pinned, ...optional.slice(0, budget)];
     if (rows <= head.length + 1) return head.slice(0, rows);
 
@@ -1046,10 +1131,10 @@ class DashboardOverlay implements Focusable {
       : rendered;
   }
 
-  private queueNote(_job: JobSnapshot): string {
+  private queueNote(): string {
     const queued = (this.#jobs ?? []).filter((item) => item.status === "queued").length;
     const capacity = this.manager.concurrency ?? 4;
-    return ` · waiting for slot · ${queued} queued · ${capacity} slots`;
+    return `${queued} queued · ${capacity} slots`;
   }
 
   /** Wrapping and Markdown are the expensive part; they only rerun when the job or width moves. */

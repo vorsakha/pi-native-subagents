@@ -18,7 +18,7 @@ Paths are relative to this file. Read the reference **before** you write the cal
 | let a child use `subagent_ask`, or answer with `subagent_answer` | `references/routed-questions.md` |
 | set spend limits, send a limited retained follow-up, set a workflow `budget`, use `resumeFromRunId`, `providerFallback`, or `retry` | `references/budgets-replay-and-provider-waits.md` |
 | use `isolation: "worktree"`, or run `/workflows reclaim` | `references/worktrees-and-retention.md` |
-| inspect running jobs, workflow activity, providers, usage, or model numbers | `references/supervision-and-telemetry.md` |
+| run `/subagents providers` or `/subagents providers refresh`, supervise or recover a selected job/workflow/agent, report on running work, or interpret usage and model numbers | `references/supervision-and-telemetry.md` |
 
 ## Choose the smallest orchestration surface
 

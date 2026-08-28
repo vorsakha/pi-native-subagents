@@ -463,8 +463,9 @@ test("workflow results use native Markdown while transcript roles and workflow m
 });
 
 test("agent detail activity does not duplicate tool detail already shown in the transcript", (t) => {
-  const run = workflow("no-duplication", "completed");
+  const run = workflow("no-duplication");
   const agent = run.agents[0]!;
+  agent.state = "running";
   agent.liveThinking = "narrowing down the failing assertion";
   agent.tools = [{ id: "bash-1", name: "bash", summary: "DISTINCT_TOOL_SUMMARY_MARKER", status: "completed" }];
   agent.transcript = [
@@ -481,15 +482,15 @@ test("agent detail activity does not duplicate tool detail already shown in the 
   overlay.handleInput(ENTER);
   const compactLines = overlay.render(72);
   assert.ok(!compactLines.some((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER")), "compact mode is the default and does not surface per-tool detail anywhere, including Activity");
-  assert.ok(compactLines.some((line) => line.includes("Activity") && line.includes("narrowing down the failing assertion")), "the Activity section still surfaces live semantic progress in compact mode");
+  assert.ok(compactLines.some((line) => line.includes("Latest") && line.includes("narrowing down the failing assertion")), "the state preview surfaces live semantic progress in compact mode");
 
   overlay.handleInput("t");
   const lines = overlay.render(72);
   assert.ok(lines.some((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER")), "the tool lifecycle row still appears in the Transcript section in full mode, via Pi's native execution component");
-  assert.ok(lines.some((line) => line.includes("Activity") && line.includes("narrowing down the failing assertion")), "the Activity section still surfaces live semantic progress");
+  assert.ok(lines.some((line) => line.includes("Latest") && line.includes("narrowing down the failing assertion")), "the state preview still surfaces live semantic progress");
 
-  const activityLine = lines.find((line) => line.includes("Activity"));
-  assert.ok(activityLine && !activityLine.includes("DISTINCT_TOOL_SUMMARY_MARKER"), "the Activity section does not repeat the tool detail already in the transcript");
+  const activityLine = lines.find((line) => line.includes("Latest"));
+  assert.ok(activityLine && !activityLine.includes("DISTINCT_TOOL_SUMMARY_MARKER"), "the state preview does not repeat the tool detail already in the transcript");
   const toolMentions = lines.filter((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER"));
   assert.equal(toolMentions.length, 1, "tool detail is rendered exactly once, in the transcript, not duplicated in Activity");
 });
@@ -1476,7 +1477,9 @@ test("a routed-question wait reads differently from a provider-quota wait in /wo
   assertPanel(overview, 120, 30);
   const overviewText = overview.join("\n");
   assert.match(overviewText, /\? 1 need input/, "the run row aggregates blocked agents in words and a glyph");
-  assert.match(overviewText, /Questions · 1 need input/);
+  assert.match(overviewText, /Question · Which compatibility behavior did we decide to preserve\?/);
+  assert.match(overviewText, /Route · tests → peer review · waiting 5s/);
+  assert.match(overviewText, /no human action required; waiting for peer review/);
   assert.match(overviewText, /waiting for review/, "the wait names the peer that owes the answer");
   assert.match(overviewText, /Which compatibility behavi/, "the bounded question rides along with the wait");
   assert.match(overviewText, /unanswered/);
@@ -1486,7 +1489,8 @@ test("a routed-question wait reads differently from a provider-quota wait in /wo
   state.overlay.handleInput(ENTER);
   const inspector = state.overlay.render(120).join("\n");
   assert.match(inspector, /agent · tests/);
-  assert.match(inspector, /Question · waiting for review/);
+  assert.match(inspector, /Question · Which compatibility behavior did we decide to preserve\?/);
+  assert.match(inspector, /Route · tests → peer review · waiting 5s/);
   assert.match(inspector, /Question context · the task wording and the fixtures disagree/);
   assert.doesNotMatch(inspector, /Provider wait/, "an interaction wait is never reported as a provider-quota wait");
 
@@ -1496,8 +1500,106 @@ test("a routed-question wait reads differently from a provider-quota wait in /wo
   quotaState.overlay.handleInput("\t");
   quotaState.overlay.handleInput(ENTER);
   const quotaText = quotaState.overlay.render(120).join("\n");
-  assert.match(quotaText, /Provider wait · codex quota/);
+  assert.match(quotaText, /Provider wait · tests · codex · window quota/);
+  assert.match(quotaText, /Retry · 1m · attempt 1\/3 · automatic; no human action required/);
   assert.doesNotMatch(quotaText, /need input|Question ·/, "a provider wait never borrows the interaction vocabulary");
+});
+
+test("workflow question previews send orchestrator answers to the parent thread, never steering", (t) => {
+  const run = workflow("orchestrator-question");
+  const agent = run.agents[1]!;
+  agent.waitingOn = {
+    ordinal: 0,
+    requestId: "req-parent",
+    target: "orchestrator",
+    sourceAgentIndex: agent.index,
+    sourceName: agent.name,
+    question: "Should the compatibility flag remain enabled?",
+    state: "pending",
+    createdAt: 60_000,
+  };
+  run.interactions = [agent.waitingOn];
+  const state = harness([run], 30, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  const overview = state.overlay.render(120).join("\n");
+  assert.match(overview, /Route · tests → parent orchestrator · waiting 5s/);
+  assert.match(overview, /parent thread: subagent_answer/);
+  assert.match(overview, /do not steer/);
+
+  state.overlay.handleInput("\t");
+  state.overlay.handleInput(ENTER);
+  const inspector = state.overlay.render(120).join("\n");
+  assert.match(inspector, /Question · Should the compatibility flag remain enabled\?/);
+  assert.match(inspector, /parent orchestrator/);
+  assert.doesNotMatch(inspector, /s steer|takeover|a answer/);
+});
+
+test("workflow inspectors put state preview and real recovery before telemetry", (t) => {
+  const failedRun = workflow("failed-priority", "failed");
+  failedRun.error = "workflow bounded failure";
+  failedRun.agents[1]!.state = "failed";
+  failedRun.agents[1]!.error = "agent bounded failure";
+  const failed = harness([failedRun], 30, () => {}, { fullscreen: true });
+  t.after(() => failed.overlay.dispose());
+  let lines = failed.overlay.render(120);
+  let text = lines.join("\n");
+  assert.match(text, /Error · workflow bounded failure/);
+  assert.match(text, /select tests, then press r to restart that agent/);
+  assert.doesNotMatch(text, /restart (?:this )?run/);
+  assert.ok(lines.findIndex((line) => line.includes("Error ·")) < lines.findIndex((line) => line.includes("Usage ·")));
+
+  failed.overlay.handleInput("\t");
+  failed.overlay.handleInput(ENTER);
+  lines = failed.overlay.render(120);
+  text = lines.join("\n");
+  assert.match(text, /Error · agent bounded failure/);
+  assert.match(text, /Recovery · press r to restart this agent/);
+  assert.ok(lines.findIndex((line) => line.includes("Error ·")) < lines.findIndex((line) => line.includes("codex\/codex-fixture-model")));
+
+  const completedAgentRun = workflow("completed-agent-no-restart");
+  completedAgentRun.agents[1]!.state = "completed";
+  completedAgentRun.agents[1]!.callIndex = undefined;
+  completedAgentRun.agents[1]!.output = "completed without a restart lineage";
+  const completedAgent = harness([completedAgentRun], 30, () => {}, { fullscreen: true });
+  t.after(() => completedAgent.overlay.dispose());
+  completedAgent.overlay.render(120);
+  completedAgent.overlay.handleInput("\t");
+  completedAgent.overlay.handleInput(ENTER);
+  const completedAgentText = completedAgent.overlay.render(120).join("\n");
+  assert.match(completedAgentText, /Result · completed without a restart lineage/);
+  assert.match(completedAgentText, /Next · no human action required/);
+  assert.doesNotMatch(completedAgentText, /press r/);
+
+  const completedRun = workflow("result-priority", "completed");
+  completedRun.result = "concise workflow result";
+  const completed = harness([completedRun], 8, () => {}, { fullscreen: true });
+  t.after(() => completed.overlay.dispose());
+  completed.overlay.render(52);
+  completed.overlay.handleInput(ENTER);
+  lines = completed.overlay.render(52);
+  assertPanel(lines, 52, 8);
+  assert.match(lines.join("\n"), /Result · .*no action · inspect here/);
+
+  const running = workflow("activity-priority");
+  running.logs = [{ index: 0, message: "assembling deterministic evidence", at: 64_000 }];
+  running.agents[1]!.liveThinking = "checking the final assertion";
+  running.agents[1]!.timestamps.updatedAt = 65_000;
+  const active = harness([running], 30, () => {}, { fullscreen: true });
+  t.after(() => active.overlay.dispose());
+  const activeLines = active.overlay.render(120);
+  assert.match(activeLines.join("\n"), /Latest · checking the final assertion/);
+  assert.ok(activeLines.findIndex((line) => line.includes("Latest ·")) < activeLines.findIndex((line) => line.includes("Usage ·")));
+
+  const paused = workflow("pause-priority", "paused");
+  const pausedState = harness([paused], 30, () => {}, { fullscreen: true });
+  t.after(() => pausedState.overlay.dispose());
+  assert.match(pausedState.overlay.render(120).join("\n"), /Paused · paused by operator[\s\S]*press p to resume; human action is required/);
+
+  const queued = workflow("queue-priority", "pending");
+  const queuedState = harness([queued], 30, () => {}, { fullscreen: true });
+  t.after(() => queuedState.overlay.dispose());
+  assert.match(queuedState.overlay.render(120).join("\n"), /Waiting · queued for workflow dispatch[\s\S]*automatic dispatch; no human action required/);
 });
 
 test("the workflow inspector reports convergence round, state, verdict, and stopping reason at every width", (t) => {
