@@ -120,7 +120,7 @@ test("workflow activity keeps textual status and never exceeds narrow terminal w
     preview: "checking the selected route and gathering useful live activity",
   }));
   const activity = store.snapshot(10);
-  const wide = renderWorkflowActivity(activity, theme, 200, { openHint: "Ctrl+Shift+W" }).join("\n");
+  const wide = renderWorkflowActivity(activity, theme, 200, { openHint: "Ctrl+Shift+F" }).join("\n");
   assert.match(wide, /Workflows · 1 active/);
   assert.match(wide, /a deliberately long workflow name/);
   assert.match(wide, /availability discovery 1\/1/);
@@ -128,7 +128,7 @@ test("workflow activity keeps textual status and never exceeds narrow terminal w
   assert.match(wide, /pi\/pi-model/);
   assert.match(wide, /checking the selected route/);
   assert.match(wide, /\/workflows/);
-  assert.match(wide, /Ctrl\+Shift\+W/);
+  assert.match(wide, /Ctrl\+Shift\+F/);
 
   for (const width of [1, 2, 4, 8, 12, 20, 40, 80]) {
     for (const line of renderWorkflowActivity(activity, theme, width)) {

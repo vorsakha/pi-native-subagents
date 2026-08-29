@@ -1,6 +1,7 @@
 import { resolve } from "node:path";
 import { getAgentDir, keyHint } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { KeyId } from "@earendil-works/pi-tui";
 import type { CapabilityRouter } from "../../src/capability-service.ts";
 import type { HarnessAvailabilityProbe } from "../../src/harness-availability.ts";
 import type { ProfileDefinition } from "../../src/types.ts";
@@ -24,11 +25,54 @@ import { renderWorkflowCall, renderWorkflowCard, renderWorkflowFailure } from ".
 const WORKFLOW_MESSAGE = "native-workflow-result";
 const MAX_RESULT_TEXT_BYTES = 48 * 1024;
 
+/**
+ * Keyboard shortcut that opens the `/workflows` supervision surface. The default
+ * deliberately avoids `ctrl+shift+w`, which `pi-web-access` registers for its web
+ * activity widget, so both packages can be enabled without a shortcut conflict.
+ * Override with `PI_NATIVE_SUBAGENTS_WORKFLOWS_SHORTCUT` (e.g. to restore the old
+ * `ctrl+shift+w`).
+ */
+export const DEFAULT_WORKFLOWS_SHORTCUT: KeyId = "ctrl+shift+f";
+export const WORKFLOWS_SHORTCUT_ENV = "PI_NATIVE_SUBAGENTS_WORKFLOWS_SHORTCUT";
+
+const SHORTCUT_MODIFIER_ORDER = ["ctrl", "alt", "shift", "super"] as const;
+
+/**
+ * Normalizes a shortcut chord to Pi's `KeyId` shape: lowercase, canonical modifier
+ * order, exactly one non-modifier key. Returns undefined when the value is unusable
+ * so callers fall back to the default.
+ */
+export function normalizeWorkflowsShortcut(value: unknown): KeyId | undefined {
+  const parts = String(value ?? "").trim().toLowerCase().split("+").map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0) return undefined;
+  const modifiers = SHORTCUT_MODIFIER_ORDER.filter((modifier) => parts.includes(modifier));
+  const keys = parts.filter((part) => !SHORTCUT_MODIFIER_ORDER.includes(part as (typeof SHORTCUT_MODIFIER_ORDER)[number]));
+  if (keys.length !== 1 || keys[0].length === 0) return undefined;
+  return [...modifiers, keys[0]].join("+") as KeyId;
+}
+
+/** Resolves the effective workflows shortcut from configuration, honoring the env override. */
+export function configuredWorkflowsShortcut(env: NodeJS.ProcessEnv = process.env): KeyId {
+  return normalizeWorkflowsShortcut(env[WORKFLOWS_SHORTCUT_ENV]) ?? DEFAULT_WORKFLOWS_SHORTCUT;
+}
+
+/** Title-cases a shortcut chord for display hints, e.g. `ctrl+shift+f` -> `Ctrl+Shift+F`. */
+export function formatWorkflowsShortcutHint(shortcut: string): string {
+  return shortcut
+    .split("+")
+    .map((part) => (part.length === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1)))
+    .join("+");
+}
+
 export interface WorkflowRegistration {
   sessionStart(ctx: ExtensionContext, jobs: JobManager): void;
   sessionShutdown(): Promise<void>;
   /** Read-only compact lookup for extension-owned workflow observations. */
   check(runId: string): WorkflowSnapshot | undefined;
+  /** Effective keyboard shortcut registered for the `/workflows` surface. */
+  readonly shortcut: KeyId;
+  /** Display hint for the effective shortcut, e.g. `Ctrl+Shift+F`. */
+  readonly shortcutHint: string;
 }
 
 export interface RegisterWorkflowOptions {
@@ -37,6 +81,8 @@ export interface RegisterWorkflowOptions {
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   savedWorkflowRoot?: string;
+  /** Effective keyboard shortcut for the `/workflows` surface; defaults to the configured value. */
+  shortcut?: KeyId;
   router?: CapabilityRouter;
   availability?: HarnessAvailabilityProbe;
   resolveProfile?: (name: string) => ProfileDefinition | undefined;
@@ -355,7 +401,10 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     await openWorkflowsDashboard(ctx, workflows);
   };
 
-  pi.registerShortcut("ctrl+shift+w", {
+  const shortcut = options.shortcut ?? configuredWorkflowsShortcut();
+  const shortcutHint = formatWorkflowsShortcutHint(shortcut);
+
+  pi.registerShortcut(shortcut, {
     description: "Open /workflows supervision",
     handler: async (ctx) => {
       try {
@@ -546,6 +595,8 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   });
 
   return {
+    shortcut,
+    shortcutHint,
     check(runId) {
       if (shuttingDown || !manager) return undefined;
       try { return compactSnapshot(manager.check(runId)); }

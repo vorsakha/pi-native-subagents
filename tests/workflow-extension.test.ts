@@ -4,6 +4,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { Check } from "typebox/value";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
+import { DEFAULT_WORKFLOWS_SHORTCUT, WORKFLOWS_SHORTCUT_ENV } from "../extensions/workflows/index.ts";
 import type { Backend } from "../src/types.ts";
 import { ControlledBackend, HoldingBackend, ImmediateBackend, context, fakePi, readyProviderStatusReader, tempDir, theme, waitFor } from "./helpers.ts";
 
@@ -18,6 +19,7 @@ async function setup(options: {
   backends?: Backend[];
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
+  env?: NodeJS.ProcessEnv;
 } = {}) {
   const root = join(await tempDir("workflow-extension"), "runs");
   const globalProfilesDir = join(await tempDir("workflow-extension-profiles"), "profiles");
@@ -29,6 +31,7 @@ async function setup(options: {
     registry: {}, legacyRoot: false, backends, workflowArtifactRoot: root, globalProfilesDir, savedWorkflowRoot,
     setInterval: options.setInterval, clearInterval: options.clearInterval,
     providerStatus: readyProviderStatusReader(),
+    env: options.env ?? { ...process.env, [WORKFLOWS_SHORTCUT_ENV]: undefined },
   });
   return { root, savedWorkflowRoot, pi };
 }
@@ -382,7 +385,10 @@ test("concurrent workflows share one session widget and open the existing workfl
   assert.match(rendered, /Second workflow/);
   assert.equal((rendered.match(/[├└]─/g) ?? []).length, 2, "one row is rendered per workflow run");
 
-  await pi.shortcuts.get("ctrl+shift+w")?.handler(session.ctx);
+  assert.equal(pi.shortcuts.has("ctrl+shift+w"), false, "the default no longer collides with pi-web-access");
+  const rawWidget = widgetFactory(undefined, theme).render(200).join("\n");
+  assert.match(rawWidget, /Ctrl\+Shift\+F/, "the widget hint follows the effective shortcut");
+  await pi.shortcuts.get(DEFAULT_WORKFLOWS_SHORTCUT)?.handler(session.ctx);
   assert.match(session.notifications.at(-1)?.message ?? "", /First workflow/);
   assert.match(session.notifications.at(-1)?.message ?? "", /Second workflow/);
 
@@ -390,6 +396,34 @@ test("concurrent workflows share one session widget and open the existing workfl
   backend.completeTask("second task", "second result");
   await waitFor(() => pi.messages.length === 2, "both workflow results delivered");
   await waitFor(() => session.widgets.get("native-subagents-active") === undefined, "aggregate widget removed after final delivery");
+  await pi.handlers.get("session_shutdown")?.();
+});
+
+test("the workflows supervision shortcut and its displayed hint follow the configured override", async () => {
+  const { pi } = await setup({
+    backends: [new ControlledBackend("codex")],
+    env: { ...process.env, [WORKFLOWS_SHORTCUT_ENV]: "Shift+Ctrl+W" },
+  });
+  const session = context({ hasUI: true });
+  pi.handlers.get("session_start")?.({}, session.ctx);
+
+  assert.equal(pi.shortcuts.has(DEFAULT_WORKFLOWS_SHORTCUT), false, "the default is replaced by the override");
+  assert.ok(pi.shortcuts.get("ctrl+shift+w"), "the override is normalized to canonical modifier order");
+
+  await pi.tools.get("workflow").execute("wf-override", {
+    name: "Override workflow",
+    script: `export default async () => agent("task", { name: "agent", access: "readOnly", harness: "codex" })`,
+    background: true,
+  }, undefined, undefined, session.ctx);
+
+  const widgetFactory = session.widgets.get("native-subagents-active") as
+    ((tui: unknown, theme: unknown) => { render(width: number): string[] }) | undefined;
+  assert.ok(widgetFactory, "the aggregate widget is mounted for the running workflow");
+  const rendered = widgetFactory(undefined, theme).render(200).join("\n");
+  assert.match(rendered, /Ctrl\+Shift\+W/, "the widget hint follows the configured shortcut");
+
+  await pi.shortcuts.get("ctrl+shift+w")?.handler(session.ctx);
+  assert.match(session.notifications.at(-1)?.message ?? "", /Override workflow/);
   await pi.handlers.get("session_shutdown")?.();
 });
 

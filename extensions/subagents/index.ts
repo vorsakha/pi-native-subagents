@@ -86,7 +86,7 @@ import type { AccessMode, Backend, HarnessName, EffortLevel, JobSnapshot, Profil
 import type { SpendBudget } from "../../src/budget.ts";
 import { formatSpendBudget } from "../../src/budget.ts";
 import { renderWorkflowActivity, WorkflowActivityStore, type WorkflowActivitySnapshot } from "../workflows/activity.ts";
-import { registerWorkflows } from "../workflows/index.ts";
+import { configuredWorkflowsShortcut, formatWorkflowsShortcutHint, registerWorkflows } from "../workflows/index.ts";
 import type { WorkflowSnapshot } from "../../src/workflows/types.ts";
 
 /** Production session-peer source backed by Pi's real SessionManager. Never mutates the source session. */
@@ -313,6 +313,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const sessionPeers = options.sessionPeerSource ?? createRealSessionPeerSource();
   let profileCatalog: ProfileCatalog = loadProfiles(globalProfilesDir);
   const configuredHarness = configuredHarnessFromEnv(env);
+  const workflowsShortcut = configuredWorkflowsShortcut(env);
+  const workflowsShortcutHint = formatWorkflowsShortcutHint(workflowsShortcut);
   let activeHarness = configuredHarness;
   let manager: JobManager | undefined;
   let unsubscribeManager: (() => void) | undefined;
@@ -433,7 +435,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
             if (current.workflows.rows.length) {
               return renderWorkflowActivity(current.workflows, theme, width, {
                 context: activityContext(current.direct),
-                openHint: "Ctrl+Shift+W",
+                openHint: workflowsShortcutHint,
               });
             }
             return [truncateToWidth(legacyActivityLine(current.direct, theme), Math.max(0, width), "")];
@@ -574,6 +576,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const workflows = registerWorkflows(pi, {
     artifactRoot: options.workflowArtifactRoot,
     savedWorkflowRoot: options.savedWorkflowRoot,
+    shortcut: workflowsShortcut,
     defaultHarness: () => activeHarness,
     router: capabilities,
     availability,
