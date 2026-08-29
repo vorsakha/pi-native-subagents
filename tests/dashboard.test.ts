@@ -1212,6 +1212,44 @@ test("a composer opened before a routed question cannot submit and keeps its dra
   assert.match(text, /waiting on a routed question/);
 });
 
+test("an answer composer cannot submit after its routed request is replaced or cleared", (t) => {
+  for (const replacement of [
+    interactionSnapshot({ requestId: "req-b", sourceJobId: "answer-identity", humanVisible: true }),
+    undefined,
+  ]) {
+    const current: JobSnapshot = {
+      ...parkedJob("answer-identity"),
+      humanVisible: true,
+      interaction: interactionSnapshot({ requestId: "req-a", sourceJobId: "answer-identity", humanVisible: true }),
+    };
+    const { overlay, manager } = dashboard([current], 24, () => {}, undefined, {
+      focusJobId: current.id,
+      submitKey: "\u0011",
+    });
+    t.after(() => overlay.dispose());
+    overlay.focused = true;
+    overlay.render(120);
+    overlay.handleInput("a");
+    for (const character of "answer for req-a") overlay.handleInput(character);
+
+    current.interaction = replacement;
+    for (const listener of manager.listeners) listener(current);
+    overlay.handleInput("\u0011");
+
+    const stale = overlay.render(120).join("\n");
+    assert.deepEqual(manager.answerCalls, [], "the stale request is never answered");
+    assert.match(stale, /answer for req-a/, "the stale draft remains in its original composer");
+    assert.match(stale, /question changed or closed/);
+
+    overlay.handleInput(ESCAPE);
+    if (replacement) {
+      overlay.handleInput("a");
+      const next = overlay.render(120).join("\n");
+      assert.doesNotMatch(next, /answer for req-a/, "the old request draft cannot cross into the replacement request");
+    }
+  }
+});
+
 test("the inline answer composer resolves a human-owned question and surfaces a rejected answer", async (t) => {
   const parked = { ...parkedJob("human"), humanVisible: true, interaction: interactionSnapshot({ sourceJobId: "human", humanVisible: true, requestId: "req-9" }) };
   const { overlay, manager } = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id, submitKey: "\u0011" });

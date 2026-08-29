@@ -261,8 +261,8 @@ class DashboardOverlay implements Focusable {
   /** Identity that owns the preserved draft; a draft never crosses jobs or composer kinds. */
   #draftOwner: { jobId: string; composer: "answer" | "steer" | "follow-up"; requestId?: string } | undefined;
   #pendingSend: { jobId: string; draft: string; inputRevision: number } | undefined;
-  /** Request ID the answer composer is bound to, so a changed question cannot be answered by a stale draft. */
-  #answerRequestId: string | undefined;
+  /** Exact job/request identity the answer composer may resolve. */
+  #answerIdentity: { jobId: string; requestId: string } | undefined;
   #inputRevision = 0;
   #input = new Input();
   #jobs: JobSnapshot[] | undefined;
@@ -577,7 +577,7 @@ class DashboardOverlay implements Focusable {
   private resetCompactHierarchy(): void {
     this.#focus = { kind: "job-list" };
     this.#behavior = undefined;
-    this.#answerRequestId = undefined;
+    this.#answerIdentity = undefined;
     this.#confirmCancelId = undefined;
     this.#renderedCancelId = undefined;
     this.#renderedConfirmationId = undefined;
@@ -642,7 +642,7 @@ class DashboardOverlay implements Focusable {
   private leaveComposer(): void {
     this.#focus = { kind: "job-detail" };
     this.#behavior = undefined;
-    this.#answerRequestId = undefined;
+    this.#answerIdentity = undefined;
     this.#input.focused = false;
   }
 
@@ -670,7 +670,7 @@ class DashboardOverlay implements Focusable {
     this.bindDraft({ jobId: job.id, composer: "answer", requestId: interaction.requestId });
     this.#focus = { kind: "composer", composer: "answer" };
     this.#behavior = undefined;
-    this.#answerRequestId = interaction.requestId;
+    this.#answerIdentity = { jobId: job.id, requestId: interaction.requestId };
     this.#input.focused = this.#focused;
   }
 
@@ -739,11 +739,25 @@ class DashboardOverlay implements Focusable {
    * message and keeps the draft instead of silently dropping the answer.
    */
   private submitAnswer(answer: string, raw: string): void {
-    const requestId = this.#answerRequestId;
+    const identity = this.#answerIdentity;
     const answerInteraction = this.manager.answerInteraction;
-    if (!requestId || !answerInteraction) return;
+    if (!identity || !answerInteraction) return;
+    const job = this.currentJob(this.manager.list());
+    const interaction = job && pendingInteraction(job);
+    if (
+      !job
+      || job.id !== identity.jobId
+      || !interaction
+      || interaction.requestId !== identity.requestId
+      || !interaction.humanVisible
+      || interaction.target.kind !== "orchestrator"
+    ) {
+      this.#notice = "This routed question changed or closed. Your draft is unchanged; go back before answering the current question.";
+      this.tui.requestRender();
+      return;
+    }
     try {
-      answerInteraction.call(this.manager, requestId, answer, "human");
+      answerInteraction.call(this.manager, identity.requestId, answer, "human");
       this.#input.setValue("");
       this.#notice = "Answer delivered; the subagent resumed.";
       this.leaveComposer();
