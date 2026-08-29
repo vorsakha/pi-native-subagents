@@ -18,6 +18,7 @@ import {
   dashboardConfirmKeyLabel,
   dashboardFoldRow,
   dashboardLayout,
+  dashboardInfoRule,
   dashboardScrollRule,
   dashboardSectionRow,
   dashboardSelectionMarker,
@@ -252,6 +253,8 @@ class DashboardOverlay implements Focusable {
   #confirmCancelId: string | undefined;
   /** `?` cheatsheet toggle; browse-only, never intercepts takeover composer input. */
   #showHelp = false;
+  /** Routine telemetry is opt-in; state and recovery remain visible without it. */
+  #showInfo = false;
   #notice = "";
   #behavior: SendBehavior | undefined;
   #pendingSend: { jobId: string; draft: string; inputRevision: number } | undefined;
@@ -448,6 +451,12 @@ class DashboardOverlay implements Focusable {
 
     if (!composing && data === "?") {
       this.#showHelp = true;
+      this.tui.requestRender();
+      return;
+    }
+
+    if (!composing && data === "i") {
+      this.#showInfo = !this.#showInfo;
       this.tui.requestRender();
       return;
     }
@@ -895,6 +904,7 @@ class DashboardOverlay implements Focusable {
         ["a", "answer a question your own /subagent job asked"],
         ["x", "cancel a live job (press twice)"],
         ["t / Ctrl+T", "toggle compact/full tool display"],
+        ["i", "show / hide routine info"],
       ] },
       { title: "Scroll", entries: [
         ["Shift+↑↓", "scroll transcript"],
@@ -1057,7 +1067,7 @@ class DashboardOverlay implements Focusable {
   private renderDetail(job: JobSnapshot, rows: number, width: number): string[] {
     const now = this.#now();
     const status = statusMeta(job.status, now);
-    const pinned = [this.renderTitle(job, width)];
+    const identity = [this.renderTitle(job, width)];
     const generation = job.generation ? ` · turn ${job.generation + 1}` : "";
     const statusLine = truncate(
       `${this.theme.fg(status.color, `${status.glyph} ${job.status}`)}${this.theme.fg("dim", ` · ${formatElapsed(job, now)}${generation}`)}`,
@@ -1070,15 +1080,15 @@ class DashboardOverlay implements Focusable {
       width,
       !!this.manager.answerInteraction,
     );
-    if (pendingInteraction(job)) pinned.push(...statePreview, statusLine);
-    else pinned.push(statusLine, ...statePreview);
+    identity.push(statusLine);
+    const pinned = [...statePreview];
     if (job.answeringInteraction) {
       pinned.push(truncate(this.theme.fg("muted", `↩ answering ${sanitizeInline(job.answeringInteraction.sourceName)}`), width));
     }
 
-    const optional: string[] = [];
+    const info: string[] = [];
     const task = sanitizeInline(job.task);
-    optional.push(truncate(this.theme.fg("dim", `task  ${task || "(no task description)"}`), width));
+    info.push(truncate(this.theme.fg("dim", `Task · ${task || "(no task description)"}`), width));
     const route = [
       job.access,
       job.profile ? `profile ${sanitizeInline(job.profile)}` : "",
@@ -1087,19 +1097,30 @@ class DashboardOverlay implements Focusable {
       `${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}`,
       job.capabilities?.auto ? "auto-routed" : "",
     ].filter(Boolean).join(" · ");
-    optional.push(truncate(this.theme.fg("muted", `route ${route}`), width));
+    info.push(truncate(this.theme.fg("muted", `Route · ${route}`), width));
     const meter = [formatUsage(job.usage), `budget ${formatSpendBudget(job.budget, job.usage, job.harness)}`, formatContext(job.context), job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""]
       .filter(Boolean).join(" · ");
-    if (meter) optional.push(truncate(this.theme.fg("dim", `usage ${meter}`), width));
+    if (meter) info.push(truncate(this.theme.fg("dim", `Usage · ${meter}`), width));
+    if (job.capabilities || job.requires?.length) {
+      const capability = [
+        job.capabilities?.auto ? "auto-routed" : "explicit route",
+        job.requires?.length ? `required ${job.requires.map(sanitizeInline).join(", ")}` : "",
+        job.capabilities?.matched.length ? `matched ${job.capabilities.matched.map(sanitizeInline).join(", ")}` : "",
+        job.capabilities?.revision ? `revision ${shortId(job.capabilities.revision)}` : "",
+      ].filter(Boolean).join(" · ");
+      info.push(truncate(this.theme.fg("dim", `Capabilities · ${capability}`), width));
+    }
+    if (job.peer) info.push(truncate(this.theme.fg("muted", `Provenance · session peer of ${shortId(sanitizeText(job.peer.sourceSessionId))}`), width));
+    if (job.independentOf) info.push(truncate(this.theme.fg("muted", `Provenance · independent of ${shortId(sanitizeText(job.independentOf))}`), width));
     if (job.workflow) {
       const phase = job.workflow.phase ? ` · ${sanitizeInline(job.workflow.phase)}` : "";
-      optional.push(truncate(this.theme.fg("muted", `flow  ${shortId(sanitizeText(job.workflow.runId))} · ${sanitizeInline(job.workflow.label)}${phase}`), width));
+      info.push(truncate(this.theme.fg("muted", `Ownership · workflow ${shortId(sanitizeText(job.workflow.runId))} · ${sanitizeInline(job.workflow.label)}${phase} · supervise in /workflows`), width));
     }
-    if (job.status === "queued") optional.push(truncate(this.theme.fg("dim", `queue ${this.queueNote()}`), width));
+    if (job.status === "queued") info.push(truncate(this.theme.fg("dim", `Queue · ${this.queueNote()}`), width));
     for (const warning of (job.warnings ?? []).slice(-2)) {
-      optional.push(truncate(this.theme.fg("warning", `!  ${sanitizeInline(warning)}`), width));
+      pinned.push(truncate(this.theme.fg("warning", `!  ${sanitizeInline(warning)}`), width));
     }
-    if (job.truncated) optional.push(truncate(this.theme.fg("warning", "!  bounded output truncated — earliest lines dropped"), width));
+    if (job.truncated) pinned.push(truncate(this.theme.fg("warning", "!  bounded output truncated — earliest lines dropped"), width));
 
     // Tool activity lives in the transcript's Pi-style execution shells. Keeping
     // a second recent-tools list here duplicates the same calls and steals rows
@@ -1108,11 +1129,12 @@ class DashboardOverlay implements Focusable {
     // Full Pi tool shells can need a call row plus a result row. Let routine
     // metadata yield that second transcript row when full detail is selected.
     const minimumTranscriptRows = this.#toolDisplay === "full" ? 2 : 1;
+    const disclosed = [dashboardInfoRule(this.theme, this.#showInfo, width)];
     const budget = Math.max(0, rows - pinned.length - 1 - minimumTranscriptRows);
-    const head = [...pinned, ...optional.slice(0, budget)];
+    const head = [...pinned, ...identity.slice(0, Math.max(0, budget - disclosed.length)), ...disclosed.slice(0, budget)];
     if (rows <= head.length + 1) return head.slice(0, rows);
 
-    const transcript = this.transcript(job, width);
+    const transcript = this.#showInfo ? [...info, ...this.transcript(job, width)] : this.transcript(job, width);
     const transcriptRows = Math.max(0, rows - head.length - 1);
     if (this.#scrollJobId !== job.id) this.resetScroll();
     this.#transcriptRows = transcriptRows;
@@ -1121,7 +1143,7 @@ class DashboardOverlay implements Focusable {
     this.#scroll = this.#followTail ? max : clampDashboard(this.#scroll, 0, max);
     const start = this.#scroll;
     const end = Math.min(transcript.length, start + transcriptRows);
-    const label = dashboardViewportLabel("transcript", start, end, transcript.length, this.#followTail);
+    const label = dashboardViewportLabel(this.#showInfo ? "detail" : "transcript", start, end, transcript.length, this.#followTail);
     head.push(dashboardScrollRule(this.theme, label, width));
     for (const line of transcript.slice(start, end)) head.push(truncate(line, width, ""));
     return head;
@@ -1178,6 +1200,7 @@ class DashboardOverlay implements Focusable {
   private controls(frame: DashboardFrame, job: JobSnapshot | undefined): string {
     const scroll = "Shift+↑↓ scroll";
     const toolToggle = `t ${this.#toolDisplay === "compact" ? "full" : "compact"}`;
+    const infoToggle = `i ${this.#showInfo ? "hide info" : "info"}`;
     if (this.#focus.kind === "composer" && this.#focus.composer === "answer") {
       return `${dashboardSubmitKeyLabel(this.keybindings)} answer · ${dashboardCancelKeyLabel(this.keybindings)} back · ${scroll}`;
     }
@@ -1201,6 +1224,7 @@ class DashboardOverlay implements Focusable {
         sendable && live ? "s steer" : "",
         sendable && !live ? "f follow-up" : "",
         toolToggle,
+        infoToggle,
         "? help",
       ].filter(Boolean).join(" · ");
     }
@@ -1211,6 +1235,7 @@ class DashboardOverlay implements Focusable {
       sendable && live ? "s steer" : "",
       sendable && !live ? "f follow-up" : "",
       toolToggle,
+      infoToggle,
       `${scroll} · Ctrl+U/D · g/G`,
       "? help",
     ].filter(Boolean).join(" · ");

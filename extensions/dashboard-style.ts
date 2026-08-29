@@ -339,6 +339,11 @@ export function dashboardScrollRule(theme: Theme, label: string, width: number):
   return theme.fg("dim", truncateToWidth(`── ${label} ${"─".repeat(safeWidth)}`, safeWidth, ""));
 }
 
+/** Shared disclosure grammar for routine inspector telemetry. */
+export function dashboardInfoRule(theme: Theme, expanded: boolean, width: number): string {
+  return dashboardScrollRule(theme, expanded ? "info expanded · i hide" : "info · i show", width);
+}
+
 /** Textual, non-selectable list section header with its complete entity count. */
 export function dashboardSectionRow(theme: Theme, label: string, count: number, width: number): string {
   return dashboardScrollRule(theme, `${label} · ${count}`, width);

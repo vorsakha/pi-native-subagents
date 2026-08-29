@@ -16,6 +16,7 @@ import {
   dashboardConfirmKeyLabel,
   dashboardFoldRow,
   dashboardLayout,
+  dashboardInfoRule,
   dashboardNestedSelectionMarker,
   dashboardOverlayRows,
   dashboardScrollRule,
@@ -196,6 +197,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
   #confirmCancel: CancelTarget | undefined;
   /** `?` cheatsheet toggle; focus-specific and never intercepted while armed for cancellation. */
   #showHelp = false;
+  #showInfo = false;
   #notice = "";
   #runs: WorkflowSnapshot[] = [];
   #layout: DashboardLayout | undefined;
@@ -387,6 +389,12 @@ export class WorkflowsDashboardOverlay implements Focusable {
 
     if (data === "?") {
       this.#showHelp = true;
+      this.tui.requestRender();
+      return;
+    }
+
+    if (data === "i" && this.#focus === "agent-detail") {
+      this.#showInfo = !this.#showInfo;
       this.tui.requestRender();
       return;
     }
@@ -969,6 +977,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
           ["X", "cancel the run (press twice)"],
           ["r", "restart this agent"],
           ["t / Ctrl+T", "toggle compact/full tool display"],
+          ["i", "show / hide routine info"],
         ] },
         { title: "Scroll", entries: [
           ["j k / ↑↓ / PgUp/PgDn", "scroll detail"],
@@ -1343,9 +1352,11 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const route = agent.harness || agent.model ? `${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
     const usage = formatUsage(agent.usage);
     const policy = `${agent.access}${agent.profile ? ` · profile ${boundedInline(agent.profile, 500)}` : ""}${agent.independent ? " · independent" : ""}`;
-    const metadata: string[] = [
+    const pinned: string[] = [
       `${this.theme.fg("accent", this.theme.bold(boundedInline(agent.name, 1_000)))} ${this.theme.fg(status.color, `· ${status.glyph} ${agent.state}`)}`,
       ...this.renderAgentStatePreview(agent, width),
+    ];
+    const metadata: string[] = [
       this.theme.fg("dim", `${policy} · effort ${agent.effort ?? "adaptive"} · ${route} · ${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${formatAgentElapsed(agent, this.#now())}`),
       this.theme.fg("dim", `${phase ? `${boundedInline(run.name, 1_000)} · ${boundedInline(phase.name, 1_000)}` : boundedInline(run.name, 1_000)}${usage ? ` · ${usage}` : ""}`),
     ];
@@ -1386,33 +1397,32 @@ export class WorkflowsDashboardOverlay implements Focusable {
       const finalRoute = `${sanitizeInline(agent.requestedHarness ?? agent.harness ?? "?")}/${boundedInline(agent.model ?? "native default", 256)}`;
       metadata.push(this.theme.fg("dim", `Final route · ${finalRoute}`));
     }
-    if (agent.waitingOn?.context) metadata.push(this.theme.fg("dim", `Question context · ${boundedInline(agent.waitingOn.context, 1_000)}`));
+    if (agent.waitingOn?.context) pinned.push(this.theme.fg("dim", `Question context · ${boundedInline(agent.waitingOn.context, 1_000)}`));
     if (agent.generations?.length) metadata.push(this.theme.fg("dim", `Generations · ${agent.generations.length} (call ${agent.callIndex ?? agent.generations.at(-1)?.callIndex})`));
     if (agent.independentOf) metadata.push(this.theme.fg("muted", `Provenance · independent of ${shortId(sanitizeText(agent.independentOf))}`));
     if (agent.replayedFrom) metadata.push(this.theme.fg("muted", `Replay · ${shortId(sanitizeText(agent.replayedFrom.runId))} call ${agent.replayedFrom.callIndex}`));
     if (agent.replacedBy) metadata.push(this.theme.fg("muted", `Replacement · ${shortId(sanitizeText(agent.replacedBy.replacementRunId))} · ${boundedInline(agent.replacedBy.reason, 1_000)}`));
-    if (agent.truncated) metadata.push(this.theme.fg("warning", "Output · bounded transcript omitted older content"));
+    if (agent.truncated) pinned.push(this.theme.fg("warning", "Output · bounded transcript omitted older content"));
 
     // Keep the operator's most important recovery context visible while the
     // bounded result body follows its tail. Omitted metadata and the full
     // bounded sections remain scrollable, so g/G and page navigation reach
     // every part.
-    if (agent.prompt) metadata.push(this.theme.fg("muted", `Prompt · ${boundedInline(agent.prompt, 2_000)}`));
-
-    const pinnedRows = Math.min(metadata.length, Math.max(0, rows - MIN_SCROLLABLE_DETAIL_ROWS));
-    const pinned = metadata.slice(0, pinnedRows);
-    const omittedMetadata = metadata.length > pinnedRows
-      ? [this.theme.fg("muted", "Metadata"), ...metadata.slice(pinnedRows)]
-      : [];
-    const body = [...omittedMetadata, ...this.agentDetailBody(run, phase, agent, width)];
+    const disclosure = [dashboardInfoRule(this.theme, this.#showInfo, width)];
+    const pinnedBudget = Math.max(0, rows - MIN_SCROLLABLE_DETAIL_ROWS);
+    const visiblePinned = pinned.slice(0, pinnedBudget);
+    const visibleDisclosure = disclosure.slice(0, Math.max(0, pinnedBudget - visiblePinned.length));
+    const body = this.#showInfo
+      ? [...metadata, ...this.agentDetailBody(run, phase, agent, width)]
+      : this.agentDetailBody(run, phase, agent, width);
     const resultRows = this.renderScrollableBody(
       body,
-      rows - pinned.length,
+      rows - visiblePinned.length - visibleDisclosure.length,
       `agent:${run.runId}:${phase?.index ?? "none"}:${agent.index}`,
       width,
-      "transcript",
+      this.#showInfo ? "detail" : "transcript",
     );
-    return fitDashboardRows([...pinned, ...resultRows], rows);
+    return fitDashboardRows([...visiblePinned, ...visibleDisclosure, ...resultRows], rows);
   }
 
   private agentDetailBody(run: WorkflowSnapshot, phase: WorkflowPhase | undefined, agent: WorkflowAgentRecord, width: number): string[] {
@@ -1609,6 +1619,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
         live ? runCancelLabel : "",
         agentVisible && agent?.callIndex !== undefined ? agentRestartLabel : "",
         `t ${this.#toolDisplay === "compact" ? "full" : "compact"}`,
+        `i ${this.#showInfo ? "hide info" : "info"}`,
         "Esc/← outline",
         "jk/Pg scroll · Ctrl+U/D · g/G",
         "? help",

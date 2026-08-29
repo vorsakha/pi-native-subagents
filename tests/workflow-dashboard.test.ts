@@ -365,8 +365,10 @@ test("workflow results use native Markdown while transcript roles and workflow m
   assert.ok(lines.some((line) => line.includes("> **inspect this literally**")));
   assert.ok(lines.some((line) => line.includes("~ considering options")));
   assert.ok(lines.some((line) => line.includes("read") && line.includes("file.ts")), "full mode renders the tool through Pi's native execution component");
-  assert.ok(lines.some((line) => line.includes("Prompt · Review the implementation")));
-  assert.ok(lines.some((line) => line.includes("effort high")));
+  overlay.handleInput("i");
+  overlay.handleInput("g");
+  const infoLines = overlay.render(72);
+  assert.ok(infoLines.some((line) => line.includes("effort high")));
 
   const standalone = workflow("standalone", "completed");
   standalone.agents = [];
@@ -714,11 +716,38 @@ test("metadata-rich agent inspectors reserve result rows at medium and short hei
   assert.match(shortInitial, /COMPLETED_OUTPUT_METADATA/);
   short.overlay.handleInput("g");
   const shortTop = short.overlay.render(72).join("\n");
-  assert.match(shortTop, /Metadata|ERROR_METADATA/);
+  assert.match(shortTop, /Error/);
   short.overlay.handleInput(PAGE_DOWN);
   assert.notEqual(short.overlay.render(72).join("\n"), shortTop, "Page Down advances the short result body");
   short.overlay.handleInput("G");
   assert.match(short.overlay.render(72).join("\n"), /COMPLETED_OUTPUT_METADATA/);
+});
+
+test("workflow agent info fold is opt-in and short geometry retains a useful result row", (t) => {
+  const run = workflow("info-fold", "completed");
+  const agent = run.agents[0]!;
+  agent.context = { tokens: 48_000, window: 128_000, servingModel: "served-model" };
+  agent.isolation = { type: "worktree", state: "preserved", branch: "feature/漢字", changed: true };
+  agent.independentOf = "producer-run";
+  agent.replayedFrom = { runId: "source-run", callIndex: 2 };
+  agent.replacedBy = { replacementRunId: "replacement-run", reason: "retry", at: 4_000 };
+  agent.transcript = [{ kind: "assistant", text: "USEFUL_WORKFLOW_RESULT" }];
+  agent.output = "USEFUL_WORKFLOW_RESULT";
+  const state = harness([run], 8, () => {}, { fullscreen: true, renderMarkdown: (text) => [text] });
+  t.after(() => state.overlay.dispose());
+
+  openAgentDetail(state.overlay, 52);
+  let lines = state.overlay.render(52);
+  assertPanel(lines, 52, 8);
+  assert.match(lines.join("\n"), /USEFUL_WORKFLOW_RESULT/);
+  assert.doesNotMatch(lines.join("\n"), /Isolation ·|Replay ·|Replacement ·/);
+
+  state.overlay.handleInput("i");
+  state.overlay.handleInput("g");
+  lines = state.overlay.render(52);
+  assertPanel(lines, 52, 8);
+  assert.match(lines.join("\n"), /readOnly|Context ·|Isolation ·/);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 52));
 });
 
 test("provider fallback dashboard metadata sanitizes every model route", (t) => {
@@ -741,6 +770,8 @@ test("provider fallback dashboard metadata sanitizes every model route", (t) => 
   t.after(() => state.overlay.dispose());
 
   openAgentDetail(state.overlay, 100);
+  state.overlay.handleInput("i");
+  state.overlay.handleInput("g");
   const inspector = state.overlay.render(100).join("\n");
   assert.match(inspector, /Provider fallback · used · declared codex\/declared MODEL/);
   assert.match(inspector, /Attempt 1 · claude\/primary MODEL/);
@@ -1666,6 +1697,10 @@ test("workflow inspectors put state preview and real recovery before telemetry",
   text = lines.join("\n");
   assert.match(text, /Error · agent bounded failure/);
   assert.match(text, /Recovery · press r to restart this agent/);
+  assert.doesNotMatch(text, /codex\/codex-fixture-model/, "routine route telemetry is folded by default");
+  failed.overlay.handleInput("i");
+  failed.overlay.handleInput("g");
+  lines = failed.overlay.render(120);
   assert.ok(lines.findIndex((line) => line.includes("Error ·")) < lines.findIndex((line) => line.includes("codex\/codex-fixture-model")));
 
   const completedAgentRun = workflow("completed-agent-no-restart");

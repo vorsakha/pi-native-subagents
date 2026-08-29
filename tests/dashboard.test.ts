@@ -301,7 +301,7 @@ test("explicit job focus separates selection, detail scrolling, and composer dra
   state.overlay.handleInput(RIGHT);
   assert.match(
     state.overlay.render(120).find((line) => line.includes("transcript")) ?? "",
-    /transcript 2–20\/81 · paused · G resumes live/,
+    /transcript 2–22\/81 · paused · G resumes live/,
     "detail focus changes preserve the paused range while the total tracks live output",
   );
   state.overlay.handleInput("G");
@@ -1201,4 +1201,37 @@ test("direct inspectors prioritize activity, results, failures, and queue recove
   const liveFailureText = liveFailureState.overlay.render(120).join("\n");
   assert.match(liveFailureText, /Recovery · press s to steer/);
   assert.doesNotMatch(liveFailureText, /press f to follow up/);
+});
+
+test("direct inspector hides routine info by default and keeps a transcript row at short height", (t) => {
+  const current = jobSnapshot({
+    id: "info-fold",
+    name: "info-fold",
+    access: "readOnly",
+    independent: true,
+    independentOf: "producer-job",
+    task: "inspect metadata",
+    context: { tokens: 32_000, window: 128_000, servingModel: "served-model" },
+    requires: ["tool:read"],
+    capabilities: { harness: "codex", matched: ["tool:read"], revision: "revision-1234", discoveredAt: 1, auto: true },
+    transcript: [{ kind: "assistant", text: "USEFUL_TRANSCRIPT_ROW" }],
+    output: "USEFUL_TRANSCRIPT_ROW",
+  });
+  const state = dashboard([current], 8, () => {}, undefined, { focusJobId: current.id, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(52);
+  state.overlay.handleInput(ENTER);
+  let lines = state.overlay.render(52);
+  assert.equal(lines.length, 8);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 52));
+  assert.match(lines.join("\n"), /USEFUL_TRANSCRIPT_ROW/);
+  assert.doesNotMatch(lines.join("\n"), /Capabilities ·|Provenance ·/);
+
+  state.overlay.handleInput("i");
+  state.overlay.handleInput("g");
+  lines = state.overlay.render(52);
+  assert.equal(lines.length, 8);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 52));
+  assert.match(lines.join("\n"), /Task · inspect metadata|Route · readOnly/);
 });
