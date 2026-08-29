@@ -7,6 +7,7 @@ import type { KeybindingsManager } from "@earendil-works/pi-tui";
 import {
   createDashboardOverlay,
   truncateDashboardLine,
+  type DashboardMode,
 } from "../extensions/subagents/dashboard.ts";
 import { alignDashboardRow, createDashboardFrame, dashboardLayout } from "../extensions/dashboard-style.ts";
 import { dashboardCollectionViewport, groupDashboardCollection } from "../extensions/dashboard-collection.ts";
@@ -352,6 +353,35 @@ test("composer drafts stay bound to one job and composer identity", (t) => {
   assert.doesNotMatch(state.overlay.render(52).join("\n"), /second draft/, "another composer kind cannot inherit a steer draft");
 });
 
+test("compatibility takeover mode preserves only its steer draft identity", (t) => {
+  const current = job("compatibility-takeover");
+  const state = dashboard([current], 30, () => {}, undefined, {
+    focusJobId: current.id,
+    mode: "takeover",
+    fullscreen: true,
+  });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(52);
+  for (const character of "keep compatibility draft") state.overlay.handleInput(character);
+  state.overlay.handleInput(ESCAPE);
+  state.overlay.handleInput("s");
+  assert.match(
+    state.overlay.render(52).join("\n"),
+    /keep compatibility draft/,
+    "reopening steer for the same job retains the mode-takeover draft",
+  );
+
+  state.overlay.handleInput(ESCAPE);
+  state.overlay.handleInput("f");
+  assert.doesNotMatch(
+    state.overlay.render(52).join("\n"),
+    /keep compatibility draft/,
+    "the compatibility draft cannot cross into a different composer identity",
+  );
+});
+
 test("six-row steer and answer composers keep their input visible", (t) => {
   const steer = dashboard([job("six-row-steer")], 6, () => {}, undefined, { fullscreen: true });
   t.after(() => steer.overlay.dispose());
@@ -537,6 +567,7 @@ function dashboard(
   renderMarkdown: (text: string, width: number) => string[] = (text) => text.split("\n"),
   options: {
     focusJobId?: string;
+    mode?: DashboardMode;
     fullscreen?: boolean;
     sendError?: string;
     sendPromise?: Promise<JobSnapshot>;
@@ -610,6 +641,7 @@ function dashboard(
       now: () => 65_000,
       renderMarkdown,
       focusJobId: options.focusJobId,
+      mode: options.mode,
       fullscreen: options.fullscreen,
       availability: options.availability,
     },

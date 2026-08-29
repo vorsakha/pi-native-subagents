@@ -208,6 +208,7 @@ export interface DashboardOverlayOptions {
 }
 
 export type DashboardMode = "browse" | "takeover" | "answer";
+type DraftOwner = { jobId: string; composer: "answer" | "steer" | "follow-up"; requestId?: string };
 export type SubagentsDashboardFocus =
   | { kind: "job-list" }
   | { kind: "job-detail" }
@@ -259,7 +260,7 @@ class DashboardOverlay implements Focusable {
   #notice = "";
   #behavior: SendBehavior | undefined;
   /** Identity that owns the preserved draft; a draft never crosses jobs or composer kinds. */
-  #draftOwner: { jobId: string; composer: "answer" | "steer" | "follow-up"; requestId?: string } | undefined;
+  #draftOwner: DraftOwner | undefined;
   #pendingSend: { jobId: string; draft: string; inputRevision: number } | undefined;
   /** Exact job/request identity the answer composer may resolve. */
   #answerIdentity: { jobId: string; requestId: string } | undefined;
@@ -343,6 +344,9 @@ class DashboardOverlay implements Focusable {
     this.#jobs = jobs;
     const collection = jobDashboardCollection(jobs);
     const chosen = this.syncSelection(collection.items);
+    if (chosen && this.#focus.kind === "composer" && this.#focus.composer !== "answer" && !this.#draftOwner) {
+      this.bindDraft({ jobId: chosen.id, composer: this.#focus.composer });
+    }
     this.syncTicker(jobs);
 
     const rows = dashboardOverlayRows(this.tui.terminal?.rows ?? 0, this.fullscreen());
@@ -674,7 +678,7 @@ class DashboardOverlay implements Focusable {
     this.#input.focused = this.#focused;
   }
 
-  private bindDraft(owner: { jobId: string; composer: "answer" | "steer" | "follow-up"; requestId?: string }): void {
+  private bindDraft(owner: DraftOwner): void {
     const current = this.#draftOwner;
     if (!current
       || current.jobId !== owner.jobId
