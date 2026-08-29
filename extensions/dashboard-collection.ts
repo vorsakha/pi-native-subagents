@@ -140,8 +140,10 @@ export function dashboardCollectionViewport<Item, Group extends string, Id>(
       const row = visibleRows[index];
       if (!row) continue;
       const selected = row.kind === "item" && selectedId !== undefined && idFor(row.item) === selectedId;
-      if (replaceItem < 0 && row.kind === "item" && !selected) replaceItem = index;
-      if (replaceOther < 0 && row.kind !== "section" && !selected) {
+      if (replaceItem < 0 && row.kind === "item" && row.group === foldRow.group && !selected) {
+        replaceItem = index;
+      }
+      if (replaceOther < 0 && row.group === foldRow.group && row.kind !== "section" && !selected) {
         replaceOther = index;
       }
     }

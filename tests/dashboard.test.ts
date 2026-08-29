@@ -98,7 +98,10 @@ test("grouped collection rows keep headers presentational and selected entities 
   const pressuredView = dashboardCollectionViewport(pressured, "live-1", 3, (item) => item.id);
   assert.ok(pressuredView.rows.some((row) => row.kind === "item" && row.item.id === "live-1"));
   assert.ok(pressuredView.rows.some((row) => row.kind === "section" && row.label === "Active"), "the visible group keeps its textual heading");
-  assert.ok(pressuredView.rows.some((row) => row.kind === "fold" && row.hidden === 2), "the fold count includes a displaced entity row");
+  assert.ok(
+    pressuredView.rows.every((row) => row.kind !== "fold" || row.hidden === 1),
+    "a finished fold never counts a displaced active entity",
+  );
 });
 
 test("direct jobs render attention groups with counts and navigate only entity rows", (t) => {
@@ -1108,6 +1111,29 @@ test("a job parked on a question states the wait in words, withdraws steer/follo
   assert.ok(!overlay.render(120).some((line) => line.includes("▸ takeover ·")), "no key opens a competing user turn while a question is pending");
 });
 
+test("a composer opened before a routed question cannot submit and keeps its draft", (t) => {
+  const current = job("stale-composer");
+  const { overlay, manager } = dashboard([current], 24, () => {}, undefined, { focusJobId: current.id });
+  t.after(() => overlay.dispose());
+  overlay.focused = true;
+  overlay.render(120);
+  overlay.handleInput("s");
+  for (const character of "keep this draft") overlay.handleInput(character);
+
+  current.interaction = interactionSnapshot({
+    sourceJobId: current.id,
+    sourceName: current.name,
+    question: "Which route should answer?",
+  });
+  for (const listener of manager.listeners) listener(current);
+  overlay.handleInput(ENTER);
+
+  const text = overlay.render(120).join("\n");
+  assert.deepEqual(manager.sendCalls, []);
+  assert.match(text, /keep this draft/);
+  assert.match(text, /waiting on a routed question/);
+});
+
 test("the inline answer composer resolves a human-owned question and surfaces a rejected answer", async (t) => {
   const parked = { ...parkedJob("human"), humanVisible: true, interaction: interactionSnapshot({ sourceJobId: "human", humanVisible: true, requestId: "req-9" }) };
   const { overlay, manager } = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id, submitKey: "\u0011" });
@@ -1289,4 +1315,26 @@ test("direct inspector hides routine info by default and keeps a transcript row 
   assert.equal(lines.length, 8);
   assert.ok(lines.every((line) => visibleWidth(line) <= 52));
   assert.match(lines.join("\n"), /Task · inspect metadata|Route · readOnly/);
+});
+
+test("short direct question inspectors keep the transcript reserve", (t) => {
+  const current = {
+    ...parkedJob("short-question"),
+    interaction: interactionSnapshot({
+      sourceJobId: "short-question",
+      sourceName: "short-question",
+      humanVisible: true,
+      question: "Which fixture is authoritative?",
+      context: "the task and tests disagree",
+    }),
+    transcript: [{ kind: "assistant" as const, text: "TRANSCRIPT_RESERVE" }],
+  };
+  const state = dashboard([current], 8, () => {}, undefined, { focusJobId: current.id, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(52);
+  state.overlay.handleInput(ENTER);
+  const lines = state.overlay.render(52);
+  assert.match(lines.find((line) => line.includes("transcript")) ?? "", /transcript/);
+  assert.match(lines.join("\n"), /last line/, "the reserved body row renders the transcript tail");
 });

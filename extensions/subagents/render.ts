@@ -432,7 +432,7 @@ export function jobDashboardSummary(job: JobSnapshot): DashboardSummary {
   }
 
   if (job.status === "running") {
-    return { kind: "lifecycle", text: "waiting for first response" };
+    return { kind: "lifecycle", text: job.progressed ? "working" : "waiting for first response" };
   }
   return { kind: "lifecycle", text: job.status };
 }

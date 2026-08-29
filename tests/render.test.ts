@@ -63,6 +63,10 @@ test("direct job dashboard summaries keep operator-attention priority", () => {
     kind: "result",
     text: "Shipped the fix",
   });
+  assert.deepEqual(jobDashboardSummary(job({ status: "running", progressed: true })), {
+    kind: "lifecycle",
+    text: "working",
+  });
 });
 
 test("renderer sanitizes output and enforces collapsed/expanded line budgets", () => {

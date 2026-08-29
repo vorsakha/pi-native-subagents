@@ -680,6 +680,11 @@ class DashboardOverlay implements Focusable {
     }
     const job = this.currentJob(this.#jobs ?? this.manager.list());
     if (!job) return;
+    if (pendingInteraction(job)) {
+      this.#notice = "This job is waiting on a routed question. Your draft is unchanged; answer through the displayed route.";
+      this.tui.requestRender();
+      return;
+    }
     const policy = takeoverPolicy(job);
     if (!policy.reusable) {
       this.#notice = policy.restriction ?? "This native session is read-only.";
@@ -1154,9 +1159,12 @@ class DashboardOverlay implements Focusable {
     // metadata yield that second transcript row when full detail is selected.
     const minimumTranscriptRows = this.#toolDisplay === "full" ? 2 : 1;
     const disclosed = [dashboardInfoRule(this.theme, this.#showInfo, width)];
-    const budget = Math.max(0, rows - pinned.length - 1 - minimumTranscriptRows);
-    const head = [...pinned, ...identity.slice(0, Math.max(0, budget - disclosed.length)), ...disclosed.slice(0, budget)];
-    if (rows <= head.length + 1) return head.slice(0, rows);
+    const headBudget = Math.max(0, rows - 1 - minimumTranscriptRows);
+    const visiblePinned = pinned.slice(0, headBudget);
+    const remainingHeadRows = headBudget - visiblePinned.length;
+    const visibleIdentity = identity.slice(0, Math.max(0, remainingHeadRows - disclosed.length));
+    const visibleDisclosure = disclosed.slice(0, Math.max(0, remainingHeadRows - visibleIdentity.length));
+    const head = [...visiblePinned, ...visibleIdentity, ...visibleDisclosure];
 
     const transcript = this.#showInfo ? [...info, ...this.transcript(job, width)] : this.transcript(job, width);
     const transcriptRows = Math.max(0, rows - head.length - 1);

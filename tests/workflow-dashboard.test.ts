@@ -782,6 +782,77 @@ test("workflow agent info fold is opt-in and short geometry retains a useful res
   assert.ok(lines.every((line) => visibleWidth(line) <= 52));
 });
 
+test("terminal workflow agents use end labels while their workflow remains active", (t) => {
+  const run = workflow("terminal-agent-active-run");
+  run.status = "running";
+  run.agents[1]!.state = "failed";
+  run.agents[1]!.error = "agent stopped";
+  run.agents[1]!.transcript = [{ kind: "assistant", text: "TERMINAL_AGENT_OUTPUT" }];
+  const state = harness([run], 24, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  openAgentDetail(state.overlay, 72, 1);
+  const label = state.overlay.render(72).find((line) => line.includes("transcript")) ?? "";
+  assert.match(label, /· end/);
+  assert.doesNotMatch(label, /live|resumes live/);
+});
+
+test("short workflow agent inspectors pin recovery details above the transcript reserve", (t) => {
+  const failedRun = workflow("short-failed-agent", "failed");
+  failedRun.agents[1]!.state = "failed";
+  failedRun.agents[1]!.error = "bounded agent failure";
+  failedRun.agents[1]!.transcript = [{ kind: "assistant", text: "SHORT_AGENT_TRANSCRIPT" }];
+  const failed = harness([failedRun], 8, () => {}, { fullscreen: true });
+  t.after(() => failed.overlay.dispose());
+  openAgentDetail(failed.overlay, 52, 1);
+  const failedText = failed.overlay.render(52).join("\n");
+  assert.match(failedText, /Error · bounded agent failure/);
+  assert.match(failedText, /Recovery · press r to restart this agent/);
+  assert.match(failedText, /transcript/);
+  assert.match(failedText, /test result 59/, "the reserved body row renders the transcript tail");
+
+  const waitingRun = workflow("short-provider-wait");
+  const waiting = waitingRun.agents[1]!;
+  waiting.state = "waiting";
+  waiting.providerWait = {
+    provider: "codex",
+    kind: "quota",
+    scope: "quota",
+    detail: "quota window",
+    retryAt: 125_000,
+    attempt: 1,
+    maxAttempts: 3,
+  };
+  waiting.transcript = [{ kind: "assistant", text: "WAIT_TRANSCRIPT" }];
+  const provider = harness([waitingRun], 8, () => {}, { fullscreen: true });
+  t.after(() => provider.overlay.dispose());
+  openAgentDetail(provider.overlay, 52, 1);
+  const providerText = provider.overlay.render(52).join("\n");
+  assert.match(providerText, /Provider wait ·/);
+  assert.match(providerText, /Retry · 1m · attempt 1\/3 · automatic/);
+  assert.match(providerText, /test result 59/, "provider waits also retain the transcript body row");
+
+  const questionRun = workflow("short-question");
+  questionRun.agents[1]!.waitingOn = {
+    ordinal: 0,
+    requestId: "short-question-request",
+    target: "orchestrator",
+    sourceAgentIndex: 1,
+    sourceName: "tests",
+    question: "Which behavior should remain?",
+    state: "pending",
+    createdAt: 60_000,
+  };
+  const question = harness([questionRun], 8, () => {}, { fullscreen: true });
+  t.after(() => question.overlay.dispose());
+  openAgentDetail(question.overlay, 120, 1);
+  const questionText = question.overlay.render(120).join("\n");
+  assert.match(questionText, /Question · Which behavior should remain\?/);
+  assert.match(questionText, /Route · tests → parent orchestrator/);
+  assert.match(questionText, /Next · parent thread: subagent_answer; do not steer/);
+  assert.match(questionText, /transcript/);
+});
+
 test("workflow run preview stays pinned ahead of result rows and routine info is opt-in", (t) => {
   const run = workflow("run-preview", "failed");
   run.error = "provider failed";
@@ -971,14 +1042,14 @@ test("scrolling clamps, follows live tails until unpinned, and reaches standalon
   assert.match(pausedAtTop.join("\n"), /line 0/);
   assert.match(
     pausedAtTop.find((line) => line.includes("transcript")) ?? "",
-    /transcript \d+–\d+\/\d+ · paused · G resumes live/,
-    "workflow agent detail labels a paused bounded viewport",
+    /transcript \d+–\d+\/\d+ · paused · G resumes end/,
+    "a terminal workflow agent resumes its end even while the run remains active",
   );
   const narrowPaused = overlay.render(40);
   assertPanel(narrowPaused, 40, 24);
   assert.match(
     overlay.render(72).find((line) => line.includes("transcript")) ?? "",
-    /paused · G resumes live/,
+    /paused · G resumes end/,
     "width changes preserve workflow agent tail state",
   );
   overlay.handleInput(PAGE_DOWN);
@@ -991,7 +1062,7 @@ test("scrolling clamps, follows live tails until unpinned, and reaches standalon
   overlay.handleInput("G");
   const resumed = overlay.render(52);
   assert.match(resumed.join("\n"), /line 160/);
-  assert.match(resumed.find((line) => line.includes("transcript")) ?? "", /· live/);
+  assert.match(resumed.find((line) => line.includes("transcript")) ?? "", /· end/);
   assert.match(pinned, /line/);
 
   const standalone = workflow("workflow-result", "completed");

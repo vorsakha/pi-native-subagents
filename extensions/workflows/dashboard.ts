@@ -46,6 +46,7 @@ import { availabilityLabel } from "../../src/harness-availability.ts";
 import { formatWorkflowBudget } from "../../src/workflows/budget.ts";
 import type {
   WorkflowAgentRecord,
+  WorkflowAgentState,
   WorkflowPhase,
   WorkflowSnapshot,
 } from "../../src/workflows/types.ts";
@@ -1133,6 +1134,20 @@ export class WorkflowsDashboardOverlay implements Focusable {
     ];
   }
 
+  private renderCompactQuestionPreview(interaction: NonNullable<WorkflowAgentRecord["waitingOn"]>, width: number): string[] {
+    const elapsed = formatDurationLabel(Math.max(0, this.#now() - interaction.createdAt));
+    const target = interaction.target === "peer"
+      ? `peer ${sanitizeInline(interaction.targetName ?? "agent")}`
+      : "parent orchestrator";
+    const next = interaction.target === "peer"
+      ? `no action; waiting for ${target}`
+      : "parent thread: subagent_answer; do not steer";
+    return [
+      truncateWorkflowDashboardLine(this.theme.fg("warning", `Question · ${sanitizeInline(interaction.question)}`), width),
+      truncateWorkflowDashboardLine(this.theme.fg("muted", `Route · ${sanitizeInline(interaction.sourceName)} → ${target} · waiting ${elapsed} · Next · ${next}`), width),
+    ];
+  }
+
   private renderProviderWaitPreview(agent: WorkflowAgentRecord, width: number): string[] {
     const wait = agent.providerWait;
     if (!wait) return [];
@@ -1382,10 +1397,11 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const route = agent.harness || agent.model ? `${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}` : "route pending";
     const usage = formatUsage(agent.usage);
     const policy = `${agent.access}${agent.profile ? ` · profile ${boundedInline(agent.profile, 500)}` : ""}${agent.independent ? " · independent" : ""}`;
-    const pinned: string[] = [
-      `${this.theme.fg("accent", this.theme.bold(boundedInline(agent.name, 1_000)))} ${this.theme.fg(status.color, `· ${status.glyph} ${agent.state}`)}`,
-      ...this.renderAgentStatePreview(agent, width),
-    ];
+    const identity = `${this.theme.fg("accent", this.theme.bold(boundedInline(agent.name, 1_000)))} ${this.theme.fg(status.color, `· ${status.glyph} ${agent.state}`)}`;
+    const pinnedBudget = Math.max(0, rows - MIN_SCROLLABLE_DETAIL_ROWS);
+    const pinned = agent.waitingOn && pinnedBudget < 3
+      ? this.renderCompactQuestionPreview(agent.waitingOn, width)
+      : this.renderAgentStatePreview(agent, width);
     const metadata: string[] = [
       this.theme.fg("dim", `${policy} · effort ${agent.effort ?? "adaptive"} · ${route} · ${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${formatAgentElapsed(agent, this.#now())}`),
       this.theme.fg("dim", `${phase ? `${boundedInline(run.name, 1_000)} · ${boundedInline(phase.name, 1_000)}` : boundedInline(run.name, 1_000)}${usage ? ` · ${usage}` : ""}`),
@@ -1439,21 +1455,21 @@ export class WorkflowsDashboardOverlay implements Focusable {
     // bounded sections remain scrollable, so g/G and page navigation reach
     // every part.
     const disclosure = [dashboardInfoRule(this.theme, this.#showInfo, width)];
-    const pinnedBudget = Math.max(0, rows - MIN_SCROLLABLE_DETAIL_ROWS);
     const visiblePinned = pinned.slice(0, pinnedBudget);
-    const visibleDisclosure = disclosure.slice(0, Math.max(0, pinnedBudget - visiblePinned.length));
+    const identityRows = visiblePinned.length < pinnedBudget ? [identity] : [];
+    const visibleDisclosure = disclosure.slice(0, Math.max(0, pinnedBudget - visiblePinned.length - identityRows.length));
     const body = this.#showInfo
       ? [...metadata, ...this.agentDetailBody(run, phase, agent, width)]
       : this.agentDetailBody(run, phase, agent, width);
     const resultRows = this.renderScrollableBody(
       body,
-      rows - visiblePinned.length - visibleDisclosure.length,
+      rows - visiblePinned.length - identityRows.length - visibleDisclosure.length,
       `agent:${run.runId}:${phase?.index ?? "none"}:${agent.index}`,
       width,
       this.#showInfo ? "detail" : "transcript",
-      !workflowIsTerminal(run.status),
+      !workflowAgentIsTerminal(agent.state),
     );
-    return fitDashboardRows([...visiblePinned, ...visibleDisclosure, ...resultRows], rows);
+    return fitDashboardRows([...visiblePinned, ...identityRows, ...visibleDisclosure, ...resultRows], rows);
   }
 
   private agentDetailBody(run: WorkflowSnapshot, phase: WorkflowPhase | undefined, agent: WorkflowAgentRecord, width: number): string[] {
@@ -1741,6 +1757,10 @@ function isCancellableAgent(agent: WorkflowAgentRecord | undefined): agent is Wo
   return (agent.state === "queued" || agent.state === "running")
     && typeof agent.jobId === "string"
     && agent.jobId.trim().length > 0;
+}
+
+function workflowAgentIsTerminal(state: WorkflowAgentState): boolean {
+  return state === "completed" || state === "failed" || state === "cancelled" || state === "aborted";
 }
 
 function formatAgentElapsed(agent: WorkflowAgentRecord, now: number): string {
