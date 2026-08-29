@@ -353,7 +353,7 @@ test("composer drafts stay bound to one job and composer identity", (t) => {
   assert.doesNotMatch(state.overlay.render(52).join("\n"), /second draft/, "another composer kind cannot inherit a steer draft");
 });
 
-test("compatibility takeover mode preserves only its steer draft identity", (t) => {
+test("compatibility takeover mode preserves a running job's steer draft", (t) => {
   const current = job("compatibility-takeover");
   const state = dashboard([current], 30, () => {}, undefined, {
     focusJobId: current.id,
@@ -372,13 +372,52 @@ test("compatibility takeover mode preserves only its steer draft identity", (t) 
     /keep compatibility draft/,
     "reopening steer for the same job retains the mode-takeover draft",
   );
+});
 
+test("compatibility takeover mode preserves a completed retained job's follow-up draft", (t) => {
+  const current = job("compatibility-follow-up", "completed");
+  const state = dashboard([current], 30, () => {}, undefined, {
+    focusJobId: current.id,
+    mode: "takeover",
+    fullscreen: true,
+  });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(52);
+  assert.match(state.overlay.render(52).join("\n"), /composer · follow-up/);
+  for (const character of "keep completed draft") state.overlay.handleInput(character);
   state.overlay.handleInput(ESCAPE);
+  state.overlay.handleInput("f");
+  assert.match(
+    state.overlay.render(52).join("\n"),
+    /keep completed draft/,
+    "reopening follow-up for the same job retains the compatibility draft",
+  );
+});
+
+test("compatibility takeover drafts do not cross composer kinds", (t) => {
+  const current = job("compatibility-cross-kind");
+  const state = dashboard([current], 30, () => {}, undefined, {
+    focusJobId: current.id,
+    mode: "takeover",
+    fullscreen: true,
+  });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(52);
+  for (const character of "running steer draft") state.overlay.handleInput(character);
+  state.overlay.handleInput(ESCAPE);
+
+  current.status = "completed";
+  for (const listener of state.manager.listeners) listener(current);
+  state.overlay.render(52);
   state.overlay.handleInput("f");
   assert.doesNotMatch(
     state.overlay.render(52).join("\n"),
-    /keep compatibility draft/,
-    "the compatibility draft cannot cross into a different composer identity",
+    /running steer draft/,
+    "a steer draft cannot cross into the completed job's follow-up composer",
   );
 });
 

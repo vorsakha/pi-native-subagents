@@ -209,6 +209,7 @@ export interface DashboardOverlayOptions {
 
 export type DashboardMode = "browse" | "takeover" | "answer";
 type DraftOwner = { jobId: string; composer: "answer" | "steer" | "follow-up"; requestId?: string };
+type TakeoverComposer = Exclude<DraftOwner["composer"], "answer">;
 export type SubagentsDashboardFocus =
   | { kind: "job-list" }
   | { kind: "job-detail" }
@@ -216,6 +217,10 @@ export type SubagentsDashboardFocus =
 export type { DashboardLayout, DashboardLayoutKind } from "../dashboard-style.ts";
 
 type JobDashboardGroup = "input" | "working" | "waiting" | "failed" | "finished";
+
+function takeoverComposer(behavior: SendBehavior): TakeoverComposer {
+  return behavior === "followUp" ? "follow-up" : "steer";
+}
 
 const JOB_DASHBOARD_GROUPS = [
   { key: "input", label: "Needs input" },
@@ -345,7 +350,11 @@ class DashboardOverlay implements Focusable {
     const collection = jobDashboardCollection(jobs);
     const chosen = this.syncSelection(collection.items);
     if (chosen && this.#focus.kind === "composer" && this.#focus.composer !== "answer" && !this.#draftOwner) {
-      this.bindDraft({ jobId: chosen.id, composer: this.#focus.composer });
+      const policy = takeoverPolicy(chosen);
+      const composer = takeoverComposer(policy.behavior);
+      this.#focus = { kind: "composer", composer };
+      this.#behavior = policy.behavior;
+      this.bindDraft({ jobId: chosen.id, composer });
     }
     this.syncTicker(jobs);
 
@@ -636,7 +645,7 @@ class DashboardOverlay implements Focusable {
       this.#notice = policy.restriction ?? "This native session is read-only.";
       return;
     }
-    const composer = behavior === "followUp" ? "follow-up" : "steer";
+    const composer = takeoverComposer(behavior);
     this.bindDraft({ jobId: job.id, composer });
     this.#focus = { kind: "composer", composer };
     this.#behavior = behavior;
