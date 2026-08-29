@@ -1395,7 +1395,7 @@ test("direct inspector hides routine info by default and keeps a transcript row 
   assert.match(lines.join("\n"), /Task · inspect metadata|Route · readOnly/);
 });
 
-test("short direct question inspectors pin the next action ahead of transcript content", (t) => {
+test("short direct question inspectors pin the next action and retain transcript content", (t) => {
   const current = {
     ...parkedJob("short-question"),
     interaction: interactionSnapshot({
@@ -1413,6 +1413,9 @@ test("short direct question inspectors pin the next action ahead of transcript c
   state.overlay.render(52);
   state.overlay.handleInput(ENTER);
   const lines = state.overlay.render(52);
+  assert.equal(lines.length, 8);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 52));
   assert.match(lines.find((line) => line.includes("transcript")) ?? "", /transcript/);
   assert.match(lines.join("\n"), /Next · press a to answer inline/);
+  assert.match(lines.join("\n"), /last line/, "the reserved body row renders the transcript tail");
 });

@@ -1,6 +1,6 @@
 # Supervision surfaces and telemetry
 
-Read this when reporting on a running job, interpreting usage or model numbers, or telling a human where to look. Do not narrate key bindings: every dashboard has a contextual, focus-aware `?` legend that is authoritative for its current focus.
+Read this when reporting a running job or interpreting usage or model numbers. Do not narrate key bindings: each dashboard's contextual `?` legend is authoritative.
 
 ## Surfaces
 
@@ -8,10 +8,10 @@ Read this when reporting on a running job, interpreting usage or model numbers, 
 - `/workflows` has `runs`, `outline`, and `agent-detail` focus. Its bounded outline models every recorded or planned phase and expands the selected phase's filtered agents. Agent rows show lifecycle state and semantic progress; phase rows remain visible under filters. Control workflow agents through `/workflows`, not `/subagents`.
 - Direct-job and workflow-agent transcript labels show the visible line range. Scrolling away from the tail marks the viewport `paused`; press `G` to resume the live tail or a terminal transcript's end.
 - Direct jobs and workflow-owned child jobs remain in the shared editor activity widget. Workflow runs use one session-level widget keyed by stable run ID. Opening it uses `/workflows`; it never creates a second dashboard.
-- Workflow tool calls and results keep durable transcript cards, run IDs, and artifact references. Activity remains keyboard reachable, textual, and narrow-width safe.
+- Workflow calls and results keep durable transcript cards, run IDs, and artifact references. Activity is keyboard reachable, textual, and narrow-width safe.
 - Workflow-owned jobs stay tagged in `/subagents`; the activity widget counts them separately.
 - Inspectors default to state preview plus outline, transcript, or result. Press `i` to show or hide routine route/model, usage/budget, context, capability/availability, provenance, isolation, replay, and replacement telemetry. Errors, questions, provider waits, warnings, and recovery stay pinned. Short transcript and result inspectors reserve a label and one body row. Previews do not repeat full tool calls or result bodies.
-- Transcripts default to compact tool-call groups with counts and running/failed visibility; full native tool rendering is a toggle. Workflow inspection preserves run and node identities through refresh, filtering, reordering, replacement, and resize. Missing nodes fall back to their phase, then the current phase, then the first visible node.
+- Transcripts default to compact tool-call groups with counts and running/failed visibility; full native rendering is a toggle. Workflow inspection preserves run and node identities through refresh, filtering, reordering, replacement, and resize. Missing nodes fall back to their phase, then the current phase, then the first visible node.
 - Wide dashboards keep the grouped run rail beside either the outline or agent detail. Medium dashboards keep a short grouped run list above it. Narrow dashboards show one focus layer at a time. Backtracking restores the prior node identity; no layout adds a permanent third column.
 - Phase rows, omission rows, headers, and filtered or hidden agents are never agent-action targets. Restart and agent cancellation require an eligible selected agent that survived the final rendered outline/detail viewport. Run cancellation remains a separate confirmed action.
 - Dashboard headers keep needs-input, active, and failed counts ahead of retained totals and route detail as width shrinks. If individual harness labels do not fit, abnormal route health remains visible as `routes abnormal`. Empty `/subagents` panels point to `/subagent <task>`; empty `/workflows` panels tell the operator to invoke a workflow and return. Very short panels expose only close and ignore hidden actions.

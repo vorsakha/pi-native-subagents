@@ -872,11 +872,14 @@ test("short workflow agent inspectors pin recovery details above the transcript 
   const question = harness([questionRun], 8, () => {}, { fullscreen: true });
   t.after(() => question.overlay.dispose());
   openAgentDetail(question.overlay, 52, 1);
-  const questionText = question.overlay.render(52).join("\n");
+  const questionLines = question.overlay.render(52);
+  assertPanel(questionLines, 52, 8);
+  const questionText = questionLines.join("\n");
   assert.match(questionText, /Question · Which behavior should remain\?/);
   assert.match(questionText, /Route · tests → parent orchestrator/);
   assert.match(questionText, /Next · parent: subagent_answer; do not steer/);
   assert.match(questionText, /transcript/);
+  assert.match(questionText, /test result 59/, "questions also retain the transcript body row");
 });
 
 test("workflow run preview stays pinned ahead of result rows and routine info is opt-in", (t) => {

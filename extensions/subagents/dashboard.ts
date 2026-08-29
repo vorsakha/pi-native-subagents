@@ -863,13 +863,15 @@ class DashboardOverlay implements Focusable {
   ): string[] {
     const detail = this.#focus.kind !== "job-list" && chosen;
     const view = dashboardCollectionViewport(collection, this.#selectedId, layout.contentRows, (job) => job.id);
-    const lines = [
-      this.renderHeader(frame, jobs),
-      frame.top(detail ? this.detailTitle(chosen) : this.listTitle(jobs, view)),
-    ];
+    // At the eight-row floor, question supervision needs five inspector rows.
+    // Keep the panel and footer geometry; the session summary yields its row.
+    const expandQuestionDetail = detail && layout.contentRows === 4 && pendingInteraction(chosen);
+    const bodyRows = layout.contentRows + (expandQuestionDetail ? 1 : 0);
+    const lines = expandQuestionDetail ? [] : [this.renderHeader(frame, jobs)];
+    lines.push(frame.top(detail ? this.detailTitle(chosen) : this.listTitle(jobs, view)));
     const body = detail
-      ? this.renderInspector(chosen, layout.contentRows, Math.max(1, frame.innerWidth - 1)).map((row) => ` ${row}`)
-      : this.renderList(jobs, view, chosen, layout.contentRows, frame.innerWidth);
+      ? this.renderInspector(chosen, bodyRows, Math.max(1, frame.innerWidth - 1)).map((row) => ` ${row}`)
+      : this.renderList(jobs, view, chosen, bodyRows, frame.innerWidth);
     for (const row of body) lines.push(frame.row(row));
     lines.push(frame.bottom(), this.renderHint(frame, chosen));
     return lines;
@@ -1177,7 +1179,7 @@ class DashboardOverlay implements Focusable {
 
     // Full Pi tool shells can need a call row plus a result row. Let routine
     // metadata yield that second transcript row when full detail is selected.
-    const minimumTranscriptRows = pendingInteraction(job) ? 0 : this.#toolDisplay === "full" ? 2 : 1;
+    const minimumTranscriptRows = this.#toolDisplay === "full" ? 2 : 1;
     const disclosed = [dashboardInfoRule(this.theme, this.#showInfo, width)];
     const headBudget = Math.max(0, rows - 1 - minimumTranscriptRows);
     const visiblePinned = pinned.slice(0, headBudget);

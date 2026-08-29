@@ -923,14 +923,19 @@ export class WorkflowsDashboardOverlay implements Focusable {
   ): string[] {
     const view = dashboardCollectionViewport(collection, this.#selectedRunId, layout.contentRows, (run) => run.runId);
     const detail = this.#focus !== "runs" && chosen;
-    const lines = [
-      this.renderHeader(frame, runs),
-      frame.top(detail ? this.detailTitle(chosen) : this.listTitle(runs, view)),
-    ];
+    // At the eight-row floor, question supervision needs five inspector rows.
+    // Keep the panel and footer geometry; the run summary yields its row.
+    const expandQuestionDetail = this.#focus === "agent-detail"
+      && layout.contentRows === 4
+      && !!chosen
+      && !!this.selectedAgent(chosen)?.waitingOn;
+    const bodyRows = layout.contentRows + (expandQuestionDetail ? 1 : 0);
+    const lines = expandQuestionDetail ? [] : [this.renderHeader(frame, runs)];
+    lines.push(frame.top(detail ? this.detailTitle(chosen) : this.listTitle(runs, view)));
     const body = detail
-      ? this.renderInspector(chosen, layout.contentRows, Math.max(1, frame.innerWidth - 1)).map((row) => ` ${row}`)
-      : this.renderRunList(runs, view, chosen, layout.contentRows, frame.innerWidth);
-    for (const row of fitDashboardRows(body, layout.contentRows)) lines.push(frame.row(row));
+      ? this.renderInspector(chosen, bodyRows, Math.max(1, frame.innerWidth - 1)).map((row) => ` ${row}`)
+      : this.renderRunList(runs, view, chosen, bodyRows, frame.innerWidth);
+    for (const row of fitDashboardRows(body, bodyRows)) lines.push(frame.row(row));
     lines.push(frame.bottom(), this.renderHint(frame, chosen));
     return lines;
   }
@@ -1403,7 +1408,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const usage = formatUsage(agent.usage);
     const policy = `${agent.access}${agent.profile ? ` · profile ${boundedInline(agent.profile, 500)}` : ""}${agent.independent ? " · independent" : ""}`;
     const identity = `${this.theme.fg("accent", this.theme.bold(boundedInline(agent.name, 1_000)))} ${this.theme.fg(status.color, `· ${status.glyph} ${agent.state}`)}`;
-    const pinnedBudget = Math.max(0, rows - (agent.waitingOn ? 1 : MIN_SCROLLABLE_DETAIL_ROWS));
+    const pinnedBudget = Math.max(0, rows - MIN_SCROLLABLE_DETAIL_ROWS);
     const pinned = agent.waitingOn && pinnedBudget < 3
       ? this.renderCompactQuestionPreview(agent.waitingOn, width)
       : this.renderAgentStatePreview(agent, width);
