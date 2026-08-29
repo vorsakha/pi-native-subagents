@@ -321,7 +321,10 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
       } else if (job.status === "queued") {
         lines.push(sectionLine(theme, "Activity", "waiting for an agent slot", "dim"));
       } else if (job.status === "running") {
-        lines.push(sectionLine(theme, "Activity", "waiting for the first response", "dim"));
+        // Once the reducer latches `progressed`, model/thinking/tool events have already
+        // landed: an instantaneously empty preview is a gap between steps, not a cold
+        // start, so the first-response wording must never reappear after progress.
+        lines.push(sectionLine(theme, "Activity", job.progressed ? "working" : "waiting for the first response", "dim"));
       }
     }
   } else if (!job.output) {

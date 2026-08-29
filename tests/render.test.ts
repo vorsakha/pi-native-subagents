@@ -17,6 +17,7 @@ import {
   type FollowThroughCheckpoint,
 } from "../extensions/subagents/render.ts";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
+import { reduceJob } from "../src/reducer.ts";
 import type { ToolTrace } from "../src/types.ts";
 import { ImmediateBackend, ansiTheme, fakePi, interactionSnapshot, jobSnapshot as job, theme, usage } from "./helpers.ts";
 
@@ -197,6 +198,46 @@ test("expanded activity prioritizes semantic progress over the tool list", () =>
   const completedNoOutput = buildJobCardLines(job({ status: "completed", output: "", endedAt: 5_000 }), theme, { expanded: true, now: 5_000 });
   assert.ok(completedNoOutput.some((line) => line.includes("Result") && line.includes("(no assistant text)")));
   assert.ok(completedNoOutput.every((line) => !line.includes("Activity")), "completed cards foreground Result, not Activity");
+});
+
+test("running Activity keeps first-response wording only for a true cold start, not for gaps after progress", () => {
+  const activity = (snapshot: ReturnType<typeof job>) =>
+    buildJobCardLines(snapshot, theme, { expanded: true, now: 5_000 }).find((line) => line.includes("Activity"));
+
+  // Cold start: no model/thinking/tool event has landed yet.
+  const coldStart = activity(job({ status: "running" }));
+  assert.ok(coldStart?.includes("waiting for the first response"), "a job with no progress still explains it is waiting for the first response");
+
+  // Latched progress with an instantaneously empty preview (thinking cleared, tool settled).
+  const gapAfterProgress = activity(job({ status: "running", progressed: true }));
+  assert.ok(gapAfterProgress, "a progressed job still carries an Activity line during a gap");
+  assert.ok(!gapAfterProgress!.includes("waiting for the first response"), "first-response wording never shows once the job has progressed");
+  assert.ok(gapAfterProgress!.includes("working"), "a progressed job shows a stable working label between steps");
+});
+
+test("reducer-driven thinking→tool→thinking never lets the first-response wording reappear after progress", () => {
+  const activityText = (snapshot: Parameters<typeof buildJobCardLines>[0]) =>
+    buildJobCardLines(snapshot, theme, { expanded: true, now: 5_000 }).find((line) => line.includes("Activity")) ?? "";
+
+  let state = reduceJob(job({ status: "running" }), { type: "started", at: 2_000 });
+  assert.ok(activityText(state).includes("waiting for the first response"), "before any event the card is honestly cold");
+
+  state = reduceJob(state, { type: "thinking_delta", text: "weighing options" });
+  assert.ok(activityText(state).includes("weighing options"), "live thinking is previewed while it streams");
+
+  state = reduceJob(state, { type: "thinking_message", text: "weighing options" });
+  assert.ok(!activityText(state).includes("waiting for the first response"), "the gap after thinking settles is not a cold start");
+  assert.ok(activityText(state).includes("working"), "settled thinking leaves a stable working label");
+
+  state = reduceJob(state, { type: "tool_start", id: "1", name: "read" });
+  assert.ok(activityText(state).includes("running read"), "a running tool is the live operational indicator");
+
+  state = reduceJob(state, { type: "tool_end", id: "1" });
+  assert.ok(!activityText(state).includes("waiting for the first response"), "the gap after a tool settles is not a cold start");
+  assert.ok(activityText(state).includes("working"), "settled tool leaves a stable working label");
+
+  state = reduceJob(state, { type: "thinking_message", text: "next step" });
+  assert.ok(!activityText(state).includes("waiting for the first response"), "a later thinking→gap cycle still never reverts to first-response wording");
 });
 
 test("every direct tool registers width-safe, sanitized trace renderers", () => {
