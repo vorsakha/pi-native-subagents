@@ -321,6 +321,66 @@ test("explicit job focus separates selection, detail scrolling, and composer dra
   assert.match(state.overlay.render(120).join("\n"), /line 80/, "resuming reaches output received while paused");
 });
 
+test("composer drafts stay bound to one job and composer identity", (t) => {
+  const first = job("draft-first");
+  const second: JobSnapshot = job("draft-second");
+  const state = dashboard([first, second], 30, () => {}, undefined, { focusJobId: first.id, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(52);
+  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput("s");
+  for (const character of "message for first") state.overlay.handleInput(character);
+  state.overlay.handleInput(ESCAPE);
+  state.overlay.handleInput(LEFT);
+  state.overlay.handleInput("j");
+  state.overlay.handleInput(RIGHT);
+  state.overlay.handleInput("s");
+  assert.doesNotMatch(state.overlay.render(52).join("\n"), /message for first/);
+
+  for (const character of "second draft") state.overlay.handleInput(character);
+  state.overlay.handleInput(ESCAPE);
+  second.interaction = interactionSnapshot({
+    requestId: "draft-second-question",
+    sourceJobId: second.id,
+    sourceName: second.name,
+    humanVisible: true,
+  });
+  for (const listener of state.manager.listeners) listener(second);
+  state.overlay.handleInput("a");
+  assert.doesNotMatch(state.overlay.render(52).join("\n"), /second draft/, "another composer kind cannot inherit a steer draft");
+});
+
+test("six-row steer and answer composers keep their input visible", (t) => {
+  const steer = dashboard([job("six-row-steer")], 6, () => {}, undefined, { fullscreen: true });
+  t.after(() => steer.overlay.dispose());
+  steer.overlay.focused = true;
+  steer.overlay.render(52);
+  steer.overlay.handleInput(ENTER);
+  steer.overlay.handleInput("s");
+  steer.overlay.handleInput("v");
+  assert.match(steer.overlay.render(52).join("\n"), /> v/);
+
+  const answeringJob = {
+    ...job("six-row-answer"),
+    interaction: interactionSnapshot({
+      requestId: "six-row-request",
+      sourceJobId: "six-row-answer",
+      sourceName: "six-row-answer",
+      humanVisible: true,
+    }),
+  };
+  const answer = dashboard([answeringJob], 6, () => {}, undefined, { fullscreen: true });
+  t.after(() => answer.overlay.dispose());
+  answer.overlay.focused = true;
+  answer.overlay.render(52);
+  answer.overlay.handleInput(ENTER);
+  answer.overlay.handleInput("a");
+  answer.overlay.handleInput("y");
+  assert.match(answer.overlay.render(52).join("\n"), /> y/);
+});
+
 test("terminal job viewport labels use end instead of live", (t) => {
   const completed = { ...job("terminal-label", "completed"), output: "done", transcript: [{ kind: "assistant" as const, text: "done" }] };
   const state = dashboard([completed], 24, () => {}, undefined, { focusJobId: completed.id, fullscreen: true });
@@ -668,6 +728,24 @@ test("responsive job header keeps attention counts and abnormal route text befor
 
   const wide = state.overlay.render(180)[0] ?? "";
   assert.match(wide, /claude login required/, "wide headers retain individual route states");
+});
+
+test("minimum-width job header keeps the largest fitting attention prefix", (t) => {
+  const jobs = [
+    ...Array.from({ length: 10 }, (_, index) => ({
+      ...job(`input-${index}`),
+      interaction: interactionSnapshot({ sourceJobId: `input-${index}`, sourceName: `input-${index}` }),
+    })),
+    ...Array.from({ length: 10 }, (_, index) => job(`active-${index}`)),
+    ...Array.from({ length: 10 }, (_, index) => job(`failed-${index}`, "failed")),
+  ];
+  const state = dashboard(jobs, 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  const header = state.overlay.render(40)[0] ?? "";
+  assert.match(header, /10 need input/);
+  assert.match(header, /20 active/);
+  assert.doesNotMatch(header, /30 jobs/);
 });
 
 test("empty jobs name the next safe command within constrained geometry", (t) => {
@@ -1317,7 +1395,7 @@ test("direct inspector hides routine info by default and keeps a transcript row 
   assert.match(lines.join("\n"), /Task · inspect metadata|Route · readOnly/);
 });
 
-test("short direct question inspectors keep the transcript reserve", (t) => {
+test("short direct question inspectors pin the next action ahead of transcript content", (t) => {
   const current = {
     ...parkedJob("short-question"),
     interaction: interactionSnapshot({
@@ -1336,5 +1414,5 @@ test("short direct question inspectors keep the transcript reserve", (t) => {
   state.overlay.handleInput(ENTER);
   const lines = state.overlay.render(52);
   assert.match(lines.find((line) => line.includes("transcript")) ?? "", /transcript/);
-  assert.match(lines.join("\n"), /last line/, "the reserved body row renders the transcript tail");
+  assert.match(lines.join("\n"), /Next · press a to answer inline/);
 });

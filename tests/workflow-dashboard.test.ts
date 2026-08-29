@@ -292,6 +292,32 @@ test("responsive workflow header keeps input, active, and failed counts", (t) =>
   assert.ok(visibleWidth(header) <= 60);
 });
 
+test("minimum-width workflow header keeps the largest fitting attention prefix", (t) => {
+  const inputs = Array.from({ length: 10 }, (_, index) => {
+    const run = workflow(`header-input-${index}`);
+    run.agents[1]!.waitingOn = {
+      ordinal: 0,
+      requestId: `header-question-${index}`,
+      target: "orchestrator",
+      sourceAgentIndex: 1,
+      sourceName: "tests",
+      question: "Proceed?",
+      state: "pending",
+      createdAt: 60_000,
+    };
+    return run;
+  });
+  const active = Array.from({ length: 10 }, (_, index) => workflow(`header-active-${index}`));
+  const failed = Array.from({ length: 10 }, (_, index) => workflow(`header-failed-${index}`, "failed"));
+  const state = harness([...inputs, ...active, ...failed], 24, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  const header = state.overlay.render(40)[0] ?? "";
+  assert.match(header, /10 need input/);
+  assert.match(header, /20 active/);
+  assert.doesNotMatch(header, /30 runs/);
+});
+
 test("empty workflows name the next safe action within constrained geometry", (t) => {
   const state = harness([], 10, () => {}, { fullscreen: true });
   t.after(() => state.overlay.dispose());
@@ -845,11 +871,11 @@ test("short workflow agent inspectors pin recovery details above the transcript 
   };
   const question = harness([questionRun], 8, () => {}, { fullscreen: true });
   t.after(() => question.overlay.dispose());
-  openAgentDetail(question.overlay, 120, 1);
-  const questionText = question.overlay.render(120).join("\n");
+  openAgentDetail(question.overlay, 52, 1);
+  const questionText = question.overlay.render(52).join("\n");
   assert.match(questionText, /Question · Which behavior should remain\?/);
   assert.match(questionText, /Route · tests → parent orchestrator/);
-  assert.match(questionText, /Next · parent thread: subagent_answer; do not steer/);
+  assert.match(questionText, /Next · parent: subagent_answer; do not steer/);
   assert.match(questionText, /transcript/);
 });
 

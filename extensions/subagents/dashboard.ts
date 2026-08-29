@@ -131,6 +131,7 @@ function directJobStatePreview(
         : "Next · inline answering is unavailable in this session";
     } else {
       next = "Next · parent thread: subagent_answer; do not steer";
+      if (visibleWidth(next) > width) next = "Next · parent: subagent_answer; do not steer";
     }
     const rows = [
       line("warning", `Question · ${sanitizeInline(interaction.question)}`),
@@ -257,6 +258,8 @@ class DashboardOverlay implements Focusable {
   #showInfo = false;
   #notice = "";
   #behavior: SendBehavior | undefined;
+  /** Identity that owns the preserved draft; a draft never crosses jobs or composer kinds. */
+  #draftOwner: { jobId: string; composer: "answer" | "steer" | "follow-up"; requestId?: string } | undefined;
   #pendingSend: { jobId: string; draft: string; inputRevision: number } | undefined;
   /** Request ID the answer composer is bound to, so a changed question cannot be answered by a stale draft. */
   #answerRequestId: string | undefined;
@@ -629,7 +632,9 @@ class DashboardOverlay implements Focusable {
       this.#notice = policy.restriction ?? "This native session is read-only.";
       return;
     }
-    this.#focus = { kind: "composer", composer: behavior === "followUp" ? "follow-up" : "steer" };
+    const composer = behavior === "followUp" ? "follow-up" : "steer";
+    this.bindDraft({ jobId: job.id, composer });
+    this.#focus = { kind: "composer", composer };
     this.#behavior = behavior;
     this.#input.focused = this.#focused;
   }
@@ -662,10 +667,23 @@ class DashboardOverlay implements Focusable {
       this.#notice = "This session cannot answer routed questions.";
       return;
     }
+    this.bindDraft({ jobId: job.id, composer: "answer", requestId: interaction.requestId });
     this.#focus = { kind: "composer", composer: "answer" };
     this.#behavior = undefined;
     this.#answerRequestId = interaction.requestId;
     this.#input.focused = this.#focused;
+  }
+
+  private bindDraft(owner: { jobId: string; composer: "answer" | "steer" | "follow-up"; requestId?: string }): void {
+    const current = this.#draftOwner;
+    if (!current
+      || current.jobId !== owner.jobId
+      || current.composer !== owner.composer
+      || current.requestId !== owner.requestId) {
+      this.#inputRevision++;
+      this.#input.setValue("");
+    }
+    this.#draftOwner = owner;
   }
 
   private submit(raw: string): void {
@@ -943,6 +961,8 @@ class DashboardOverlay implements Focusable {
       [...attention, routeFallback],
       ["Subagents", ...attention],
       attention,
+      ...attention.slice(0, -1).map((_, index) => attention.slice(0, attention.length - index - 1)),
+      ...attention.slice(0, -1).map((_, index) => ["Subagents", ...attention.slice(0, attention.length - index - 1)]),
       ["Subagents", `${jobs.length} jobs`],
     ].map((parts) => parts.filter(Boolean).join(" · "));
     const availableWidth = Math.max(0, frame.innerWidth - 2);
@@ -1067,7 +1087,7 @@ class DashboardOverlay implements Focusable {
       return fitDashboardRows([this.theme.fg("dim", "Select a job to inspect its route, usage, and transcript.")], rows);
     }
     const composer = this.composing() ? this.renderComposer(job, width) : [];
-    const bodyRows = Math.max(1, rows - composer.length);
+    const bodyRows = Math.max(0, rows - composer.length);
     return [...fitDashboardRows(this.renderDetail(job, bodyRows, width), bodyRows), ...composer].slice(0, rows);
   }
 
@@ -1157,7 +1177,7 @@ class DashboardOverlay implements Focusable {
 
     // Full Pi tool shells can need a call row plus a result row. Let routine
     // metadata yield that second transcript row when full detail is selected.
-    const minimumTranscriptRows = this.#toolDisplay === "full" ? 2 : 1;
+    const minimumTranscriptRows = pendingInteraction(job) ? 0 : this.#toolDisplay === "full" ? 2 : 1;
     const disclosed = [dashboardInfoRule(this.theme, this.#showInfo, width)];
     const headBudget = Math.max(0, rows - 1 - minimumTranscriptRows);
     const visiblePinned = pinned.slice(0, headBudget);

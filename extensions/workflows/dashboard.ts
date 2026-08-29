@@ -1024,6 +1024,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
       ["Workflow runs", ...attention],
       ["Workflows", ...attention],
       attention,
+      ...attention.slice(0, -1).map((_, index) => attention.slice(0, attention.length - index - 1)),
+      ...attention.slice(0, -1).map((_, index) => ["Workflows", ...attention.slice(0, attention.length - index - 1)]),
       ["Workflows", `${runs.length} runs`],
     ].map((parts) => parts.filter(Boolean).join(" · "));
     const availableWidth = Math.max(0, frame.innerWidth - 2);
@@ -1124,9 +1126,12 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const target = interaction.target === "peer"
       ? `peer ${sanitizeInline(interaction.targetName ?? "agent")}`
       : "parent orchestrator";
-    const next = interaction.target === "peer"
+    let next = interaction.target === "peer"
       ? `Next · no human action required; waiting for ${target}`
       : "Next · parent thread: subagent_answer; do not steer";
+    if (interaction.target !== "peer" && visibleWidth(next) > width) {
+      next = "Next · parent: subagent_answer; do not steer";
+    }
     return [
       truncateWorkflowDashboardLine(this.theme.fg("warning", `Question · ${sanitizeInline(interaction.question)}`), width),
       truncateWorkflowDashboardLine(this.theme.fg("muted", `Route · ${sanitizeInline(interaction.sourceName)} → ${target} · waiting ${elapsed}`), width),
@@ -1398,7 +1403,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const usage = formatUsage(agent.usage);
     const policy = `${agent.access}${agent.profile ? ` · profile ${boundedInline(agent.profile, 500)}` : ""}${agent.independent ? " · independent" : ""}`;
     const identity = `${this.theme.fg("accent", this.theme.bold(boundedInline(agent.name, 1_000)))} ${this.theme.fg(status.color, `· ${status.glyph} ${agent.state}`)}`;
-    const pinnedBudget = Math.max(0, rows - MIN_SCROLLABLE_DETAIL_ROWS);
+    const pinnedBudget = Math.max(0, rows - (agent.waitingOn ? 1 : MIN_SCROLLABLE_DETAIL_ROWS));
     const pinned = agent.waitingOn && pinnedBudget < 3
       ? this.renderCompactQuestionPreview(agent.waitingOn, width)
       : this.renderAgentStatePreview(agent, width);
