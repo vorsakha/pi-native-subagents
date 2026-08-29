@@ -269,6 +269,25 @@ test("explicit job focus separates selection, detail scrolling, and composer dra
   assert.notEqual(scrolled.join("\n"), top, "j scrolls instead of changing jobs in detail focus");
   assert.match(scrolled.find((line) => line.includes("focus-first") && line.includes("❯")) ?? "", /focus-first/);
   const pausedRange = scrolled.find((line) => line.includes("transcript"));
+  assert.match(
+    pausedRange ?? "",
+    /transcript \d+–\d+\/\d+ · paused · G resumes live/,
+    "scrolling away from the tail labels the bounded viewport and its resume key",
+  );
+
+  const resizedPaused = state.overlay.render(72);
+  assert.ok(resizedPaused.every((line) => visibleWidth(line) <= 72));
+  assert.match(
+    resizedPaused.find((line) => line.includes("transcript")) ?? "",
+    /paused · G resumes live/,
+    "a width change preserves the paused viewport state",
+  );
+  first.output += "\nline 80";
+  first.transcript[0]!.text += "\nline 80";
+  for (const listener of state.manager.listeners) listener(first);
+  const updatedWhilePaused = state.overlay.render(72);
+  assert.doesNotMatch(updatedWhilePaused.join("\n"), /line 80/, "live output does not move a paused viewport");
+  assert.match(updatedWhilePaused.find((line) => line.includes("transcript")) ?? "", /paused · G resumes live/);
 
   state.overlay.handleInput("s");
   for (const character of "keep this draft") state.overlay.handleInput(character);
@@ -280,11 +299,18 @@ test("explicit job focus separates selection, detail scrolling, and composer dra
   state.overlay.handleInput(LEFT);
   assert.match(state.overlay.render(120).join("\n"), /▸ jobs/, "Left backs out from detail to the job list");
   state.overlay.handleInput(RIGHT);
-  assert.equal(
-    state.overlay.render(120).find((line) => line.includes("transcript")),
-    pausedRange,
-    "detail focus changes preserve the paused transcript viewport",
+  assert.match(
+    state.overlay.render(120).find((line) => line.includes("transcript")) ?? "",
+    /transcript 2–20\/81 · paused · G resumes live/,
+    "detail focus changes preserve the paused range while the total tracks live output",
   );
+  state.overlay.handleInput("G");
+  assert.match(
+    state.overlay.render(120).find((line) => line.includes("transcript")) ?? "",
+    /· live/,
+    "G resumes live tail-following",
+  );
+  assert.match(state.overlay.render(120).join("\n"), /line 80/, "resuming reaches output received while paused");
 });
 
 test("minimum-width live cancellation keeps its Unicode hint visible through confirmation", (t) => {

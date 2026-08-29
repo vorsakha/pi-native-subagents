@@ -23,6 +23,7 @@ import {
   dashboardSelectionMarker,
   dashboardSubmitKeyLabel,
   dashboardSummaryColor,
+  dashboardViewportLabel,
   fitDashboardRows,
   formatDurationLabel,
   isFullscreenTui,
@@ -1120,8 +1121,7 @@ class DashboardOverlay implements Focusable {
     this.#scroll = this.#followTail ? max : clampDashboard(this.#scroll, 0, max);
     const start = this.#scroll;
     const end = Math.min(transcript.length, start + transcriptRows);
-    const range = transcriptRows ? `${start + 1}–${end}` : "0";
-    const label = `transcript ${range}/${transcript.length}${this.#followTail ? " · live" : ""}`;
+    const label = dashboardViewportLabel("transcript", start, end, transcript.length, this.#followTail);
     head.push(dashboardScrollRule(this.theme, label, width));
     for (const line of transcript.slice(start, end)) head.push(truncate(line, width, ""));
     return head;

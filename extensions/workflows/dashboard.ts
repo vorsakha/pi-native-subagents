@@ -22,6 +22,7 @@ import {
   dashboardSectionRow,
   dashboardSelectionMarker,
   dashboardSummaryColor,
+  dashboardViewportLabel,
   fitDashboardRows,
   formatDurationLabel,
   isFullscreenTui,
@@ -832,7 +833,13 @@ export class WorkflowsDashboardOverlay implements Focusable {
     return Math.max(1, Math.floor(this.#resultRows / 2));
   }
 
-  private renderScrollableBody(body: string[], rows: number, key: string, width: number): string[] {
+  private renderScrollableBody(
+    body: string[],
+    rows: number,
+    key: string,
+    width: number,
+    section?: string,
+  ): string[] {
     const viewportRows = Math.max(0, rows - 1);
     this.#resultRows = viewportRows;
     this.#resultTotal = body.length;
@@ -846,10 +853,13 @@ export class WorkflowsDashboardOverlay implements Focusable {
     this.#scroll = this.#followTail ? max : clampDashboard(this.#scroll, 0, max);
     const start = this.#scroll;
     const end = Math.min(body.length, start + viewportRows);
-    const range = viewportRows ? `${start + 1}–${end}` : "0";
     // Matches /subagents' `── label ──` divider so the two panels share one
     // scroll-label grammar instead of a plain themed text row.
-    const label = dashboardScrollRule(this.theme, `Detail ${range}/${body.length} · Shift+↑↓/PgUp/PgDn · Ctrl+U/D · g/G`, width);
+    const range = viewportRows ? `${start + 1}–${end}` : "0";
+    const text = section
+      ? dashboardViewportLabel(section, start, end, body.length, this.#followTail)
+      : `Detail ${range}/${body.length} · Shift+↑↓/PgUp/PgDn · Ctrl+U/D · g/G`;
+    const label = dashboardScrollRule(this.theme, text, width);
     return [label, ...body.slice(start, end)];
   }
 
@@ -1395,7 +1405,13 @@ export class WorkflowsDashboardOverlay implements Focusable {
       ? [this.theme.fg("muted", "Metadata"), ...metadata.slice(pinnedRows)]
       : [];
     const body = [...omittedMetadata, ...this.agentDetailBody(run, phase, agent, width)];
-    const resultRows = this.renderScrollableBody(body, rows - pinned.length, `agent:${run.runId}:${phase?.index ?? "none"}:${agent.index}`, width);
+    const resultRows = this.renderScrollableBody(
+      body,
+      rows - pinned.length,
+      `agent:${run.runId}:${phase?.index ?? "none"}:${agent.index}`,
+      width,
+      "transcript",
+    );
     return fitDashboardRows([...pinned, ...resultRows], rows);
   }
 

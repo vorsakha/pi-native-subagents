@@ -879,7 +879,20 @@ test("scrolling clamps, follows live tails until unpinned, and reaches standalon
   const tail = overlay.render(52).join("\n");
   assert.match(tail, /line 159/);
   overlay.handleInput("g");
-  assert.match(overlay.render(52).join("\n"), /line 0/);
+  const pausedAtTop = overlay.render(72);
+  assert.match(pausedAtTop.join("\n"), /line 0/);
+  assert.match(
+    pausedAtTop.find((line) => line.includes("transcript")) ?? "",
+    /transcript \d+–\d+\/\d+ · paused · G resumes live/,
+    "workflow agent detail labels a paused bounded viewport",
+  );
+  const narrowPaused = overlay.render(40);
+  assertPanel(narrowPaused, 40, 24);
+  assert.match(
+    overlay.render(72).find((line) => line.includes("transcript")) ?? "",
+    /paused · G resumes live/,
+    "width changes preserve workflow agent tail state",
+  );
   overlay.handleInput(PAGE_DOWN);
   overlay.handleInput(CTRL_D);
   overlay.handleInput(SHIFT_UP);
@@ -888,7 +901,9 @@ test("scrolling clamps, follows live tails until unpinned, and reaches standalon
   emit("scroll");
   assert.doesNotMatch(overlay.render(52).join("\n"), /line 160/, "upward scrolling unpins live tail following");
   overlay.handleInput("G");
-  assert.match(overlay.render(52).join("\n"), /line 160/);
+  const resumed = overlay.render(52);
+  assert.match(resumed.join("\n"), /line 160/);
+  assert.match(resumed.find((line) => line.includes("transcript")) ?? "", /· live/);
   assert.match(pinned, /line/);
 
   const standalone = workflow("workflow-result", "completed");

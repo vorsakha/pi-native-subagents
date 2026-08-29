@@ -79,6 +79,18 @@ export interface DashboardLayout {
   detailRows: number;
 }
 
+/** Shared bounded-output label; paused viewports always advertise the one-key return to tail-following. */
+export function dashboardViewportLabel(
+  section: string,
+  start: number,
+  end: number,
+  total: number,
+  live: boolean,
+): string {
+  const range = end > start ? `${start + 1}–${end}` : "0";
+  return `${section} ${range}/${total} · ${live ? "live" : "paused · G resumes live"}`;
+}
+
 export function dashboardLayout(width: number, rows: number): DashboardLayout {
   const height = Math.max(0, Math.floor(rows));
   const contentRows = Math.max(1, height - DASHBOARD_CHROME_ROWS);
