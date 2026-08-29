@@ -22,6 +22,8 @@ const ESCAPE = "\u001b";
 const PAGE_UP = "\u001b[5~";
 const CTRL_T = String.fromCharCode(20);
 const PAGE_DOWN = "\u001b[6~";
+const RIGHT = "\u001b[C";
+const LEFT = "\u001b[D";
 
 test("dashboard truncation respects terminal display width for Unicode and ANSI", () => {
   for (const value of [
@@ -224,7 +226,7 @@ test("job summaries render in wide, medium, and narrow rows without displacing i
   assert.ok(owned.overlay.render(40).some((line) => line.includes("owned") && line.includes("workflow")), "workflow ownership survives the minimum width");
 });
 
-test("browse detail keeps Page Up and Page Down aliases in wide and medium layouts", (t) => {
+test("detail focus keeps Page Up and Page Down aliases in wide and medium layouts", (t) => {
   const output = Array.from({ length: 80 }, (_, index) => `page ${index}`).join("\n");
   for (const width of [120, 72]) {
     const state = dashboard([{ ...job(`paging-${width}`, "completed"), output, transcript: [{ kind: "assistant", text: output }] }], 30, () => {}, (text) => text.split("\n"), { fullscreen: true });
@@ -232,6 +234,7 @@ test("browse detail keeps Page Up and Page Down aliases in wide and medium layou
 
     assert.equal(dashboardLayout(width, 30).kind, width === 120 ? "wide" : "medium");
     state.overlay.render(width);
+    state.overlay.handleInput(ENTER);
     state.overlay.handleInput("g");
     const top = state.overlay.render(width).join("\n");
     state.overlay.handleInput(PAGE_DOWN);
@@ -239,6 +242,49 @@ test("browse detail keeps Page Up and Page Down aliases in wide and medium layou
     state.overlay.handleInput(PAGE_UP);
     assert.equal(state.overlay.render(width).join("\n"), top, `Page Up returns to the ${width}-column detail top`);
   }
+});
+
+test("explicit job focus separates selection, detail scrolling, and composer drafts", (t) => {
+  const output = Array.from({ length: 80 }, (_, index) => `line ${index}`).join("\n");
+  const first = { ...job("focus-first"), name: "focus-first", output, transcript: [{ kind: "assistant" as const, text: output }] };
+  const second = { ...job("focus-second"), name: "focus-second" };
+  const state = dashboard([first, second], 30, () => {}, (text) => text.split("\n"), {
+    focusJobId: first.id,
+    fullscreen: true,
+  });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(120);
+  state.overlay.handleInput("j");
+  assert.match(state.overlay.render(120).find((line) => line.includes("focus-second") && line.includes("❯")) ?? "", /focus-second/);
+  state.overlay.handleInput("k");
+  state.overlay.handleInput(RIGHT);
+  assert.match(state.overlay.render(52).join("\n"), /▸ detail/, "Right drills into detail and survives a narrow resize");
+
+  state.overlay.handleInput("g");
+  const top = state.overlay.render(120).join("\n");
+  state.overlay.handleInput("j");
+  const scrolled = state.overlay.render(120);
+  assert.notEqual(scrolled.join("\n"), top, "j scrolls instead of changing jobs in detail focus");
+  assert.match(scrolled.find((line) => line.includes("focus-first") && line.includes("❯")) ?? "", /focus-first/);
+  const pausedRange = scrolled.find((line) => line.includes("transcript"));
+
+  state.overlay.handleInput("s");
+  for (const character of "keep this draft") state.overlay.handleInput(character);
+  state.overlay.handleInput(LEFT);
+  assert.match(state.overlay.render(120).join("\n"), /▸ detail/, "Left backs out of the composer by one layer");
+  state.overlay.handleInput("s");
+  assert.match(state.overlay.render(120).join("\n"), /keep this draft/, "the steer draft survives focus changes");
+  state.overlay.handleInput(ESCAPE);
+  state.overlay.handleInput(LEFT);
+  assert.match(state.overlay.render(120).join("\n"), /▸ jobs/, "Left backs out from detail to the job list");
+  state.overlay.handleInput(RIGHT);
+  assert.equal(
+    state.overlay.render(120).find((line) => line.includes("transcript")),
+    pausedRange,
+    "detail focus changes preserve the paused transcript viewport",
+  );
 });
 
 test("minimum-width live cancellation keeps its Unicode hint visible through confirmation", (t) => {
@@ -258,21 +304,21 @@ test("minimum-width live cancellation keeps its Unicode hint visible through con
   assert.deepEqual(state.manager.cancelCalls, ["cancel-你好👩🏽‍💻"]);
 });
 
-test("compact geometry resets hidden takeover state and accepts only its close control", (t) => {
+test("compact geometry resets hidden composer state and accepts only its close control", (t) => {
   const closed: unknown[] = [];
   const state = dashboard([job("compact")], 30, (value) => closed.push(value), undefined, { fullscreen: true });
   t.after(() => state.overlay.dispose());
 
   state.overlay.render(52);
   state.overlay.handleInput(ENTER);
-  state.overlay.handleInput(ENTER);
-  assert.match(state.overlay.render(52).join("\n"), /takeover/);
+  state.overlay.handleInput("s");
+  assert.match(state.overlay.render(52).join("\n"), /composer · steer/);
 
   state.setRows(5);
   const compact = state.overlay.render(52);
   assert.equal(compact.length, 5);
   assert.match(compact.join("\n"), /Esc close/);
-  assert.doesNotMatch(compact.join("\n"), /takeover|detail/);
+  assert.doesNotMatch(compact.join("\n"), /composer|detail/);
 
   for (const input of [ENTER, "p", "r", "s", "f", "x", PAGE_DOWN]) state.overlay.handleInput(input);
   assert.deepEqual(state.manager.cancelCalls, []);
@@ -281,25 +327,25 @@ test("compact geometry resets hidden takeover state and accepts only its close c
 
   state.setRows(30);
   const restored = state.overlay.render(52).join("\n");
-  assert.match(restored, /Enter open/);
-  assert.doesNotMatch(restored, /takeover|detail/);
+  assert.match(restored, /Enter\/→ inspe/);
+  assert.doesNotMatch(restored, /composer|detail/);
   state.overlay.handleInput(ESCAPE);
   assert.deepEqual(closed, [null]);
 });
 
-test("narrow list ignores hidden scrolling, navigation, takeover, and cancellation controls", (t) => {
+test("narrow list keeps selection keys out of the hidden detail viewport", (t) => {
   const state = dashboard([job("narrow-list", "completed")], 30, () => {}, undefined, { fullscreen: true });
   t.after(() => state.overlay.dispose());
 
   state.overlay.render(52);
   const list = state.overlay.render(52).join("\n");
-  assert.match(list, /Enter open/);
-  assert.doesNotMatch(list, /Enter takeover|x cancel|scroll/);
+  assert.match(list, /Enter\/→ inspect/);
+  assert.doesNotMatch(list, /scroll/);
 
-  for (const input of ["p", "h", "l", "f", "x", "X", "g", PAGE_DOWN, "r"]) state.overlay.handleInput(input);
+  for (const input of ["p", "h", "g", PAGE_DOWN, "r"]) state.overlay.handleInput(input);
   assert.deepEqual(state.manager.cancelCalls, []);
   assert.deepEqual(state.manager.sendCalls, []);
-  assert.match(state.overlay.render(52).join("\n"), /Enter open/);
+  assert.match(state.overlay.render(52).join("\n"), /Enter\/→ inspect/);
 
   state.overlay.handleInput(ENTER);
   assert.match(state.overlay.render(52).join("\n"), /detail/);
@@ -316,22 +362,22 @@ test("narrow detail ignores controls that are not exposed by a read-only inspect
   state.overlay.handleInput(ENTER);
   const detail = state.overlay.render(52).join("\n");
   assert.match(detail, /detail/);
-  assert.doesNotMatch(detail, /Enter takeover|s steer|f follow-up|x cancel/);
+  assert.doesNotMatch(detail, /s steer|f follow-up|x cancel/);
   state.overlay.handleInput("g");
   const top = state.overlay.render(52).join("\n");
   state.overlay.handleInput(PAGE_DOWN);
-  assert.equal(state.overlay.render(52).join("\n"), top, "hidden page scrolling does not move the narrow detail pane");
+  assert.notEqual(state.overlay.render(52).join("\n"), top, "Page Down scrolls the focused narrow detail pane");
 
-  for (const input of ["p", "h", "l", ENTER, "s", "f", "x", "X"]) state.overlay.handleInput(input);
+  for (const input of ["p", ENTER, "s", "f", "x", "X"]) state.overlay.handleInput(input);
   assert.deepEqual(state.manager.cancelCalls, []);
   assert.deepEqual(state.manager.sendCalls, []);
   assert.match(state.overlay.render(52).join("\n"), /detail/);
 
   state.overlay.handleInput(ESCAPE);
-  assert.match(state.overlay.render(52).join("\n"), /Enter open/);
+  assert.match(state.overlay.render(52).join("\n"), /Enter\/→ inspect/);
 });
 
-test("takeover accepts composer input without exposing browse cancellation or hidden paging", (t) => {
+test("composer accepts input without exposing detail cancellation or paging", (t) => {
   const current = {
     ...job("takeover-controls"),
     output: Array.from({ length: 80 }, (_, index) => `output ${index}`).join("\n"),
@@ -341,19 +387,19 @@ test("takeover accepts composer input without exposing browse cancellation or hi
 
   state.overlay.render(52);
   state.overlay.handleInput(ENTER);
-  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput("s");
   const takeover = state.overlay.render(52).join("\n");
-  assert.match(takeover, /▸ takeover ·/);
+  assert.match(takeover, /▸ composer · steer/);
   assert.match(takeover, /Enter steer/);
   assert.match(takeover, /Esc back/);
 
   for (const input of ["p", "r", "x", "f", PAGE_DOWN]) state.overlay.handleInput(input);
   assert.deepEqual(state.manager.cancelCalls, []);
   assert.deepEqual(state.manager.sendCalls, []);
-  assert.match(state.overlay.render(52).join("\n"), /▸ takeover ·/);
+  assert.match(state.overlay.render(52).join("\n"), /▸ composer · steer/);
 
   state.overlay.handleInput(ESCAPE);
-  assert.doesNotMatch(state.overlay.render(52).join("\n"), /▸ takeover ·/);
+  assert.doesNotMatch(state.overlay.render(52).join("\n"), /▸ composer/);
 });
 
 function job(id: string, status: JobSnapshot["status"] = "running"): JobSnapshot {
@@ -497,6 +543,7 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
   assert.ok(wide.every((line) => visibleWidth(line) <= 120));
   assert.ok(wide.some((line) => line.includes("first-39")), "live detail follows the transcript tail");
 
+  overlay.handleInput(ENTER);
   overlay.handleInput("g");
   const top = overlay.render(120);
   assert.ok(top.some((line) => line.includes("first-0")), "g scrolls to the transcript top");
@@ -505,6 +552,7 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
   assert.ok(halfPage.some((line) => line.includes("first-")));
   assert.ok(halfPage.every((line) => visibleWidth(line) <= 120));
 
+  overlay.handleInput(ESCAPE);
   overlay.handleInput("k");
   assert.ok(overlay.render(72).some((line) => line.includes("second")), "selection moves by job id");
   overlay.handleInput("x");
@@ -515,10 +563,11 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
   assert.ok(renders() >= 1);
 
   overlay.handleInput("k");
-  overlay.handleInput("\r");
-  assert.ok(overlay.render(72).some((line) => line.includes("takeover")), "takeover stays in the same panel");
+  overlay.handleInput("f");
+  assert.ok(overlay.render(72).some((line) => line.includes("follow-up")), "the composer stays in the same panel");
   overlay.handleInput("\x1b");
-  assert.ok(!overlay.render(72).some((line) => line.includes("▸ takeover ·")), "Escape returns from takeover without losing the panel");
+  assert.ok(!overlay.render(72).some((line) => line.includes("▸ composer")), "Escape returns from the composer without losing the panel");
+  overlay.handleInput("\x1b");
   overlay.handleInput("\x1b");
   assert.deepEqual(closed, [null]);
   assert.equal(manager.listeners.size, 0, "closing the dashboard unsubscribes from manager updates");
@@ -715,7 +764,7 @@ test("t toggles tool display from the narrow list pane, and the detail title car
   assert.match(overlay.render(52).join("\n"), /detail · [\w-]+ · completed · compact/, "a second narrow-list t toggle reverts the mode");
 });
 
-test("? opens a width-safe grouped cheatsheet in browse, dismisses without losing state, and stays printable in takeover", (t) => {
+test("? opens a width-safe grouped cheatsheet, dismisses without losing state, and stays printable in the composer", (t) => {
   for (const width of [40, 72, 120]) {
     const state = dashboard([job("cheatsheet")], 30, () => {}, undefined, { fullscreen: true });
     t.after(() => state.overlay.dispose());
@@ -740,13 +789,13 @@ test("? opens a width-safe grouped cheatsheet in browse, dismisses without losin
   }
 });
 
-test("the cheatsheet never intercepts ? inside the takeover composer", (t) => {
+test("the cheatsheet never intercepts ? inside the steer composer", (t) => {
   const state = dashboard([job("cheatsheet-takeover")], 30, () => {}, undefined, { fullscreen: true });
   t.after(() => state.overlay.dispose());
   state.overlay.focused = true;
   state.overlay.render(90);
-  state.overlay.handleInput("\r");
-  assert.match(state.overlay.render(90).join("\n"), /takeover/);
+  state.overlay.handleInput("s");
+  assert.match(state.overlay.render(90).join("\n"), /composer · steer/);
 
   state.overlay.handleInput("?");
   state.overlay.handleInput("!");
@@ -761,20 +810,20 @@ test("configurable confirm/cancel/submit bindings render their configured key na
     getKeys: (binding) => binding === "tui.select.cancel" ? ["q"] : binding === "tui.select.confirm" ? ["space"] : [],
   });
   t.after(() => configured.overlay.dispose());
-  assert.match(configured.overlay.render(60).join("\n"), /Space open/i, "the narrow list hint reflects the configured confirm key");
+  assert.match(configured.overlay.render(60).join("\n"), /Space\/→ inspect/i, "the narrow list hint reflects the configured confirm key");
   const wide = configured.overlay.render(90).join("\n");
-  assert.match(wide, /Space takeover/i, "the browse hint reflects the configured confirm key");
+  assert.match(wide, /Space\/→ inspect/i, "the list hint reflects the configured confirm key");
   assert.match(wide, /Q close/i, "the browse hint reflects the configured cancel key");
   assert.doesNotMatch(wide, /Esc close/);
 
   const defaulted = dashboard([job("default-keys")], 30, () => {}, undefined, { fullscreen: true });
   t.after(() => defaulted.overlay.dispose());
   const defaultHint = defaulted.overlay.render(90).join("\n");
-  assert.match(defaultHint, /Enter takeover/);
+  assert.match(defaultHint, /Enter\/→ inspect/);
   assert.match(defaultHint, /Esc close/);
 });
 
-test("in-panel takeover toggles tool rendering with Ctrl+T and treats a bare t as composer input", (t) => {
+test("in-panel composer toggles tool rendering with Ctrl+T and treats a bare t as composer input", (t) => {
   const current = {
     ...job("takeover-toggle-tools"),
     output: "",
@@ -788,7 +837,7 @@ test("in-panel takeover toggles tool rendering with Ctrl+T and treats a bare t a
   overlay.focused = true;
 
   overlay.render(90);
-  overlay.handleInput("\r"); // Enter takeover for a live, reusable job.
+  overlay.handleInput("s");
   const compact = overlay.render(90);
   assert.ok(compact.some((line) => line.includes("1 tool call")), "takeover compact mode is the default");
   assert.ok(compact.some((line) => line.includes("Ctrl+T full")), "takeover hint offers the toggle to full mode");
@@ -835,7 +884,7 @@ test("takeover restores a rejected draft without overwriting newer input", async
   t.after(() => overlay.dispose());
   overlay.focused = true;
   overlay.render(72);
-  overlay.handleInput("\r");
+  overlay.handleInput("s");
   for (const character of "g/G draft message") overlay.handleInput(character);
   overlay.handleInput("\u0011");
   await tick();
@@ -852,7 +901,7 @@ test("a newer draft survives rejection of an earlier in-flight send", async (t) 
   t.after(() => overlay.dispose());
   overlay.focused = true;
   overlay.render(72);
-  overlay.handleInput("\r");
+  overlay.handleInput("s");
   for (const character of "first") overlay.handleInput(character);
   overlay.handleInput("\r");
   for (const character of "second") overlay.handleInput(character);
