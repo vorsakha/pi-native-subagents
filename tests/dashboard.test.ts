@@ -421,6 +421,35 @@ test("compatibility takeover drafts do not cross composer kinds", (t) => {
   );
 });
 
+test("completion leaves an open compatibility steer draft stale and follow-up starts with its own draft", (t) => {
+  const current = job("compatibility-open-transition");
+  const state = dashboard([current], 30, () => {}, undefined, {
+    focusJobId: current.id,
+    mode: "takeover",
+    fullscreen: true,
+  });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(52);
+  for (const character of "stale steer content") state.overlay.handleInput(character);
+
+  current.status = "completed";
+  for (const listener of state.manager.listeners) listener(current);
+
+  const stale = state.overlay.render(52).join("\n");
+  assert.match(stale, /stale steer content/, "the open steer draft remains intact after completion");
+  assert.match(stale, /steer draft preserved · no longer sendable/);
+  state.overlay.handleInput(ENTER);
+  assert.deepEqual(state.manager.sendCalls, [], "Enter cannot convert the stale steer into a follow-up");
+
+  state.overlay.handleInput(ESCAPE);
+  state.overlay.handleInput("f");
+  const followUp = state.overlay.render(52).join("\n");
+  assert.match(followUp, /composer · follow-up/);
+  assert.doesNotMatch(followUp, /stale steer content/, "the follow-up composer has its own empty draft identity");
+});
+
 test("six-row steer and answer composers keep their input visible", (t) => {
   const steer = dashboard([job("six-row-steer")], 6, () => {}, undefined, { fullscreen: true });
   t.after(() => steer.overlay.dispose());
