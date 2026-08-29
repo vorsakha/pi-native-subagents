@@ -134,18 +134,23 @@ export function dashboardCollectionViewport<Item, Group extends string, Id>(
     }
   }
   if (foldRow && rowBudget >= 2 && !visibleRows.some((row) => row.kind === "fold")) {
-    let replaceSection = -1;
+    let replaceItem = -1;
     let replaceOther = -1;
     for (let index = visibleRows.length - 1; index >= 0; index--) {
       const row = visibleRows[index];
       if (!row) continue;
-      if (replaceSection < 0 && row.kind === "section") replaceSection = index;
-      if (replaceOther < 0 && (row.kind !== "item" || selectedId === undefined || idFor(row.item) !== selectedId)) {
+      const selected = row.kind === "item" && selectedId !== undefined && idFor(row.item) === selectedId;
+      if (replaceItem < 0 && row.kind === "item" && !selected) replaceItem = index;
+      if (replaceOther < 0 && row.kind !== "section" && !selected) {
         replaceOther = index;
       }
     }
-    const replaceAt = replaceSection >= 0 ? replaceSection : replaceOther;
-    if (replaceAt >= 0) visibleRows[replaceAt] = foldRow;
+    const replaceAt = replaceItem >= 0 ? replaceItem : replaceOther;
+    if (replaceAt >= 0 && foldRow.kind === "fold") {
+      const displaced = visibleRows[replaceAt]?.kind === "item" ? 1 : 0;
+      visibleRows[replaceAt] = { ...foldRow, hidden: foldRow.hidden + displaced };
+      folded += displaced;
+    }
   }
 
   return {

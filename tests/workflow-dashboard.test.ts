@@ -772,6 +772,7 @@ test("workflow agent info fold is opt-in and short geometry retains a useful res
   assertPanel(lines, 52, 8);
   assert.match(lines.join("\n"), /USEFUL_WORKFLOW_RESULT/);
   assert.doesNotMatch(lines.join("\n"), /Isolation ·|Replay ·|Replacement ·/);
+  assert.match(lines.find((line) => line.includes("transcript")) ?? "", /· end/, "terminal agent output is labelled as an end, not live");
 
   state.overlay.handleInput("i");
   state.overlay.handleInput("g");
@@ -779,6 +780,30 @@ test("workflow agent info fold is opt-in and short geometry retains a useful res
   assertPanel(lines, 52, 8);
   assert.match(lines.join("\n"), /readOnly|Context ·|Isolation ·/);
   assert.ok(lines.every((line) => visibleWidth(line) <= 52));
+});
+
+test("workflow run preview stays pinned ahead of result rows and routine info is opt-in", (t) => {
+  const run = workflow("run-preview", "failed");
+  run.error = "provider failed";
+  run.agents = [];
+  run.phases[0] = { ...run.phases[0]!, agents: [], error: "provider failed" };
+  run.result = "RECOVERABLE_RESULT";
+  const state = harness([run], 8, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  openOutline(state.overlay, 52);
+  let lines = state.overlay.render(52);
+  assertPanel(lines, 52, 8);
+  assert.match(lines.join("\n"), /Error ·.*provider failed/);
+  assert.match(lines.join("\n"), /Recovery ·/);
+  assert.match(lines.join("\n"), /RECOVERABLE_RESULT/);
+  assert.doesNotMatch(lines.join("\n"), /Review and verify Unicode output/, "routine run metadata is folded by default");
+
+  state.setRows(24);
+  state.overlay.handleInput("i");
+  lines = state.overlay.render(72);
+  assertPanel(lines, 72, 24);
+  assert.match(lines.join("\n"), /Review and verify Unicode output/, "i reveals routine run metadata in outline focus");
 });
 
 test("provider fallback dashboard metadata sanitizes every model route", (t) => {
@@ -832,8 +857,9 @@ test("metadata-rich standalone workflow results keep a scrollable result row", (
   assert.doesNotMatch(tail, /Detail 0\//);
   assert.match(tail, /standalone result 39/);
 
+  state.overlay.handleInput("i");
   state.overlay.handleInput("g");
-  assert.match(state.overlay.render(52).join("\n"), /Phase 1\/\?|Verification/, "overflow metadata is reachable from the top");
+  assert.match(state.overlay.render(52).join("\n"), /Activity/, "the bounded result body is reachable from the top");
   state.overlay.handleInput("G");
   assert.match(state.overlay.render(52).join("\n"), /standalone result 39/, "the result tail remains reachable after scrolling");
 });
@@ -1716,6 +1742,8 @@ test("workflow inspectors put state preview and real recovery before telemetry",
   failedRun.agents[1]!.error = "agent bounded failure";
   const failed = harness([failedRun], 30, () => {}, { fullscreen: true });
   t.after(() => failed.overlay.dispose());
+  failed.overlay.render(120);
+  failed.overlay.handleInput("i");
   let lines = failed.overlay.render(120);
   let text = lines.join("\n");
   assert.match(text, /Error · workflow bounded failure/);
@@ -1723,6 +1751,7 @@ test("workflow inspectors put state preview and real recovery before telemetry",
   assert.doesNotMatch(text, /restart (?:this )?run/);
   assert.ok(lines.findIndex((line) => line.includes("Error ·")) < lines.findIndex((line) => line.includes("Usage ·")));
 
+  failed.overlay.handleInput("i");
   openAgentDetail(failed.overlay, 120, 1);
   lines = failed.overlay.render(120);
   text = lines.join("\n");
@@ -1762,8 +1791,11 @@ test("workflow inspectors put state preview and real recovery before telemetry",
   running.agents[1]!.timestamps.updatedAt = 65_000;
   const active = harness([running], 30, () => {}, { fullscreen: true });
   t.after(() => active.overlay.dispose());
-  const activeLines = active.overlay.render(120);
+  let activeLines = active.overlay.render(120);
   assert.match(activeLines.join("\n"), /Latest · checking the final assertion/);
+  assert.doesNotMatch(activeLines.join("\n"), /Usage ·/, "routine run usage is folded by default");
+  active.overlay.handleInput("i");
+  activeLines = active.overlay.render(120);
   assert.ok(activeLines.findIndex((line) => line.includes("Latest ·")) < activeLines.findIndex((line) => line.includes("Usage ·")));
 
   const paused = workflow("pause-priority", "paused");
@@ -1800,6 +1832,8 @@ test("the workflow inspector reports convergence round, state, verdict, and stop
   const state = harness([run], 30, () => {}, { fullscreen: true });
   t.after(() => state.overlay.dispose());
 
+  state.overlay.render(200);
+  state.overlay.handleInput("i");
   const wide = state.overlay.render(200);
   assertPanel(wide, 200, 30);
   const line = wide.find((entry) => entry.includes("Convergence · "));

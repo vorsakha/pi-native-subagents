@@ -394,7 +394,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
       return;
     }
 
-    if (data === "i" && this.#focus === "agent-detail") {
+    if (data === "i") {
       this.#showInfo = !this.#showInfo;
       this.tui.requestRender();
       return;
@@ -848,6 +848,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     key: string,
     width: number,
     section?: string,
+    canGrow = true,
   ): string[] {
     const viewportRows = Math.max(0, rows - 1);
     this.#resultRows = viewportRows;
@@ -866,7 +867,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     // scroll-label grammar instead of a plain themed text row.
     const range = viewportRows ? `${start + 1}–${end}` : "0";
     const text = section
-      ? dashboardViewportLabel(section, start, end, body.length, this.#followTail)
+      ? dashboardViewportLabel(section, start, end, body.length, this.#followTail, canGrow)
       : `Detail ${range}/${body.length} · Shift+↑↓/PgUp/PgDn · Ctrl+U/D · g/G`;
     const label = dashboardScrollRule(this.theme, text, width);
     return [label, ...body.slice(start, end)];
@@ -1229,10 +1230,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const usage = formatUsage(usageSnapshot);
     const budget = formatWorkflowBudget(run, usageSnapshot);
     const status = workflowStatusMeta(run);
-    const essential: string[] = [
-      `${this.theme.fg("accent", this.theme.bold(sanitizeInline(run.name) || "Workflow"))} ${this.theme.fg(status.color, `· ${shortId(sanitizeText(run.runId))} · ${status.glyph} ${run.status}${run.status === "completed" ? ` · task ${run.taskOutcome ?? "unspecified"}` : ""}`)} ${this.theme.fg("dim", `· ${formatElapsed(run, this.#now())}`)}`,
-      ...this.renderRunStatePreview(run, width),
-    ];
+    const identity = `${this.theme.fg("accent", this.theme.bold(sanitizeInline(run.name) || "Workflow"))} ${this.theme.fg(status.color, `· ${shortId(sanitizeText(run.runId))} · ${status.glyph} ${run.status}${run.status === "completed" ? ` · task ${run.taskOutcome ?? "unspecified"}` : ""}`)} ${this.theme.fg("dim", `· ${formatElapsed(run, this.#now())}`)}`;
+    const essential = this.renderRunStatePreview(run, width);
     const phaseLifecycle = model.phases.length && run.currentPhase === null
       ? "Phase · no current phase"
       : model.phaseProgress.waiting
@@ -1241,7 +1240,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
           ? "Phase · no phases recorded"
           : undefined;
     if (phaseLifecycle) essential.push(this.theme.fg("dim", phaseLifecycle));
-    const optional: string[] = [
+    const optional: string[] = [identity,
       this.theme.fg("dim", boundedInline(run.description, 2_000) || "(no workflow description)"),
     ];
     if (phase?.description) optional.push(this.theme.fg("muted", `Phase context · ${boundedInline(phase.description, 2_000)}`));
@@ -1271,25 +1270,28 @@ export class WorkflowsDashboardOverlay implements Focusable {
 
     const hasWorkflowResult = (selectedPhase?.agentCount ?? 0) === 0
       && (run.result !== undefined || phase?.result !== undefined || !!run.logs?.length);
-    const completeNonResultRows = essential.length + optional.length + 1 + Math.max(1, model.nodes.length);
-    const resultReserve = hasWorkflowResult && rows >= 4
-      ? Math.min(8, Math.max(MIN_SCROLLABLE_DETAIL_ROWS, rows - completeNonResultRows))
+    const essentialBudget = Math.min(essential.length, rows);
+    const afterEssential = Math.max(0, rows - essentialBudget);
+    const resultReserve = hasWorkflowResult && afterEssential >= MIN_SCROLLABLE_DETAIL_ROWS
+      ? Math.min(8, Math.max(MIN_SCROLLABLE_DETAIL_ROWS, afterEssential - 2))
       : 0;
-    const minimumOutline = 1;
-    const essentialBudget = Math.min(essential.length, Math.max(0, rows - minimumOutline - 1 - resultReserve));
-    const fixedRows = essentialBudget + 1 + resultReserve;
-    const available = Math.max(minimumOutline, rows - fixedRows);
-    const wantedOutlineRows = Math.max(1, Math.min(model.nodes.length || 1, available));
-    const optionalBudget = Math.min(optional.length, Math.max(0, available - wantedOutlineRows));
-    const outlineRows = Math.max(1, rows - essentialBudget - optionalBudget - 1 - resultReserve);
+    const outlineBudget = Math.max(0, afterEssential - resultReserve);
+    const wantedOutlineRows = Math.min(1 + Math.max(1, model.nodes.length), outlineBudget);
+    const shownOptional = this.#showInfo ? optional : optional.slice(0, 1);
+    const optionalBudget = Math.min(shownOptional.length, Math.max(0, outlineBudget - wantedOutlineRows));
+    const outlineRows = Math.max(0, outlineBudget - optionalBudget - 1);
     const outline = boundWorkflowOutline(model, outlineRows);
     const lines = [
       ...essential.slice(0, essentialBudget),
-      ...optional.slice(0, optionalBudget),
-      this.theme.fg("muted", `Outline · filter ${this.#agentFilter} · ${model.nodes.length} node${model.nodes.length === 1 ? "" : "s"}`),
-      ...(outline.length
-        ? outline.map((row) => this.renderOutlineRow(row, model, run, width))
-        : [this.theme.fg("dim", run.status === "pending" ? "No phases recorded yet." : "No recorded or planned phases.")]),
+      ...shownOptional.slice(0, optionalBudget),
+      ...(outlineBudget > optionalBudget ? [
+        this.theme.fg("muted", `Outline · filter ${this.#agentFilter} · ${model.nodes.length} node${model.nodes.length === 1 ? "" : "s"}`),
+        ...(outline.length
+          ? outline.map((row) => this.renderOutlineRow(row, model, run, width))
+          : outlineRows > 0
+            ? [this.theme.fg("dim", run.status === "pending" ? "No phases recorded yet." : "No recorded or planned phases.")]
+            : []),
+      ] : []),
     ];
 
     if (hasWorkflowResult && resultReserve) {
@@ -1298,6 +1300,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
         resultReserve,
         `workflow:${run.runId}:${phase?.index ?? "none"}`,
         width,
+        undefined,
+        !workflowIsTerminal(run.status),
       ));
     } else {
       this.#resultRows = 0;
@@ -1447,6 +1451,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
       `agent:${run.runId}:${phase?.index ?? "none"}:${agent.index}`,
       width,
       this.#showInfo ? "detail" : "transcript",
+      !workflowIsTerminal(run.status),
     );
     return fitDashboardRows([...visiblePinned, ...visibleDisclosure, ...resultRows], rows);
   }
@@ -1634,7 +1639,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const runCancelLabel = shortActions ? "X cancel" : "X cancel run";
     if (this.#focus === "runs") {
       const navigation = shortActions ? "↑↓/jk" : "↑↓/jk select";
-      const actions = [live ? runCancelLabel : "", `${confirm}/→ outline`, navigation, live ? `p ${run?.status === "paused" ? "resume" : "pause"}` : "", "? help"].filter(Boolean).join(" · ");
+      const actions = [live ? runCancelLabel : "", `${confirm}/→ outline`, navigation, live ? `p ${run?.status === "paused" ? "resume" : "pause"}` : "", `i ${this.#showInfo ? "hide info" : "info"}`, "? help"].filter(Boolean).join(" · ");
       const rendered = frame.hint(actions, back);
       if (live && rendered.includes(runCancelLabel)) this.#renderedRunCancelId = run?.runId;
       return rendered;
@@ -1656,6 +1661,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
         live ? `p ${run?.status === "paused" ? "resume" : "pause"}` : "",
         agentVisible && agent?.callIndex !== undefined ? agentRestartLabel : "",
         `↑↓/jk nodes · ${confirm}/→ drill · f filter`,
+        `i ${this.#showInfo ? "hide info" : "info"}`,
         "Esc/← runs",
         "? help",
       ];

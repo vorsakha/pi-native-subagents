@@ -469,8 +469,7 @@ class DashboardOverlay implements Focusable {
       // bundled Input component otherwise consults its own TUI keybinding
       // singleton. Printable navigation keys, including `?`, must remain
       // ordinary composer text here.
-      if (matchesKey(data, Key.left)) this.leaveComposer();
-      else if (matchesKey(data, Key.shift(Key.up))) this.scroll(-1);
+      if (matchesKey(data, Key.shift(Key.up))) this.scroll(-1);
       else if (matchesKey(data, Key.shift(Key.down))) this.scroll(1);
       else if (matchesKey(data, Key.ctrl("t"))) this.toggleToolDisplay();
       else if (this.keybindings.matches(data, "tui.input.submit") || matchesKey(data, Key.enter)) this.submit(this.#input.getValue());
@@ -1168,7 +1167,14 @@ class DashboardOverlay implements Focusable {
     this.#scroll = this.#followTail ? max : clampDashboard(this.#scroll, 0, max);
     const start = this.#scroll;
     const end = Math.min(transcript.length, start + transcriptRows);
-    const label = dashboardViewportLabel(this.#showInfo ? "detail" : "transcript", start, end, transcript.length, this.#followTail);
+    const label = dashboardViewportLabel(
+      this.#showInfo ? "detail" : "transcript",
+      start,
+      end,
+      transcript.length,
+      this.#followTail,
+      !isTerminal(job.status),
+    );
     head.push(dashboardScrollRule(this.theme, label, width));
     for (const line of transcript.slice(start, end)) head.push(truncate(line, width, ""));
     return head;

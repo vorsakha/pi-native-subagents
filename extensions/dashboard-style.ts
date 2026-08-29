@@ -85,10 +85,12 @@ export function dashboardViewportLabel(
   start: number,
   end: number,
   total: number,
-  live: boolean,
+  following: boolean,
+  canGrow = true,
 ): string {
   const range = end > start ? `${start + 1}–${end}` : "0";
-  return `${section} ${range}/${total} · ${live ? "live" : "paused · G resumes live"}`;
+  const tail = canGrow ? "live" : "end";
+  return `${section} ${range}/${total} · ${following ? tail : `paused · G resumes ${tail}`}`;
 }
 
 export function dashboardLayout(width: number, rows: number): DashboardLayout {

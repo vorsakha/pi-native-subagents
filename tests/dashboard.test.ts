@@ -97,7 +97,8 @@ test("grouped collection rows keep headers presentational and selected entities 
   );
   const pressuredView = dashboardCollectionViewport(pressured, "live-1", 3, (item) => item.id);
   assert.ok(pressuredView.rows.some((row) => row.kind === "item" && row.item.id === "live-1"));
-  assert.ok(pressuredView.rows.some((row) => row.kind === "fold" && row.hidden === 1), "folding always has a visible count when two rows fit");
+  assert.ok(pressuredView.rows.some((row) => row.kind === "section" && row.label === "Active"), "the visible group keeps its textual heading");
+  assert.ok(pressuredView.rows.some((row) => row.kind === "fold" && row.hidden === 2), "the fold count includes a displaced entity row");
 });
 
 test("direct jobs render attention groups with counts and navigate only entity rows", (t) => {
@@ -290,11 +291,15 @@ test("explicit job focus separates selection, detail scrolling, and composer dra
   assert.match(updatedWhilePaused.find((line) => line.includes("transcript")) ?? "", /paused · G resumes live/);
 
   state.overlay.handleInput("s");
-  for (const character of "keep this draft") state.overlay.handleInput(character);
+  for (const character of "keep this draf") state.overlay.handleInput(character);
+  state.overlay.handleInput("x");
   state.overlay.handleInput(LEFT);
-  assert.match(state.overlay.render(120).join("\n"), /▸ detail/, "Left backs out of the composer by one layer");
+  state.overlay.handleInput("t");
+  assert.match(state.overlay.render(120).join("\n"), /keep this draft.*x/s, "Left moves the draft cursor instead of leaving the composer");
+  state.overlay.handleInput(ESCAPE);
+  assert.match(state.overlay.render(120).join("\n"), /▸ detail/, "Escape backs out of the composer by one layer");
   state.overlay.handleInput("s");
-  assert.match(state.overlay.render(120).join("\n"), /keep this draft/, "the steer draft survives focus changes");
+  assert.match(state.overlay.render(120).join("\n"), /keep this draft.*x/s, "the steer draft survives focus changes");
   state.overlay.handleInput(ESCAPE);
   state.overlay.handleInput(LEFT);
   assert.match(state.overlay.render(120).join("\n"), /▸ jobs/, "Left backs out from detail to the job list");
@@ -311,6 +316,18 @@ test("explicit job focus separates selection, detail scrolling, and composer dra
     "G resumes live tail-following",
   );
   assert.match(state.overlay.render(120).join("\n"), /line 80/, "resuming reaches output received while paused");
+});
+
+test("terminal job viewport labels use end instead of live", (t) => {
+  const completed = { ...job("terminal-label", "completed"), output: "done", transcript: [{ kind: "assistant" as const, text: "done" }] };
+  const state = dashboard([completed], 24, () => {}, undefined, { focusJobId: completed.id, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(72);
+  state.overlay.handleInput(RIGHT);
+  const label = state.overlay.render(72).find((line) => line.includes("transcript")) ?? "";
+  assert.match(label, /· end/);
+  assert.doesNotMatch(label, /· live/);
 });
 
 test("minimum-width live cancellation keeps its Unicode hint visible through confirmation", (t) => {
