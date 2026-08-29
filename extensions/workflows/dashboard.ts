@@ -3,6 +3,7 @@ import {
   Key,
   matchesKey,
   truncateToWidth,
+  visibleWidth,
   type Focusable,
   type KeybindingsManager,
   type TUI,
@@ -291,7 +292,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const frame = createDashboardFrame(this.theme, width, this.#focused);
     if (rows < DASHBOARD_COMPACT_ROWS) {
       this.resetCompactHierarchy();
-      return fitDashboardRows(this.renderCompact(rows, runs.length, frame), rows);
+      return fitDashboardRows(this.renderCompact(rows, runs, frame), rows);
     }
 
     const layout = dashboardLayout(width, rows);
@@ -932,11 +933,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
     return lines;
   }
 
-  private renderCompact(rows: number, count: number, frame: DashboardFrame): string[] {
-    const header = frame.header(
-      this.theme.fg("accent", this.theme.bold("Workflow runs")),
-      this.theme.fg("muted", `${count} run${count === 1 ? "" : "s"}`),
-    );
+  private renderCompact(rows: number, runs: WorkflowSnapshot[], frame: DashboardFrame): string[] {
+    const header = this.renderHeader(frame, runs);
     if (rows <= 1) return [truncateWorkflowDashboardLine("Esc close", frame.innerWidth + 2)];
     if (rows === 2) return [header, frame.hint("Esc close")];
     if (rows === 3) return [header, frame.row(this.theme.fg("dim", "  Resize to inspect workflows.")), frame.hint("Esc close")];
@@ -1010,9 +1008,29 @@ export class WorkflowsDashboardOverlay implements Focusable {
 
   private renderHeader(frame: DashboardFrame, runs: WorkflowSnapshot[]): string {
     const active = runs.filter((run) => !workflowIsTerminal(run.status)).length;
+    const needInput = runs.filter((run) => workflowNeedsInput(run) > 0).length;
+    const failed = runs.filter((run) =>
+      run.status === "failed" || (run.status === "completed" && run.taskOutcome === "unsuccessful")
+    ).length;
+    const attention = [
+      needInput ? `${needInput} need input` : "",
+      active ? `${active} active` : "",
+      failed ? `${failed} failed` : "",
+    ].filter(Boolean);
+    const candidates = [
+      ["Workflow runs", ...attention, `${runs.length} retained`],
+      ["Workflow runs", ...attention],
+      ["Workflows", ...attention],
+      attention,
+      ["Workflows", `${runs.length} runs`],
+    ].map((parts) => parts.filter(Boolean).join(" · "));
+    const availableWidth = Math.max(0, frame.innerWidth - 2);
+    const text = candidates.find((candidate) => visibleWidth(candidate) <= availableWidth)
+      ?? candidates.at(-1)
+      ?? "Workflows";
     return frame.header(
-      this.theme.fg("accent", this.theme.bold("Workflow runs")),
-      this.theme.fg("muted", `${runs.length} run${runs.length === 1 ? "" : "s"}${active ? ` · ${active} active` : ""}`),
+      this.theme.fg("accent", this.theme.bold(text)),
+      "",
     );
   }
 
@@ -1037,14 +1055,14 @@ export class WorkflowsDashboardOverlay implements Focusable {
   }
 
   private renderRunRail(runs: WorkflowSnapshot[], view: WorkflowListViewport, chosen: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
-    if (!runs.length) return fitDashboardRows([this.theme.fg("muted", "No workflow runs in this session.")], rows);
+    if (!runs.length) return this.renderEmptyRuns(rows, false);
     return fitDashboardRows(view.rows.map((row) => row.kind === "item"
       ? this.renderRun(row.item, row.item.runId === chosen?.runId, width, true)
       : this.renderCollectionRow(row, width)), rows);
   }
 
   private renderRunList(runs: WorkflowSnapshot[], view: WorkflowListViewport, chosen: WorkflowSnapshot | undefined, rows: number, width: number): string[] {
-    if (!runs.length) return fitDashboardRows([this.theme.fg("muted", "  No workflow runs in this session.")], rows);
+    if (!runs.length) return this.renderEmptyRuns(rows, true);
     return fitDashboardRows(view.rows.map((row) => row.kind === "item"
       ? this.renderRun(row.item, row.item.runId === chosen?.runId, width)
       : this.renderCollectionRow(row, width)), rows);
@@ -1057,6 +1075,14 @@ export class WorkflowsDashboardOverlay implements Focusable {
     return row.kind === "section"
       ? dashboardSectionRow(this.theme, row.label, row.count, width)
       : dashboardFoldRow(this.theme, row.label, row.hidden, width);
+  }
+
+  private renderEmptyRuns(rows: number, indented: boolean): string[] {
+    const prefix = indented ? "  " : "";
+    return fitDashboardRows([
+      this.theme.fg("muted", `${prefix}No workflow runs in this session.`),
+      this.theme.fg("dim", `${prefix}Invoke a workflow, then return to /workflows.`),
+    ], rows);
   }
 
   private renderRun(run: WorkflowSnapshot, selected: boolean, width: number, rail = false): string {

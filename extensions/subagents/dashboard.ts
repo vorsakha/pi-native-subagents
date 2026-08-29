@@ -355,7 +355,7 @@ class DashboardOverlay implements Focusable {
     const frame = createDashboardFrame(this.theme, width, this.#focused);
     if (rows < DASHBOARD_COMPACT_ROWS) {
       this.resetCompactHierarchy();
-      return this.renderCompact(rows, jobs.length, frame, width);
+      return this.renderCompact(rows, jobs, frame, width);
     }
 
     const layout = dashboardLayout(width, rows);
@@ -853,11 +853,8 @@ class DashboardOverlay implements Focusable {
     return lines;
   }
 
-  private renderCompact(rows: number, count: number, frame: DashboardFrame, width: number): string[] {
-    const header = frame.header(
-      this.theme.fg("accent", this.theme.bold("Native subagents")),
-      this.theme.fg("muted", `${count} job${count === 1 ? "" : "s"}`),
-    );
+  private renderCompact(rows: number, jobs: JobSnapshot[], frame: DashboardFrame, width: number): string[] {
+    const header = this.renderHeader(frame, jobs);
     if (rows <= 1) return [truncate("Esc close", width)];
     if (rows === 2) return [header, frame.hint("Esc close")];
     if (rows === 3) return [header, frame.row(this.theme.fg("dim", "  Screen too short — resize to supervise jobs.")), frame.hint("Esc close")];
@@ -917,20 +914,40 @@ class DashboardOverlay implements Focusable {
   }
 
   private renderHeader(frame: DashboardFrame, jobs: JobSnapshot[]): string {
-    const running = jobs.filter((job) => job.status === "running").length;
+    const active = jobs.filter((job) => job.status === "running").length;
     const queued = jobs.filter((job) => job.status === "queued").length;
     const capacity = this.manager.concurrency ?? 4;
     const needInput = jobs.filter((job) => pendingInteraction(job)).length;
-    const summary = [
-      `${running}/${capacity} running`,
-      queued ? `${queued} queued` : "",
+    const failed = jobs.filter((job) => job.status === "failed").length;
+    const attention = [
       needInput ? `${needInput} need input` : "",
+      active ? `${active} active` : "",
+      failed ? `${failed} failed` : "",
+    ].filter(Boolean);
+    const routine = [
       `${jobs.length} retained`,
-    ].filter(Boolean).join(" · ");
+      `${active}/${capacity} slots`,
+      queued ? `${queued} queued` : "",
+    ].filter(Boolean);
     const availability = formatDashboardAvailability(this.#availability);
+    const routeFallback = dashboardAvailabilityFallback(this.#availability);
+    const candidates = [
+      ["Native subagents", ...attention, ...routine, availability],
+      ["Native subagents", ...attention, ...routine, routeFallback],
+      ["Native subagents", ...attention, routeFallback],
+      ["Subagents", ...attention, routeFallback],
+      [...attention, routeFallback],
+      ["Subagents", ...attention],
+      attention,
+      ["Subagents", `${jobs.length} jobs`],
+    ].map((parts) => parts.filter(Boolean).join(" · "));
+    const availableWidth = Math.max(0, frame.innerWidth - 2);
+    const text = candidates.find((candidate) => visibleWidth(candidate) <= availableWidth)
+      ?? candidates.at(-1)
+      ?? "Subagents";
     return frame.header(
-      this.theme.fg("accent", this.theme.bold(`Native subagents${availability ? ` · ${availability}` : ""}`)),
-      this.theme.fg("muted", summary),
+      this.theme.fg("accent", this.theme.bold(text)),
+      "",
     );
   }
 
@@ -962,7 +979,7 @@ class DashboardOverlay implements Focusable {
     rows: number,
     width: number,
   ): string[] {
-    if (!jobs.length) return fitDashboardRows([this.theme.fg("muted", "No jobs in this session.")], rows);
+    if (!jobs.length) return this.renderEmptyJobs(rows, false);
     const lines = view.rows.map((row) => {
       if (row.kind !== "item") return this.renderCollectionRow(row, width);
       const job = row.item;
@@ -993,7 +1010,7 @@ class DashboardOverlay implements Focusable {
     rows: number,
     width: number,
   ): string[] {
-    if (!jobs.length) return fitDashboardRows([this.theme.fg("muted", "  No jobs in this session.")], rows);
+    if (!jobs.length) return this.renderEmptyJobs(rows, true);
     return fitDashboardRows(view.rows.map((row) => row.kind === "item"
       ? this.renderJob(row.item, row.item.id === chosen?.id, width)
       : this.renderCollectionRow(row, width)), rows);
@@ -1006,6 +1023,14 @@ class DashboardOverlay implements Focusable {
     return row.kind === "section"
       ? dashboardSectionRow(this.theme, row.label, row.count, width)
       : dashboardFoldRow(this.theme, row.label, row.hidden, width);
+  }
+
+  private renderEmptyJobs(rows: number, indented: boolean): string[] {
+    const prefix = indented ? "  " : "";
+    return fitDashboardRows([
+      this.theme.fg("muted", `${prefix}No jobs in this session.`),
+      this.theme.fg("dim", `${prefix}/subagent <task> starts one.`),
+    ], rows);
   }
 
   private renderJob(job: JobSnapshot, selected: boolean, width: number): string {
@@ -1339,6 +1364,16 @@ export function formatDashboardAvailability(activations: HarnessActivation[] | u
     const state = activation.enabled ? availabilityLabel(activation.availability.status) : "disabled by user";
     return `${activation.harness} ${state}`;
   }).join(" · ");
+}
+
+function dashboardAvailabilityFallback(activations: HarnessActivation[] | undefined): string {
+  if (!activations?.length) return "routes status unknown";
+  if (activations.some((activation) =>
+    !activation.enabled || !["ready", "unknown"].includes(activation.availability.status)
+  )) return "routes abnormal";
+  return activations.some((activation) => activation.availability.status === "unknown")
+    ? "routes status unknown"
+    : "";
 }
 
 export function renderMarkdown(text: string, width: number): string[] {

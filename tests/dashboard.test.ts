@@ -621,6 +621,44 @@ test("dashboard header exposes normalized harness states in text, not color alon
   assert.match(header, /codex disabled by user/);
 });
 
+test("responsive job header keeps attention counts and abnormal route text before routine detail", (t) => {
+  const blocked = {
+    ...job("blocked"),
+    interaction: interactionSnapshot({ sourceJobId: "blocked", sourceName: "blocked" }),
+  };
+  const failed = job("failed", "failed");
+  const availability = [
+    harnessActivation(availabilityFixture("pi"), true),
+    harnessActivation(availabilityFixture("claude", {
+      authenticated: false,
+      ready: false,
+      detail: "Claude Code is not logged in",
+    }), true),
+  ];
+  const state = dashboard([blocked, failed], 24, () => {}, undefined, { availability, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  const constrained = state.overlay.render(72)[0] ?? "";
+  assert.match(constrained, /1 need input/);
+  assert.match(constrained, /1 active/);
+  assert.match(constrained, /1 failed/);
+  assert.match(constrained, /routes abnormal/);
+  assert.doesNotMatch(constrained, /claude login required/, "the aggregate replaces labels that do not fit");
+  assert.ok(visibleWidth(constrained) <= 72);
+
+  const wide = state.overlay.render(180)[0] ?? "";
+  assert.match(wide, /claude login required/, "wide headers retain individual route states");
+});
+
+test("empty jobs name the next safe command within constrained geometry", (t) => {
+  const state = dashboard([], 10, () => {}, undefined, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+  const lines = state.overlay.render(40);
+  assert.equal(lines.length, 10);
+  assert.match(lines.join("\n"), /\/subagent <task>/);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 40));
+});
+
 test("dashboard pins errors and exposes queued empty states", (t) => {
   const failed = { ...job("failed", "failed"), output: "", error: "Harness exited before first response" };
   const queued = { ...job("queued", "queued"), output: "" };

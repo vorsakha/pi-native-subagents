@@ -269,6 +269,37 @@ test("workflow runs render attention groups with counts and keep grouped states 
   assert.deepEqual(state.actions.at(-1), { type: "cancel", runId: "pending" }, "run actions target the selected identity, not a section row");
 });
 
+test("responsive workflow header keeps input, active, and failed counts", (t) => {
+  const input = workflow("header-input");
+  input.agents[1]!.waitingOn = {
+    ordinal: 0,
+    requestId: "header-question",
+    target: "orchestrator",
+    sourceAgentIndex: 1,
+    sourceName: "tests",
+    question: "Proceed?",
+    state: "pending",
+    createdAt: 60_000,
+  };
+  const failed = workflow("header-failed", "failed");
+  const state = harness([input, failed], 24, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  const header = state.overlay.render(60)[0] ?? "";
+  assert.match(header, /1 need input/);
+  assert.match(header, /1 active/);
+  assert.match(header, /1 failed/);
+  assert.ok(visibleWidth(header) <= 60);
+});
+
+test("empty workflows name the next safe action within constrained geometry", (t) => {
+  const state = harness([], 10, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+  const lines = state.overlay.render(52);
+  assertPanel(lines, 52, 10);
+  assert.match(lines.join("\n"), /Invoke a workflow, then return to \/workflows\./);
+});
+
 test("workflow finished folding reveals selection and selection survives a group move", (t) => {
   const active = workflow("active");
   const finished = Array.from({ length: 7 }, (_, index) => workflow(`done-${index + 1}`, "completed"));
