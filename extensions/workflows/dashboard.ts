@@ -1567,15 +1567,29 @@ export class WorkflowsDashboardOverlay implements Focusable {
     width: number,
   ): string[] {
     const status = traceStatusMeta(advisor.state, this.#now());
-    const lines = [
+    const pinned = [
       `${this.theme.fg("accent", this.theme.bold(`advisor · ${boundedInline(advisor.advisorName, 1_000)}`))} ${this.theme.fg(status.color, `· ${status.glyph} ${advisor.state}`)}`,
       this.theme.fg("dim", `${advisor.advisorId} · lineage ${advisor.lineage}/${advisor.generation ?? "?"} · ${advisor.harness ?? "?"}/${advisor.model ?? "default"} · ${formatUsage(advisor.usage)}`),
       this.theme.fg("dim", `${phase ? `${boundedInline(run.name, 1_000)} · ${boundedInline(phase.name, 1_000)}` : boundedInline(run.name, 1_000)} · call ${advisor.callIndex}${advisor.queuedMs ? ` · advisor queue ${advisor.queuedMs}ms` : ""}${advisor.outputProvenance === "replay" ? " · replayed" : ""}`),
       advisor.error ? this.theme.fg("error", `Error · ${boundedInline(advisor.error, 2_000)}`) : this.theme.fg("muted", `Question · ${boundedInline(advisor.prompt, 2_000)}`),
       ...(advisor.context ? [this.theme.fg("dim", `Context · ${boundedInline(advisor.context, 2_000)}`)] : []),
-      ...String(advisor.output ?? "(no advisor output)").split("\n").map((line) => this.theme.fg("toolOutput", line)),
     ];
-    return fitDashboardRows(lines.map((line) => truncateWorkflowDashboardLine(line, width)), rows);
+    const visiblePinned = pinned.slice(0, Math.max(0, rows - MIN_SCROLLABLE_DETAIL_ROWS));
+    const body = String(advisor.output ?? "(no advisor output)")
+      .split("\n")
+      .map((line) => truncateWorkflowDashboardLine(this.theme.fg("toolOutput", line), width));
+    const resultRows = this.renderScrollableBody(
+      body,
+      rows - visiblePinned.length,
+      `advisor:${run.runId}:${phase?.index ?? "none"}:${advisor.index}`,
+      width,
+      "advisor output",
+      advisor.state === "queued" || advisor.state === "running",
+    );
+    return fitDashboardRows([
+      ...visiblePinned.map((line) => truncateWorkflowDashboardLine(line, width)),
+      ...resultRows,
+    ], rows);
   }
 
   private agentDetailBody(run: WorkflowSnapshot, phase: WorkflowPhase | undefined, agent: WorkflowAgentRecord, width: number): string[] {

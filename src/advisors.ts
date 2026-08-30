@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { constants as fsConstants, realpathSync } from "node:fs";
-import { lstat, mkdir, open, realpath, rename, rm, type FileHandle } from "node:fs/promises";
+import { constants as fsConstants, existsSync, realpathSync } from "node:fs";
+import { chmod, lstat, mkdir, open, realpath, rename, rm, stat, type FileHandle } from "node:fs/promises";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { firstReachedSpendWarning, validateSpendBudget, type SpendBudget } from "./budget.ts";
 import type { JobManager } from "./manager.ts";
@@ -152,8 +152,13 @@ export interface AdvisorStore {
 export class FileAdvisorStore implements AdvisorStore {
   readonly #trustedRoot: string;
   readonly #segments: string[];
+  readonly #descriptorRoot?: string;
 
-  constructor(root: string, trustedRoot = dirname(resolve(root))) {
+  constructor(
+    root: string,
+    trustedRoot = dirname(resolve(root)),
+    options: { descriptorAnchoring?: boolean } = {},
+  ) {
     const requestedRoot = resolve(root);
     const requestedTrustedRoot = resolve(trustedRoot);
     const relation = relative(requestedTrustedRoot, requestedRoot);
@@ -162,16 +167,17 @@ export class FileAdvisorStore implements AdvisorStore {
     }
     this.#trustedRoot = realpathSync(requestedTrustedRoot);
     this.#segments = relation.split(sep).filter(Boolean);
+    this.#descriptorRoot = options.descriptorAnchoring === false ? undefined : availableDescriptorRoot();
   }
 
   async load(threadId: string): Promise<StoredAdvisor[]> {
-    let directory: FileHandle | undefined;
+    let directory: PrivateDirectory | undefined;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      directory = await openPrivateDirectory(this.#trustedRoot, this.#segments, false);
-      handle = await open(join(directoryAnchor(directory), this.#filename(threadId)), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-      const info = await handle.stat();
-      if (!info.isFile()) throw new Error("Advisor state path is not a regular file");
+      directory = await openPrivateDirectory(this.#trustedRoot, this.#segments, false, this.#descriptorRoot);
+      const path = join(directory.path, this.#filename(threadId));
+      handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+      await verifyOpenPrivateFile(directory, path, handle);
       const parsed = JSON.parse(await handle.readFile("utf8")) as AdvisorStorePayload;
       if (parsed.version !== 1 || parsed.threadId !== threadId || !Array.isArray(parsed.advisors)) return [];
       return parsed.advisors
@@ -192,12 +198,12 @@ export class FileAdvisorStore implements AdvisorStore {
       throw error;
     } finally {
       await handle?.close().catch(() => undefined);
-      await directory?.close().catch(() => undefined);
+      await directory?.close();
     }
   }
 
   async save(threadId: string, advisors: StoredAdvisor[]): Promise<void> {
-    const directory = await openPrivateDirectory(this.#trustedRoot, this.#segments, true);
+    const directory = await openPrivateDirectory(this.#trustedRoot, this.#segments, true, this.#descriptorRoot);
     const payload: AdvisorStorePayload = {
       version: 1,
       threadId,
@@ -210,7 +216,7 @@ export class FileAdvisorStore implements AdvisorStore {
     try {
       await atomicPrivateWrite(directory, this.#filename(threadId), JSON.stringify(payload));
     } finally {
-      await directory.close().catch(() => undefined);
+      await directory.close();
     }
   }
 
@@ -305,7 +311,8 @@ export class AdvisorRegistry {
     return () => this.#listeners.delete(listener);
   }
 
-  list(threadId = this.#threadId): AdvisorSnapshot[] {
+  list(threadId = this.#threadId, trusted = false): AdvisorSnapshot[] {
+    this.#assertTrusted(trusted);
     this.#assertThread(threadId);
     return [...this.#records.values()]
       .filter((record) => record.state !== "closed")
@@ -313,15 +320,16 @@ export class AdvisorRegistry {
       .map(publicSnapshot);
   }
 
-  get(threadId: string, idOrAlias: string): AdvisorSnapshot {
+  get(threadId: string, idOrAlias: string, trusted = false): AdvisorSnapshot {
+    this.#assertTrusted(trusted);
     return publicSnapshot(this.#resolve(threadId, idOrAlias));
   }
 
   async open(request: AdvisorOpenRequest): Promise<AdvisorSnapshot> {
+    this.#assertTrusted(request.trusted);
     await this.initialize();
     this.#assertThread(request.threadId);
     if (this.#closed) throw new Error("Advisor registry is closed");
-    if (!request.trusted) throw new Error("Advisors are disabled for untrusted projects");
     if (this.#records.size >= MAX_ADVISORS_PER_THREAD) throw new Error(`Advisor limit reached (${MAX_ADVISORS_PER_THREAD} per thread)`);
     const name = requireText(request.name, "Advisor name", 160);
     const description = requireText(request.description, "Advisor description", 4_000);
@@ -333,7 +341,7 @@ export class AdvisorRegistry {
     }
     const cwd = await containedCwd(this.#projectRoot, request.cwd);
     const budget = validateSpendBudget(request.budget, "Advisor budget");
-    const profile = request.profile === undefined ? undefined : requireText(request.profile, "Advisor profile", 160);
+    const profile = canonicalProfile(request.profile);
     const resolution = await this.#router.resolve({ ...request, cwd, profile }, undefined);
     const policy: AdvisorPolicy = {
       cwd,
@@ -382,9 +390,9 @@ export class AdvisorRegistry {
   }
 
   async consult(request: AdvisorConsultRequest): Promise<AdvisorConsultResult> {
+    this.#assertTrusted(request.trusted);
     await this.initialize();
     if (this.#closed) throw new Error("Advisor registry is closed");
-    if (!request.trusted) throw new Error("Advisor consultation is disabled for untrusted projects");
     const record = this.#resolve(request.threadId, request.advisorId);
     const question = requireText(request.question, "Advisor question", 100_000);
     const context = boundedOptional(request.context, MAX_ADVISOR_CONTEXT_BYTES, "Advisor context");
@@ -424,7 +432,8 @@ export class AdvisorRegistry {
     }
   }
 
-  async reset(threadId: string, idOrAlias: string): Promise<AdvisorSnapshot> {
+  async reset(threadId: string, idOrAlias: string, trusted = false): Promise<AdvisorSnapshot> {
+    this.#assertTrusted(trusted);
     await this.initialize();
     const record = this.#resolve(threadId, idOrAlias);
     if (record.state === "consulting" || record.queued) throw new Error("Cannot reset an advisor with an active or queued consultation");
@@ -454,7 +463,8 @@ export class AdvisorRegistry {
     return publicSnapshot(record);
   }
 
-  async close(threadId: string, idOrAlias: string): Promise<AdvisorSnapshot> {
+  async close(threadId: string, idOrAlias: string, trusted = false): Promise<AdvisorSnapshot> {
+    this.#assertTrusted(trusted);
     await this.initialize();
     const record = this.#resolve(threadId, idOrAlias);
     if (record.state === "consulting" || record.queued) {
@@ -479,8 +489,13 @@ export class AdvisorRegistry {
     return publicSnapshot(record);
   }
 
-  async hibernate(threadId: string, idOrAlias: string): Promise<AdvisorSnapshot> {
+  async hibernate(threadId: string, idOrAlias: string, trusted = false): Promise<AdvisorSnapshot> {
+    this.#assertTrusted(trusted);
     const record = this.#resolve(threadId, idOrAlias);
+    return this.#hibernate(record);
+  }
+
+  async #hibernate(record: InternalAdvisor): Promise<AdvisorSnapshot> {
     if (record.state === "consulting" || record.queued) throw new Error("Cannot hibernate an active advisor");
     if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
     record.jobId = undefined;
@@ -720,7 +735,7 @@ export class AdvisorRegistry {
   #scheduleIdle(record: InternalAdvisor): void {
     record.idleTimer = setTimeout(() => {
       record.idleTimer = undefined;
-      void this.hibernate(record.threadId, record.id).catch((error) => {
+      void this.#hibernate(record).catch((error) => {
         record.state = "unavailable";
         record.error = error instanceof Error ? error.message : String(error);
         this.#publish(record);
@@ -754,6 +769,10 @@ export class AdvisorRegistry {
     for (const listener of this.#listeners) {
       try { listener(snapshot); } catch { /* observers cannot change lifecycle */ }
     }
+  }
+
+  #assertTrusted(trusted: boolean): void {
+    if (!trusted) throw new Error("Advisors are disabled for untrusted projects");
   }
 }
 
@@ -1006,59 +1025,150 @@ async function containedCwd(root: string, value: string, requireStableIdentity =
   return cwd;
 }
 
-async function openPrivateDirectory(trustedRoot: string, segments: string[], create: boolean): Promise<FileHandle> {
-  let current = await open(trustedRoot, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+interface PrivateDirectory {
+  path: string;
+  verify(): Promise<void>;
+  sync(): Promise<void>;
+  close(): Promise<void>;
+}
+
+function availableDescriptorRoot(): string | undefined {
+  if (process.platform === "win32") return undefined;
+  return ["/proc/self/fd", "/dev/fd"].find((candidate) => existsSync(candidate));
+}
+
+async function openPrivateDirectory(
+  trustedRoot: string,
+  segments: string[],
+  create: boolean,
+  descriptorRoot: string | undefined,
+): Promise<PrivateDirectory> {
+  if (!descriptorRoot) {
+    const path = join(trustedRoot, ...segments);
+    await verifyPortablePrivateDirectory(trustedRoot, segments, create);
+    return {
+      path,
+      verify: () => verifyPortablePrivateDirectory(trustedRoot, segments, false),
+      sync: async () => undefined,
+      close: async () => undefined,
+    };
+  }
+
+  const flags = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | (fsConstants.O_NOFOLLOW ?? 0);
+  let current: FileHandle | undefined;
   try {
+    current = await open(trustedRoot, flags);
+    await verifyDescriptorDirectory(current, join(descriptorRoot, String(current.fd)));
     for (const segment of segments) {
-      const child = join(directoryAnchor(current), segment);
+      const child = join(descriptorRoot, String(current.fd), segment);
       if (create) await mkdir(child, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== "EEXIST") throw error;
       });
-      const next = await open(child, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
-      const info = await next.stat();
-      if (!info.isDirectory()) {
-        await next.close();
-        throw new Error(`Advisor state path is not a private directory: ${child}`);
+      const next = await open(child, flags);
+      try {
+        await verifyDescriptorDirectory(next, join(descriptorRoot, String(next.fd)));
+        const info = await next.stat();
+        if (!info.isDirectory()) throw new Error(`Advisor state path is not a private directory: ${child}`);
+        await next.chmod(0o700);
+      } catch (error) {
+        await next.close().catch(() => undefined);
+        throw error;
       }
-      await next.chmod(0o700);
       await current.close();
       current = next;
     }
-    return current;
+    const handle = current;
+    return {
+      path: join(descriptorRoot, String(handle.fd)),
+      verify: () => verifyDescriptorDirectory(handle, join(descriptorRoot, String(handle.fd))),
+      sync: () => handle.sync().catch(() => undefined),
+      close: () => handle.close().catch(() => undefined),
+    };
   } catch (error) {
-    await current.close().catch(() => undefined);
-    throw error;
+    await current?.close().catch(() => undefined);
+    try {
+      return await openPrivateDirectory(trustedRoot, segments, create, undefined);
+    } catch {
+      throw error;
+    }
   }
 }
 
-function directoryAnchor(directory: FileHandle): string {
-  if (process.platform === "linux") return `/proc/self/fd/${directory.fd}`;
-  if (process.platform !== "win32") return `/dev/fd/${directory.fd}`;
-  throw new Error("Advisor private storage requires descriptor-relative filesystem access");
+async function verifyDescriptorDirectory(handle: FileHandle, path: string): Promise<void> {
+  const [handleInfo, pathInfo] = await Promise.all([handle.stat(), stat(path)]);
+  if (!handleInfo.isDirectory() || !pathInfo.isDirectory()
+      || handleInfo.dev !== pathInfo.dev || handleInfo.ino !== pathInfo.ino) {
+    throw new Error("Advisor private directory descriptor identity changed");
+  }
 }
 
-async function atomicPrivateWrite(directory: FileHandle, filename: string, contents: string): Promise<void> {
-  const root = directoryAnchor(directory);
-  const path = join(root, filename);
+async function verifyPortablePrivateDirectory(trustedRoot: string, segments: string[], create: boolean): Promise<void> {
+  let current = trustedRoot;
+  const roots = [trustedRoot, ...segments.map((segment) => current = join(current, segment))];
+  for (const path of roots) {
+    if (create && path !== trustedRoot) await mkdir(path, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error;
+    });
+    const info = await lstat(path);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`Advisor state path is not a private directory: ${path}`);
+    const canonical = await realpath(path);
+    if (!sameFilesystemPath(canonical, path)) throw new Error(`Advisor state directory identity changed: ${path}`);
+    if (path !== trustedRoot) await chmod(path, 0o700);
+  }
+}
+
+function sameFilesystemPath(left: string, right: string): boolean {
+  const normalize = (value: string) => process.platform === "win32" ? resolve(value).toLocaleLowerCase("en-US") : resolve(value);
+  return normalize(left) === normalize(right);
+}
+
+async function verifyOpenPrivateFile(directory: PrivateDirectory, path: string, handle: FileHandle): Promise<void> {
+  await directory.verify();
+  const [pathInfo, handleInfo] = await Promise.all([lstat(path), handle.stat()]);
+  if (pathInfo.isSymbolicLink() || !pathInfo.isFile() || !handleInfo.isFile()) {
+    throw new Error(`Advisor state path is not a regular file: ${path}`);
+  }
+  if (pathInfo.dev !== handleInfo.dev || pathInfo.ino !== handleInfo.ino) {
+    throw new Error(`Advisor state file identity changed: ${path}`);
+  }
+}
+
+async function atomicPrivateWrite(directory: PrivateDirectory, filename: string, contents: string): Promise<void> {
+  const path = join(directory.path, filename);
+  await directory.verify();
   try {
     const current = await lstat(path);
     if (current.isSymbolicLink() || !current.isFile()) throw new Error(`Advisor state path is not a regular file: ${path}`);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  const temporary = join(root, `.${filename}.${randomBytes(8).toString("hex")}.tmp`);
+  const temporary = join(directory.path, `.${filename}.${randomBytes(8).toString("hex")}.tmp`);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
   try {
     handle = await open(temporary, "wx", 0o600);
+    await verifyOpenPrivateFile(directory, temporary, handle);
     await handle.writeFile(contents, "utf8");
     await handle.sync();
     await handle.close();
     handle = undefined;
+    await directory.verify();
+    try {
+      const current = await lstat(path);
+      if (current.isSymbolicLink() || !current.isFile()) throw new Error(`Advisor state path is not a regular file: ${path}`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
     await rename(temporary, path);
-    await directory.sync().catch(() => undefined);
+    await directory.verify();
+    const stored = await lstat(path);
+    if (stored.isSymbolicLink() || !stored.isFile()) throw new Error(`Advisor state path is not a regular file: ${path}`);
+    await directory.sync();
   } catch (error) {
     await handle?.close().catch(() => undefined);
-    await rm(temporary, { force: true }).catch(() => undefined);
+    await directory.verify().then(
+      () => rm(temporary, { force: true }).catch(() => undefined),
+      () => undefined,
+    );
     throw error;
   }
 }
@@ -1068,6 +1178,14 @@ function requireText(value: unknown, label: string, max: number): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (!normalized || normalized.length > max) throw new Error(`${label} must contain 1–${max} characters`);
   return normalized;
+}
+
+function canonicalProfile(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string") throw new Error("Advisor profile must be a string");
+  const profile = value.trim();
+  if (!profile || profile.length > 160) throw new Error("Advisor profile must contain 1–160 characters");
+  return profile;
 }
 
 function boundedOptional(value: string | undefined, maxBytes: number, label: string): string | undefined {

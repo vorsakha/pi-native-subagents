@@ -5,7 +5,7 @@ import { createDashboardFrame, dashboardLayout, dashboardOverlayRows, isFullscre
 import { formatUsage, sanitizeInline, shortId } from "../subagents/render.ts";
 
 export interface AdvisorsDashboardManager {
-  list(): AdvisorSnapshot[];
+  list(threadId: string, trusted: boolean): AdvisorSnapshot[];
   subscribe(listener: (advisor: AdvisorSnapshot) => void): () => void;
   consult(request: {
     threadId: string;
@@ -14,8 +14,8 @@ export interface AdvisorsDashboardManager {
     sender: "human";
     trusted: boolean;
   }): Promise<AdvisorConsultResult>;
-  close(threadId: string, advisorId: string): Promise<AdvisorSnapshot>;
-  reset(threadId: string, advisorId: string): Promise<AdvisorSnapshot>;
+  close(threadId: string, advisorId: string, trusted: boolean): Promise<AdvisorSnapshot>;
+  reset(threadId: string, advisorId: string, trusted: boolean): Promise<AdvisorSnapshot>;
 }
 
 type Mode = "list" | "ask" | "confirm-close" | "confirm-reset";
@@ -71,8 +71,9 @@ export class AdvisorsDashboard implements Focusable {
     this.#threadId = threadId;
     this.#isTrusted = isTrusted;
     this.#done = done;
-    this.#selectedId = manager.list()[0]?.id;
+    this.#selectedId = manager.list(threadId, isTrusted())[0]?.id;
     this.#unsubscribe = manager.subscribe(() => {
+      if (!this.#isTrusted()) return;
       this.#repairSelection();
       this.#tui.requestRender();
     });
@@ -86,6 +87,16 @@ export class AdvisorsDashboard implements Focusable {
 
   handleInput(data: string): void {
     const cancel = matchesKey(data, Key.escape) || this.#keybindings.matches(data, "tui.select.cancel");
+    if (!this.#isTrusted()) {
+      if (cancel) {
+        this.dispose();
+        this.#done();
+      } else {
+        this.#message = this.#theme.fg("error", "Advisors are disabled because this project is untrusted.");
+        this.#tui.requestRender();
+      }
+      return;
+    }
     if (this.#mode === "ask") {
       if (cancel) {
         this.#mode = "list";
@@ -108,7 +119,7 @@ export class AdvisorsDashboard implements Focusable {
       this.#done();
       return;
     }
-    const roster = this.#manager.list();
+    const roster = this.#manager.list(this.#threadId, this.#isTrusted());
     const index = Math.max(0, roster.findIndex((advisor) => advisor.id === this.#selectedId));
     if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.#selectedId = roster[Math.max(0, index - 1)]?.id;
     else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.#selectedId = roster[Math.min(roster.length - 1, index + 1)]?.id;
@@ -125,7 +136,15 @@ export class AdvisorsDashboard implements Focusable {
     const rows = dashboardOverlayRows(this.#tui.terminal.rows, isFullscreenTui(this.#tui));
     const layout = dashboardLayout(width, rows);
     const frame = createDashboardFrame(this.#theme, width, this.#focused);
-    const roster = this.#manager.list();
+    if (!this.#isTrusted()) {
+      const lines = [frame.header("Thread advisors", "unavailable"), frame.top("trusted project required")];
+      for (let index = 0; index < layout.contentRows; index++) {
+        lines.push(frame.row(index === 0 ? this.#theme.fg("error", "Advisor state is hidden while this project is untrusted.") : ""));
+      }
+      lines.push(frame.bottom(), frame.hint("Esc close"));
+      return lines.slice(0, rows);
+    }
+    const roster = this.#manager.list(this.#threadId, this.#isTrusted());
     const selected = this.#selected();
     const title = `Thread advisors · ${roster.length}/${16}`;
     const rosterLines: string[] = [];
@@ -162,11 +181,16 @@ export class AdvisorsDashboard implements Focusable {
   }
 
   #selected(): AdvisorSnapshot | undefined {
-    return this.#manager.list().find((advisor) => advisor.id === this.#selectedId);
+    if (!this.#isTrusted()) return undefined;
+    return this.#manager.list(this.#threadId, this.#isTrusted()).find((advisor) => advisor.id === this.#selectedId);
   }
 
   #repairSelection(): void {
-    const roster = this.#manager.list();
+    if (!this.#isTrusted()) {
+      this.#selectedId = undefined;
+      return;
+    }
+    const roster = this.#manager.list(this.#threadId, this.#isTrusted());
     if (!roster.some((advisor) => advisor.id === this.#selectedId)) this.#selectedId = roster[0]?.id;
   }
 
@@ -186,13 +210,19 @@ export class AdvisorsDashboard implements Focusable {
   }
 
   async #confirm(): Promise<void> {
+    if (!this.#isTrusted()) {
+      this.#message = this.#theme.fg("error", "Advisors are disabled because this project is untrusted.");
+      this.#mode = "list";
+      this.#tui.requestRender();
+      return;
+    }
     const advisor = this.#selected();
     if (!advisor) return;
     const action = this.#mode;
     this.#mode = "list";
     try {
-      if (action === "confirm-close") await this.#manager.close(this.#threadId, advisor.id);
-      else await this.#manager.reset(this.#threadId, advisor.id);
+      if (action === "confirm-close") await this.#manager.close(this.#threadId, advisor.id, this.#isTrusted());
+      else await this.#manager.reset(this.#threadId, advisor.id, this.#isTrusted());
       this.#message = action === "confirm-close" ? "Advisor closed." : "Advisor lineage reset explicitly.";
     } catch (error) {
       this.#message = this.#theme.fg("error", error instanceof Error ? error.message : String(error));
@@ -203,7 +233,12 @@ export class AdvisorsDashboard implements Focusable {
 }
 
 export async function openAdvisorsDashboard(ctx: ExtensionCommandContext, manager: AdvisorsDashboardManager): Promise<void> {
-  const roster = manager.list();
+  const trusted = ctx.isProjectTrusted();
+  if (!trusted) {
+    ctx.ui.notify("Advisors are disabled for untrusted projects.", "error");
+    return;
+  }
+  const roster = manager.list(ctx.sessionManager.getSessionId(), true);
   if (ctx.mode !== "tui") {
     ctx.ui.notify(roster.length
       ? roster.map((advisor) => `${advisor.id} ${advisor.name} ${advisor.state} ${advisor.policy.harness}/${advisor.policy.model ?? "default"} generation ${advisor.generation} queued ${advisor.queued}`).join("\n")

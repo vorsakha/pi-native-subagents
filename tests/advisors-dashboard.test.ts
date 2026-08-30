@@ -18,8 +18,9 @@ function harness(options: { advisors?: number; rows?: number } = {}) {
   const listeners = new Set<(advisor: ReturnType<typeof advisorSnapshotFixture>) => void>();
   let renders = 0;
   let closed = 0;
+  let trusted = true;
   const manager: AdvisorsDashboardManager = {
-    list: () => roster,
+    list: (_threadId, allowed) => allowed ? roster : [],
     subscribe: (listener) => { listeners.add(listener); return () => listeners.delete(listener); },
     consult: async (request) => {
       calls.push(request.question);
@@ -34,13 +35,15 @@ function harness(options: { advisors?: number; rows?: number } = {}) {
         queuedMs: 0,
       };
     },
-    close: async (_threadId, advisorId) => {
+    close: async (_threadId, advisorId, allowed) => {
+      assert.equal(allowed, true);
       const advisor = roster.find((candidate) => candidate.id === advisorId)!;
       roster.splice(roster.indexOf(advisor), 1);
       for (const listener of listeners) listener({ ...advisor, state: "closed" });
       return { ...advisor, state: "closed" };
     },
-    reset: async (_threadId, advisorId) => {
+    reset: async (_threadId, advisorId, allowed) => {
+      assert.equal(allowed, true);
       const advisor = roster.find((candidate) => candidate.id === advisorId)!;
       advisor.lineage++;
       advisor.generation = 0;
@@ -56,9 +59,16 @@ function harness(options: { advisors?: number; rows?: number } = {}) {
     matches: () => false,
     getKeys: () => [],
   } as unknown as KeybindingsManager;
-  const dashboard = new AdvisorsDashboard(tui, theme, keybindings, manager, "thread-advisors", () => true, () => { closed++; });
+  const dashboard = new AdvisorsDashboard(tui, theme, keybindings, manager, "thread-advisors", () => trusted, () => { closed++; });
   dashboard.focused = true;
-  return { dashboard, roster, calls, get renders() { return renders; }, get closed() { return closed; } };
+  return {
+    dashboard,
+    roster,
+    calls,
+    setTrusted(value: boolean) { trusted = value; },
+    get renders() { return renders; },
+    get closed() { return closed; },
+  };
 }
 
 test("advisor dashboard renders bounded identity, policy, queue, usage, and provenance without private continuations", () => {
@@ -112,5 +122,22 @@ test("advisor dashboard keeps the selected roster row and inspector visible in a
   assert.match(text, /Advisor 15.*owner/);
   assert.match(text, /Route.*read-only/);
   assert.doesNotMatch(text, /❯.*Advisor 00/);
+  state.dashboard.dispose();
+});
+
+test("advisor dashboard hides the roster and refuses lifecycle controls after trust is revoked", async () => {
+  const state = harness();
+  state.dashboard.handleInput("x");
+  state.setTrusted(false);
+  state.dashboard.handleInput(ENTER);
+  await tick();
+  const text = state.dashboard.render(72).join("\n");
+  assert.match(text, /hidden while this project is untrusted/);
+  assert.doesNotMatch(text, /Security advisor|lineage|generation/);
+  assert.equal(state.roster.length, 1, "revoked trust cannot confirm a pending close");
+  state.dashboard.handleInput("r");
+  state.dashboard.handleInput("a");
+  assert.equal(state.roster[0]?.lineage, 1);
+  assert.deepEqual(state.calls, []);
   state.dashboard.dispose();
 });

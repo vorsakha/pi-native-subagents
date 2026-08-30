@@ -395,6 +395,47 @@ test("workflow dashboard marks completed unsuccessful runs with warning color", 
   assert.match(rendered, /! completed · task unsuccessful/);
 });
 
+test("workflow advisor output uses the shared scroll viewport instead of truncating", (t) => {
+  const run = workflow("advisor-scroll", "completed");
+  run.agents = [];
+  run.phases[0]!.agents = [];
+  run.phases[0]!.advisorConsultations = [0];
+  run.advisorConsultations = [{
+    index: 0,
+    callIndex: 0,
+    callFingerprint: `sha256:${"a".repeat(64)}`,
+    advisorId: "adv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    advisorName: "Security advisor",
+    lineage: 1,
+    generation: 2,
+    phase: 0,
+    state: "completed",
+    timestamps: { createdAt: 1_000, startedAt: 2_000, updatedAt: 3_000, endedAt: 3_000 },
+    prompt: "Review the boundary",
+    output: Array.from({ length: 40 }, (_, index) => `advisor output ${index}`).join("\n"),
+    harness: "claude",
+    usage: { input: 10, output: 40, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+    queuedMs: 2,
+    outputProvenance: "advisor",
+  }];
+  const state = harness([run], 16, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+  openOutline(state.overlay, 72);
+  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput(ENTER);
+  let text = state.overlay.render(72).join("\n");
+  assert.match(text, /advisor output.*\d+–40\/40/);
+  assert.match(text, /advisor output 39/);
+  assert.doesNotMatch(text, /advisor output 0(?:\D|$)/);
+
+  state.overlay.handleInput("g");
+  text = state.overlay.render(72).join("\n");
+  assert.match(text, /advisor output 0/);
+  assert.doesNotMatch(text, /advisor output 39/);
+  state.overlay.handleInput(PAGE_DOWN);
+  assert.match(state.overlay.render(72).join("\n"), /advisor output [1-9]/);
+});
+
 test("minimum-width live run and agent cancellation keep Unicode controls visible through confirmation", (t) => {
   const runState = harness([workflow("cancel-run")], 30, () => {}, { fullscreen: true });
   runState.manager.list()[0]!.name = "Release 你好👩🏽‍💻";

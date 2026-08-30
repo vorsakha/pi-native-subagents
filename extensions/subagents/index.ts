@@ -643,9 +643,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     setInterval: options.setInterval,
     clearInterval: options.clearInterval,
     advisors: {
-      async describe(threadId, advisorId) {
+      async describe(threadId, advisorId, trusted) {
+        if (!trusted) throw new Error("Advisors are disabled for untrusted projects");
         await getAdvisors().initialize();
-        const advisor = getAdvisors().get(threadId, advisorId);
+        const advisor = getAdvisors().get(threadId, advisorId, trusted);
         return {
           id: advisor.id,
           name: advisor.name,
@@ -1234,6 +1235,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   pi.registerCommand("advisors", {
     description: "Open the thread advisor dashboard.",
     handler: async (_args, ctx) => {
+      if (!ctx.isProjectTrusted()) {
+        ctx.ui.notify("Advisors are disabled for untrusted projects.", "error");
+        return;
+      }
       await getAdvisors().initialize();
       await openAdvisorsDashboard(ctx, getAdvisors());
     },
@@ -1276,8 +1281,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         }
         if ((action === "close" || action === "reset") && target && rest.length === 0) {
           const advisor = action === "close"
-            ? await getAdvisors().close(advisorThreadId(ctx), target)
-            : await getAdvisors().reset(advisorThreadId(ctx), target);
+            ? await getAdvisors().close(advisorThreadId(ctx), target, ctx.isProjectTrusted())
+            : await getAdvisors().reset(advisorThreadId(ctx), target, ctx.isProjectTrusted());
           ctx.ui.notify(advisorSummary(advisor), action === "close" ? "info" : "warning");
           return;
         }
@@ -1388,8 +1393,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     promptSnippet: "List this thread's retained advisors",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      if (!ctx.isProjectTrusted()) throw new Error("Advisors are disabled for untrusted projects");
       await getAdvisors().initialize();
-      const roster = getAdvisors().list(advisorThreadId(ctx));
+      const roster = getAdvisors().list(advisorThreadId(ctx), ctx.isProjectTrusted());
       return { content: [{ type: "text" as const, text: roster.length ? roster.map(advisorSummary).join("\n") : "No advisors are open in this thread." }], details: { advisors: roster } };
     },
     renderCall(_args, theme) { return renderToolCallLine(theme, "List", "advisors"); },
@@ -1411,8 +1417,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       parameters: Type.Object({ advisorId: Type.String({ minLength: 1, maxLength: 200 }) }),
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
         const advisor = action === "close"
-          ? await getAdvisors().close(advisorThreadId(ctx), params.advisorId)
-          : await getAdvisors().reset(advisorThreadId(ctx), params.advisorId);
+          ? await getAdvisors().close(advisorThreadId(ctx), params.advisorId, ctx.isProjectTrusted())
+          : await getAdvisors().reset(advisorThreadId(ctx), params.advisorId, ctx.isProjectTrusted());
         return { content: [{ type: "text" as const, text: advisorSummary(advisor) }], details: { advisor } };
       },
       renderCall(args, theme) { return renderToolCallLine(theme, "Run", args.advisorId, action); },

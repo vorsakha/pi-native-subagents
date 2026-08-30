@@ -220,6 +220,29 @@ test("the subagent extension surface", async (t) => {
       startsBeforeUntrustedConsult,
       "an untrusted context cannot dispatch a restored trusted advisor",
     );
+    const { ctx: untrustedAdvisorCtx, notifications: untrustedAdvisorNotifications } = context({
+      trusted: false,
+      sessionId: "extension-session",
+    });
+    for (const tool of ["advisor_list", "advisor_close", "advisor_reset"] as const) {
+      await assert.rejects(
+        pi.tools.get(tool).execute(
+          `untrusted-${tool}`,
+          tool === "advisor_list" ? {} : { advisorId: opened.details.advisor.id },
+          undefined,
+          undefined,
+          untrustedAdvisorCtx,
+        ),
+        /untrusted projects/i,
+      );
+    }
+    await pi.commands.get("advisor").handler(`close ${opened.details.advisor.id}`, untrustedAdvisorCtx);
+    assert.match(untrustedAdvisorNotifications.at(-1)?.message ?? "", /untrusted projects/i);
+    await pi.commands.get("advisors").handler("", untrustedAdvisorCtx);
+    assert.match(untrustedAdvisorNotifications.at(-1)?.message ?? "", /untrusted projects/i);
+    assert.doesNotMatch(untrustedAdvisorNotifications.at(-1)?.message ?? "", /Security|adv_[a-f0-9]{32}/);
+    const stillOpen = await pi.tools.get("advisor_list").execute("advisor-list-after-untrusted", {}, undefined, undefined, ctx);
+    assert.equal(stillOpen.details.advisors[0].id, opened.details.advisor.id);
 
     const { ctx: multibyteCtx } = context({
       sessionId: "extension-session",

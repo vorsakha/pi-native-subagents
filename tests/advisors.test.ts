@@ -51,8 +51,8 @@ test("advisor_open is turn-free and consultation policy is immutable, read-only,
   assert.match(opened.id, /^adv_[a-f0-9]{32}$/);
   assert.equal(opened.state, "defined");
   assert.equal(backend.starts.length, 0, "opening resolves policy without starting a model turn");
-  assert.equal(registry.get(threadId, "SEC").id, opened.id, "aliases are stable and case-normalized within a thread");
-  assert.throws(() => registry.get("other-thread", opened.id), /different parent thread/);
+  assert.equal(registry.get(threadId, "SEC", true).id, opened.id, "aliases are stable and case-normalized within a thread");
+  assert.throws(() => registry.get("other-thread", opened.id, true), /different parent thread/);
 
   const consultation = registry.consult({
     threadId,
@@ -77,7 +77,7 @@ test("advisor_open is turn-free and consultation policy is immutable, read-only,
   assert.equal(result.ok, true);
   assert.equal(result.generation, 1);
   assert.equal(result.output, "The boundary fails closed.");
-  const snapshot = registry.get(threadId, opened.id);
+  const snapshot = registry.get(threadId, opened.id, true);
   assert.equal(snapshot.state, "idle");
   assert.equal(snapshot.usage.input, 20);
   assert.equal(snapshot.ledger[0]?.sender, "orchestrator");
@@ -90,6 +90,12 @@ test("advisor_open is turn-free and consultation policy is immutable, read-only,
 test("advisor dispatch rechecks trust and generic job controls cannot reach advisor-owned jobs", async () => {
   const { backend, jobs, registry } = setup();
   const opened = await openSecurity(registry);
+  assert.throws(() => registry.list(threadId, false), /untrusted projects/);
+  assert.throws(() => registry.get(threadId, opened.id, false), /untrusted projects/);
+  await assert.rejects(registry.close(threadId, opened.id, false), /untrusted projects/);
+  await assert.rejects(registry.reset(threadId, opened.id, false), /untrusted projects/);
+  await assert.rejects(registry.hibernate(threadId, opened.id, false), /untrusted projects/);
+  assert.equal(registry.get(threadId, opened.id, true).state, "defined", "untrusted lifecycle calls cannot mutate the roster");
   await assert.rejects(
     registry.consult({
       threadId,
@@ -136,7 +142,7 @@ test("advisor consultations serialize, accumulate usage, enforce the cumulative 
   const second = registry.consult({ threadId, advisorId: opened.id, question: "second", sender: "workflow", trusted: true });
   await backend.waitForStart();
   assert.equal(backend.starts.length, 1);
-  assert.equal(registry.get(threadId, opened.id).queued, 1);
+  assert.equal(registry.get(threadId, opened.id, true).queued, 1);
   const jobId = backend.starts[0]!;
   backend.emitContinuation(jobId, "codex-serialized");
   backend.complete(jobId, "one", { input: 40, output: 10, turns: 1 });
@@ -145,7 +151,7 @@ test("advisor consultations serialize, accumulate usage, enforce the cumulative 
   assert.equal(backend.starts.length, 1, "the second consultation retains the native session");
   backend.complete(jobId, "two", { input: 30, output: 5, turns: 1 });
   assert.equal((await second).ok, true);
-  const snapshot = registry.get(threadId, opened.id);
+  const snapshot = registry.get(threadId, opened.id, true);
   assert.equal(snapshot.generation, 2);
   assert.deepEqual(snapshot.usage, { input: 70, output: 15, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2 });
   assert.equal(snapshot.ledger.length, 2);
@@ -162,13 +168,13 @@ test("closing deletes advisor identity so aliases and roster capacity are reusab
   const { jobs, registry } = setup();
   for (let index = 0; index < 16; index++) {
     const opened = await openSecurity(registry);
-    const closed = await registry.close(threadId, opened.id);
+    const closed = await registry.close(threadId, opened.id, true);
     assert.equal(closed.state, "closed");
-    assert.equal(registry.list().length, 0);
+    assert.equal(registry.list(threadId, true).length, 0);
   }
   const reopened = await openSecurity(registry);
-  assert.equal(registry.get(threadId, "sec").id, reopened.id);
-  await registry.close(threadId, reopened.id);
+  assert.equal(registry.get(threadId, "sec", true).id, reopened.id);
+  await registry.close(threadId, reopened.id, true);
   await registry.shutdown();
   await jobs.shutdown();
 });
@@ -183,7 +189,7 @@ test("idle advisors release provider resources and lazily resume only their reco
   backend.complete(firstJob, "remembered");
   await first;
   await delay(40);
-  assert.equal(registry.get(threadId, opened.id).state, "hibernated");
+  assert.equal(registry.get(threadId, opened.id, true).state, "hibernated");
   assert.ok(backend.closes.includes(firstJob), "idle hibernation closes the resident provider process");
 
   const resumed = registry.consult({ threadId, advisorId: opened.id, question: "what did I say?", sender: "human", trusted: true });
@@ -210,12 +216,12 @@ test("missing or failed continuation becomes explicitly unavailable until retry 
   await firstRuntime.backend.waitForStart();
   firstRuntime.backend.complete(firstRuntime.backend.starts[0]!, "answer without continuation", { input: 7, output: 2, turns: 1 });
   assert.equal((await first).ok, true, "the completed answer remains usable");
-  assert.equal(firstRuntime.registry.get(threadId, opened.id).state, "unavailable");
+  assert.equal(firstRuntime.registry.get(threadId, opened.id, true).state, "unavailable");
   await assert.rejects(
     firstRuntime.registry.consult({ threadId, advisorId: opened.id, question: "again", sender: "human", trusted: true }),
     /reset or close/i,
   );
-  const reset = await firstRuntime.registry.reset(threadId, opened.id);
+  const reset = await firstRuntime.registry.reset(threadId, opened.id, true);
   assert.equal(reset.id, opened.id, "reset preserves stable advisor identity");
   assert.equal(reset.lineage, 1);
   assert.equal(reset.generation, 0);
@@ -235,14 +241,14 @@ test("route failure preserves identity and continuation for an explicit same-lin
   backend.emitContinuation(firstJob, "codex-retry");
   backend.complete(firstJob, "established");
   await first;
-  await registry.hibernate(threadId, opened.id);
+  await registry.hibernate(threadId, opened.id, true);
 
   router.error = new Error("capability disappeared");
   const failed = await registry.consult({ threadId, advisorId: opened.id, question: "retry later", sender: "human", trusted: true });
   assert.equal(failed.ok, false);
   assert.match(failed.error ?? "", /capability disappeared/);
-  assert.equal(registry.get(threadId, opened.id).state, "unavailable");
-  assert.equal(registry.get(threadId, opened.id).lineage, 0);
+  assert.equal(registry.get(threadId, opened.id, true).state, "unavailable");
+  assert.equal(registry.get(threadId, opened.id, true).lineage, 0);
 
   router.error = undefined;
   const retry = registry.consult({
@@ -263,7 +269,7 @@ test("route failure preserves identity and continuation for an explicit same-lin
   backend.emitContinuation(request.jobId, "codex-retry");
   backend.complete(request.jobId, "recovered");
   assert.equal((await retry).ok, true);
-  assert.equal(registry.get(threadId, opened.id).lineage, 0);
+  assert.equal(registry.get(threadId, opened.id, true).lineage, 0);
   await registry.shutdown();
   await jobs.shutdown();
 });
@@ -283,7 +289,7 @@ test("restoration preserves the unavailable retry gate and its redacted public e
   first.backend.emitContinuation(first.backend.starts[0]!, "persisted-retry-secret");
   first.backend.complete(first.backend.starts[0]!, "established");
   await initial;
-  await first.registry.hibernate(threadId, opened.id);
+  await first.registry.hibernate(threadId, opened.id, true);
   first.router.error = new Error("failed /private/persisted-retry-secret.jsonl for persisted-retry-secret");
   assert.equal((await first.registry.consult({
     threadId,
@@ -297,7 +303,7 @@ test("restoration preserves the unavailable retry gate and its redacted public e
 
   const restored = setup({ store });
   await restored.registry.initialize();
-  const snapshot = restored.registry.get(threadId, opened.id);
+  const snapshot = restored.registry.get(threadId, opened.id, true);
   assert.equal(snapshot.state, "unavailable");
   assert.doesNotMatch(snapshot.error ?? "", /persisted-retry-secret|\/private\/persisted-retry-secret\.jsonl/);
   await assert.rejects(restored.registry.consult({
@@ -321,7 +327,7 @@ test("resume failures preserve exact lineage, redact private identities, and kee
   backend.emitContinuation(firstJob, "codex-recorded-secret");
   backend.complete(firstJob, "established");
   await first;
-  await registry.hibernate(threadId, opened.id);
+  await registry.hibernate(threadId, opened.id, true);
 
   router.error = new Error("cannot resume codex-recorded-secret at /private/codex-recorded-secret.jsonl");
   const failed = await registry.consult({
@@ -333,7 +339,7 @@ test("resume failures preserve exact lineage, redact private identities, and kee
   });
   assert.equal(failed.ok, false);
   assert.doesNotMatch(failed.error ?? "", /codex-recorded-secret|\/private\/codex-recorded-secret\.jsonl/);
-  const unavailable = registry.get(threadId, opened.id);
+  const unavailable = registry.get(threadId, opened.id, true);
   assert.equal(unavailable.state, "unavailable");
   assert.doesNotMatch(JSON.stringify(unavailable.ledger), /codex-recorded-secret|\/private\/codex-recorded-secret\.jsonl/);
 
@@ -349,7 +355,7 @@ test("resume failures preserve exact lineage, redact private identities, and kee
     retryUnavailable: true,
     signal: aborted.signal,
   }), /cancel before admission/);
-  const afterAbort = registry.get(threadId, opened.id);
+  const afterAbort = registry.get(threadId, opened.id, true);
   assert.equal(afterAbort.state, "unavailable", "cancelled admission cannot clear the unavailable recovery gate");
   assert.equal(afterAbort.error, unavailable.error);
   assert.equal(afterAbort.generation, unavailable.generation);
@@ -375,7 +381,7 @@ test("resume failures preserve exact lineage, redact private identities, and kee
   const driftedResult = await drifted;
   assert.equal(driftedResult.ok, false);
   assert.match(driftedResult.error ?? "", /different native advisor identity/);
-  assert.doesNotMatch(JSON.stringify(registry.get(threadId, opened.id)), /codex-(?:recorded|replacement)-secret/);
+  assert.doesNotMatch(JSON.stringify(registry.get(threadId, opened.id, true)), /codex-(?:recorded|replacement)-secret/);
   assert.ok(backend.closes.includes(backend.starts[1]!), "a rejected provider lineage releases its retained native run");
 
   const recovered = registry.consult({
@@ -415,7 +421,7 @@ test("first-generation provider failures redact every newly reported native refe
   backend.emitContinuation(jobId, "first-generation-private-id");
   backend.fail(jobId, "provider failed first-generation-private-id at /private/first-generation-private-id.jsonl");
   const result = await consultation;
-  const publicState = JSON.stringify({ result, snapshot: registry.get(threadId, opened.id) });
+  const publicState = JSON.stringify({ result, snapshot: registry.get(threadId, opened.id, true) });
   assert.equal(result.ok, false);
   assert.doesNotMatch(publicState, /first-generation-private-id|\/private\/first-generation-private-id\.jsonl/);
   assert.ok(backend.closes.includes(jobId), "failed native advisor runs are released before their job handle is dropped");
@@ -445,7 +451,7 @@ test("workflow advisor turns remain in the workflow scheduler lane behind direct
     trusted: true,
     workflow: { runId: "wf_priority", callIndex: 0 },
   });
-  await waitFor(() => registry.get(threadId, opened.id).state === "consulting", "advisor consultation admission");
+  await waitFor(() => registry.get(threadId, opened.id, true).state === "consulting", "advisor consultation admission");
   const direct = jobs.spawn({ task: "later direct work", cwd: process.cwd(), trusted: true, harness: "codex" });
 
   backend.complete(blocker.id);
@@ -512,7 +518,7 @@ test("thread rosters persist privately with typed continuations while public sta
       projectRoot: process.cwd(),
     });
     await restored.initialize();
-    const snapshot = restored.get(threadId, opened.id);
+    const snapshot = restored.get(threadId, opened.id, true);
     assert.equal(snapshot.state, "hibernated");
     assert.equal(snapshot.generation, 1);
     assert.equal(snapshot.ledger[0]?.workflow?.runId, "run-1");
@@ -568,7 +574,7 @@ test("malformed stored continuations preserve the advisor roster as explicitly u
       projectRoot: process.cwd(),
     });
     await restored.initialize();
-    const snapshot = restored.get(threadId, opened.id);
+    const snapshot = restored.get(threadId, opened.id, true);
     assert.equal(snapshot.id, opened.id);
     assert.equal(snapshot.state, "unavailable");
     assert.match(snapshot.error ?? "", /continuation is invalid.*reset or close/i);
@@ -576,7 +582,7 @@ test("malformed stored continuations preserve the advisor roster as explicitly u
     assert.equal(snapshot.usage.input, 9);
     assert.equal(snapshot.ledger[0]?.output, "preserved answer");
     assert.equal(restoredBackend.starts.length, 0);
-    const reset = await restored.reset(threadId, opened.id);
+    const reset = await restored.reset(threadId, opened.id, true);
     assert.equal(reset.id, opened.id);
     assert.equal(reset.state, "defined");
     assert.equal(reset.lineage, 1);
@@ -628,7 +634,7 @@ test("restoration preserves a changed cwd as unavailable and rejects symlink rep
       projectRoot: project,
     });
     await restored.initialize();
-    const snapshot = restored.get(threadId, opened.id);
+    const snapshot = restored.get(threadId, opened.id, true);
     assert.equal(snapshot.state, "unavailable");
     assert.match(snapshot.error ?? "", /cwd.*changed|trusted project directory/i);
     await assert.rejects(
@@ -650,14 +656,14 @@ test("restoration preserves a changed cwd as unavailable and rejects symlink rep
   }
 });
 
-test("restored advisors use the canonical profile identity and behavior captured at registration", async () => {
+test("restored advisors trim only profile boundaries and preserve internal whitespace", async () => {
   const store = new MemoryAdvisorStore();
   const first = setup({ store });
   first.router.resolution = {
     harness: "codex",
     requires: [],
     effort: "high",
-    profileBinding: { name: "audit", systemPrompt: "ORIGINAL IMMUTABLE PROFILE" },
+    profileBinding: { name: "security  audit", systemPrompt: "ORIGINAL IMMUTABLE PROFILE" },
   };
   const opened = await first.registry.open({
     threadId,
@@ -666,9 +672,9 @@ test("restored advisors use the canonical profile identity and behavior captured
     cwd: process.cwd(),
     trusted: true,
     harness: "codex",
-    profile: "  audit  ",
+    profile: "  security  audit  ",
   });
-  assert.equal(opened.policy.profile, "audit");
+  assert.equal(opened.policy.profile, "security  audit");
   assert.equal(opened.policy.effort, "high");
   const initial = first.registry.consult({
     threadId,
@@ -690,7 +696,7 @@ test("restored advisors use the canonical profile identity and behavior captured
     harness: "codex",
     requires: [],
     effort: "low",
-    profileBinding: { name: "audit", systemPrompt: "MUTATED PROFILE" },
+    profileBinding: { name: "security  audit", systemPrompt: "MUTATED PROFILE" },
   };
   await restored.registry.initialize();
   const resumed = restored.registry.consult({
@@ -726,6 +732,16 @@ test("advisor private persistence rejects symlinked roots and state files", asyn
     const nested = new FileAdvisorStore(join(privateBase, "native-subagents", "advisors"), privateBase);
     await assert.rejects(nested.save(threadId, []), /private directory|symbolic link|ELOOP|ENOTDIR/i);
     assert.deepEqual(await readdir(redirected), [], "a symlinked private-root ancestor cannot receive advisor state");
+
+    const portableBase = join(base, "portable-agent-dir");
+    await mkdir(portableBase);
+    const portableRoot = join(portableBase, "native-subagents", "advisors");
+    const portable = new FileAdvisorStore(portableRoot, portableBase, { descriptorAnchoring: false });
+    await portable.save(threadId, []);
+    assert.deepEqual(await portable.load(threadId), [], "platforms without descriptor paths retain private-store functionality");
+    await rm(join(portableBase, "native-subagents"), { recursive: true });
+    await symlink(redirected, join(portableBase, "native-subagents"), "dir");
+    await assert.rejects(portable.save(threadId, []), /private directory|identity changed/i);
 
     const root = join(base, "private");
     const store = new FileAdvisorStore(root);
@@ -764,7 +780,7 @@ test("shutdown waits for restoration before persisting the durable roster", asyn
   assert.equal(store.records.get(threadId)?.length, 1, "shutdown cannot overwrite a pending restored roster with an empty snapshot");
   releaseLoad();
   await Promise.all([initializing, shutdown]);
-  assert.equal(restored.registry.get(threadId, opened.id).id, opened.id);
+  assert.equal(restored.registry.get(threadId, opened.id, true).id, opened.id);
   assert.equal(store.records.get(threadId)?.[0]?.id, opened.id);
   await restored.jobs.shutdown();
 });
@@ -808,7 +824,7 @@ test("advisor context and queue bounds fail before provider dispatch", async () 
     registry.consult({ threadId, advisorId: opened.id, question: "ninth queued", sender: "human", trusted: true }),
     /queue is full/,
   );
-  assert.equal(registry.get(threadId, opened.id).queued, 8);
+  assert.equal(registry.get(threadId, opened.id, true).queued, 8);
   for (const controller of queuedControllers) controller.abort(new Error("test cleanup"));
   activeController.abort(new Error("test cleanup"));
   await Promise.allSettled([active, ...queued]);
@@ -861,7 +877,7 @@ test("cancellation and shutdown keep serialization until native teardown and usa
   await queuedSettled;
   assert.equal(result.ok, false);
   assert.equal(backend.starts.length, 1, "no replacement lineage starts during cancellation settlement");
-  const snapshot = registry.get(threadId, opened.id);
+  const snapshot = registry.get(threadId, opened.id, true);
   assert.deepEqual(snapshot.usage, { input: 13, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 });
   assert.equal(snapshot.ledger.at(-1)?.state, "cancelled");
   assert.deepEqual(snapshot.ledger.at(-1)?.usage, snapshot.usage);

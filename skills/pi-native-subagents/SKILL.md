@@ -174,7 +174,7 @@ Check every returned result's `ok` field and preserve bounded error details in t
 These are enforced by the runtime. Do not design around them.
 
 - **No nested delegation.** Children never receive subagent, advisor, or workflow capabilities, and cannot answer interactive approvals, escalate permissions, or administer plugins and MCP.
-- **Trusted project and cwd containment.** Execution requires a trusted project, and child working directories must stay inside it. Advisor consultations recheck trust and stable realpath cwd identity before every dispatch. Workflow sources must be contained by the same rules.
+- **Trusted project and cwd containment.** Execution requires a trusted project, and child working directories must stay inside it. Every advisor read, lifecycle control, and consultation rechecks trust; consultations also recheck stable realpath cwd identity before dispatch. Workflow sources must be contained by the same rules.
 - **Deny-by-construction read-only.** A read-only child is sandboxed by the native runtime, not asked to behave.
 - **Deterministic sandbox.** Workflow code has no imports, filesystem, network, environment variables, subprocesses, credentials, `require`, or `process`. `Date.now()`, zero-argument `new Date()`, and `Math.random()` all throw. Results, metadata, requests, logs, phases, source, and arguments are bounded and must be JSON-serializable.
 - **Bounded run shape.** At most 32 workflow calls per run (`agent()`, `followUp()`, and `consult()` share the budget), at most four concurrent workers, and at most four active native turns globally. Routed questions are bounded separately at 32 per run and never consume a call ordinal.

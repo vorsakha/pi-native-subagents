@@ -104,7 +104,7 @@ const ADVISOR_OPTION_KEYS = new Set(["phase", "context"]);
 class WorkflowAdvisorBudgetError extends Error {}
 
 export interface WorkflowAdvisorGateway {
-  describe(threadId: string, advisorId: string): Promise<{ id: string; name: string; lineage: number; harness: HarnessName; model?: string }>;
+  describe(threadId: string, advisorId: string, trusted: boolean): Promise<{ id: string; name: string; lineage: number; harness: HarnessName; model?: string }>;
   consult(request: {
     threadId: string;
     advisorId: string;
@@ -1922,7 +1922,7 @@ export class WorkflowManager {
       }
       const preflight = this.#budgetPreflight(entry);
       if (preflight) throw new WorkflowAdvisorBudgetError(preflight);
-      const advisor = await this.#advisors.describe(request.sessionId, advisorId);
+      const advisor = await this.#advisors.describe(request.sessionId, advisorId, request.trusted);
       assertSupportedSpendBudget(entry.snapshot.budget, advisor.harness);
       const phase = this.#resolveAgentPhase(entry, options.phase);
       this.#markPhaseRunning(entry, phase);
@@ -3667,8 +3667,11 @@ export class WorkflowManager {
     if (budget.maxTokens !== undefined && tokens >= budget.maxTokens) return `Workflow token budget exhausted (${tokens}/${budget.maxTokens})`;
     if (budget.maxCost !== undefined && usage.cost >= budget.maxCost) return `Workflow cost budget exhausted ($${usage.cost.toFixed(4)}/$${budget.maxCost})`;
     if (budget.maxTurns !== undefined && usage.turns >= budget.maxTurns) return `Workflow turn budget exhausted (${usage.turns}/${budget.maxTurns})`;
-    const agent = budget.maxTokensPerAgent === undefined ? undefined : entry.snapshot.agents.find((candidate) => candidate.usage.input + candidate.usage.output >= budget.maxTokensPerAgent!);
-    if (agent) return `Workflow per-agent token budget exhausted for ${agent.name} (${agent.usage.input + agent.usage.output}/${budget.maxTokensPerAgent})`;
+    const call = this.#reachedCallTokenBudget(entry);
+    if (call) {
+      const scope = call.kind === "agent" ? "per-agent" : "per-call";
+      return `Workflow ${scope} token budget exhausted for ${call.label} (${call.tokens}/${budget.maxTokensPerAgent})`;
+    }
     return undefined;
   }
 
@@ -4333,14 +4336,36 @@ export class WorkflowManager {
       }
     }
     const limit = entry.snapshot.budget?.maxTokensPerAgent;
-    const agent = limit === undefined ? undefined : entry.snapshot.agents.find((candidate) => candidate.usage.input + candidate.usage.output >= limit);
-    if (agent && !entry.reachedBudgetWarnings.has("agentTokens")) {
-      const warning = `Workflow budget agent tokens limit reached for ${agent.name} (${agent.usage.input + agent.usage.output}/${limit}); later dispatches are blocked`;
+    const call = this.#reachedCallTokenBudget(entry);
+    if (call && !entry.reachedBudgetWarnings.has("agentTokens")) {
+      const warning = call.kind === "agent"
+        ? `Workflow budget agent tokens limit reached for ${call.label} (${call.tokens}/${limit}); later dispatches are blocked`
+        : `Workflow budget per-call tokens limit reached for ${call.label} (${call.tokens}/${limit}); later dispatches are blocked`;
       entry.reachedBudgetWarnings.add("agentTokens");
       entry.snapshot.warnings = [...(entry.snapshot.warnings ?? []), warning].slice(-16);
       changed = true;
     }
     if (changed) this.#touch(entry);
+  }
+
+  #reachedCallTokenBudget(entry: RunEntry): { kind: "agent" | "advisor"; label: string; tokens: number } | undefined {
+    const limit = entry.snapshot.budget?.maxTokensPerAgent;
+    if (limit === undefined) return undefined;
+    const calls = [
+      ...entry.snapshot.agents.map((agent) => ({
+        callIndex: agent.callIndex ?? agent.index,
+        kind: "agent" as const,
+        label: agent.name,
+        tokens: agent.usage.input + agent.usage.output,
+      })),
+      ...(entry.snapshot.advisorConsultations ?? []).map((advisor) => ({
+        callIndex: advisor.callIndex,
+        kind: "advisor" as const,
+        label: `advisor ${advisor.advisorName}`,
+        tokens: advisor.usage.input + advisor.usage.output,
+      })),
+    ].sort((left, right) => left.callIndex - right.callIndex);
+    return calls.find((call) => call.tokens >= limit);
   }
 
   #ensurePhase(entry: RunEntry, rawTitle: string): number {

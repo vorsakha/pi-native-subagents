@@ -365,6 +365,41 @@ test("workflow advisor calls share the hard call budget and cumulative spend pre
   } finally { await f.cleanup(); }
 });
 
+test("an advisor call reaching maxTokensPerAgent blocks later dispatch and records the warning", async () => {
+  const advisors = new ControlledAdvisorGateway();
+  const advisorId = "adv_24242424242424242424242424242424";
+  advisors.add(advisorId);
+  advisors.results.push({
+    ok: true,
+    advisorId,
+    advisorName: "Security advisor",
+    lineage: 0,
+    generation: 1,
+    output: "large bounded answer",
+    usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+    route: { harness: "claude" },
+    queuedMs: 0,
+  });
+  const f = await fixture(4, undefined, undefined, undefined, undefined, advisors);
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        const first = await consult(${JSON.stringify(advisorId)}, "first");
+        const second = await consult(${JSON.stringify(advisorId)}, "second");
+        return { first, second };
+      }
+    `, { advisors: [advisorId], budget: { maxAgents: 2, maxTokensPerAgent: 10 } }));
+    const final = await started.completion;
+    const result = final.result as { first: { ok: boolean }; second: { ok: boolean; limit?: string; error?: string } };
+    assert.equal(result.first.ok, true);
+    assert.equal(result.second.ok, false);
+    assert.equal(result.second.limit, "budget");
+    assert.match(result.second.error ?? "", /per-call token budget.*advisor Security advisor.*12\/10/i);
+    assert.equal(advisors.requests.length, 1);
+    assert.ok(final.warnings?.some((warning) => /per-call tokens.*advisor Security advisor.*12\/10/i.test(warning)));
+  } finally { await f.cleanup(); }
+});
+
 test("workflow replay reuses journaled advisor answers and cancellation reaches an in-flight consultation", async () => {
   const advisors = new ControlledAdvisorGateway();
   const advisorId = "adv_33333333333333333333333333333333";
