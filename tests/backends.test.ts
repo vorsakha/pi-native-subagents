@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { delay, tempDir } from "./helpers.ts";
+import { delay, GatedManagedProcess, tempDir } from "./helpers.ts";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ClaudeBackend, CLAUDE_SUBAGENT_ASK_TOOL, forbiddenInitTools } from "../src/backends/claude.ts";
@@ -1069,6 +1069,54 @@ test("Claude classifies an authoritative rate_limit rejection into structured un
   assert.equal(events.some((event) => event.type === "thinking_message"), false);
   assert.equal(events.some((event) => event.type === "tool_start"), false);
   await run.close();
+});
+
+test("Claude close waits for native process-tree termination after provider failure", async () => {
+  const nativeProcess = new GatedManagedProcess();
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield {
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: Math.floor((Date.now() + 5 * 60_000) / 1000), rateLimitType: "five_hour" },
+    };
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [] }, error: "rate_limit" };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    processFactory: () => nativeProcess,
+    queryFn: ((input: { options?: Record<string, unknown> }) => {
+      const spawnProcess = input.options?.spawnClaudeCodeProcess as ((options: {
+        command: string;
+        args: string[];
+        cwd?: string;
+        env: NodeJS.ProcessEnv;
+        signal: AbortSignal;
+      }) => unknown) | undefined;
+      assert.ok(spawnProcess, "Claude launch installs the managed process-tree wrapper");
+      spawnProcess({
+        command: "fixture-claude",
+        args: [],
+        cwd: process.cwd(),
+        env: process.env,
+        signal: new AbortController().signal,
+      });
+      return stream;
+    }) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
+
+  await run.completed;
+  assert.equal(terminal(events)?.type, "failed");
+  let closed = false;
+  const closing = run.close().then(() => { closed = true; });
+  await nativeProcess.waitUntilTerminate();
+  await delay(0);
+  assert.equal(closed, false, "close cannot resolve while the failed Claude process tree still exists");
+  nativeProcess.release();
+  await closing;
+  assert.equal(closed, true);
 });
 
 test("Claude accounts terminal quota-frame usage before failure and withholds pre-inference proof", async () => {

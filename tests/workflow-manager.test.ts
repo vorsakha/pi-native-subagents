@@ -1799,6 +1799,80 @@ test("continued follow-up retained-session rejection preserves cumulative lineag
   }
 });
 
+test("continued follow-up validation failures preserve cumulative lineage usage in results and journals", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const script = `export default async () => {
+      const continued = await agent("continued validation target", {
+        harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+      });
+      const empty = await followUp(continued.jobId, "");
+      const policy = await followUp(continued.jobId, "cannot change access", { access: "full" });
+      return { empty, policy };
+    };`;
+    const started = await f.workflows.start(f.request(script));
+    await f.claude.waitForStart();
+    const primary = f.claude.starts[0]!;
+    f.claude.emit(primary, { type: "message", text: "progress" });
+    f.claude.emit(primary, { type: "usage", usage: { input: 2, output: 1, turns: 1 } });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+    await f.backend.waitForStart();
+    f.backend.complete(f.backend.starts[0]!, "continued", { input: 3, output: 4, turns: 1 });
+
+    const final = await started.completion;
+    const result = final.result as Record<"empty" | "policy", { ok: boolean; error?: string; usage?: Record<string, number> }>;
+    const usage = { input: 5, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2 };
+    assert.match(result.empty.error ?? "", /non-empty prompt/);
+    assert.match(result.policy.error ?? "", /does not accept policy options: access/);
+    assert.deepEqual(result.empty.usage, usage);
+    assert.deepEqual(result.policy.usage, usage);
+    assert.equal(f.backend.sends.length, 0);
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const failures = journal.filter((record) => record.kind === "followUp" && record.state === "failed");
+    assert.equal(failures.length, 2);
+    assert.deepEqual(failures.map((record) => record.result?.usage), [usage, usage]);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("thrown continued follow-up admission failure journals cumulative lineage usage", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const script = `export const meta = { phases: ["build"] };
+    export default async () => {
+      phase("build");
+      const continued = await agent("continued mutable target", {
+        harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+      });
+      return followUp(continued.jobId, "invalid phase admission", { phase: "undeclared" });
+    };`;
+    const started = await f.workflows.start(f.request(script));
+    await f.claude.waitForStart();
+    const primary = f.claude.starts[0]!;
+    f.claude.emit(primary, { type: "message", text: "progress" });
+    f.claude.emit(primary, { type: "usage", usage: { input: 2, output: 1, turns: 1 } });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+    await f.backend.waitForStart();
+    f.backend.complete(f.backend.starts[0]!, "continued", { input: 3, output: 4, turns: 1 });
+
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.equal((final.result as { ok: boolean }).ok, false);
+    assert.match((final.result as { error?: string }).error ?? "", /not declared/);
+    assert.equal(f.backend.sends.length, 0, "the rejected follow-up never reaches the retained session");
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const followUp = [...journal].reverse().find((record) => record.kind === "followUp" && record.state === "failed");
+    assert.deepEqual(followUp?.result?.usage, {
+      input: 5, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2,
+    });
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("ordinary progressed failure persists dashboard and restart refusal proof", async () => {
   const f = await fixture();
   try {
@@ -1816,6 +1890,53 @@ test("ordinary progressed failure persists dashboard and restart refusal proof",
       f.workflows.restartAgent(final.runId, final.agents[0]!.index),
       /progressed continuation checkpoint/i,
     );
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("cancelling a progressed fresh agent preserves durable restart refusal proof", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => agent("cancel progressed primary");`));
+    await f.backend.waitForStart();
+    const jobId = f.backend.starts[0]!;
+    f.backend.emit(jobId, { type: "tool_start", id: "write", name: "Write", summary: "changed state" });
+    await f.workflows.cancelAgent(started.snapshot.runId, 0, "cancel after progress");
+
+    const final = await started.completion;
+    assert.equal(final.agents[0]?.state, "cancelled");
+    assert.equal(final.agents[0]?.progressedCheckpoint, true);
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const terminal = [...journal].reverse().find((record) => record.kind === "agent" && record.state === "failed");
+    assert.equal(terminal?.result?.progressed, true);
+    await assert.rejects(f.workflows.restartAgent(final.runId, 0), /progressed continuation checkpoint/i);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("cancelling a progressed retained follow-up preserves durable restart refusal proof", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => {
+      const first = await agent("retained cancellation target", { access: "readOnly" });
+      return followUp(first.jobId, "cancel progressed follow-up");
+    };`));
+    await f.backend.waitForStart();
+    const jobId = f.backend.starts[0]!;
+    f.backend.complete(jobId, "ready");
+    await f.backend.waitForSend();
+    f.backend.emit(jobId, { type: "message", text: "follow-up progress" });
+    await f.workflows.cancelAgent(started.snapshot.runId, 0, "cancel retained progress");
+
+    const final = await started.completion;
+    assert.equal(final.agents[0]?.state, "cancelled");
+    assert.equal(final.agents[0]?.progressedCheckpoint, true);
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const terminal = [...journal].reverse().find((record) => record.kind === "followUp" && record.state === "failed");
+    assert.equal(terminal?.result?.progressed, true);
+    await assert.rejects(f.workflows.restartAgent(final.runId, 0), /progressed continuation checkpoint/i);
   } finally {
     await f.cleanup();
   }
@@ -4524,6 +4645,55 @@ test("a peer can address a continued lineage by its stable logical job ID", asyn
     const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
     const peer = [...journal].reverse().find((record) => record.kind === "peerQuestion" && record.state === "completed");
     assert.deepEqual(peer?.result?.usage, target.usage, "peer journal usage covers the continued logical lineage");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("failed peer answer on a continued lineage journals all primary and answer-turn usage", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const started = await f.workflows.start(f.request(`export default async () => {
+      const target = await agent("continued failing peer target", {
+        name: "target", harness: "claude", access: "readOnly",
+        continuationFallback: { harness: "codex" }
+      });
+      return agent("ask failing target " + target.jobId, {
+        name: "asker", harness: "claude", access: "readOnly"
+      });
+    };`));
+    await f.claude.waitForStart();
+    const logicalJobId = f.claude.starts[0]!;
+    f.claude.emit(logicalJobId, { type: "message", text: "partial target answer" });
+    f.claude.emit(logicalJobId, { type: "usage", usage: { input: 2, output: 1, turns: 1 } });
+    f.claude.fail(logicalJobId, "quota", progressedQuota("claude"));
+
+    await f.backend.waitForStart();
+    const replacementJobId = f.backend.starts[0]!;
+    f.backend.complete(replacementJobId, "continued target ready", { input: 3, output: 4, turns: 1 });
+    await f.claude.waitForStart(2);
+    const askerJobId = f.claude.starts[1]!;
+    const asked = f.claude.ask(askerJobId, {
+      question: "What state should I use?",
+      target: { type: "agent", jobId: logicalJobId },
+    });
+    await f.backend.waitForSend();
+    f.backend.emit(replacementJobId, { type: "usage", usage: { input: 5, output: 6, turns: 1 } });
+    f.backend.fail(replacementJobId, "peer answer failed");
+    await assert.rejects(asked, /peer answer failed/);
+
+    f.claude.complete(askerJobId, "asker recovered");
+    const final = await started.completion;
+    const target = final.agents.find((agent) => agent.name === "target")!;
+    const usage = { input: 10, output: 11, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 3 };
+    assert.deepEqual(target.usage, usage);
+    assert.equal(target.state, "completed", "failed auxiliary work does not rewrite the consumed target result");
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const peer = [...journal].reverse().find((record) => record.kind === "peerQuestion" && record.state === "failed");
+    assert.match(peer?.result?.error ?? "", /peer answer failed/);
+    assert.deepEqual(peer?.result?.usage, usage);
+    assert.equal(peer?.route?.continuation?.replacementJobId, replacementJobId);
   } finally {
     await f.cleanup();
   }

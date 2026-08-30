@@ -23,7 +23,7 @@ Continuation opens only when all of these are true:
 
 - the failed fresh `agent()` or retained `followUp()` reported structured, authoritative provider unavailability for the provider actually running it;
 - the failed generation itself recorded model or tool progress, and the failure is not marked pre-inference; activity from an earlier retained generation never qualifies a new turn;
-- the failed native process has settled and its retained resources are closed;
+- the failed native process tree has exited and its retained resources are closed;
 - the target freshly reports ready and satisfies the original fixed policy, including every required capability;
 - the shared cwd is a provable Git checkout whose HEAD, staged entries, index flags, status, and changed worktree contents can be checkpointed; assume-unchanged, skip-worktree, and fsmonitor-valid flags are unsupported;
 - this logical lineage has not already used its one continuation.
@@ -59,7 +59,7 @@ On exact `resumeFromRunId` replay:
 - a progressed-primary record with no safe handoff is returned as failed and is never rerun;
 - missing proof or checkout divergence fails closed without either provider dispatch.
 
-Usage is cumulative across the failed turn, replacement, and later logical generations. Returned follow-up results and terminal journals—including for pre-dispatch refusal or lost-session failure—plus peer-answer journals and snapshots all include the failed primary usage. Archived attempts show their own delta, including after handoff replay; replay adds no usage and earlier generations are never counted twice. Reconstructed calls retain the original capability requirements. An interrupted handoff must resume with the source workflow budget unchanged. Call ordinals, cancellation, approvals, journal order, convergence state, and replay provenance remain attached to the logical call. Manual suffix restart is refused if it would discard any agent-call progressed checkpoint, even when no continuation opened; peer-question ordinals never affect that decision.
+Usage is cumulative across the failed turn, replacement, and later logical generations. Returned follow-up results and terminal journals for validation, admission, cancellation, or lost-session failures include the failed primary usage. Successful and failed peer-answer journals and snapshots do too, including usage spent by the answer turn. Archived attempts show their own delta, including after handoff replay; replay adds no usage and earlier generations are never counted twice. Reconstructed calls retain the original capability requirements. An interrupted handoff must resume with the source workflow budget unchanged. Call ordinals, cancellation, approvals, journal order, convergence state, and replay provenance remain attached to the logical call. Manual suffix restart is refused if it would discard any agent-call progressed checkpoint, even when no continuation opened. Cancelling a progressed current turn preserves that checkpoint. Peer-question ordinals never affect the decision.
 
 `/workflows` shows the declaration as unused or used, `claude → codex (continued)` (or the reverse), the trigger, checkpoint, failed and replacement job provenance, and attempts. Replacement IDs are historical provenance; the dashboard does not claim a persisted or terminal replacement is retained. Provider waiting and pre-inference fallback keep separate labels.
 

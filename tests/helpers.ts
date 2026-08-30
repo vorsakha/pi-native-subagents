@@ -25,6 +25,7 @@ import type { InteractionDeadlineClock } from "../src/manager.ts";
 import type { WorkflowCheckoutProof } from "../src/workflows/checkout.ts";
 import type { WorkflowCheckoutOperations } from "../src/workflows/manager.ts";
 import type { ProviderStatus, ProviderStatusReader, ProviderStatusRequest } from "../src/provider-status.ts";
+import type { ManagedProcess } from "../src/process-tree.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 import {
   harnessAvailability,
@@ -42,6 +43,32 @@ export async function ticks(count = 1): Promise<void> {
 }
 
 export const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Managed native process whose tree-termination proof is held until released. */
+export class GatedManagedProcess implements ManagedProcess {
+  readonly child = {
+    stderr: { resume() {} },
+  } as unknown as ManagedProcess["child"];
+  #terminateReached = false;
+  #terminateReachedResolve!: () => void;
+  readonly #terminateReachedPromise = new Promise<void>((resolve) => { this.#terminateReachedResolve = resolve; });
+  #release!: () => void;
+  readonly #released = new Promise<void>((resolve) => { this.#release = resolve; });
+
+  terminate(): Promise<void> {
+    this.#terminateReached = true;
+    this.#terminateReachedResolve();
+    return this.#released;
+  }
+
+  waitUntilTerminate(): Promise<void> {
+    return this.#terminateReached ? Promise.resolve() : this.#terminateReachedPromise;
+  }
+
+  release(): void {
+    this.#release();
+  }
+}
 
 /** Deterministic deadline clock for interaction lifecycle tests. */
 export class ControlledInteractionClock implements InteractionDeadlineClock {

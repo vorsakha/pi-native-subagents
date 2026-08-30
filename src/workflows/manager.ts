@@ -1176,13 +1176,14 @@ export class WorkflowManager {
           : this.#withMutationLock(request.cwd, attemptSignal, execute);
         result = await this.#withDispatchSlot(entry, attemptSignal, isolated);
       } catch (error) {
+        const failedRecord = record ?? entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
+        const progressed = progressedFailure || failedRecord?.progressedCheckpoint === true;
         const failed = {
           ok: false,
           output: "",
           error: boundedText(error),
-          ...(progressedFailure ? { progressed: true as const } : {}),
+          ...(progressed ? { progressed: true as const } : {}),
         } satisfies WorkflowJournalResult;
-        const failedRecord = record ?? entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
         if (attemptSignal.aborted && failedRecord) {
           failedRecord.state = "cancelled";
           failedRecord.error = failed.error;
@@ -1191,7 +1192,7 @@ export class WorkflowManager {
           failedRecord.timestamps.endedAt = failedRecord.timestamps.updatedAt;
           this.#touch(entry);
           record = failedRecord;
-          result = { ...failed, progressed: progressedFailure || undefined };
+          result = { ...failed, progressed: progressed || undefined };
           break;
         }
         await this.#appendJournal(entry, {
@@ -1214,7 +1215,14 @@ export class WorkflowManager {
         record.timestamps.updatedAt = Date.now();
         record.timestamps.endedAt = record.timestamps.updatedAt;
         this.#touch(entry);
-        result = { ok: false, output: result.output, jobId: result.jobId, error: record.error, usage: result.usage };
+        result = {
+          ok: false,
+          output: result.output,
+          jobId: result.jobId,
+          error: record.error,
+          usage: result.usage,
+          progressed: result.progressed,
+        };
         break;
       }
       if (!usedFallback && "fallback" in fallbackDeclaration && fallbackDeclaration.fallback) {
@@ -1480,10 +1488,12 @@ export class WorkflowManager {
     try {
     let result: WorkflowAttemptResult;
     let progressedFailure = false;
+    const initialOwner = this.#jobOwners.get(jobId);
+    const targetAgent = initialOwner?.runId === entry.snapshot.runId
+      ? entry.snapshot.agents[initialOwner.agentIndex]
+      : undefined;
     try {
       const execute = () => this.#runFreshFollowUp(entry, request, jobId, prompt, options, attemptSignal, callIndex, fingerprint);
-      const owner = this.#jobOwners.get(jobId);
-      const targetAgent = owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined;
       const isolated = () => targetAgent?.access === "readOnly"
         ? execute()
         : this.#withMutationLock(request.cwd, attemptSignal, execute);
@@ -1519,14 +1529,17 @@ export class WorkflowManager {
         result.usage = clone(record.usage);
       }
     } catch (error) {
+      const owner = this.#jobOwners.get(jobId);
+      const record = targetAgent
+        ?? (owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined);
+      const progressed = progressedFailure || record?.progressedCheckpoint === true;
       const failed = {
         ok: false,
         output: "",
         error: boundedText(error),
-        ...(progressedFailure ? { progressed: true as const } : {}),
+        usage: record ? clone(record.usage) : undefined,
+        ...(progressed ? { progressed: true as const } : {}),
       } satisfies WorkflowJournalResult;
-      const owner = this.#jobOwners.get(jobId);
-      const record = owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined;
       await this.#appendJournal(entry, {
         callIndex,
         fingerprint,
@@ -1541,8 +1554,10 @@ export class WorkflowManager {
       throw error;
     }
     const owner = this.#jobOwners.get(jobId);
-    const record = owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined;
+    const record = targetAgent
+      ?? (owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined);
     result.jobId = record?.logicalJobId ?? jobId;
+    if (record) result.usage = clone(record.usage);
     await this.#appendJournal(entry, {
       callIndex,
       fingerprint,
@@ -2038,7 +2053,14 @@ export class WorkflowManager {
       await this.#jobs.cancel(job.id, "Workflow agent wait aborted").catch(() => undefined);
       const final = this.#jobs.check(job.id);
       this.#updateAgentFromJob(final);
-      return { ok: false, output: final.output, jobId: final.id, error: boundedText(error), usage: clone(final.usage) };
+      return {
+        ok: false,
+        output: final.output,
+        jobId: final.id,
+        error: boundedText(error),
+        usage: clone(final.usage),
+        progressed: final.progressed,
+      };
     } finally {
       signal.removeEventListener("abort", abort);
       try { await finishIsolation(); }
@@ -2240,7 +2262,15 @@ export class WorkflowManager {
       await this.#jobs.cancel(retainedJobId, "Workflow follow-up wait aborted").catch(() => undefined);
       const final = this.#jobs.check(retainedJobId);
       this.#updateAgentFromJob(final);
-      return { ok: false, output: final.output, jobId: final.id, error: boundedText(error), usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)) };
+      return {
+        ok: false,
+        output: final.output,
+        jobId: final.id,
+        error: boundedText(error),
+        usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)),
+        progressed: final.progressed,
+        attemptUsageBase,
+      };
     } finally {
       signal.removeEventListener("abort", abort);
     }
@@ -2816,7 +2846,8 @@ export class WorkflowManager {
         state: "failed",
         at: Date.now(),
         agentIndex: owner.agentIndex,
-        result: { ok: false, output: "", error: boundedText(error, 2_000) },
+        result: { ok: false, output: "", error: boundedText(error, 2_000), usage: clone(target.usage) },
+        route: journalRoute(target),
         interaction: { ...detail },
       }).catch(() => undefined);
       throw error;
@@ -2941,6 +2972,8 @@ export class WorkflowManager {
         usage: addWorkflowUsage(target.retryUsage, workflowUsage(final.usage)),
       };
     } catch (error) {
+      try { this.#updateAgentFromJob(this.#jobs.check(jobId)); }
+      catch { /* a lost retained session has no newer usage to project */ }
       failGeneration(boundedText(error));
       throw error;
     } finally {
@@ -3405,7 +3438,7 @@ export class WorkflowManager {
     agent.effort = job.effort;
     agent.preview = job.output.slice(-500);
     agent.error = job.error;
-    if (job.progressed && job.status === "failed") agent.progressedCheckpoint = true;
+    if (job.progressed && (job.status === "failed" || job.status === "cancelled")) agent.progressedCheckpoint = true;
     agent.usage = addWorkflowUsage(agent.retryUsage, workflowUsage(job.usage));
     agent.context = job.context ? { ...job.context } : undefined;
     agent.timestamps.updatedAt = now;

@@ -7,6 +7,7 @@ import type { CapabilityHealth, CapabilitySourceStatus, DiscoveredCapability } f
 import { sanitizeSubscriptionEnv } from "../env.ts";
 import { boundedAppend } from "../reducer.ts";
 import { normalizeRetryAt, providerUnavailabilityDetail, type ProviderUnavailability } from "../provider-unavailability.ts";
+import { spawnManaged, type ManagedProcess } from "../process-tree.ts";
 import {
   PARENT_THREAD_MCP_SERVER,
   PARENT_THREAD_TOOL_DESCRIPTION,
@@ -87,10 +88,12 @@ function claudeSettings(policy: Pick<BackendPolicy, "customization" | "access">)
 
 type ClaudeQuery = typeof query;
 type ClaudeAuthVerifier = (command: string, cwd: string, env: NodeJS.ProcessEnv, signal: AbortSignal) => Promise<void>;
+type ClaudeProcessFactory = typeof spawnManaged;
 interface ClaudeBackendOptions {
   inactivityTimeoutMs?: number;
   queryFn?: ClaudeQuery;
   verifyAuth?: ClaudeAuthVerifier;
+  processFactory?: ClaudeProcessFactory;
 }
 
 /** Accumulated per-session runtime telemetry, mutated in place as authoritative frames arrive. */
@@ -167,12 +170,14 @@ export class ClaudeBackend implements Backend {
   readonly #inactivityTimeoutMs: number;
   readonly #query: ClaudeQuery;
   readonly #verifyAuth: ClaudeAuthVerifier;
+  readonly #processFactory: ClaudeProcessFactory;
 
   constructor(command = "claude", options: ClaudeBackendOptions = {}) {
     this.#command = command;
     this.#inactivityTimeoutMs = options.inactivityTimeoutMs ?? 15 * 60_000;
     this.#query = options.queryFn ?? query;
     this.#verifyAuth = options.verifyAuth ?? verifyClaudeSubscription;
+    this.#processFactory = options.processFactory ?? spawnManaged;
   }
 
   /**
@@ -394,6 +399,7 @@ export class ClaudeBackend implements Backend {
     let output = "";
     const telemetry: ClaudeTelemetry = {};
     const queuedMessages: Array<{ text: string; behavior: SendBehavior }> = [];
+    let nativeProcess: ManagedProcess | undefined;
     let resolveCompleted!: () => void;
     const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
     const watchdog = createActivityWatchdog(this.#inactivityTimeoutMs, () => {
@@ -527,6 +533,18 @@ export class ClaudeBackend implements Backend {
         extraArgs: { "safe-mode": null },
         persistSession: true,
         includePartialMessages: true,
+        spawnClaudeCodeProcess: (options) => {
+          if (nativeProcess) throw new Error("Claude SDK attempted to spawn more than one native process for a query");
+          nativeProcess = this.#processFactory(options.command, options.args, {
+            cwd: options.cwd,
+            env: options.env,
+            signal: options.signal,
+          });
+          // The SDK custom-process interface does not consume stderr. Drain it
+          // so provider diagnostics cannot fill the pipe and stall shutdown.
+          nativeProcess.child.stderr.resume();
+          return nativeProcess.child;
+        },
       },
     });
     watchdog.arm();
@@ -560,13 +578,23 @@ export class ClaudeBackend implements Backend {
       }
     })();
 
-    const stop = async () => {
+    let stopping: Promise<void> | undefined;
+    const stop = () => {
+      if (stopping) return stopping;
       closing = true;
       watchdog.clear();
       input.close();
       if (!controller.signal.aborted) controller.abort();
       stream.close();
-      await withTimeout(consuming, 5_000, "Claude SDK shutdown").catch(() => undefined);
+      stopping = (async () => {
+        // Query.close() starts cleanup but cannot be awaited. Query.return()
+        // waits for the SDK cleanup path; the managed process then proves the
+        // entire detached process group is gone before close resolves.
+        await withTimeout(stream.return(undefined), 5_000, "Claude SDK cleanup").catch(() => undefined);
+        await nativeProcess?.terminate(0);
+        await withTimeout(consuming, 1_000, "Claude SDK shutdown").catch(() => undefined);
+      })();
+      return stopping;
     };
 
     return {
@@ -602,6 +630,9 @@ export class ClaudeBackend implements Backend {
         input.close();
         controller.abort();
         stream.close();
+        await nativeProcess?.terminate(0);
+        await withTimeout(stream.return(undefined), 1_000, "Claude SDK force-close").catch(() => undefined);
+        await withTimeout(consuming, 1_000, "Claude SDK force-close shutdown").catch(() => undefined);
         finish({ type: "cancelled", reason: "Claude force-closed after shutdown deadline" });
       },
     };

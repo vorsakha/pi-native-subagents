@@ -99,7 +99,7 @@ agent("task", {
 });
 ```
 
-This permits one bounded handoff after authoritative provider unavailability and observed progress. It keeps the logical job ID stable across replacement and follow-ups, rechecks readiness and capabilities, then checkout and budgets at queued startup, and never replays the primary or falls through to provider waiting. Do not combine it with `providerFallback` or worktree isolation. Read `references/progressed-continuation.md` first.
+This permits one bounded handoff after authoritative provider unavailability and observed progress. It fully terminates the failed process tree, keeps the logical job ID stable across replacement and follow-ups, rechecks readiness and capabilities, then checkout and budgets at queued startup, and never replays the primary or falls through to provider waiting. Do not combine it with `providerFallback` or worktree isolation. Read `references/progressed-continuation.md` first.
 
 ```js
 export const meta = { name: "parallel-review" };
