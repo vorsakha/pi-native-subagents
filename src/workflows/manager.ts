@@ -2329,6 +2329,9 @@ export class WorkflowManager {
     record.structured = structured;
     record.structuredTransport = replay.result.transport;
     record.error = replay.result.error;
+    if (replay.result.progressed === true || replay.route?.continuation !== undefined) {
+      record.progressedCheckpoint = true;
+    }
     record.timestamps.updatedAt = now;
     record.timestamps.endedAt = now;
     this.#touch(entry);
@@ -2416,6 +2419,8 @@ export class WorkflowManager {
     currentPrompt: string,
   ): Promise<WorkflowAttemptResult> {
     const checkpoint = handoff.checkpoint;
+    const progressRoute = journalRoute(record);
+    if (progressRoute) progressRoute.continuation = undefined;
     await this.#appendJournal(entry, {
       callIndex,
       fingerprint,
@@ -2423,7 +2428,7 @@ export class WorkflowManager {
       state: "progressed",
       at: Date.now(),
       agentIndex: record.index,
-      route: journalRoute(record),
+      route: progressRoute,
       continuationProgress: {
         agentIndex: record.index,
         logicalJobId: checkpoint.logicalJobId,
@@ -2962,6 +2967,7 @@ export class WorkflowManager {
       if (input.signal.aborted) abort();
       else input.signal.addEventListener("abort", abort, { once: true });
       const final = await this.#jobs.wait(jobId, { signal: input.signal });
+      if (input.signal.aborted) throw abortError(input.signal.reason);
       this.#updateAgentFromJob(final);
       if (final.status !== "completed") throw new Error(final.error ?? `Peer agent ${final.status} before answering`);
       if (!final.output.trim()) throw new Error(`Peer agent ${target.name} returned no answer text`);

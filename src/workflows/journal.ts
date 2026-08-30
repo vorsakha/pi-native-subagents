@@ -1,6 +1,9 @@
 import { createHash } from "node:crypto";
 import type {
+  WorkflowContinuationHandoff,
+  WorkflowContinuationProgress,
   WorkflowJournalRecord,
+  WorkflowJournalRoute,
   WorkflowJournalResult,
   WorkflowReplayCall,
   WorkflowReplayHandoff,
@@ -70,6 +73,77 @@ export function workflowDefinitionFingerprint(input: {
   });
 }
 
+function callKind(record: WorkflowJournalRecord): "agent" | "followUp" {
+  return record.kind === "followUp" ? "followUp" : "agent";
+}
+
+function routeIdentity(route: WorkflowJournalRoute): Omit<WorkflowJournalRoute, "continuation"> {
+  const { continuation: _continuation, ...identity } = route;
+  return identity;
+}
+
+function usageContainsAttempt(progress: WorkflowContinuationProgress): boolean {
+  const keys = ["input", "output", "cacheRead", "cacheWrite", "cost", "turns"] as const;
+  return keys.every((key) => progress.attemptUsage[key] <= progress.usage[key]);
+}
+
+/**
+ * A handoff authorizes replacement only when it is the second checkpoint for
+ * the exact progressed primary recorded earlier for that call. Structural
+ * validity alone cannot prove that lineage, route, or accounting identity.
+ */
+function continuationCheckpointsMatch(
+  progressRecord: WorkflowJournalRecord,
+  handoffRecord: WorkflowJournalRecord,
+): boolean {
+  const progress = progressRecord.continuationProgress;
+  const handoff = handoffRecord.continuation;
+  const progressRoute = progressRecord.route;
+  const handoffRoute = handoffRecord.route;
+  if (!progress || !handoff || !progressRoute || !handoffRoute) return false;
+  if (callKind(progressRecord) !== callKind(handoffRecord)
+      || progressRecord.agentIndex !== progress.agentIndex
+      || handoffRecord.agentIndex !== handoff.agentIndex
+      || progress.agentIndex !== handoff.agentIndex
+      || !usageContainsAttempt(progress)) return false;
+
+  const progressProof = {
+    agentIndex: progress.agentIndex,
+    logicalJobId: progress.logicalJobId ?? progress.failedJobId,
+    failedJobId: progress.failedJobId,
+    target: progress.target,
+    trigger: progress.trigger,
+    attemptUsage: progress.attemptUsage,
+    usage: progress.usage,
+  };
+  const handoffProof = {
+    agentIndex: handoff.agentIndex,
+    logicalJobId: handoff.logicalJobId ?? handoff.failedJobId,
+    failedJobId: handoff.failedJobId,
+    target: handoff.target,
+    trigger: handoff.trigger,
+    attemptUsage: handoff.attemptUsage ?? handoff.usage,
+    usage: handoff.usage,
+  };
+  if (canonicalJson(progressProof) !== canonicalJson(handoffProof)
+      || canonicalJson(routeIdentity(progressRoute)) !== canonicalJson(routeIdentity(handoffRoute))) return false;
+
+  const continuation = handoffRoute.continuation;
+  return progress.trigger.provider !== progress.target.harness
+    && progressRoute.continuation === undefined
+    && progressRoute.jobId === progress.failedJobId
+    && progressRoute.logicalJobId === (progress.logicalJobId ?? progress.failedJobId)
+    && progressRoute.harness === progress.trigger.provider
+    && canonicalJson(progressRoute.continuationFallback ?? null) === canonicalJson(progress.target)
+    && continuation?.state === "handoff"
+    && continuation.fromHarness === progress.trigger.provider
+    && continuation.toHarness === progress.target.harness
+    && continuation.failedJobId === progress.failedJobId
+    && continuation.replacementJobId === undefined
+    && continuation.checkoutDigest === handoff.checkout.digest
+    && canonicalJson(continuation.trigger) === canonicalJson(progress.trigger);
+}
+
 /** Return every independently replayable completed call. Failed, incomplete,
  * duplicated, or fingerprint-inconsistent ordinals are excluded without
  * discarding later parallel calls whose own journal pairs remain valid. */
@@ -77,6 +151,7 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
   const started = new Map<number, WorkflowJournalRecord>();
   const progressed = new Map<number, WorkflowJournalRecord>();
   const handoffs = new Map<number, WorkflowJournalRecord>();
+  const rejectedHandoffs = new Map<number, WorkflowJournalRecord>();
   const completed = new Map<number, WorkflowJournalRecord>();
   const invalid = new Set<number>();
 
@@ -93,17 +168,25 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
     }
     if (record.state === "progressed") {
       if (!priorStart || priorStart.fingerprint !== record.fingerprint || progressed.has(record.callIndex)
-          || handoffs.has(record.callIndex) || completed.has(record.callIndex) || !record.continuationProgress) {
+          || callKind(priorStart) !== callKind(record) || handoffs.has(record.callIndex)
+          || completed.has(record.callIndex) || !record.continuationProgress) {
         invalid.add(record.callIndex);
       } else progressed.set(record.callIndex, record);
       continue;
     }
     if (record.state === "handoff") {
-      if (!priorStart || priorStart.fingerprint !== record.fingerprint || handoffs.has(record.callIndex)
-          || completed.has(record.callIndex) || !record.continuation) invalid.add(record.callIndex);
-      else handoffs.set(record.callIndex, record);
+      const progress = progressed.get(record.callIndex);
+      if (!priorStart || priorStart.fingerprint !== record.fingerprint || !record.continuation) {
+        invalid.add(record.callIndex);
+      } else if (!progress || handoffs.has(record.callIndex) || completed.has(record.callIndex)
+          || !continuationCheckpointsMatch(progress, record)) {
+        rejectedHandoffs.set(record.callIndex, record);
+        handoffs.delete(record.callIndex);
+        completed.delete(record.callIndex);
+      } else handoffs.set(record.callIndex, record);
       continue;
     }
+    if (rejectedHandoffs.has(record.callIndex)) continue;
     if (!priorStart || priorStart.fingerprint !== record.fingerprint || completed.has(record.callIndex)) {
       invalid.add(record.callIndex);
       continue;
@@ -145,6 +228,20 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
       },
     });
   }
+  for (const [callIndex, record] of rejectedHandoffs) {
+    if (invalid.has(callIndex) || progressed.has(callIndex)) continue;
+    replayable.set(callIndex, {
+      ...record,
+      state: "failed",
+      route: undefined,
+      result: {
+        ok: false,
+        output: "",
+        error: "Continuation handoff lacks a matching progressed-primary checkpoint; neither provider was dispatched",
+        progressed: true,
+      },
+    });
+  }
 
   return [...replayable.entries()]
     .filter(([callIndex, record]) => !invalid.has(callIndex) && !!record.result)
@@ -166,7 +263,7 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
  */
 export function replayableJournalHandoffs(records: WorkflowJournalRecord[]): WorkflowReplayHandoff[] {
   const started = new Map<number, WorkflowJournalRecord>();
-  const progressed = new Set<number>();
+  const progressed = new Map<number, WorkflowJournalRecord>();
   const handoffs = new Map<number, WorkflowJournalRecord>();
   const terminal = new Set<number>();
   const invalid = new Set<number>();
@@ -184,12 +281,15 @@ export function replayableJournalHandoffs(records: WorkflowJournalRecord[]): Wor
       continue;
     }
     if (record.state === "progressed") {
-      if (progressed.has(record.callIndex) || handoffs.has(record.callIndex) || !record.continuationProgress) invalid.add(record.callIndex);
-      else progressed.add(record.callIndex);
+      if (callKind(start) !== callKind(record) || progressed.has(record.callIndex)
+          || handoffs.has(record.callIndex) || !record.continuationProgress) invalid.add(record.callIndex);
+      else progressed.set(record.callIndex, record);
       continue;
     }
     if (record.state === "handoff") {
-      if (handoffs.has(record.callIndex) || !record.continuation) invalid.add(record.callIndex);
+      const progress = progressed.get(record.callIndex);
+      if (!progress || handoffs.has(record.callIndex) || !record.continuation
+          || !continuationCheckpointsMatch(progress, record)) invalid.add(record.callIndex);
       else handoffs.set(record.callIndex, record);
       continue;
     }

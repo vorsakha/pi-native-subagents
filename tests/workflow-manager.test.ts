@@ -8,7 +8,7 @@ import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
 import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, ScriptedHarnessAvailability, tempDir, tick, waitFor } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
-import { workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint, workflowInteractionFingerprint } from "../src/workflows/journal.ts";
+import { replayableJournalInteractions, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint, workflowInteractionFingerprint } from "../src/workflows/journal.ts";
 import {
   aggregateWorkflowUsage,
   WorkflowManager,
@@ -4194,6 +4194,38 @@ test("resuming a workflow replays a matched follow-up without a duplicate native
   }
 });
 
+test("replaying a progressed terminal follow-up restores dashboard restart refusal proof", async () => {
+  const f = await fixture();
+  const script = `export default async () => {
+    const first = await agent("replay progressed follow-up", { access: "readOnly" });
+    return followUp(first.jobId, "fail after progress");
+  };`;
+  try {
+    const source = await f.workflows.start(f.request(script));
+    await f.backend.waitForStart();
+    const jobId = f.backend.starts[0]!;
+    f.backend.complete(jobId, "ready");
+    await f.backend.waitForSend();
+    f.backend.emit(jobId, { type: "message", text: "follow-up made progress" });
+    f.backend.fail(jobId, "follow-up failed after progress");
+    const sourceFinal = await source.completion;
+    assert.equal(sourceFinal.agents[0]?.progressedCheckpoint, true);
+
+    const requestCount = f.backend.requests.length;
+    const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: sourceFinal.runId }));
+    const final = await resumed.completion;
+    assert.equal(f.backend.requests.length, requestCount, "exact replay dispatches neither generation");
+    assert.equal(final.agents[0]?.state, "failed");
+    assert.equal(final.agents[0]?.progressedCheckpoint, true, "replay restores the dashboard's authoritative restart proof");
+    await assert.rejects(
+      f.workflows.restartAgent(final.runId, final.agents[0]!.index),
+      /progressed continuation checkpoint/i,
+    );
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("partial replay that excludes a follow-up's own journal entry fails cleanly instead of resuming or creating a new session", async () => {
   const f = await fixture();
   const script = `
@@ -4935,6 +4967,63 @@ test("a cancelled peer answer settles native cancellation before usage journalin
     const restarted = await f.workflows.restartAgent(final.runId, planner.index);
     const cancelled = await f.workflows.cancel(restarted.snapshot.runId, "restart policy accepted cancelled peer progress");
     assert.equal(cancelled.status, "aborted");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a peer answer completed before dismissal is rejected before journaling or replay", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "ORIGINAL PLAN", { input: 2, output: 1, turns: 1 });
+    await waitFor(() => f.backend.requests.length === 2, "implementer dispatch");
+    const implementerJobId = f.backend.requests[1]!.jobId;
+
+    const asked = f.backend.ask(implementerJobId, {
+      question: "which plan?",
+      target: { type: "agent", jobId: plannerJobId },
+    });
+    const rejected = assert.rejects(asked, /discard late peer answer/);
+    await waitFor(() => f.backend.sends.length === 1, "peer follow-up dispatch");
+
+    let unsubscribe = () => {};
+    const dismissed = new Promise<void>((resolveDismissed, rejectDismissed) => {
+      unsubscribe = f.jobs.subscribe((job, event) => {
+        if (job.id !== plannerJobId || event.type !== "completed") return;
+        queueMicrotask(() => {
+          try {
+            const pending = f.jobs.pendingInteractions().find((interaction) => interaction.sourceJobId === implementerJobId);
+            assert.ok(pending, "the source interaction remains pending until the continuation consumes the result");
+            f.jobs.dismissInteraction(pending.requestId, "discard late peer answer");
+            resolveDismissed();
+          } catch (error) {
+            rejectDismissed(error);
+          }
+        });
+      });
+    });
+
+    f.backend.complete(plannerJobId, "LATE ANSWER", { input: 4, output: 3, turns: 1 });
+    await dismissed;
+    unsubscribe();
+    await rejected;
+    f.backend.complete(implementerJobId, "IMPLEMENTED");
+    const final = await started.completion;
+    const planner = final.agents[0]!;
+    assert.equal(planner.state, "completed");
+    assert.equal(planner.output, "ORIGINAL PLAN", "the undelivered answer never replaces the consumed lineage result");
+    assert.deepEqual(planner.usage, {
+      input: 6, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2,
+    });
+
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const peerRecords = journal.filter((record) => record.kind === "peerQuestion");
+    assert.deepEqual(peerRecords.map((record) => record.state), ["started", "failed"]);
+    assert.match(peerRecords[1]?.result?.error ?? "", /discard late peer answer/);
+    assert.deepEqual(replayableJournalInteractions(journal), [], "an undelivered answer cannot become replay evidence");
   } finally {
     await f.cleanup();
   }

@@ -10,11 +10,13 @@ import {
 } from "../src/workflows/artifacts.ts";
 import {
   replayableJournalCalls,
+  replayableJournalHandoffs,
   replayableJournalInteractions,
   workflowCallFingerprint,
   workflowDefinitionFingerprint,
   workflowInteractionFingerprint,
 } from "../src/workflows/journal.ts";
+import type { WorkflowJournalRecord } from "../src/workflows/types.ts";
 
 const usage = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5, turns: 1 };
 
@@ -105,6 +107,118 @@ test("journal loading replays valid completed calls independently across a faile
     }]);
   } finally {
     await f.cleanup();
+  }
+});
+
+test("continuation handoff replay requires a matching progressed-primary checkpoint", () => {
+  const fingerprint = workflowCallFingerprint("continue safely", {
+    harness: "claude",
+    continuationFallback: { harness: "codex" },
+  });
+  const trigger = {
+    source: "continuation" as const,
+    provider: "claude" as const,
+    kind: "quota" as const,
+    retryAt: 10_000,
+    detail: "authoritative quota",
+  };
+  const target = { harness: "codex" as const, model: "replacement-model" };
+  const attemptUsage = { ...usage };
+  const cumulativeUsage = { ...usage, input: 6, output: 8, turns: 3 };
+  const route = {
+    jobId: "failed-job",
+    logicalJobId: "logical-job",
+    harness: "claude" as const,
+    requestedHarness: "claude" as const,
+    model: "primary-model",
+    status: "failed" as const,
+    error: "quota",
+    continuationFallback: target,
+  };
+  const started: WorkflowJournalRecord = {
+    version: 1, sequence: 0, callIndex: 0, fingerprint, kind: "agent", state: "started", at: 1,
+  };
+  const progressed: WorkflowJournalRecord = {
+    version: 1, sequence: 1, callIndex: 0, fingerprint, kind: "agent", state: "progressed", at: 2,
+    agentIndex: 0,
+    route,
+    continuationProgress: {
+      agentIndex: 0,
+      logicalJobId: "logical-job",
+      failedJobId: "failed-job",
+      target,
+      trigger,
+      attemptUsage,
+      usage: cumulativeUsage,
+    },
+  };
+  const handoff: WorkflowJournalRecord = {
+    version: 1, sequence: 2, callIndex: 0, fingerprint, kind: "agent", state: "handoff", at: 3,
+    agentIndex: 0,
+    route: {
+      ...route,
+      continuation: {
+        state: "handoff",
+        fromHarness: "claude",
+        toHarness: "codex",
+        failedJobId: "failed-job",
+        checkpointAt: 3,
+        checkoutDigest: `sha256:${"b".repeat(64)}`,
+        trigger,
+        warning: "continuation warning",
+      },
+    },
+    continuation: {
+      agentIndex: 0,
+      logicalJobId: "logical-job",
+      failedJobId: "failed-job",
+      phase: "build",
+      objective: "finish the change",
+      handoffPrompt: "inspect existing state and continue",
+      checkout: {
+        cwd: "/repo",
+        root: "/repo",
+        gitDir: "/repo/.git",
+        head: "a".repeat(40),
+        changedPaths: 1,
+        digest: `sha256:${"b".repeat(64)}`,
+      },
+      target,
+      trigger,
+      attemptUsage,
+      usage: cumulativeUsage,
+    },
+  };
+
+  assert.equal(replayableJournalHandoffs([started, progressed, handoff]).length, 1);
+  assert.deepEqual(replayableJournalHandoffs([started, handoff]), [], "a handoff cannot replace its missing progress proof");
+  assert.match(
+    replayableJournalCalls([started, handoff])[0]?.result.error ?? "",
+    /lacks a matching progressed-primary checkpoint/,
+    "missing proof becomes a terminal replay refusal instead of a fresh primary dispatch",
+  );
+
+  const inconsistent = [
+    (record: WorkflowJournalRecord) => {
+      record.continuation!.failedJobId = "different-failed-job";
+      record.route!.jobId = "different-failed-job";
+      record.route!.continuation!.failedJobId = "different-failed-job";
+    },
+    (record: WorkflowJournalRecord) => { record.route!.model = "different-primary-route"; },
+    (record: WorkflowJournalRecord) => {
+      record.continuation!.trigger.detail = "different trigger";
+      record.route!.continuation!.trigger.detail = "different trigger";
+    },
+    (record: WorkflowJournalRecord) => { record.continuation!.usage.input += 1; },
+  ];
+  for (const mutate of inconsistent) {
+    const changed = structuredClone(handoff);
+    mutate(changed);
+    assert.deepEqual(replayableJournalHandoffs([started, progressed, changed]), []);
+    const refused = replayableJournalCalls([started, progressed, changed]);
+    assert.equal(refused.length, 1);
+    assert.equal(refused[0]?.result.progressed, true);
+    assert.match(refused[0]?.result.error ?? "", /stopped before a safe continuation handoff/);
   }
 });
 
