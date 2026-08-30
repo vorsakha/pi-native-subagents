@@ -68,9 +68,8 @@ interface InternalInteraction {
   cancelDeadline?: () => void;
   controller: AbortController;
   settled: boolean;
-  /** Serializes the final durable peer-answer acceptance against dismissal. */
-  committingAcceptance?: boolean;
-  acceptanceCommitted?: boolean;
+  /** Second-phase replay acceptance, scheduled only once the caller can resolve. */
+  commitAcceptance?: () => Promise<void>;
 }
 
 /** Injectable interaction deadline clock. Tests advance it without sleeping. */
@@ -198,12 +197,6 @@ export interface PeerInteractionRequest {
   context?: string;
   /** Aborted when the caller is cancelled, the deadline passes, or the session shuts down. */
   signal: AbortSignal;
-  /**
-   * Runs the final durable acceptance write as the interaction's linearization
-   * point. Dismissal may win before this begins; once it begins, successful
-   * persistence wins and the answer is no longer dismissible.
-   */
-  commitAcceptance(persist: () => Promise<void>): Promise<void>;
 }
 
 export interface PeerInteractionResult {
@@ -213,6 +206,8 @@ export interface PeerInteractionResult {
   targetLabel?: string;
   /** `replay` marks an answer served from the durable journal with no new dispatch. */
   route?: "peer" | "replay";
+  /** Appends replay acceptance after the parked caller can resolve successfully. */
+  commitAcceptance?: () => Promise<void>;
 }
 
 export type PeerInteractionRouter = (request: PeerInteractionRequest) => Promise<PeerInteractionResult>;
@@ -997,9 +992,6 @@ export class JobManager {
     const pending = job?.interaction;
     if (!job || !pending) throw new InteractionError(`Unknown or already-resolved question: ${requestId}`);
     if (pending.settled) throw new InteractionError(`Question ${requestId} is ${pending.record.state} and can no longer be dismissed`);
-    if (pending.committingAcceptance || pending.acceptanceCommitted) {
-      throw new InteractionError(`Question ${requestId} has committed its durable peer answer and can no longer be dismissed`);
-    }
     pending.settle({ error: new InteractionError(reason), state: "dismissed" });
     return cloneInteraction(pending.record);
   }
@@ -1099,16 +1091,51 @@ export class JobManager {
     lease?.park();
 
     try {
-      if (target.kind === "agent") await this.#routePeerQuestion(job, pending);
-      const settled = await answered;
-      // Resolve the provider tool call only after the caller owns a slot again.
-      if (lease) await lease.reacquire();
-      return {
+      let settled: PendingInteraction;
+      if (target.kind === "agent") {
+        const routed = this.#routePeerQuestion(job, pending);
+        const interrupted = answered.then<never>(
+          () => { throw new InteractionError(`Question ${record.requestId} settled without its peer result`); },
+          (error: unknown) => { throw error; },
+        );
+        const peerResult = await Promise.race([routed, interrupted]);
+        // Keep lifecycle cancellation authoritative until the caller owns a slot
+        // and can return the answer without another asynchronous gap.
+        if (lease) {
+          try { await lease.reacquire(); }
+          catch (error) {
+            if (pending.controller.signal.aborted) throw pending.controller.signal.reason;
+            throw error;
+          }
+        }
+        if (pending.settled || pending.controller.signal.aborted) {
+          throw pending.controller.signal.reason instanceof Error
+            ? pending.controller.signal.reason
+            : new InteractionError(`Question ${record.requestId} can no longer accept an answer`);
+        }
+        pending.commitAcceptance = peerResult.commitAcceptance;
+        pending.settle({
+          answer: normalizeAnswer(peerResult.answer),
+          route: peerResult.route ?? "peer",
+          targetGeneration: peerResult.targetGeneration,
+          label: peerResult.targetLabel,
+        });
+        settled = record;
+      } else {
+        settled = await answered;
+        // Resolve the provider tool call only after the caller owns a slot again.
+        if (lease) await lease.reacquire();
+      }
+      const result = {
         answer: renderInteractionAnswer(settled),
         requestId: settled.requestId,
         route: settled.route ?? "orchestrator-model",
         answeredBy: settled.target.kind === "orchestrator" ? "orchestrator" : settled.target.label ?? settled.target.jobId ?? "peer",
       };
+      const commitAcceptance = pending.commitAcceptance;
+      pending.commitAcceptance = undefined;
+      if (commitAcceptance) void commitAcceptance().catch(() => undefined);
+      return result;
     } catch (error) {
       // A dismissed, expired, or failed question returns a tool error and the
       // child may continue reasoning, so it still needs a slot first. A
@@ -1161,7 +1188,7 @@ export class JobManager {
     return target;
   }
 
-  async #routePeerQuestion(job: InternalJob, pending: InternalInteraction): Promise<void> {
+  async #routePeerQuestion(job: InternalJob, pending: InternalInteraction): Promise<PeerInteractionResult> {
     const record = pending.record;
     const targetId = record.target.jobId!;
     const resolvedTargetId = pending.resolvedTargetJobId ?? targetId;
@@ -1171,8 +1198,9 @@ export class JobManager {
       target = this.#assertPeerEligible(job, targetId, resolvedTargetId);
       if (!router) throw new InteractionError("Peer questions require an active workflow run");
     } catch (error) {
-      pending.settle({ error: error instanceof Error ? error : new Error(String(error)), state: "dismissed" });
-      return;
+      const failure = error instanceof Error ? error : new Error(String(error));
+      pending.settle({ error: failure, state: "dismissed" });
+      throw failure;
     }
     record.state = "answering";
     if (target) {
@@ -1182,52 +1210,25 @@ export class JobManager {
     }
     this.#publishInteraction(job, record);
     const answering = target;
-    void router({
-      requestId: record.requestId,
-      source: clone(job.snapshot),
-      targetJobId: targetId,
-      target: answering ? clone(answering.snapshot) : undefined,
-      question: record.question,
-      context: record.context,
-      signal: pending.controller.signal,
-      commitAcceptance: async (persist) => {
-        const abortReason = () => pending.controller.signal.reason instanceof Error
-          ? pending.controller.signal.reason
-          : new InteractionError(`Question ${record.requestId} can no longer accept an answer`);
-        if (pending.settled || pending.controller.signal.aborted) {
-          throw abortReason();
-        }
-        if (pending.committingAcceptance || pending.acceptanceCommitted) {
-          throw new InteractionError(`Question ${record.requestId} already committed its durable peer answer`);
-        }
-        pending.committingAcceptance = true;
-        let removeAbortListener = () => {};
-        const aborted = new Promise<never>((_resolve, reject) => {
-          const abort = () => reject(abortReason());
-          if (pending.controller.signal.aborted) {
-            abort();
-            return;
-          }
-          pending.controller.signal.addEventListener("abort", abort, { once: true });
-          removeAbortListener = () => pending.controller.signal.removeEventListener("abort", abort);
-        });
-        try {
-          await Promise.race([persist(), aborted]);
-          if (pending.controller.signal.aborted) throw abortReason();
-          pending.acceptanceCommitted = true;
-        } finally {
-          removeAbortListener();
-          pending.committingAcceptance = false;
-        }
-      },
-    }).then(
-      (result) => pending.settle({ answer: normalizeAnswer(result.answer), route: result.route ?? "peer", targetGeneration: result.targetGeneration, label: result.targetLabel ?? answering?.snapshot.name }),
-      (error: unknown) => pending.settle({ error: error instanceof Error ? error : new Error(String(error)), state: "dismissed" }),
-    ).finally(() => {
-      if (!answering) return;
-      answering.answeringInteraction = undefined;
-      this.#publishAnswering(answering);
-    });
+    try {
+      const result = await router({
+        requestId: record.requestId,
+        source: clone(job.snapshot),
+        targetJobId: targetId,
+        target: answering ? clone(answering.snapshot) : undefined,
+        question: record.question,
+        context: record.context,
+        signal: pending.controller.signal,
+      });
+      return {
+        ...result,
+        targetLabel: result.targetLabel ?? answering?.snapshot.name,
+      };
+    } catch (error) {
+      const failure = error instanceof Error ? error : new Error(String(error));
+      pending.settle({ error: failure, state: "dismissed" });
+      throw failure;
+    }
   }
 
   #clearInteraction(job: InternalJob, requestId: string): void {
@@ -1237,6 +1238,11 @@ export class JobManager {
     job.interaction = undefined;
     this.#interactions.delete(requestId);
     this.#waitGraph.remove(job.snapshot.id);
+    const target = pending.resolvedTargetJobId ? this.#jobs.get(pending.resolvedTargetJobId) : undefined;
+    if (target?.answeringInteraction?.requestId === requestId) {
+      target.answeringInteraction = undefined;
+      this.#publishAnswering(target);
+    }
     this.#publishInteractionEvent(job, { type: "interaction_cleared", requestId });
   }
 

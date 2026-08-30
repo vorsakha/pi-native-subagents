@@ -8,7 +8,7 @@ import {
   normalizeTarget,
   renderOrchestratorQuestion,
 } from "../src/interactions.ts";
-import { ControlledBackend, ControlledInteractionClock, GatedAcceptanceWrite, interactionSnapshot, tick } from "./helpers.ts";
+import { ControlledBackend, ControlledInteractionClock, GatedWrite, interactionSnapshot, tick } from "./helpers.ts";
 
 function setup(concurrency = 4, interactionTimeoutMs?: number, interactionClock?: ControlledInteractionClock) {
   const backend = new ControlledBackend();
@@ -21,11 +21,11 @@ function askable(task: string, extra: Record<string, unknown> = {}) {
   return { ...base, task, interaction: { orchestrator: "allow" as const }, ...extra };
 }
 
-async function startPeerAcceptance(interactionClock?: ControlledInteractionClock) {
+async function startPeerAcceptance(interactionClock?: ControlledInteractionClock, concurrency = 2) {
   const backend = new ControlledBackend();
   const manager = new JobManager({
     backends: [backend],
-    concurrency: 2,
+    concurrency,
     interactionTimeoutMs: 1_000,
     interactionClock,
   });
@@ -41,14 +41,16 @@ async function startPeerAcceptance(interactionClock?: ControlledInteractionClock
   backend.complete(target.id, "plan");
   await tick();
 
-  const write = new GatedAcceptanceWrite();
+  const provisionalWrite = new GatedWrite();
+  const acceptanceWrite = new GatedWrite();
   let signal: AbortSignal | undefined;
   let abortEvents = 0;
   manager.setPeerInteractionRouter(async (request) => {
     signal = request.signal;
     request.signal.addEventListener("abort", () => { abortEvents++; });
-    await request.commitAcceptance(write.persist);
-    return { answer: "durably accepted answer" };
+    await provisionalWrite.persist();
+    if (request.signal.aborted) throw request.signal.reason;
+    return { answer: "durably accepted answer", commitAcceptance: acceptanceWrite.persist };
   });
   const terminalStates: string[] = [];
   manager.subscribe((job, event) => {
@@ -62,14 +64,15 @@ async function startPeerAcceptance(interactionClock?: ControlledInteractionClock
     question: "which plan?",
     target: { type: "agent", jobId: target.id },
   });
-  await write.waitUntilReached();
+  await provisionalWrite.waitUntilReached();
   assert.ok(signal);
   return {
     backend,
     manager,
     target,
     caller,
-    write,
+    provisionalWrite,
+    acceptanceWrite,
     signal,
     asked,
     terminalStates,
@@ -330,7 +333,7 @@ test("a peer-answer turn cannot ask another agent or the orchestrator", async ()
   await manager.shutdown();
 });
 
-test("deadline expiry aborts a stalled peer-acceptance write and clears the parked callback once", async () => {
+test("deadline expiry during provisional persistence clears the callback without accepting replay", async () => {
   const clock = new ControlledInteractionClock();
   const f = await startPeerAcceptance(clock);
   const rejected = assert.rejects(f.asked, /expired after 1000ms/);
@@ -343,14 +346,15 @@ test("deadline expiry aborts a stalled peer-acceptance write and clears the park
   assert.equal(f.manager.pendingInteractions().length, 0);
   assert.equal(f.manager.check(f.caller.id).interaction, undefined);
 
-  f.write.release();
+  f.provisionalWrite.release();
   await tick();
+  assert.equal(f.acceptanceWrite.calls, 0);
   assert.equal(f.manager.check(f.target.id).answeringInteraction, undefined);
   f.backend.complete(f.caller.id);
   await f.manager.shutdown();
 });
 
-test("caller cancellation aborts a stalled peer-acceptance write and cannot resolve its answer", async () => {
+test("caller cancellation during provisional persistence cannot accept replay", async () => {
   const f = await startPeerAcceptance();
   const rejected = assert.rejects(f.asked, /operator cancelled caller/);
 
@@ -362,13 +366,34 @@ test("caller cancellation aborts a stalled peer-acceptance write and cannot reso
   assert.equal(f.manager.pendingInteractions().length, 0);
   assert.equal(f.manager.check(f.caller.id).interaction, undefined);
 
-  f.write.release();
+  f.provisionalWrite.release();
   await tick();
+  assert.equal(f.acceptanceWrite.calls, 0);
   assert.equal(f.manager.check(f.target.id).answeringInteraction, undefined);
   await f.manager.shutdown();
 });
 
-test("terminal caller settlement aborts a stalled peer-acceptance write", async () => {
+test("caller cancellation while waiting to resume cannot append acceptance", async () => {
+  const f = await startPeerAcceptance(undefined, 1);
+  const blocker = f.manager.spawn({ ...base, task: "holds the only slot" });
+  await tick();
+  assert.equal(f.backend.starts.at(-1), blocker.id);
+
+  f.provisionalWrite.release();
+  await tick();
+  assert.equal(f.acceptanceWrite.calls, 0, "acceptance waits for the caller's scheduler lease");
+  const rejected = assert.rejects(f.asked, /cancel before caller resume/);
+  await f.manager.cancel(f.caller.id, "cancel before caller resume");
+  await rejected;
+  assert.equal(f.signal.aborted, true);
+  assert.equal(f.acceptanceWrite.calls, 0);
+  assert.equal(f.manager.pendingInteractions().length, 0);
+
+  f.backend.complete(blocker.id);
+  await f.manager.shutdown();
+});
+
+test("terminal caller settlement during provisional persistence cannot accept replay", async () => {
   const f = await startPeerAcceptance();
   const rejected = assert.rejects(f.asked, /Job completed before its question was answered/);
 
@@ -380,13 +405,14 @@ test("terminal caller settlement aborts a stalled peer-acceptance write", async 
   assert.equal(f.manager.pendingInteractions().length, 0);
   assert.equal(f.manager.check(f.caller.id).interaction, undefined);
 
-  f.write.release();
+  f.provisionalWrite.release();
   await tick();
+  assert.equal(f.acceptanceWrite.calls, 0);
   assert.equal(f.manager.check(f.target.id).answeringInteraction, undefined);
   await f.manager.shutdown();
 });
 
-test("session shutdown aborts a stalled peer-acceptance write", async () => {
+test("session shutdown during provisional persistence cannot accept replay", async () => {
   const f = await startPeerAcceptance();
   const rejected = assert.rejects(f.asked, /Session shutdown/);
 
@@ -398,38 +424,43 @@ test("session shutdown aborts a stalled peer-acceptance write", async () => {
   assert.equal(f.manager.pendingInteractions().length, 0);
   assert.equal(f.manager.check(f.caller.id).interaction, undefined);
 
-  f.write.release();
+  f.provisionalWrite.release();
   await tick();
+  assert.equal(f.acceptanceWrite.calls, 0);
 });
 
-test("late dismissal cannot overtake a stalled peer-acceptance write", async () => {
+test("dismissal before caller settlement prevents the acceptance append", async () => {
   const f = await startPeerAcceptance();
   const requestId = f.manager.pendingInteractions()[0]!.requestId;
-  assert.throws(
-    () => f.manager.dismissInteraction(requestId, "too late"),
-    /committed its durable peer answer/,
-    "dismissal cannot invalidate a final acceptance write already in progress",
-  );
-  assert.equal(f.signal.aborted, false);
+  const rejected = assert.rejects(f.asked, /dismiss before settlement/);
 
-  f.write.release();
-  assert.match((await f.asked).answer, /durably accepted answer/);
-  assert.equal(f.write.calls, 1);
+  f.manager.dismissInteraction(requestId, "dismiss before settlement");
+  await rejected;
+  f.provisionalWrite.release();
+  await tick();
+  assert.equal(f.acceptanceWrite.calls, 0);
   f.backend.complete(f.caller.id);
   await f.manager.shutdown();
 });
 
-test("a successful peer-acceptance write resolves the parked caller once", async () => {
+test("successful caller settlement schedules one acceptance append without waiting for it", async () => {
   const f = await startPeerAcceptance();
+  const requestId = f.manager.pendingInteractions()[0]!.requestId;
 
-  f.write.release();
+  f.provisionalWrite.release();
   assert.match((await f.asked).answer, /durably accepted answer/);
-  assert.equal(f.write.calls, 1);
+  await f.acceptanceWrite.waitUntilReached();
+  assert.equal(f.acceptanceWrite.calls, 1);
   assert.equal(f.signal.aborted, false);
   assert.deepEqual(f.terminalStates, []);
   assert.equal(f.manager.pendingInteractions().length, 0);
   assert.equal(f.manager.check(f.caller.id).interaction, undefined);
+  assert.throws(
+    () => f.manager.dismissInteraction(requestId, "too late"),
+    /Unknown or already-resolved question/,
+  );
 
+  f.acceptanceWrite.release();
   f.backend.complete(f.caller.id);
   await f.manager.shutdown();
 });

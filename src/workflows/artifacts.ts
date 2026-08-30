@@ -326,6 +326,7 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
     agents: snapshot.agents.slice(0, 32).map((agent) => ({
       ...agent,
       name: truncateUtf8(agent.name, 1_000),
+      objective: agent.objective ? truncateUtf8(agent.objective, 2 * 1024) : undefined,
       prompt: agent.prompt ? truncateUtf8(agent.prompt, 2 * 1024) : undefined,
       tools: agent.tools?.slice(-8).map((tool) => ({
         ...tool,

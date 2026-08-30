@@ -77,12 +77,17 @@ export class GatedWorkflowJournalAppender {
   #gateState: WorkflowJournalRecord["state"] = "completed";
   #reached = false;
   #failInvalidation = false;
+  #failAcceptance = false;
   #resolveReached!: () => void;
   #resolveRelease!: () => void;
   readonly #reachedPromise = new Promise<void>((resolve) => { this.#resolveReached = resolve; });
   readonly #releasePromise = new Promise<void>((resolve) => { this.#resolveRelease = resolve; });
 
   readonly append = async (root: string, runId: string, record: WorkflowJournalRecord): Promise<void> => {
+    if (this.#failAcceptance && record.kind === "peerQuestion" && record.state === "accepted") {
+      this.#failAcceptance = false;
+      throw new Error("controlled peer-answer acceptance persistence failure");
+    }
     if (this.#failInvalidation && record.kind === "peerQuestion" && record.state === "failed") {
       this.#failInvalidation = false;
       throw new Error("controlled peer-answer invalidation persistence failure");
@@ -103,6 +108,10 @@ export class GatedWorkflowJournalAppender {
     this.#failInvalidation = true;
   }
 
+  failNextAcceptance(): void {
+    this.#failAcceptance = true;
+  }
+
   waitUntilReached(): Promise<void> {
     return this.#reached ? Promise.resolve() : this.#reachedPromise;
   }
@@ -112,8 +121,8 @@ export class GatedWorkflowJournalAppender {
   }
 }
 
-/** Controlled durable write for interaction acceptance lifecycle races. */
-export class GatedAcceptanceWrite {
+/** Controlled write for interaction persistence races. */
+export class GatedWrite {
   #reached = false;
   #resolveReached!: () => void;
   #resolveRelease!: () => void;

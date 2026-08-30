@@ -2165,6 +2165,59 @@ test("retained follow-up progress cannot leak from an earlier generation into co
   }
 });
 
+test("retained continuation preserves the original objective after generation history truncates", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const originalObjective = "AUTHORITATIVE ORIGINAL OBJECTIVE";
+    const started = await f.workflows.start(f.request(`export default async () => {
+      let current = await agent(${JSON.stringify(originalObjective)}, {
+        harness: "claude",
+        access: "readOnly",
+        continuationFallback: { harness: "codex" }
+      });
+      for (let index = 1; index <= 9; index++) {
+        current = await followUp(current.jobId, "retained turn " + index);
+        if (!current.ok) return current;
+      }
+      return current;
+    };`));
+    await f.claude.waitForStart();
+    const lineage = f.claude.starts[0]!;
+    f.claude.complete(lineage, "initial result");
+
+    for (let index = 1; index <= 8; index++) {
+      await f.claude.waitForSend(index);
+      f.claude.complete(lineage, `retained result ${index}`);
+    }
+    await f.claude.waitForSend(9);
+    const truncated = f.workflows.check(started.snapshot.runId).agents[0]!;
+    assert.equal(truncated.generations?.length, 8);
+    assert.ok(
+      truncated.generations?.every((generation) => generation.prompt !== originalObjective),
+      "the bounded audit history no longer carries generation zero",
+    );
+    assert.equal(truncated.objective, originalObjective, "objective provenance is independent of retained history");
+
+    f.claude.emit(lineage, { type: "message", text: "ninth turn made progress" });
+    f.claude.fail(lineage, "quota", progressedQuota("claude"));
+    await f.backend.waitForStart();
+    const handoff = f.backend.requests[0]!.task;
+    assert.match(handoff, new RegExp(`Original objective:\\n${originalObjective}`));
+    assert.match(handoff, /Current turn:\nretained turn 9/);
+    assert.doesNotMatch(handoff, /Original objective:\nretained turn/);
+
+    f.backend.complete(f.backend.starts[0]!, "continued ninth turn");
+    const final = await started.completion;
+    assert.equal((final.result as { ok: boolean }).ok, true);
+    assert.equal(final.agents[0]?.objective, originalObjective);
+    const restored = await loadWorkflowSummaries(f.artifactRoot, { sessionId: "session-1" });
+    assert.equal(restored.find((run) => run.runId === final.runId)?.agents[0]?.objective, originalObjective);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("replay after a crash between progressed proof and handoff never reruns the primary", async () => {
   const f = await fallbackFixture();
   try {
@@ -5343,9 +5396,10 @@ test("a replayed peer answer dismissed during completed-journal persistence is i
   }
 });
 
-test("caller cancellation during peer acceptance invalidates the durable answer before replay", async () => {
+test("caller cancellation leaves only a non-replayable provisional answer when invalidation fails", async () => {
   const gate = new GatedWorkflowJournalAppender();
-  gate.arm("accepted");
+  gate.arm();
+  gate.failNextInvalidation();
   const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, gate.append);
   try {
     const started = await f.workflows.start(f.request(PEER_SCRIPT));
@@ -5361,7 +5415,7 @@ test("caller cancellation during peer acceptance invalidates the durable answer 
     });
     const rejected = assert.rejects(asked, /cancel during acceptance commit/);
     await waitFor(() => f.backend.sends.length === 1, "peer follow-up dispatch");
-    f.backend.complete(plannerJobId, "ACCEPTED BUT NOT DELIVERED");
+    f.backend.complete(plannerJobId, "PROVISIONAL BUT NOT DELIVERED");
     await gate.waitUntilReached();
 
     const cancellation = f.jobs.cancel(implementerJobId, "cancel during acceptance commit");
@@ -5374,11 +5428,49 @@ test("caller cancellation during peer acceptance invalidates the durable answer 
     const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
     assert.deepEqual(
       journal.filter((record) => record.kind === "peerQuestion").map((record) => record.state),
-      ["started", "completed", "accepted", "failed"],
+      ["started", "completed"],
     );
-    assert.deepEqual(replayableJournalInteractions(journal), [], "the cancelled answer cannot become replay evidence");
+    assert.equal(
+      journal.find((record) => record.kind === "peerQuestion" && record.state === "completed")?.interactionPending,
+      true,
+    );
+    assert.deepEqual(replayableJournalInteractions(journal), [], "the durable prefix cannot replay an undelivered answer");
   } finally {
     gate.release();
+    await f.cleanup();
+  }
+});
+
+test("acceptance persistence failure cannot make a delivered peer answer replayable", async () => {
+  const gate = new GatedWorkflowJournalAppender();
+  gate.failNextAcceptance();
+  const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, gate.append);
+  try {
+    const started = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "ORIGINAL PLAN");
+    await waitFor(() => f.backend.requests.length === 2, "implementer dispatch");
+    const implementerJobId = f.backend.requests[1]!.jobId;
+
+    const asked = f.backend.ask(implementerJobId, {
+      question: "which plan?",
+      target: { type: "agent", jobId: plannerJobId },
+    });
+    await waitFor(() => f.backend.sends.length === 1, "peer follow-up dispatch");
+    f.backend.complete(plannerJobId, "DELIVERED WITHOUT ACCEPTANCE");
+    assert.match((await asked).answer, /DELIVERED WITHOUT ACCEPTANCE/);
+
+    const final = await started.completion;
+    assert.equal(final.status, "aborted");
+    assert.match(final.error ?? "", /acceptance persistence failure/);
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    assert.deepEqual(
+      journal.filter((record) => record.kind === "peerQuestion").map((record) => record.state),
+      ["started", "completed"],
+    );
+    assert.deepEqual(replayableJournalInteractions(journal), [], "a failed acceptance append grants no replay authority");
+  } finally {
     await f.cleanup();
   }
 });

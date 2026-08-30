@@ -34,9 +34,9 @@ Continuation never widens trust, access, cwd, profile, capabilities, approval mo
 
 ## Handoff semantics
 
-The replacement continues the same workflow call and logical lineage in the same cwd and current checkout. It does **not** receive a blind replay of the original task. The bounded internal handoff includes:
+The replacement continues the same workflow call and logical lineage in the same cwd and current checkout. It does **not** receive a blind replay of the original task. The bounded handoff includes:
 
-- original objective and current turn;
+- durable original objective and current turn;
 - authoritative failure evidence and phase;
 - bounded failed output plus recent tool names, states, and summaries;
 - current convergence round and pending findings when present;

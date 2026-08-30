@@ -1621,6 +1621,10 @@ export class WorkflowManager {
         : undefined;
       if (record && target && trigger) {
         progressedFailure = true;
+        const objective = this.#originalObjective(record);
+        if (!objective) {
+          throw new Error("Workflow continuation lacks authoritative original-objective provenance");
+        }
         const schema = record.nativeStructuredSchema
           ?? (options.schema === undefined ? undefined : workflowSchema(options.schema) as Record<string, unknown> | undefined);
         result = await this.#continueProgressedCall({
@@ -1629,7 +1633,7 @@ export class WorkflowManager {
           record,
           kind: "followUp",
           logicalJobId: jobId,
-          objective: record.generations?.[0]?.prompt ?? record.prompt ?? prompt,
+          objective,
           currentPrompt: prompt,
           options,
           schema,
@@ -1861,6 +1865,7 @@ export class WorkflowManager {
         timestamps: { createdAt: now, updatedAt: now },
         harness: harness && harness !== "auto" ? harness : undefined,
         model,
+        objective: boundedText(prompt, 2 * 1024),
         prompt: boundedText(prompt, 2 * 1024),
         effort,
         tools: [],
@@ -2217,6 +2222,16 @@ export class WorkflowManager {
     };
   }
 
+  /** Recovers legacy provenance only while generation zero is still present. */
+  #originalObjective(record: WorkflowAgentRecord): string | undefined {
+    if (record.objective) return record.objective;
+    const original = record.generations?.find((generation) => generation.index === 0)?.prompt;
+    const recovered = original ?? (record.generations === undefined ? record.prompt : undefined);
+    if (!recovered) return undefined;
+    record.objective = boundedText(recovered, 2 * 1024);
+    return record.objective;
+  }
+
   async #runFreshFollowUp(
     entry: RunEntry,
     request: StartWorkflowRequest,
@@ -2282,6 +2297,7 @@ export class WorkflowManager {
       };
     }
     const effectiveSchema = nativeLineage ? workflowSchema(record.nativeStructuredSchema) : schema;
+    this.#originalObjective(record);
     // Snapshot generation 0 from the record's pre-follow-up fields before any
     // mutation below, then re-derive structuredTransport strictly for this
     // call: it must not linger from a schema-bearing agent() call now
@@ -2554,6 +2570,7 @@ export class WorkflowManager {
       phase,
       state: "failed",
       timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now },
+      objective: boundedText(handoff.checkpoint.objective, 2 * 1024),
       prompt: boundedText(prompt, 2 * 1024),
       effort: typeof options.effort === "string" && EFFORTS.has(options.effort as EffortLevel) ? options.effort as EffortLevel : undefined,
       tools: [],
@@ -2717,6 +2734,7 @@ export class WorkflowManager {
       })),
       model: replay.route?.model,
       effort: replayEffort,
+      objective: boundedText(prompt, 2 * 1024),
       prompt: boundedText(prompt, 2 * 1024),
       tools: [],
       output: replay.result.output,
@@ -2970,14 +2988,20 @@ export class WorkflowManager {
     try {
       const replayed = this.#matchReplayedInteraction(entry, questionFingerprint, detail);
       if (replayed) {
-        await this.#persistPeerAnswer(entry, request, {
+        const commitAcceptance = await this.#persistPeerAnswer(entry, request, {
           ordinal,
           questionFingerprint,
           sourceAgentIndex: owner.agentIndex,
           result: { ok: true, output: replayed.answer, usage: replayed.usage },
           interaction: { ...detail, targetGeneration: replayed.detail.targetGeneration, route: "replay" },
         });
-        return { answer: replayed.answer, targetGeneration: replayed.detail.targetGeneration, targetLabel: target.name, route: "replay" };
+        return {
+          answer: replayed.answer,
+          targetGeneration: replayed.detail.targetGeneration,
+          targetLabel: target.name,
+          route: "replay",
+          commitAcceptance,
+        };
       }
       if (!request.target) {
         if (target.replayedFrom) {
@@ -2998,7 +3022,7 @@ export class WorkflowManager {
           signal: request.signal,
         });
       });
-      await this.#persistPeerAnswer(entry, request, {
+      const commitAcceptance = await this.#persistPeerAnswer(entry, request, {
         ordinal,
         questionFingerprint,
         sourceAgentIndex: owner.agentIndex,
@@ -3006,7 +3030,13 @@ export class WorkflowManager {
         route: journalRoute(target),
         interaction: { ...detail, targetGeneration: dispatched.targetGeneration, route: "peer" },
       });
-      return { answer: dispatched.answer, targetGeneration: dispatched.targetGeneration, targetLabel: target.name, route: "peer" };
+      return {
+        answer: dispatched.answer,
+        targetGeneration: dispatched.targetGeneration,
+        targetLabel: target.name,
+        route: "peer",
+        commitAcceptance,
+      };
     } catch (error) {
       await this.#appendJournal(entry, {
         callIndex: ordinal,
@@ -3024,10 +3054,9 @@ export class WorkflowManager {
   }
 
   /**
-   * Persists an answer provisionally, lets a concurrent dismissal win, then
-   * commits a separate replay-acceptance record while JobManager serializes
-   * that final write against later dismissal. A failed invalidation append can
-   * therefore expose only a non-replayable provisional answer.
+   * Persists an answer provisionally and returns its second-phase acceptance
+   * append. JobManager schedules that append only after the parked callback can
+   * resolve, so every earlier cancellation leaves a non-replayable prefix.
    */
   async #persistPeerAnswer(
     entry: RunEntry,
@@ -3040,7 +3069,7 @@ export class WorkflowManager {
       route?: WorkflowJournalRoute;
       interaction: WorkflowInteractionJournalDetail;
     },
-  ): Promise<void> {
+  ): Promise<() => Promise<void>> {
     await this.#appendJournal(entry, {
       callIndex: input.ordinal,
       fingerprint: input.questionFingerprint,
@@ -3054,7 +3083,7 @@ export class WorkflowManager {
       interactionPending: true,
     });
     if (request.signal.aborted) throw abortError(request.signal.reason);
-    await request.commitAcceptance(() => this.#appendJournal(entry, {
+    return () => this.#appendJournal(entry, {
       callIndex: input.ordinal,
       fingerprint: input.questionFingerprint,
       kind: "peerQuestion",
@@ -3062,7 +3091,7 @@ export class WorkflowManager {
       at: Date.now(),
       agentIndex: input.sourceAgentIndex,
       interaction: { ...input.interaction },
-    }));
+    });
   }
 
   /**

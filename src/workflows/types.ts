@@ -249,7 +249,9 @@ export interface WorkflowAgentRecord {
   availabilityChecks?: WorkflowHarnessAvailabilityEvidence[];
   model?: string;
   effort?: EffortLevel;
-  /** Original caller prompt, bounded before persistence; excludes schema scaffolding. */
+  /** Authoritative originating agent() objective, fixed across bounded history truncation. */
+  objective?: string;
+  /** Latest caller prompt, bounded before persistence; excludes schema scaffolding. */
   prompt?: string;
   /** Bounded recent tool state, projected live and frozen when the job settles. */
   tools?: ToolTrace[];
