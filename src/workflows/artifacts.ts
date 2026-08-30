@@ -300,6 +300,7 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
       ...snapshot.convergence,
       name: snapshot.convergence.name ? truncateUtf8(snapshot.convergence.name, 200) : undefined,
       stoppingReason: snapshot.convergence.stoppingReason ? truncateUtf8(snapshot.convergence.stoppingReason, 2_000) : undefined,
+      pendingFindings: snapshot.convergence.pendingFindings ? truncateUtf8(snapshot.convergence.pendingFindings, 8_192) : undefined,
       rounds: snapshot.convergence.rounds.slice(-MAX_CONVERGENCE_ROUNDS),
     } : undefined,
     logs: snapshot.logs?.slice(-128).map((entry) => ({
@@ -325,6 +326,7 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
     agents: snapshot.agents.slice(0, 32).map((agent) => ({
       ...agent,
       name: truncateUtf8(agent.name, 1_000),
+      objective: agent.objective ? truncateUtf8(agent.objective, 2 * 1024) : undefined,
       prompt: agent.prompt ? truncateUtf8(agent.prompt, 2 * 1024) : undefined,
       tools: agent.tools?.slice(-8).map((tool) => ({
         ...tool,
@@ -343,6 +345,21 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
       providerFallback: agent.providerFallback ? {
         harness: agent.providerFallback.harness,
         model: agent.providerFallback.model ? truncateUtf8(agent.providerFallback.model, 256) : undefined,
+      } : undefined,
+      continuationFallback: agent.continuationFallback ? {
+        harness: agent.continuationFallback.harness,
+        model: agent.continuationFallback.model ? truncateUtf8(agent.continuationFallback.model, 256) : undefined,
+      } : undefined,
+      continuation: agent.continuation ? {
+        ...agent.continuation,
+        failedJobId: truncateUtf8(agent.continuation.failedJobId, 200),
+        replacementJobId: agent.continuation.replacementJobId ? truncateUtf8(agent.continuation.replacementJobId, 200) : undefined,
+        trigger: {
+          ...agent.continuation.trigger,
+          scope: agent.continuation.trigger.scope ? truncateUtf8(agent.continuation.trigger.scope, 300) : undefined,
+          detail: truncateUtf8(agent.continuation.trigger.detail, 500),
+        },
+        warning: truncateUtf8(agent.continuation.warning, 500),
       } : undefined,
       attempts: agent.attempts?.slice(-4).map((attempt) => ({
         ...attempt,
@@ -415,6 +432,77 @@ function isProviderFallback(value: unknown): boolean {
     && (fallback.model === undefined || typeof fallback.model === "string" && !!fallback.model && fallback.model.length <= 256);
 }
 
+const isContinuationFallback = isProviderFallback;
+
+function isCheckoutProof(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const proof = value as Record<string, unknown>;
+  return typeof proof.cwd === "string" && !!proof.cwd && proof.cwd.length <= 4_096
+    && typeof proof.root === "string" && !!proof.root && proof.root.length <= 4_096
+    && typeof proof.gitDir === "string" && !!proof.gitDir && proof.gitDir.length <= 4_096
+    && typeof proof.head === "string" && /^[a-f0-9]{40,64}$/i.test(proof.head)
+    && (proof.headRef === null || typeof proof.headRef === "string" && !!proof.headRef && proof.headRef.length <= 4_096 && !proof.headRef.includes("\0"))
+    && Number.isSafeInteger(proof.changedPaths) && (proof.changedPaths as number) >= 0 && (proof.changedPaths as number) <= 4_096
+    && typeof proof.digest === "string" && /^sha256:[a-f0-9]{64}$/.test(proof.digest);
+}
+
+function isContinuationTrigger(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const trigger = value as Record<string, unknown>;
+  return trigger.source === "continuation"
+    && (trigger.provider === "claude" || trigger.provider === "codex")
+    && trigger.kind === "quota"
+    && (trigger.retryAt === undefined || typeof trigger.retryAt === "number" && Number.isFinite(trigger.retryAt))
+    && (trigger.scope === undefined || typeof trigger.scope === "string" && trigger.scope.length <= 300)
+    && typeof trigger.detail === "string" && trigger.detail.length <= 500;
+}
+
+function isAgentContinuation(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const continuation = value as Record<string, unknown>;
+  return ["handoff", "running", "completed", "failed"].includes(String(continuation.state))
+    && (continuation.fromHarness === "claude" || continuation.fromHarness === "codex")
+    && (continuation.toHarness === "claude" || continuation.toHarness === "codex")
+    && continuation.fromHarness !== continuation.toHarness
+    && typeof continuation.failedJobId === "string" && !!continuation.failedJobId && continuation.failedJobId.length <= 200
+    && (continuation.replacementJobId === undefined || typeof continuation.replacementJobId === "string" && !!continuation.replacementJobId && continuation.replacementJobId.length <= 200)
+    && typeof continuation.checkpointAt === "number" && Number.isFinite(continuation.checkpointAt)
+    && continuation.checkpointAt >= 0 && continuation.checkpointAt <= 8_640_000_000_000_000
+    && typeof continuation.checkoutDigest === "string" && /^sha256:[a-f0-9]{64}$/.test(continuation.checkoutDigest)
+    && isContinuationTrigger(continuation.trigger)
+    && typeof continuation.warning === "string" && !!continuation.warning && continuation.warning.length <= 500;
+}
+
+function isContinuationHandoff(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const handoff = value as Record<string, unknown>;
+  return Number.isSafeInteger(handoff.agentIndex) && (handoff.agentIndex as number) >= 0 && (handoff.agentIndex as number) < 32
+    && (handoff.logicalJobId === undefined || typeof handoff.logicalJobId === "string" && !!handoff.logicalJobId && handoff.logicalJobId.length <= 200)
+    && typeof handoff.failedJobId === "string" && !!handoff.failedJobId && handoff.failedJobId.length <= 200
+    && typeof handoff.phase === "string" && handoff.phase.length <= 160
+    && typeof handoff.objective === "string" && handoff.objective.length <= 2_048
+    && typeof handoff.handoffPrompt === "string" && !!handoff.handoffPrompt && handoff.handoffPrompt.length <= 16_384
+    && (handoff.schema === undefined || !!handoff.schema && typeof handoff.schema === "object" && !Array.isArray(handoff.schema)
+      && Buffer.byteLength(JSON.stringify(handoff.schema)) <= 64 * 1_024)
+    && isCheckoutProof(handoff.checkout)
+    && isContinuationFallback(handoff.target)
+    && isContinuationTrigger(handoff.trigger)
+    && (handoff.attemptUsage === undefined || isWorkflowUsage(handoff.attemptUsage))
+    && isWorkflowUsage(handoff.usage);
+}
+
+function isContinuationProgress(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const progress = value as Record<string, unknown>;
+  return Number.isSafeInteger(progress.agentIndex) && (progress.agentIndex as number) >= 0 && (progress.agentIndex as number) < 32
+    && (progress.logicalJobId === undefined || typeof progress.logicalJobId === "string" && !!progress.logicalJobId && progress.logicalJobId.length <= 200)
+    && typeof progress.failedJobId === "string" && !!progress.failedJobId && progress.failedJobId.length <= 200
+    && isContinuationFallback(progress.target)
+    && isContinuationTrigger(progress.trigger)
+    && isWorkflowUsage(progress.attemptUsage)
+    && isWorkflowUsage(progress.usage);
+}
+
 function isWorkflowUsage(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const usage = value as Record<string, unknown>;
@@ -448,8 +536,8 @@ function isWorkflowAttempt(value: unknown): boolean {
     && (attempt.error === undefined || typeof attempt.error === "string" && attempt.error.length <= 2_000)
     && isWorkflowUsage(attempt.usage)
     && (attempt.endedAt === undefined || typeof attempt.endedAt === "number" && Number.isFinite(attempt.endedAt))
-    && (attempt.disposition === undefined || attempt.disposition === "wait" || attempt.disposition === "fallback")
-    && (attempt.trigger === undefined || isFallbackTrigger(attempt.trigger));
+    && (attempt.disposition === undefined || attempt.disposition === "wait" || attempt.disposition === "fallback" || attempt.disposition === "continuation")
+    && (attempt.trigger === undefined || isFallbackTrigger(attempt.trigger) || isContinuationTrigger(attempt.trigger));
 }
 
 function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord {
@@ -458,13 +546,18 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
   if (record.version !== 1 || !Number.isSafeInteger(record.sequence) || record.sequence! < 0 || record.sequence! >= MAX_JOURNAL_RECORDS
       || !Number.isSafeInteger(record.callIndex) || record.callIndex! < 0 || record.callIndex! >= 32
       || typeof record.fingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(record.fingerprint)
-      || !["started", "completed", "failed"].includes(record.state ?? "")
+      || !["started", "progressed", "handoff", "completed", "accepted", "failed"].includes(record.state ?? "")
       || typeof record.at !== "number" || !Number.isFinite(record.at)) return false;
   if (record.kind !== undefined && !["agent", "followUp", "peerQuestion"].includes(record.kind)) return false;
+  if (record.replayProof !== undefined && (record.replayProof !== true || record.kind === "peerQuestion")) return false;
+  if (record.replayUsageClaim !== undefined && (record.replayUsageClaim !== true
+      || record.kind === "peerQuestion" || record.replayProof === true)) return false;
   // Every peer-question state carries the same bounded lineage provenance.
   // Without it, a `started` record cannot prove what was in flight when a
   // crash occurred. Other record kinds must never acquire that authority.
   if ((record.interaction !== undefined) !== (record.kind === "peerQuestion")) return false;
+  if (record.interactionPending !== undefined && (record.interactionPending !== true
+      || record.kind !== "peerQuestion" || record.state !== "completed")) return false;
   if (record.interaction !== undefined) {
     const detail = record.interaction;
     if (!detail || typeof detail !== "object"
@@ -490,11 +583,14 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
         || record.route.availabilityChecks.length > 3
         || record.route.availabilityChecks.some((check) => !isAvailabilityEvidence(check)))
       || record.route.jobId !== undefined && (typeof record.route.jobId !== "string" || !record.route.jobId || record.route.jobId.length > 200)
+      || record.route.logicalJobId !== undefined && (typeof record.route.logicalJobId !== "string" || !record.route.logicalJobId || record.route.logicalJobId.length > 200)
       || record.route.model !== undefined && (typeof record.route.model !== "string" || record.route.model.length > 256)
       || record.route.status !== undefined && !["queued", "running", "completed", "failed", "cancelled", "aborted"].includes(record.route.status)
       || record.route.error !== undefined && (typeof record.route.error !== "string" || record.route.error.length > 2_000))) return false;
   if (record.route !== undefined && (
       record.route.providerFallback !== undefined && !isProviderFallback(record.route.providerFallback)
+      || record.route.continuationFallback !== undefined && !isContinuationFallback(record.route.continuationFallback)
+      || record.route.continuation !== undefined && !isAgentContinuation(record.route.continuation)
       || record.route.attempts !== undefined && (!Array.isArray(record.route.attempts)
         || record.route.attempts.length > 4
         || record.route.attempts.some((attempt) => !isWorkflowAttempt(attempt))))) return false;
@@ -508,11 +604,31 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || !["queued", "running", "completed", "failed", "cancelled", "aborted"].includes(record.replacementOf.sourceState)
       || record.replacementOf.sourceError !== undefined && (typeof record.replacementOf.sourceError !== "string" || record.replacementOf.sourceError.length > 2_000)
       || typeof record.replacementOf.reason !== "string" || !record.replacementOf.reason || record.replacementOf.reason.length > 200)) return false;
-  if (record.state === "started") return record.result === undefined && record.route === undefined && record.replayedFrom === undefined && record.replacementOf === undefined;
+  if (record.state === "started") return record.result === undefined && record.route === undefined && record.replayedFrom === undefined
+    && record.replacementOf === undefined && record.replayProof === undefined && record.replayUsageClaim === undefined
+    && record.interactionPending === undefined && record.continuation === undefined && record.continuationProgress === undefined;
+  if (record.state === "progressed") {
+    return record.result === undefined && record.replayedFrom === undefined && record.replacementOf === undefined
+      && record.continuation === undefined && isContinuationProgress(record.continuationProgress) && record.route !== undefined;
+  }
+  if (record.state === "handoff") {
+    return record.result === undefined && record.replayedFrom === undefined && record.replacementOf === undefined
+      && record.continuationProgress === undefined && isContinuationHandoff(record.continuation) && record.route !== undefined;
+  }
+  if (record.state === "accepted") {
+    return record.kind === "peerQuestion" && record.result === undefined && record.route === undefined
+      && record.replayedFrom === undefined && record.replacementOf === undefined
+      && record.replayProof === undefined && record.replayUsageClaim === undefined
+      && record.interactionPending === undefined && record.continuation === undefined
+      && record.continuationProgress === undefined;
+  }
+  if (record.replayProof !== undefined || record.replayUsageClaim !== undefined) return false;
+  if (record.continuation !== undefined || record.continuationProgress !== undefined) return false;
   if (!record.result || typeof record.result !== "object" || typeof record.result.ok !== "boolean"
       || typeof record.result.output !== "string" || record.result.output.length > JOURNAL_RECORD_BYTES
       || record.result.jobId !== undefined && (typeof record.result.jobId !== "string" || !record.result.jobId || record.result.jobId.length > 200)
       || record.result.error !== undefined && typeof record.result.error !== "string"
+      || record.result.progressed !== undefined && record.result.progressed !== true
       || record.result.transport !== undefined && record.result.transport !== "native" && record.result.transport !== "portable") return false;
   return record.state === "completed" ? record.result.ok : !record.result.ok;
 }
@@ -753,6 +869,19 @@ function validReplacementReference(value: unknown): boolean {
     && reference.reason.length <= 200;
 }
 
+function validReplayState(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const replay = value as Record<string, unknown>;
+  return typeof replay.sourceRunId === "string"
+    && RUN_ID_PATTERN.test(replay.sourceRunId)
+    && Number.isSafeInteger(replay.matchedCalls)
+    && (replay.matchedCalls as number) >= 0
+    && (replay.matchedCalls as number) <= 32
+    && (replay.invalidatedAt === undefined || Number.isSafeInteger(replay.invalidatedAt)
+      && (replay.invalidatedAt as number) >= 0 && (replay.invalidatedAt as number) < 32)
+    && (replay.carriedUsage === undefined || isWorkflowUsage(replay.carriedUsage));
+}
+
 function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<WorkflowSnapshot>;
@@ -777,6 +906,7 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
     && typeof candidate.timestamps.updatedAt === "number"
     && (candidate.approval === undefined || candidate.approval === "auto" || candidate.approval === "plan" || candidate.approval === "onMutate")
     && (candidate.replacementOf === undefined || validReplacementReference(candidate.replacementOf))
+    && (candidate.replay === undefined || validReplayState(candidate.replay))
     && (candidate.convergence === undefined || isWorkflowConvergence(candidate.convergence))
     && (candidate.budget === undefined || !!candidate.budget && typeof candidate.budget === "object" && !Array.isArray(candidate.budget)
       && Object.keys(candidate.budget).every((key) => ["maxAgents", "maxConcurrency", "maxTokens", "maxTokensPerAgent", "maxCost", "maxTurns"].includes(key))

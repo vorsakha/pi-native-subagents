@@ -5,6 +5,7 @@ import type { InteractionRoute, InteractionState } from "../interactions.ts";
 import type { ProviderUnavailabilityKind } from "../provider-unavailability.ts";
 import type { WorkflowWorktreeResult } from "./worktree.ts";
 import type { SpendBudget } from "../budget.ts";
+import type { WorkflowCheckoutProof } from "./checkout.ts";
 
 export type WorkflowStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
 
@@ -57,6 +58,12 @@ export interface WorkflowProviderFallback {
   model?: string;
 }
 
+/** One explicit opposite-provider route that may continue progressed work. */
+export interface WorkflowContinuationFallback {
+  harness: "claude" | "codex";
+  model?: string;
+}
+
 /** Structured reason the runtime used the declared provider fallback. */
 export interface WorkflowProviderFallbackTrigger {
   source: "readiness" | "provider";
@@ -66,6 +73,30 @@ export interface WorkflowProviderFallbackTrigger {
   retryAt?: number;
   scope?: string;
   detail: string;
+}
+
+/** Authoritative progressed failure that opened a continuation handoff. */
+export interface WorkflowContinuationTrigger {
+  source: "continuation";
+  provider: "claude" | "codex";
+  status?: undefined;
+  kind: ProviderUnavailabilityKind;
+  retryAt?: number;
+  scope?: string;
+  detail: string;
+}
+
+/** Bounded lineage provenance for the one progressed continuation route. */
+export interface WorkflowAgentContinuation {
+  state: "handoff" | "running" | "completed" | "failed";
+  fromHarness: "claude" | "codex";
+  toHarness: "claude" | "codex";
+  failedJobId: string;
+  replacementJobId?: string;
+  checkpointAt: number;
+  checkoutDigest: string;
+  trigger: WorkflowContinuationTrigger;
+  warning: string;
 }
 
 /** Bounded provenance for one abandoned attempt of a logical call that later retried. */
@@ -81,8 +112,8 @@ export interface WorkflowAgentAttempt {
   error?: string;
   usage: WorkflowUsage;
   endedAt?: number;
-  disposition?: "wait" | "fallback";
-  trigger?: WorkflowProviderFallbackTrigger;
+  disposition?: "wait" | "fallback" | "continuation";
+  trigger?: WorkflowProviderFallbackTrigger | WorkflowContinuationTrigger;
 }
 
 export interface WorkflowTimestamps {
@@ -193,10 +224,16 @@ export interface WorkflowAgentRecord {
   name: string;
   access: AccessMode;
   profile?: string;
+  /** Required capability IDs from the original call, fixed across continuation. */
+  requires?: string[];
   independent: boolean;
   independentOf?: string;
   phase: number;
   jobId?: string;
+  /** Stable script-visible lineage ID; `jobId` may move to a replacement native session. */
+  logicalJobId?: string;
+  /** Durable proof that manual replay of this agent suffix could repeat progressed effects. */
+  progressedCheckpoint?: true;
   state: WorkflowAgentState;
   timestamps: WorkflowTimestamps;
   harness?: string;
@@ -212,7 +249,9 @@ export interface WorkflowAgentRecord {
   availabilityChecks?: WorkflowHarnessAvailabilityEvidence[];
   model?: string;
   effort?: EffortLevel;
-  /** Original caller prompt, bounded before persistence; excludes schema scaffolding. */
+  /** Authoritative originating agent() objective, fixed across bounded history truncation. */
+  objective?: string;
+  /** Latest caller prompt, bounded before persistence; excludes schema scaffolding. */
   prompt?: string;
   /** Bounded recent tool state, projected live and frozen when the job settles. */
   tools?: ToolTrace[];
@@ -234,6 +273,10 @@ export interface WorkflowAgentRecord {
   providerWait?: WorkflowAgentProviderWait;
   /** Declared alternate native provider. Present whether or not it was used. */
   providerFallback?: WorkflowProviderFallback;
+  /** Declared progressed-work continuation route. Present whether or not used. */
+  continuationFallback?: WorkflowContinuationFallback;
+  /** Present after a progressed failure opened the one allowed handoff. */
+  continuation?: WorkflowAgentContinuation;
   /** Bounded provenance for prior abandoned attempts of this logical call, oldest first. */
   attempts?: WorkflowAgentAttempt[];
   /** Latest native request occupancy, when exposed by the harness. */
@@ -277,10 +320,13 @@ export interface WorkflowJournalResult {
   transport?: WorkflowStructuredTransport;
   /** Machine-readable marker that a workflow budget, not the provider, refused this call. */
   limit?: "budget";
+  /** Durable proof that replay must not restart this failed call from its original prompt. */
+  progressed?: true;
 }
 
 export interface WorkflowJournalRoute {
   jobId?: string;
+  logicalJobId?: string;
   harness?: HarnessName;
   /** Harness the caller requested (`auto` or an explicit route). Additive; absent on older journals. */
   requestedHarness?: RequestedHarness;
@@ -297,7 +343,45 @@ export interface WorkflowJournalRoute {
   status?: WorkflowAgentState;
   error?: string;
   providerFallback?: WorkflowProviderFallback;
+  continuationFallback?: WorkflowContinuationFallback;
+  continuation?: WorkflowAgentContinuation;
   attempts?: WorkflowAgentAttempt[];
+}
+
+/** Durable checkpoint that permits replacement dispatch without replaying the failed primary. */
+export interface WorkflowContinuationHandoff {
+  agentIndex: number;
+  logicalJobId?: string;
+  failedJobId: string;
+  phase: string;
+  objective: string;
+  handoffPrompt: string;
+  /** Effective bounded schema for a replacement session, when the failed generation was schema-constrained. */
+  schema?: Record<string, unknown>;
+  checkout: WorkflowCheckoutProof;
+  target: WorkflowContinuationFallback;
+  trigger: WorkflowContinuationTrigger;
+  /** Usage from only the failed generation, for attempt provenance. */
+  attemptUsage?: WorkflowUsage;
+  /** Cumulative logical-lineage usage through the failed generation. */
+  usage: WorkflowUsage;
+}
+
+/**
+ * First durable proof that a failed primary made progress and must never be
+ * replayed. This checkpoint does not authorize a replacement: checkout proof
+ * and the bounded continuation prompt arrive in the later handoff record.
+ */
+export interface WorkflowContinuationProgress {
+  agentIndex: number;
+  logicalJobId?: string;
+  failedJobId: string;
+  target: WorkflowContinuationFallback;
+  trigger: WorkflowContinuationTrigger;
+  /** Usage from only the failed generation, for replay provenance. */
+  attemptUsage: WorkflowUsage;
+  /** Cumulative logical-lineage usage through the failed generation. */
+  usage: WorkflowUsage;
 }
 
 export interface WorkflowHarnessAvailabilityEvidence {
@@ -335,17 +419,27 @@ export interface WorkflowJournalRecord {
   callIndex: number;
   /** Call fingerprint, or the question fingerprint for `peerQuestion` records. */
   fingerprint: string;
-  state: "started" | "completed" | "failed";
+  state: "started" | "progressed" | "handoff" | "completed" | "accepted" | "failed";
   at: number;
   /** Absent means "agent" for journals written before followUp() existed. */
   kind?: "agent" | "followUp" | "peerQuestion";
   agentIndex?: number;
   /** Present only on `peerQuestion` records. */
   interaction?: WorkflowInteractionJournalDetail;
+  /** A persisted peer answer that requires a later accepted record before replay. */
+  interactionPending?: true;
   result?: WorkflowJournalResult;
   route?: WorkflowJournalRoute;
   replayedFrom?: WorkflowReplayReference;
   replacementOf?: WorkflowReplacementReference;
+  /** Copied checkpoint evidence for replay validation; never replacement-dispatch authority. */
+  replayProof?: true;
+  /** A resumed handoff moved this lineage's checkpoint usage out of replay-carried usage. */
+  replayUsageClaim?: true;
+  /** Present only on a progressed continuation handoff checkpoint. */
+  continuation?: WorkflowContinuationHandoff;
+  /** Present only on the pre-settlement progressed-primary checkpoint. */
+  continuationProgress?: WorkflowContinuationProgress;
 }
 
 /** A completed peer answer that may be replayed without dispatching the target again. */
@@ -364,6 +458,21 @@ export interface WorkflowReplayCall {
   /** The lineage this call belongs to; required to reconstruct a followUp() replay. */
   agentIndex?: number;
   result: WorkflowJournalResult;
+  route?: WorkflowJournalRoute;
+  /** Accepted checkpoint chain copied into a replay journal before its terminal record. */
+  continuationProof?: {
+    progress: WorkflowContinuationProgress;
+    progressRoute: WorkflowJournalRoute;
+    handoff: WorkflowContinuationHandoff;
+    handoffRoute: WorkflowJournalRoute;
+  };
+}
+
+export interface WorkflowReplayHandoff {
+  callIndex: number;
+  fingerprint: string;
+  kind: "agent" | "followUp";
+  checkpoint: WorkflowContinuationHandoff;
   route?: WorkflowJournalRoute;
 }
 
@@ -384,6 +493,8 @@ export interface WorkflowReplayState {
   sourceRunId: string;
   matchedCalls: number;
   invalidatedAt?: number;
+  /** Durable source usage not represented by reconstructed agents, charged only when an interrupted handoff dispatches its replacement. */
+  carriedUsage?: WorkflowUsage;
 }
 
 /** Machine-readable review verdict a bounded convergence loop branches on. */
@@ -423,6 +534,8 @@ export interface WorkflowConvergence {
   verdict?: WorkflowConvergenceVerdict;
   actionableCount?: number;
   fingerprint?: string;
+  /** Bounded fix prompt containing every pending finding ID and available body evidence. */
+  pendingFindings?: string;
   /** Human-readable reason the loop stopped; present once `state` is terminal. */
   stoppingReason?: string;
   implementerJobId?: string;

@@ -44,7 +44,7 @@ The plan accepts 1–64 unique names; names are trimmed and internal whitespace 
 
 ## parallel versus pipeline
 
-`parallel` receives functions, not already-started promises — the runner owns invocation order, concurrency, call numbering, cancellation, and replay. Concurrency is an integer from 1 to 4 and defaults to 4. Use `parallel` when the next step needs the complete result set; check every returned result's `ok`.
+`parallel` receives functions, not started promises. The runner owns order, concurrency, call numbers, cancellation, and replay. Concurrency is 1 to 4 and defaults to 4. Use it when the next step needs all results; check every result's `ok`.
 
 `pipeline(items, ...stages)` accepts at most 4096 items, advances each item through the ordered stages independently with up to four concurrent lanes, and needs no global barrier between stages. **A stage that throws does not fail the run: that item's slot in the returned array becomes `null`.** Filter or branch on `null` explicitly, and never assume the returned array is item-shaped throughout:
 
@@ -73,22 +73,24 @@ if (!review.ok) return { ok: false, error: review.error };
 
 Rules:
 
-- The target must be a job this run's own `agent()` call started, still `completed`, with a retained session. Cross-workflow, direct `subagent_spawn`, expired, failed, cancelled, and not-yet-settled jobs are all rejected.
+- The target must be this run's completed retained `agent()` lineage. Its logical ID is stable across continuation and follow-ups. Cross-workflow, direct, expired, failed, cancelled and unsettled jobs are rejected.
 - `options` accepts only `phase` and `schema`. Harness, model, effort, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original `agent()` call.
 - A retained native structured session stays bound to its original schema. Every `followUp()` on that lineage is validated against the original schema and can return `structured` even when the call omits `schema`; a follow-up cannot replace the schema.
 - An `agent()` call that used `isolation: "worktree"` can never be targeted: its worktree is finalized when the call returns, so the follow-up is rejected whether the recorded state is `preserved`, `removed`, or `orphaned`.
 - Each `followUp()` consumes its own agent-call ordinal from the same 32-call budget and appears in `/workflows` as another generation under the same agent, not a new agent card.
-- `followUp()` never waits out a provider-quota rejection, even under `retry.providerUnavailable: "wait"`. It always fails immediately; retry with a fresh `agent()` call instead.
+- `followUp()` never provider-waits. It fails immediately unless its original `agent()` explicitly opted into eligible progressed continuation.
 
-## Explicit provider fallback
+## Provider recovery
 
-Only a fresh `agent()` may set `providerFallback: { harness, model? }`. Its Claude or Codex primary must name the other. Other routes, nesting, arrays, and extra fields are rejected. After dispatch, fallback requires `readOnly`, pre-inference proof, zero usage, and a `ready` target. Full-access hooks, plugins, or MCP may mutate before visible progress, so rejection stays terminal. Pre-dispatch `missing`, `unauthenticated`, or `incompatible` may fall back under either access mode.
+A fresh explicit Claude/Codex `agent()` may set one opposite native route. `providerFallback: { harness, model? }` handles authoritative pre-inference failure with zero usage; after dispatch it also requires `readOnly`.
+
+`continuationFallback: { harness, model? }` permits one handoff after authoritative unavailability and current-turn progress, including follow-ups. Progress proof blocks primary replay. Queued admission rechecks readiness and requirements, then checkout and budget under the startup deadline. Schema, policy, budgets, usage, cancellation, logical ID, and provider independence stay fixed, including on replay. Unsafe state, unavailable target, isolation, or replacement failure is terminal; no wait or loop.
 
 ## Sandbox limits and determinism
 
-- The sandbox allows workflow orchestration only: no imports, filesystem, network, environment variables, subprocesses, credentials, `require`, `process`, or nested delegation.
+- The sandbox exposes only orchestration: no imports, I/O, environment, processes, credentials, or nested delegation.
 - Workflows are deterministic: `Date.now()`, zero-argument `new Date()`, and `Math.random()` all throw.
-- Results, metadata, agent requests, logs, phases, source, and arguments are bounded and must be JSON-serializable; a single agent request is capped at 512 KiB.
+- All workflow data is bounded and JSON-serializable; one agent request is capped at 512 KiB.
 - A run may make at most 32 agent calls (`agent()` and `followUp()` share the budget) and use at most four concurrent workers. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
 - Mutating agents sharing one checkout are serialized; read-only and worktree-isolated calls are not.
 

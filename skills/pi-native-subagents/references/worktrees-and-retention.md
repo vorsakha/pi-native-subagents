@@ -10,6 +10,7 @@ Mutating agents that share one checkout are serialized. Use `isolation: "worktre
 - Each isolated call gets its own Git worktree on a `pi-workflow/<runId>/<agentIndex>` branch.
 - When the call returns, the worktree is finalized. If the child changed nothing, cleanup removes the checkout, Git registration, and branch. The runtime records `removed` only after it verifies all three are absent, whether cleanup came from normal finalization or explicit reclaim. If the child changed something, the diff is written as an `agent-<index>.patch` run artifact and the state becomes `preserved`. A finalization that could not complete cleanly is recorded as `orphaned`.
 - **A finalized worktree can never be continued.** An isolated `agent()` call can never be targeted by `followUp()`, can never answer a peer's routed question, and cannot be used inside `converge()`.
+- `continuationFallback` is also rejected with worktree isolation. Progressed continuation requires one provable shared Git checkout; it never transfers an isolated checkout or patch to another provider.
 - Preserve the resulting patch metadata in the workflow result. The patch is the durable record of what the isolated child produced.
 
 ## Inspecting and reclaiming

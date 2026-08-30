@@ -272,7 +272,7 @@ export interface SpawnRequest {
   independent?: boolean;
   /** Route on a native provider different from this existing session-scoped job. */
   independentOf?: string;
-  /** Internal durable-replay hint used only when independentOf names a prior-session job no longer retained by JobManager. */
+  /** Internal authoritative provider hint for replayed jobs or continued logical IDs; a live target must match it. */
   independentOfProvider?: ProviderFamily;
   profile?: string;
   /** Optional cumulative spend boundary for this retained native session. */
@@ -290,6 +290,8 @@ export interface SpawnRequest {
   workflow?: WorkflowJobReference;
   /** Internal synchronous gate checked immediately before a queued job starts. */
   dispatchGate?: () => string | undefined;
+  /** Internal abortable admission check run after scheduler selection and immediately before backend startup. */
+  dispatchAdmission?: (signal: AbortSignal) => Promise<DispatchAdmissionResult | undefined>;
   /** Internal session-peer fork data (source provenance plus the already-forked session file to resume). Pi-only; never set by a harness adapter. */
   peer?: PeerSessionReference & { sessionFile: string };
   /** Internal workflow-runtime request for a provider-native structured-result channel; never a model-facing tool field. */
@@ -303,6 +305,12 @@ export interface SpawnRequest {
    * runtime uses it for the bounded interaction count and budget preflight.
    */
   interactionGate?: (target: InteractionTargetKind) => string | undefined;
+}
+
+export interface DispatchAdmissionResult {
+  error?: string;
+  /** Fresh capability proof for the already-compiled harness; cannot change providers or requirements. */
+  capabilityRoute?: JobCapabilityRoute;
 }
 
 export interface ToolTrace {

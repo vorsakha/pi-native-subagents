@@ -359,7 +359,7 @@ export class PiRpcBackend implements Backend {
       closed = true;
       tearingDown = true;
       finish({ type: "failed", error: `Pi RPC produced no activity for ${this.#inactivityTimeoutMs}ms` });
-      void managed.terminate();
+      void managed.terminate().catch(() => undefined);
     });
     park.suspend = () => watchdog.suspend();
     park.resume = () => watchdog.resume();
@@ -512,7 +512,7 @@ export class PiRpcBackend implements Backend {
       const message = `Pi RPC framing failed: ${error instanceof Error ? error.message : String(error)}`;
       rejectPending(new Error(message));
       finish({ type: "failed", error: message });
-      void managed.terminate();
+      void managed.terminate().catch(() => undefined);
     };
     managed.child.stdout.on("data", (chunk: Buffer) => { try { receive(framer.push(chunk)); } catch (error) { framingFailure(error); } });
     managed.child.stdout.on("end", () => { try { receive(framer.end()); } catch (error) { framingFailure(error); } });

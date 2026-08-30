@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { delay, tempDir } from "./helpers.ts";
+import { delay, GatedManagedProcess, tempDir } from "./helpers.ts";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ClaudeBackend, CLAUDE_SUBAGENT_ASK_TOOL, forbiddenInitTools } from "../src/backends/claude.ts";
@@ -94,10 +94,15 @@ setInterval(() => {}, 1000);
 
 const CODEX_FIXTURE = `#!/usr/bin/env node
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 let buffer = "";
 let turns = 0;
 process.stdin.setEncoding("utf8");
 if (process.env.MODE === "exit") process.exit(7);
+if (process.env.DESCENDANT_PID_FILE) {
+  const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)"], { stdio: "ignore" });
+  fs.writeFileSync(process.env.DESCENDANT_PID_FILE, String(descendant.pid));
+}
 process.stdin.on("data", chunk => {
   buffer += chunk;
   for (;;) {
@@ -204,7 +209,15 @@ process.stdin.on("data", chunk => {
         } } }) + "\\n");
         setTimeout(() => process.exit(0), 30);
       }
-      if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool" && process.env.MODE !== "ask-tool" && process.env.MODE !== "exit-mid-turn") setTimeout(() => {
+      if (process.env.MODE === "quota-progress") {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { type: "agentMessage", text: "PARTIAL" } } }) + "\\n");
+          process.stdout.write(JSON.stringify({ method: "turn/completed", params: { turn: {
+            id, status: "failed", error: { code: "usage_limit_reached", resetsAt: new Date(Date.now() + 60000).toISOString() },
+          } } }) + "\\n");
+        }, 20);
+      }
+      if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool" && process.env.MODE !== "ask-tool" && process.env.MODE !== "exit-mid-turn" && process.env.MODE !== "quota-progress") setTimeout(() => {
         if (process.env.MODE === "tool-events") {
           process.stdout.write(JSON.stringify({ method: "item/started", params: { item: { id: "command-1", type: "commandExecution", command: "pwd" } } }) + "\\n");
           process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { id: "command-1", type: "commandExecution", command: "pwd", aggregatedOutput: "/tmp", status: "completed" } } }) + "\\n");
@@ -226,6 +239,11 @@ async function fixture(source: string): Promise<{ dir: string; command: string }
   await writeFile(command, source);
   await chmod(command, 0o755);
   return { dir, command };
+}
+
+function processExists(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
 function request(harness: HarnessName, cwd: string, env: NodeJS.ProcessEnv): BackendRequest {
@@ -1063,6 +1081,54 @@ test("Claude classifies an authoritative rate_limit rejection into structured un
   await run.close();
 });
 
+test("Claude close waits for native process-tree termination after provider failure", async () => {
+  const nativeProcess = new GatedManagedProcess();
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
+    yield {
+      type: "rate_limit_event",
+      rate_limit_info: { status: "rejected", resetsAt: Math.floor((Date.now() + 5 * 60_000) / 1000), rateLimitType: "five_hour" },
+    };
+    yield { type: "assistant", parent_tool_use_id: null, message: { content: [] }, error: "rate_limit" };
+  }
+  const stream = Object.assign(messages(), { close() {} });
+  const events: BackendEvent[] = [];
+  const run = await new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    processFactory: () => nativeProcess,
+    queryFn: ((input: { options?: Record<string, unknown> }) => {
+      const spawnProcess = input.options?.spawnClaudeCodeProcess as ((options: {
+        command: string;
+        args: string[];
+        cwd?: string;
+        env: NodeJS.ProcessEnv;
+        signal: AbortSignal;
+      }) => unknown) | undefined;
+      assert.ok(spawnProcess, "Claude launch installs the managed process-tree wrapper");
+      spawnProcess({
+        command: "fixture-claude",
+        args: [],
+        cwd: process.cwd(),
+        env: process.env,
+        signal: new AbortController().signal,
+      });
+      return stream;
+    }) as never,
+    inactivityTimeoutMs: 2_000,
+  }).start(request("claude", process.cwd(), process.env), (event) => events.push(event));
+
+  await run.completed;
+  assert.equal(terminal(events)?.type, "failed");
+  let closed = false;
+  const closing = run.close().then(() => { closed = true; });
+  await nativeProcess.waitUntilTerminate();
+  await delay(0);
+  assert.equal(closed, false, "close cannot resolve while the failed Claude process tree still exists");
+  nativeProcess.release();
+  await closing;
+  assert.equal(closed, true);
+});
+
 test("Claude accounts terminal quota-frame usage before failure and withholds pre-inference proof", async () => {
   async function* messages() {
     yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-session", tools: [] };
@@ -1201,6 +1267,8 @@ test("Codex classifies a structured usage-limit error only when a plausible rese
   assert.equal(withReset?.preInference, true);
   assert.equal(withReset?.scope, undefined, "Codex's error.window has no verified schema and must never reach scope");
   assert.ok(!withReset?.detail.includes("@"));
+  const afterProgress = classifyCodexUnavailability({ code: "usage_limit_reached", resetsAt: now + 60_000 }, now, true);
+  assert.equal(afterProgress?.preInference, undefined, "current-turn activity makes the same structured rejection eligible for progressed continuation");
 
   const withoutReset = classifyCodexUnavailability({ code: "usage_limit_reached", message: "quota exhausted" }, now);
   assert.ok(withoutReset, "still classified as a quota rejection, but not authoritative");
@@ -1215,6 +1283,50 @@ test("Codex classifies a structured usage-limit error only when a plausible rese
 
   const relativeDelayField = classifyCodexUnavailability({ code: "usage_limit_reached", retryAfter: 120 }, now);
   assert.equal(relativeDelayField?.authoritative, false, "retryAfter is a relative delay by convention and must never be read as an absolute reset time");
+});
+
+test("Codex exposes authoritative quota failure as progressed after current-turn assistant activity", async () => {
+  const f = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(f.command, { inactivityTimeoutMs: 2_000 }).start(
+      request("codex", f.dir, { ...process.env, MODE: "quota-progress" }),
+      (event) => events.push(event),
+    );
+    await run.completed;
+    const failed = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+    assert.equal(failed.type, "failed");
+    assert.equal(failed.unavailable?.authoritative, true);
+    assert.equal(failed.unavailable?.preInference, undefined);
+    assert.ok(events.some((event) => event.type === "message" && event.text === "PARTIAL"));
+    await run.close();
+  } finally {
+    await rm(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex failed-turn close proves its native descendants are gone before resolving", { skip: process.platform === "win32" }, async () => {
+  const f = await fixture(CODEX_FIXTURE);
+  const descendantFile = join(f.dir, "descendant.pid");
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(f.command, { inactivityTimeoutMs: 2_000 }).start(
+      request("codex", f.dir, {
+        ...process.env,
+        MODE: "quota-progress",
+        DESCENDANT_PID_FILE: descendantFile,
+      }),
+      (event) => events.push(event),
+    );
+    await run.completed;
+    assert.equal(terminal(events)?.type, "failed");
+    const descendantPid = Number(await readFile(descendantFile, "utf8"));
+    assert.equal(processExists(descendantPid), true, "fixture descendant is alive before close");
+    await run.close();
+    assert.equal(processExists(descendantPid), false, "close resolves only after the failed process group is absent");
+  } finally {
+    await rm(f.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex never copies unverified error.window data into scope, even when oversized or account-bearing", () => {

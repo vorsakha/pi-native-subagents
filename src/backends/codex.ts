@@ -109,7 +109,11 @@ const CODEX_RESET_FIELD_ALIASES = ["resetAt", "resetsAt", "reset_at", "resets_at
  * the reported error. Returns `undefined` (normal failure, never a wait) when
  * the error does not look like a usage-limit rejection.
  */
-export function classifyCodexUnavailability(turnError: unknown, now: number): ProviderUnavailability | undefined {
+export function classifyCodexUnavailability(
+  turnError: unknown,
+  now: number,
+  currentTurnProgress = false,
+): ProviderUnavailability | undefined {
   const error = asObject(turnError);
   const code = typeof error.code === "string" ? error.code : typeof error.type === "string" ? error.type : undefined;
   if (!code || !CODEX_USAGE_LIMIT_CODES.has(code)) return undefined;
@@ -124,7 +128,7 @@ export function classifyCodexUnavailability(turnError: unknown, now: number): Pr
     kind: "quota",
     retryAt,
     authoritative: retryAt !== undefined,
-    preInference: true,
+    preInference: currentTurnProgress ? undefined : true,
     // No verified schema constrains `error.window` or `error.message` (see the
     // alias comment above); unlike Claude's typed `rateLimitType` enum, they are
     // unbounded, provider-controlled text that could carry API keys, bearer
@@ -388,6 +392,7 @@ export class CodexAppServerBackend implements Backend {
     let turnOutput = "";
     /** `item/started` notifications seen for the turn currently in progress; reset at the start of each turn. */
     let turnItemCount = 0;
+    let turnProgressed = false;
     let output = "";
     let settled = false;
     let closing = false;
@@ -413,7 +418,7 @@ export class CodexAppServerBackend implements Backend {
     const watchdog = createActivityWatchdog(this.#inactivityTimeoutMs, () => {
       closing = true;
       finish({ type: "failed", error: `Codex produced no activity for ${this.#inactivityTimeoutMs}ms` });
-      void closePeer();
+      void closePeer().catch(() => undefined);
     });
     const finish = (event: BackendEvent) => {
       if (settled) return;
@@ -426,6 +431,7 @@ export class CodexAppServerBackend implements Backend {
     const startTurn = async (text: string): Promise<void> => {
       turnOutput = "";
       turnItemCount = 0;
+      turnProgressed = false;
       turnState = "starting";
       watchdog.arm();
       emit({ type: "user_message", text });
@@ -491,14 +497,18 @@ export class CodexAppServerBackend implements Backend {
       onNotification: (method, params) => {
         if (method === "item/agentMessage/delta" || method === "agentMessage/delta") {
           const delta = String(params.delta ?? "");
+          if (delta) turnProgressed = true;
           turnOutput = boundedOutput(turnOutput, delta);
           emit({ type: "text_delta", text: delta });
         } else if (method === "item/reasoning/summaryTextDelta" || method === "item/reasoning/textDelta") {
-          emit({ type: "thinking_delta", text: String(params.delta ?? "") });
+          const delta = String(params.delta ?? "");
+          if (delta) turnProgressed = true;
+          emit({ type: "thinking_delta", text: delta });
         } else if (method === "item/started") {
           const item = asObject(params.item);
           const type = String(item.type ?? "item");
           if (type === "agentMessage" || type === "reasoning") return;
+          turnProgressed = true;
           turnItemCount++;
           emit({
             type: "tool_start",
@@ -512,11 +522,16 @@ export class CodexAppServerBackend implements Backend {
           const type = String(item.type ?? "item");
           if (type === "agentMessage" && typeof item.text === "string") {
             turnOutput = boundedOutput("", item.text);
+            if (turnOutput) turnProgressed = true;
             emit({ type: "message", text: turnOutput });
           } else if (type === "reasoning") {
             const reasoning = [...stringArray(item.summary), ...stringArray(item.content)].join("\n");
-            if (reasoning) emit({ type: "thinking_message", text: reasoning });
+            if (reasoning) {
+              turnProgressed = true;
+              emit({ type: "thinking_message", text: reasoning });
+            }
           } else {
+            turnProgressed = true;
             const result = itemResult(item);
             emit({
               type: "tool_end",
@@ -580,7 +595,7 @@ export class CodexAppServerBackend implements Backend {
           else finish({
             type: "failed",
             error: String(asObject(turn.error).message ?? `Codex turn ${status}`),
-            unavailable: classifyCodexUnavailability(turn.error, Date.now()),
+            unavailable: classifyCodexUnavailability(turn.error, Date.now(), turnProgressed),
           });
         }
       },

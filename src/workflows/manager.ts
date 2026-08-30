@@ -1,6 +1,6 @@
 import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
-import { isRequestedHarness, routeCapabilities, type RequestedHarness } from "../capability-routing.ts";
+import { isRequestedHarness, routeCapabilities, type CapabilityRouting, type RequestedHarness } from "../capability-routing.ts";
 import type { CapabilityRouter } from "../capability-service.ts";
 import { HarnessAutoUnavailableError, HarnessUnavailableError, type HarnessAvailabilityProbe, type HarnessAvailabilityStatus } from "../harness-availability.ts";
 import type { JobManager, PeerInteractionRequest, PeerInteractionResult } from "../manager.ts";
@@ -25,15 +25,18 @@ import { MAX_CONVERGENCE_ROUNDS } from "./convergence.ts";
 import {
   canonicalJson,
   replayableJournalCalls,
+  replayableJournalHandoffs,
   replayableJournalInteractions,
   workflowCallFingerprint,
   workflowDefinitionFingerprint,
   workflowFollowUpFingerprint,
   workflowInteractionFingerprint,
+  workflowReplayReferenceKey,
 } from "./journal.ts";
 import { resolveWorkflowStructured, workflowSchema } from "./schema.ts";
 import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
 import { workflowTaskOutcome } from "./outcome.ts";
+import { assertWorkflowCheckout, captureWorkflowCheckout, type WorkflowCheckoutProof } from "./checkout.ts";
 import { finishWorkflowWorktree, prepareWorkflowWorktree, reclaimWorkflowWorktree, type WorkflowWorktreeHandle, type WorkflowWorktreeReclamation } from "./worktree.ts";
 import {
   applyWorkflowRetention,
@@ -69,6 +72,11 @@ import type {
   WorkflowUsage,
   WorkflowProviderFallback,
   WorkflowProviderFallbackTrigger,
+  WorkflowContinuationFallback,
+  WorkflowContinuationHandoff,
+  WorkflowContinuationProgress,
+  WorkflowContinuationTrigger,
+  WorkflowReplayHandoff,
 } from "./types.ts";
 
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
@@ -118,15 +126,28 @@ export interface StartedWorkflow {
   completion: Promise<WorkflowSnapshot>;
 }
 
+type WorkflowAttemptResult = Omit<WorkflowAgentResult, "usage"> & {
+  usage?: WorkflowUsage;
+  unavailable?: ProviderUnavailability;
+  progressed?: boolean;
+  fallbackTrigger?: WorkflowProviderFallbackTrigger;
+  attemptUsageBase?: WorkflowUsage;
+};
+
+const CONTINUATION_WARNING = "Continuation cannot guarantee exactly-once behavior for commands, hooks, plugins, MCP calls, or other external side effects from the failed native process.";
+
 interface ReplayRuntime {
   sourceRunId: string;
   calls: WorkflowReplayCall[];
+  handoffs: WorkflowReplayHandoff[];
   /** Completed peer answers from the source run, matched by identity rather than ordinal. */
   interactions: WorkflowReplayInteraction[];
   /** Ordinals already served in this run, so one record answers at most one question. */
   usedInteractions: Set<number>;
   active: boolean;
   priorJobProviders: Map<string, ProviderFamily>;
+  /** Source usage not represented by replayed agents, retained for interrupted-handoff admission. */
+  carriedUsage?: WorkflowUsage;
 }
 
 interface RunEntry {
@@ -160,7 +181,22 @@ interface RunEntry {
 interface ReplaySource {
   snapshot: WorkflowSnapshot;
   calls: WorkflowReplayCall[];
+  handoffs: WorkflowReplayHandoff[];
   interactions: WorkflowReplayInteraction[];
+  progressedCalls: Set<number>;
+  usage: WorkflowUsage;
+}
+
+function progressedJournalCalls(records: WorkflowJournalRecord[]): Set<number> {
+  return new Set(records.flatMap((record) =>
+    record.kind !== "peerQuestion" && (record.state === "progressed"
+      || record.state === "handoff"
+      || record.result?.progressed === true
+      || record.continuationProgress !== undefined
+      || record.continuation !== undefined
+      || record.route?.continuation !== undefined)
+      ? [record.callIndex]
+      : []));
 }
 
 function workflowUsage(usage?: Partial<Usage>): WorkflowUsage {
@@ -186,6 +222,69 @@ function addWorkflowUsage(base: WorkflowUsage | undefined, addition: WorkflowUsa
   };
 }
 
+function maxWorkflowUsage(left: WorkflowUsage, right: WorkflowUsage): WorkflowUsage {
+  return {
+    input: Math.max(left.input, right.input),
+    output: Math.max(left.output, right.output),
+    cacheRead: Math.max(left.cacheRead, right.cacheRead),
+    cacheWrite: Math.max(left.cacheWrite, right.cacheWrite),
+    cost: Math.max(left.cost, right.cost),
+    turns: Math.max(left.turns, right.turns),
+  };
+}
+
+function workflowUsageContains(total: WorkflowUsage, part: WorkflowUsage): boolean {
+  return total.input >= part.input
+    && total.output >= part.output
+    && total.cacheRead >= part.cacheRead
+    && total.cacheWrite >= part.cacheWrite
+    && total.cost >= part.cost
+    && total.turns >= part.turns;
+}
+
+/**
+ * Recovers cumulative source spend from the journal without double-charging a
+ * logical agent across follow-ups or peer answers. The snapshot remains a
+ * conservative fallback for older journals and replay-carried accounting.
+ */
+function durableReplaySourceUsage(snapshot: WorkflowSnapshot, records: WorkflowJournalRecord[]): WorkflowUsage {
+  const snapshotLineages = new Map<string, WorkflowUsage>();
+  const journalLineages = new Map<string, WorkflowUsage>();
+  const replayClaims = new Map<string, WorkflowUsage>();
+  const hasCarriedLedger = snapshot.replay?.carriedUsage !== undefined;
+  for (const agent of snapshot.agents) snapshotLineages.set(`agent:${agent.index}`, workflowUsage(agent.usage));
+
+  for (const record of records) {
+    const usage = record.result?.usage ?? record.continuation?.usage ?? record.continuationProgress?.usage;
+    if (!usage) continue;
+    const agentIndex = record.kind === "peerQuestion"
+      ? record.interaction?.targetAgentIndex
+      : record.agentIndex;
+    const key = agentIndex === undefined ? `call:${record.callIndex}` : `agent:${agentIndex}`;
+    const normalized = workflowUsage(usage);
+    if (record.replayUsageClaim === true) {
+      replayClaims.set(key, maxWorkflowUsage(replayClaims.get(key) ?? workflowUsage(), normalized));
+      continue;
+    }
+    if (record.replayProof === true || record.replayedFrom !== undefined
+        || record.kind === "peerQuestion" && record.interaction?.route === "replay") continue;
+    journalLineages.set(key, maxWorkflowUsage(journalLineages.get(key) ?? workflowUsage(), normalized));
+  }
+
+  const currentLineages = new Map(snapshotLineages);
+  for (const [key, journalUsage] of journalLineages) {
+    const snapshotUsage = snapshotLineages.get(key) ?? workflowUsage();
+    const claim = hasCarriedLedger ? replayClaims.get(key) : undefined;
+    const currentJournalUsage = claim && !workflowUsageContains(snapshotUsage, claim)
+      ? subtractWorkflowUsageFloor(journalUsage, claim)
+      : journalUsage;
+    currentLineages.set(key, maxWorkflowUsage(snapshotUsage, currentJournalUsage));
+  }
+
+  const currentUsage = [...currentLineages.values()].reduce(addWorkflowUsage, workflowUsage());
+  return addWorkflowUsage(snapshot.replay?.carriedUsage, currentUsage);
+}
+
 /** Isolates one attempt's own usage out of a cumulative total, for bounded per-attempt provenance. */
 function subtractWorkflowUsage(total: WorkflowUsage, base: WorkflowUsage | undefined): WorkflowUsage {
   if (!base) return total;
@@ -196,6 +295,17 @@ function subtractWorkflowUsage(total: WorkflowUsage, base: WorkflowUsage | undef
     cacheWrite: total.cacheWrite - base.cacheWrite,
     cost: total.cost - base.cost,
     turns: total.turns - base.turns,
+  };
+}
+
+function subtractWorkflowUsageFloor(total: WorkflowUsage, base: WorkflowUsage): WorkflowUsage {
+  return {
+    input: Math.max(0, total.input - base.input),
+    output: Math.max(0, total.output - base.output),
+    cacheRead: Math.max(0, total.cacheRead - base.cacheRead),
+    cacheWrite: Math.max(0, total.cacheWrite - base.cacheWrite),
+    cost: Math.max(0, total.cost - base.cost),
+    turns: Math.max(0, total.turns - base.turns),
   };
 }
 
@@ -307,6 +417,7 @@ function journalRoute(agent?: WorkflowAgentRecord): WorkflowJournalRoute | undef
   if (!agent) return undefined;
   return {
     jobId: agent.jobId,
+    logicalJobId: agent.logicalJobId,
     harness: agent.harness as HarnessName | undefined,
     requestedHarness: isRequestedHarness(agent.requestedHarness) ? agent.requestedHarness : undefined,
     availability: isAvailabilityStatus(agent.availability) ? agent.availability : undefined,
@@ -320,6 +431,11 @@ function journalRoute(agent?: WorkflowAgentRecord): WorkflowJournalRoute | undef
       harness: agent.providerFallback.harness,
       model: agent.providerFallback.model ? boundedText(agent.providerFallback.model, 256) : undefined,
     } : undefined,
+    continuationFallback: agent.continuationFallback ? {
+      harness: agent.continuationFallback.harness,
+      model: agent.continuationFallback.model ? boundedText(agent.continuationFallback.model, 256) : undefined,
+    } : undefined,
+    continuation: agent.continuation ? clone(agent.continuation) : undefined,
     attempts: agent.attempts?.slice(-4).map((attempt) => ({
       ...attempt,
       model: attempt.model ? boundedText(attempt.model, 256) : undefined,
@@ -355,6 +471,34 @@ function parseProviderFallback(options: Record<string, unknown>):
     return { error: "providerFallback.harness must be claude or codex" };
   }
   if (candidate.harness === primary) return { error: "providerFallback.harness must be the opposite native provider" };
+  let model: string | undefined;
+  try { model = normalizeModel(candidate.model); }
+  catch (error) { return { error: boundedText(error) }; }
+  return { primary, fallback: { harness: candidate.harness, model } };
+}
+
+function parseContinuationFallback(options: Record<string, unknown>):
+  | { fallback?: WorkflowContinuationFallback; primary?: NativeWorkflowHarness }
+  | { error: string } {
+  if (!Object.hasOwn(options, "continuationFallback")) return {};
+  if (Object.hasOwn(options, "providerFallback")) {
+    return { error: "providerFallback and continuationFallback cannot be combined on one logical call" };
+  }
+  const primary = options.harness;
+  if (primary !== "claude" && primary !== "codex") {
+    return { error: "continuationFallback requires an explicit primary harness of claude or codex" };
+  }
+  const value = options.continuationFallback;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return { error: "continuationFallback must be an object with harness and optional model" };
+  }
+  const candidate = value as Record<string, unknown>;
+  const unknown = Object.keys(candidate).filter((key) => key !== "harness" && key !== "model");
+  if (unknown.length) return { error: `continuationFallback contains unknown field: ${unknown[0]}` };
+  if (candidate.harness !== "claude" && candidate.harness !== "codex") {
+    return { error: "continuationFallback.harness must be claude or codex" };
+  }
+  if (candidate.harness === primary) return { error: "continuationFallback.harness must be the opposite native provider" };
   let model: string | undefined;
   try { model = normalizeModel(candidate.model); }
   catch (error) { return { error: boundedText(error) }; }
@@ -397,10 +541,20 @@ function budgetsAllowReplay(source: WorkflowBudgetPolicy | undefined, next: Work
   return true;
 }
 
+function budgetsMatch(source: WorkflowBudgetPolicy | undefined, next: WorkflowBudgetPolicy | undefined): boolean {
+  return (["maxAgents", "maxConcurrency", "maxTokens", "maxTokensPerAgent", "maxCost", "maxTurns"] as const)
+    .every((key) => source?.[key] === next?.[key]);
+}
+
 function abortError(reason: unknown): Error {
   const error = reason instanceof Error ? reason : new Error(String(reason ?? "Workflow aborted"));
   error.name = "AbortError";
   return error;
+}
+
+export interface WorkflowCheckoutOperations {
+  capture(cwd: string, signal: AbortSignal): Promise<WorkflowCheckoutProof>;
+  assert(proof: WorkflowCheckoutProof, signal: AbortSignal): Promise<void>;
 }
 
 export class WorkflowManager {
@@ -424,6 +578,8 @@ export class WorkflowManager {
   readonly #replaySourceRunIds = new Set<string>();
   readonly #maxRetainedRuns: number;
   readonly #providerWaitClock: ProviderWaitClock;
+  readonly #checkout: WorkflowCheckoutOperations;
+  readonly #journalAppender: typeof appendWorkflowJournal;
 
   constructor(options: {
     jobs: JobManager;
@@ -439,6 +595,10 @@ export class WorkflowManager {
     retainedRuns?: number;
     /** Test-only injection point for provider-quota wait scheduling; defaults to a real, abortable, unref'd timer. */
     providerWaitClock?: ProviderWaitClock;
+    /** Test-only checkout proof injection; production uses abortable Git-backed proof operations. */
+    checkout?: WorkflowCheckoutOperations;
+    /** Test-only journal injection for deterministic persistence races. */
+    journalAppender?: typeof appendWorkflowJournal;
   }) {
     this.#jobs = options.jobs;
     this.#artifactRoot = resolve(options.artifactRoot);
@@ -451,10 +611,18 @@ export class WorkflowManager {
       ? options.retainedRuns!
       : DEFAULT_WORKFLOW_RETAINED_RUNS;
     this.#providerWaitClock = options.providerWaitClock ?? DEFAULT_PROVIDER_WAIT_CLOCK;
+    this.#checkout = options.checkout ?? {
+      capture: captureWorkflowCheckout,
+      assert: assertWorkflowCheckout,
+    };
+    this.#journalAppender = options.journalAppender ?? appendWorkflowJournal;
     this.#unsubscribeJobs = this.#jobs.subscribe((job, event) => this.#updateAgentFromJob(job, event));
     // Same-run peer routing is workflow policy; JobManager owns only the
     // generic lifecycle rules and hands the authorized request over here.
-    this.#releasePeerRouter = this.#jobs.setPeerInteractionRouter((request) => this.#answerPeerQuestion(request));
+    this.#releasePeerRouter = this.#jobs.setPeerInteractionRouter(
+      (request) => this.#answerPeerQuestion(request),
+      (source, targetJobId) => this.#resolvePeerTargetJobId(source, targetJobId),
+    );
   }
 
   async initialize(): Promise<void> {
@@ -528,7 +696,9 @@ export class WorkflowManager {
       if (!terminalWorkflow(source.snapshot.status)) throw new Error("Cannot resume from an active workflow");
       if (!source.snapshot.definitionFingerprint) throw new Error("Workflow predates durable replay and cannot be resumed");
       const sameDefinition = source.snapshot.replayBaseFingerprint
-        ? source.snapshot.replayBaseFingerprint === replayBaseFingerprint && budgetsAllowReplay(source.snapshot.budget, budget)
+        ? source.snapshot.replayBaseFingerprint === replayBaseFingerprint
+          && budgetsAllowReplay(source.snapshot.budget, budget)
+          && (!source.handoffs.length || budgetsMatch(source.snapshot.budget, budget))
         : source.snapshot.definitionFingerprint === definitionFingerprint;
       if (!sameDefinition) {
         throw new Error("Workflow definition or execution context does not match the replay source (including budget)");
@@ -537,10 +707,14 @@ export class WorkflowManager {
       if (restartAt !== undefined && (!Number.isSafeInteger(restartAt) || restartAt < 0 || restartAt >= 32)) {
         throw new Error("restartFromCallIndex must be an agent call ordinal from 0 to 31");
       }
+      if (restartAt !== undefined && [...source.progressedCalls].some((callIndex) => callIndex >= restartAt)) {
+        throw new Error("Cannot restart a workflow suffix that contains a progressed continuation checkpoint; recover from its durable handoff instead");
+      }
       const calls = restartAt === undefined ? source.calls : source.calls.filter((call) => call.callIndex < restartAt);
       replay = {
         sourceRunId: source.snapshot.runId,
         calls,
+        handoffs: restartAt === undefined ? source.handoffs : source.handoffs.filter((handoff) => handoff.callIndex < restartAt),
         interactions: source.interactions,
         usedInteractions: new Set(),
         active: true,
@@ -549,6 +723,9 @@ export class WorkflowManager {
           const harness = call.route?.harness;
           return jobId && (harness === "claude" || harness === "codex") ? [[jobId, harness] as const] : [];
         })),
+        carriedUsage: restartAt === undefined && source.handoffs.length
+          ? clone(source.usage)
+          : undefined,
       };
     }
     const warnings = workflowBudgetWarnings(budget);
@@ -576,6 +753,7 @@ export class WorkflowManager {
         sourceRunId: replay.sourceRunId,
         matchedCalls: 0,
         invalidatedAt: request.restartFromCallIndex,
+        ...(replay.carriedUsage ? { carriedUsage: clone(replay.carriedUsage) } : {}),
       } : undefined,
     };
     await this.#evictOldRuns();
@@ -670,27 +848,63 @@ export class WorkflowManager {
    * summary and journal read, so a concurrent retention pass cannot delete a
    * source between those reads. Terminal sources remain claimed by this
    * manager while an explicit replay references them. */
-  async #loadReplaySource(runId: string): Promise<ReplaySource | undefined> {
+  async #loadReplaySource(runId: string, ancestors = new Set<string>()): Promise<ReplaySource | undefined> {
+    if (ancestors.has(runId)) return undefined;
+    const nextAncestors = new Set(ancestors).add(runId);
     const inMemory = this.#runs.get(runId);
+    let snapshot: WorkflowSnapshot | undefined;
+    let records: WorkflowJournalRecord[] = [];
     if (inMemory) {
-      const records = await loadWorkflowJournal(this.#artifactRoot, runId);
+      snapshot = inMemory.snapshot;
+      if (terminalWorkflow(snapshot.status)) records = await loadWorkflowJournal(this.#artifactRoot, runId);
+    } else {
+      const lease = this.#retentionLease;
+      if (!lease) throw new Error("Workflow session lease is unavailable");
+      const loaded = await withWorkflowRetentionLock(this.#artifactRoot, async () => {
+        const source = await readWorkflowRunSummary(this.#artifactRoot, runId);
+        if (!source) return undefined;
+        if (!terminalWorkflow(source.status)) return { snapshot: source, records: [] as WorkflowJournalRecord[] };
+        await lease.claimWhileLocked([runId]);
+        this.#replaySourceRunIds.add(runId);
+        return { snapshot: source, records: await loadWorkflowJournal(this.#artifactRoot, runId) };
+      });
+      snapshot = loaded?.snapshot;
+      records = loaded?.records ?? [];
+    }
+    if (!snapshot) return undefined;
+    if (!terminalWorkflow(snapshot.status)) {
       return {
-        snapshot: inMemory.snapshot,
-        calls: replayableJournalCalls(records),
-        interactions: replayableJournalInteractions(records),
+        snapshot,
+        calls: [],
+        handoffs: [],
+        interactions: [],
+        progressedCalls: new Set(),
+        usage: workflowUsage(),
       };
     }
-    const lease = this.#retentionLease;
-    if (!lease) throw new Error("Workflow session lease is unavailable");
-    return withWorkflowRetentionLock(this.#artifactRoot, async () => {
-      const snapshot = await readWorkflowRunSummary(this.#artifactRoot, runId);
-      if (!snapshot) return undefined;
-      if (!terminalWorkflow(snapshot.status)) return { snapshot, calls: [], interactions: [] };
-      await lease.claimWhileLocked([runId]);
-      this.#replaySourceRunIds.add(runId);
-      const records = await loadWorkflowJournal(this.#artifactRoot, runId);
-      return { snapshot, calls: replayableJournalCalls(records), interactions: replayableJournalInteractions(records) };
-    });
+
+    const sourceRuns = new Map<string, ReplaySource | undefined>();
+    const replaySources = new Map<string, WorkflowReplayCall>();
+    for (const record of records) {
+      if (record.state !== "completed" || record.result?.ok !== true
+          || !record.route?.continuation || !record.replayedFrom) continue;
+      let source = sourceRuns.get(record.replayedFrom.runId);
+      if (!sourceRuns.has(record.replayedFrom.runId)) {
+        source = await this.#loadReplaySource(record.replayedFrom.runId, nextAncestors);
+        sourceRuns.set(record.replayedFrom.runId, source);
+      }
+      const call = source?.calls.find((candidate) => candidate.callIndex === record.replayedFrom!.callIndex);
+      if (call) replaySources.set(workflowReplayReferenceKey(record.replayedFrom), call);
+    }
+    const calls = replayableJournalCalls(records, replaySources);
+    return {
+      snapshot,
+      calls,
+      handoffs: replayableJournalHandoffs(records),
+      interactions: replayableJournalInteractions(records),
+      progressedCalls: progressedJournalCalls(records),
+      usage: durableReplaySourceUsage(snapshot, records),
+    };
   }
 
   /** Enumerates every preserved/orphaned worktree across this manager's artifact root. */
@@ -796,6 +1010,10 @@ export class WorkflowManager {
     if (!agent) throw new Error(`Unknown workflow agent: ${agentIndex}`);
     if (agent.callIndex === undefined) throw new Error("Workflow agent predates durable replay and cannot be restarted");
     if (!entry.request) throw new Error("Workflow definition is unavailable in this session; rerun the workflow tool with resumeFromRunId");
+    const journal = await loadWorkflowJournal(this.#artifactRoot, runId);
+    if ([...progressedJournalCalls(journal)].some((callIndex) => callIndex >= agent.callIndex!)) {
+      throw new Error("Cannot restart a workflow suffix that contains a progressed continuation checkpoint; recover from its durable handoff instead");
+    }
     if (!terminalWorkflow(entry.snapshot.status)) await this.cancel(runId, `Restarting workflow from agent ${agent.name}`);
     const reason = replacementReason(agent);
     const replacementOf: WorkflowReplacementReference = {
@@ -968,11 +1186,12 @@ export class WorkflowManager {
     if (entry.replay?.active && expected?.fingerprint === fingerprint && expected.kind === "agent") {
       const record = this.#recordReplayedAgent(entry, prompt, options, callIndex, fingerprint, expected);
       entry.snapshot.replay!.matchedCalls++;
+      await this.#appendReplayedContinuationProof(entry, callIndex, fingerprint, "agent", record.index, expected);
       await this.#appendJournal(entry, {
         callIndex,
         fingerprint,
         kind: "agent",
-        state: "completed",
+        state: expected.result.ok ? "completed" : "failed",
         at: Date.now(),
         agentIndex: record.index,
         result: clone(expected.result),
@@ -981,6 +1200,53 @@ export class WorkflowManager {
       });
       this.#touch(entry);
       return clone(expected.result);
+    }
+    const handoff = entry.replay?.active
+      ? entry.replay.handoffs.find((candidate) => candidate.callIndex === callIndex && candidate.fingerprint === fingerprint && candidate.kind === "agent")
+      : undefined;
+    if (handoff) {
+      const record = this.#recordHandoffAgent(entry, prompt, options, callIndex, fingerprint, handoff);
+      const callController = new AbortController();
+      entry.callControllers.set(callIndex, callController);
+      const bridgeCallAbort = () => callController.abort(signal.reason);
+      if (signal.aborted) bridgeCallAbort();
+      else signal.addEventListener("abort", bridgeCallAbort, { once: true });
+      let result: WorkflowAttemptResult;
+      try {
+        result = await this.#resumeContinuationHandoff(entry, request, record, handoff, callController.signal, callIndex, fingerprint, prompt);
+      } catch (error) {
+        const cancelled = callController.signal.aborted;
+        record.state = cancelled ? "cancelled" : "failed";
+        record.error = boundedText(cancelled ? callController.signal.reason ?? error : error);
+        if (record.continuation) record.continuation.state = "failed";
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt = record.timestamps.updatedAt;
+        this.#touch(entry);
+        result = { ok: false, output: "", error: record.error, progressed: true, usage: clone(record.usage) };
+      } finally {
+        entry.callControllers.delete(callIndex);
+        signal.removeEventListener("abort", bridgeCallAbort);
+      }
+      const sanitized: WorkflowAgentResult = {
+        ok: result.ok,
+        output: result.output,
+        jobId: record.logicalJobId ?? handoff.checkpoint.logicalJobId ?? result.jobId,
+        error: result.error,
+        usage: clone(record.usage),
+        structured: result.structured,
+        limit: result.limit,
+      };
+      await this.#appendJournal(entry, {
+        callIndex,
+        fingerprint,
+        kind: "agent",
+        state: sanitized.ok ? "completed" : "failed",
+        at: Date.now(),
+        agentIndex: record.index,
+        result: { ...clone(sanitized), transport: record.structuredTransport, ...(!sanitized.ok ? { progressed: true as const } : {}) } as WorkflowJournalResult,
+        route: journalRoute(record),
+      });
+      return sanitized;
     }
     if (entry.replay?.active) {
       entry.snapshot.replay!.invalidatedAt ??= callIndex;
@@ -995,14 +1261,9 @@ export class WorkflowManager {
     const attemptSignal = callController.signal;
 
     try {
-    type Attempt = Omit<WorkflowAgentResult, "usage"> & {
-      usage?: WorkflowUsage;
-      unavailable?: ProviderUnavailability;
-      progressed?: boolean;
-      fallbackTrigger?: WorkflowProviderFallbackTrigger;
-    };
     const fallbackDeclaration = parseProviderFallback(options);
-    let result: Attempt;
+    const continuationDeclaration = parseContinuationFallback(options);
+    let result: WorkflowAttemptResult;
     const policy = entry.snapshot.retry;
     let record: WorkflowAgentRecord | undefined;
     let pinnedHarness: HarnessName | undefined;
@@ -1010,6 +1271,8 @@ export class WorkflowManager {
     let fallbackRoute: WorkflowProviderFallback | undefined;
     let fallbackTrigger: WorkflowProviderFallbackTrigger | undefined;
     let usedFallback = false;
+    let usedContinuation = false;
+    let progressedFailure = false;
     for (;;) {
       try {
         const attemptRetry = record ? {
@@ -1026,8 +1289,14 @@ export class WorkflowManager {
           : this.#withMutationLock(request.cwd, attemptSignal, execute);
         result = await this.#withDispatchSlot(entry, attemptSignal, isolated);
       } catch (error) {
-        const failed = { ok: false, output: "", error: boundedText(error) } satisfies WorkflowJournalResult;
         const failedRecord = record ?? entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
+        const progressed = progressedFailure || failedRecord?.progressedCheckpoint === true;
+        const failed = {
+          ok: false,
+          output: "",
+          error: boundedText(error),
+          ...(progressed ? { progressed: true as const } : {}),
+        } satisfies WorkflowJournalResult;
         if (attemptSignal.aborted && failedRecord) {
           failedRecord.state = "cancelled";
           failedRecord.error = failed.error;
@@ -1036,7 +1305,7 @@ export class WorkflowManager {
           failedRecord.timestamps.endedAt = failedRecord.timestamps.updatedAt;
           this.#touch(entry);
           record = failedRecord;
-          result = failed;
+          result = { ...failed, progressed: progressed || undefined };
           break;
         }
         await this.#appendJournal(entry, {
@@ -1059,7 +1328,14 @@ export class WorkflowManager {
         record.timestamps.updatedAt = Date.now();
         record.timestamps.endedAt = record.timestamps.updatedAt;
         this.#touch(entry);
-        result = { ok: false, output: result.output, jobId: result.jobId, error: record.error, usage: result.usage };
+        result = {
+          ok: false,
+          output: result.output,
+          jobId: result.jobId,
+          error: record.error,
+          usage: result.usage,
+          progressed: result.progressed,
+        };
         break;
       }
       if (!usedFallback && "fallback" in fallbackDeclaration && fallbackDeclaration.fallback) {
@@ -1077,6 +1353,36 @@ export class WorkflowManager {
         break;
       }
       if (usedFallback) break;
+      if ("fallback" in continuationDeclaration && continuationDeclaration.fallback) {
+        const trigger = this.#planContinuation(record, result, continuationDeclaration.primary!, continuationDeclaration.fallback);
+        if (trigger) {
+          progressedFailure = true;
+          result = await this.#continueProgressedCall({
+            entry,
+            request,
+            record,
+            kind: "agent",
+            logicalJobId: record.logicalJobId,
+            objective: prompt,
+            currentPrompt: prompt,
+            options,
+            schema: record.nativeStructuredSchema
+              ?? (options.schema === undefined ? undefined : workflowSchema(options.schema) as Record<string, unknown> | undefined),
+            signal: attemptSignal,
+            callIndex,
+            fingerprint,
+            target: continuationDeclaration.fallback,
+            trigger,
+          });
+          result.jobId = record.logicalJobId;
+          usedContinuation = true;
+          break;
+        }
+        // A declared continuation route owns this call's recovery policy. It
+        // never falls through to the run-wide same-provider wait policy,
+        // whether the failed turn progressed or was rejected pre-inference.
+        break;
+      }
       if (!policy || policy.providerUnavailable !== "wait") break;
       // `entry.providerWaitBudgetMs` is a run-wide allowance shared by every logical
       // call, including concurrent ones from `parallel()`. Reading and decrementing
@@ -1136,7 +1442,7 @@ export class WorkflowManager {
       output: result.output,
       jobId: result.jobId,
       error: result.error,
-      usage: usedFallback && finalRecord ? clone(finalRecord.usage) : result.usage,
+      usage: (usedFallback || usedContinuation) && finalRecord ? clone(finalRecord.usage) : result.usage,
       structured: result.structured,
       // Machine-readable budget marker, preserved so a bounded convergence
       // loop reports `limit-reached` rather than parsing failure prose.
@@ -1149,7 +1455,11 @@ export class WorkflowManager {
       state: sanitized.ok ? "completed" : "failed",
       at: Date.now(),
       agentIndex: finalRecord?.index,
-      result: { ...clone(sanitized), transport: finalRecord?.structuredTransport } as WorkflowJournalResult,
+      result: {
+        ...clone(sanitized),
+        transport: finalRecord?.structuredTransport,
+        ...(!sanitized.ok && result.progressed ? { progressed: true as const } : {}),
+      } as WorkflowJournalResult,
       route: journalRoute(finalRecord),
       replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
     });
@@ -1199,7 +1509,7 @@ export class WorkflowManager {
       // (possibly reordered) parallel dispatch completion, which can differ
       // from this reconstruction's push order and would otherwise mislabel
       // a sibling agent's record.
-      const targetIndex = entry.snapshot.agents.findIndex((candidate) => candidate.jobId === jobId);
+      const targetIndex = entry.snapshot.agents.findIndex((candidate) => candidate.logicalJobId === jobId || candidate.jobId === jobId);
       const record = targetIndex < 0 ? undefined : this.#recordReplayedFollowUp(entry, targetIndex, prompt, callIndex, fingerprint, expected);
       if (!record) {
         const error = "Workflow follow-up replay could not locate its source agent lineage";
@@ -1207,38 +1517,147 @@ export class WorkflowManager {
         return { ok: false, output: "", error };
       }
       entry.snapshot.replay!.matchedCalls++;
+      const replayedResult = clone(expected.result);
+      replayedResult.jobId = record.logicalJobId ?? jobId;
+      await this.#appendReplayedContinuationProof(entry, callIndex, fingerprint, "followUp", record.index, expected);
       await this.#appendJournal(entry, {
         callIndex,
         fingerprint,
         kind: "followUp",
-        state: "completed",
+        state: expected.result.ok ? "completed" : "failed",
         at: Date.now(),
         agentIndex: record.index,
-        result: clone(expected.result),
+        result: replayedResult,
         route: expected.route ? { ...expected.route } : undefined,
         replayedFrom: { runId: entry.replay.sourceRunId, callIndex: expected.callIndex },
       });
       this.#touch(entry);
-      return clone(expected.result);
+      return replayedResult;
+    }
+    const handoff = entry.replay?.active
+      ? entry.replay.handoffs.find((candidate) => candidate.callIndex === callIndex && candidate.fingerprint === fingerprint && candidate.kind === "followUp")
+      : undefined;
+    if (handoff) {
+      const targetIndex = entry.snapshot.agents.findIndex((candidate) => candidate.logicalJobId === jobId || candidate.jobId === jobId);
+      const record = targetIndex < 0 ? undefined : entry.snapshot.agents[targetIndex];
+      if (!record) {
+        const error = "Workflow continuation replay could not locate its source agent lineage";
+        await this.#appendJournal(entry, { callIndex, fingerprint, kind: "followUp", state: "failed", at: Date.now(), result: { ok: false, output: "", error, progressed: true } });
+        return { ok: false, output: "", error };
+      }
+      this.#applyHandoffCheckpoint(record, handoff);
+      this.#claimReplayHandoffUsage(entry, handoff.checkpoint);
+      const callController = new AbortController();
+      entry.callControllers.set(callIndex, callController);
+      const bridgeCallAbort = () => callController.abort(signal.reason);
+      if (signal.aborted) bridgeCallAbort();
+      else signal.addEventListener("abort", bridgeCallAbort, { once: true });
+      let result: WorkflowAttemptResult;
+      try {
+        result = await this.#resumeContinuationHandoff(entry, request, record, handoff, callController.signal, callIndex, fingerprint, prompt);
+      } catch (error) {
+        const cancelled = callController.signal.aborted;
+        record.state = cancelled ? "cancelled" : "failed";
+        record.error = boundedText(cancelled ? callController.signal.reason ?? error : error);
+        if (record.continuation) record.continuation.state = "failed";
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt = record.timestamps.updatedAt;
+        this.#touch(entry);
+        result = { ok: false, output: "", error: record.error, progressed: true, usage: clone(record.usage) };
+      } finally {
+        entry.callControllers.delete(callIndex);
+        signal.removeEventListener("abort", bridgeCallAbort);
+      }
+      const sanitized: WorkflowAgentResult = {
+        ok: result.ok,
+        output: result.output,
+        jobId: record.logicalJobId ?? jobId,
+        error: result.error,
+        usage: clone(record.usage),
+        structured: result.structured,
+        limit: result.limit,
+      };
+      await this.#appendJournal(entry, {
+        callIndex,
+        fingerprint,
+        kind: "followUp",
+        state: sanitized.ok ? "completed" : "failed",
+        at: Date.now(),
+        agentIndex: record.index,
+        result: { ...clone(sanitized), transport: record.structuredTransport, ...(!sanitized.ok ? { progressed: true as const } : {}) } as WorkflowJournalResult,
+        route: journalRoute(record),
+      });
+      return sanitized;
     }
     if (entry.replay?.active) {
       entry.snapshot.replay!.invalidatedAt ??= callIndex;
       this.#touch(entry);
     }
 
-    let result: WorkflowAgentResult;
+    const callController = new AbortController();
+    entry.callControllers.set(callIndex, callController);
+    const bridgeCallAbort = () => callController.abort(signal.reason);
+    if (signal.aborted) bridgeCallAbort();
+    else signal.addEventListener("abort", bridgeCallAbort, { once: true });
+    const attemptSignal = callController.signal;
     try {
-      const execute = () => this.#runFreshFollowUp(entry, request, jobId, prompt, options, signal, callIndex, fingerprint);
-      const owner = this.#jobOwners.get(jobId);
-      const targetAgent = owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined;
+    let result: WorkflowAttemptResult;
+    let progressedFailure = false;
+    const initialOwner = this.#jobOwners.get(jobId);
+    const targetAgent = initialOwner?.runId === entry.snapshot.runId
+      ? entry.snapshot.agents[initialOwner.agentIndex]
+      : undefined;
+    try {
+      const execute = () => this.#runFreshFollowUp(entry, request, jobId, prompt, options, attemptSignal, callIndex, fingerprint);
       const isolated = () => targetAgent?.access === "readOnly"
         ? execute()
-        : this.#withMutationLock(request.cwd, signal, execute);
-      result = await this.#withDispatchSlot(entry, signal, isolated);
+        : this.#withMutationLock(request.cwd, attemptSignal, execute);
+      result = await this.#withDispatchSlot(entry, attemptSignal, isolated);
+      const record = targetAgent;
+      const target = record?.continuationFallback;
+      const primary = record?.harness;
+      const trigger = record && target && (primary === "claude" || primary === "codex")
+        ? this.#planContinuation(record, result, primary, target)
+        : undefined;
+      if (record && target && trigger) {
+        progressedFailure = true;
+        const objective = this.#originalObjective(record);
+        if (!objective) {
+          throw new Error("Workflow continuation lacks authoritative original-objective provenance");
+        }
+        const schema = record.nativeStructuredSchema
+          ?? (options.schema === undefined ? undefined : workflowSchema(options.schema) as Record<string, unknown> | undefined);
+        result = await this.#continueProgressedCall({
+          entry,
+          request,
+          record,
+          kind: "followUp",
+          logicalJobId: jobId,
+          objective,
+          currentPrompt: prompt,
+          options,
+          schema,
+          signal: attemptSignal,
+          callIndex,
+          fingerprint,
+          target,
+          trigger,
+          attemptUsageBase: result.attemptUsageBase,
+        });
+        result.jobId = jobId;
+        result.usage = clone(record.usage);
+      }
     } catch (error) {
-      const failed = { ok: false, output: "", error: boundedText(error) } satisfies WorkflowJournalResult;
       const owner = this.#jobOwners.get(jobId);
-      const record = owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined;
+      const record = targetAgent
+        ?? (owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined);
+      const failed = {
+        ok: false,
+        output: "",
+        error: boundedText(error),
+        usage: record ? clone(record.usage) : undefined,
+        ...(progressedFailure ? { progressed: true as const } : {}),
+      } satisfies WorkflowJournalResult;
       await this.#appendJournal(entry, {
         callIndex,
         fingerprint,
@@ -1253,7 +1672,10 @@ export class WorkflowManager {
       throw error;
     }
     const owner = this.#jobOwners.get(jobId);
-    const record = owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined;
+    const record = targetAgent
+      ?? (owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined);
+    result.jobId = record?.logicalJobId ?? jobId;
+    if (record) result.usage = clone(record.usage);
     await this.#appendJournal(entry, {
       callIndex,
       fingerprint,
@@ -1261,11 +1683,51 @@ export class WorkflowManager {
       state: result.ok ? "completed" : "failed",
       at: Date.now(),
       agentIndex: record?.index,
-      result: { ...clone(result), transport: record?.structuredTransport } as WorkflowJournalResult,
+      result: {
+        ...clone(result),
+        transport: record?.structuredTransport,
+        ...(!result.ok && result.progressed ? { progressed: true as const } : {}),
+      } as WorkflowJournalResult,
       route: journalRoute(record),
       replacementOf: entry.snapshot.replacementOf ? clone(entry.snapshot.replacementOf) : undefined,
     });
     return result;
+    } finally {
+      entry.callControllers.delete(callIndex);
+      signal.removeEventListener("abort", bridgeCallAbort);
+    }
+  }
+
+  #resolveIndependenceTarget(
+    entry: RunEntry,
+    requestedJobId: string | undefined,
+  ): { jobId?: string; provider?: ProviderFamily } {
+    if (!requestedJobId) return {};
+    const target = entry.snapshot.agents.find((candidate) =>
+      candidate.logicalJobId === requestedJobId || candidate.jobId === requestedJobId);
+    const replacementJobId = target?.continuation?.replacementJobId;
+    if (replacementJobId) {
+      let replacement: JobSnapshot | undefined;
+      try {
+        replacement = this.#jobs.check(replacementJobId);
+      } catch {
+        // A replayed or evicted native session has no live JobManager target.
+        // Only durable replay provenance may identify its provider below.
+      }
+      if (replacement) {
+        if (replacement.harness !== target.continuation?.toHarness) {
+          throw new Error("Continuation replacement provider does not match its recorded lineage");
+        }
+        return { jobId: replacementJobId, provider: replacement.harness };
+      }
+      const replayProvider = entry.replay?.priorJobProviders.get(requestedJobId);
+      if (replayProvider) return { jobId: requestedJobId, provider: replayProvider };
+      throw new Error("Continuation replacement is unavailable as an independence target");
+    }
+    return {
+      jobId: requestedJobId,
+      provider: entry.replay?.priorJobProviders.get(requestedJobId),
+    };
   }
 
   async #runFreshAgent(
@@ -1281,18 +1743,20 @@ export class WorkflowManager {
       attempt: number;
       pinnedHarness?: HarnessName;
       model?: string;
-      disposition: "wait" | "fallback";
-      trigger?: WorkflowProviderFallbackTrigger;
+      disposition: "wait" | "fallback" | "continuation";
+      trigger?: WorkflowProviderFallbackTrigger | WorkflowContinuationTrigger;
+      task?: string;
+      attemptUsageBase?: WorkflowUsage;
+      includeReplayCarriedUsage?: true;
+      beforeSpawn?: () => Promise<void>;
+      beforeStart?: (signal: AbortSignal) => Promise<void>;
     },
-  ): Promise<Omit<WorkflowAgentResult, "usage"> & {
-    usage?: WorkflowUsage;
-    unavailable?: ProviderUnavailability;
-    progressed?: boolean;
-    fallbackTrigger?: WorkflowProviderFallbackTrigger;
-  }> {
+  ): Promise<WorkflowAttemptResult> {
     if (!prompt.trim()) return { ok: false, output: "", error: "agent() requires a non-empty prompt" };
     const fallbackDeclaration = parseProviderFallback(options);
     if ("error" in fallbackDeclaration) return { ok: false, output: "", error: fallbackDeclaration.error };
+    const continuationDeclaration = parseContinuationFallback(options);
+    if ("error" in continuationDeclaration) return { ok: false, output: "", error: continuationDeclaration.error };
     const preflightError = retry ? undefined : this.#budgetPreflight(entry);
     if (preflightError) return { ok: false, output: "", error: preflightError, limit: "budget" };
     if (["role", "agent", "tier", "modelTier", "modelProfile", "backend"].some((key) => Object.hasOwn(options, key))) {
@@ -1303,7 +1767,7 @@ export class WorkflowManager {
     const harness = retry?.pinnedHarness ?? (options.harness === undefined ? undefined : String(options.harness) as RequestedHarness);
     if (harness && !isRequestedHarness(harness)) return { ok: false, output: "", error: `Unknown harness: ${harness}` };
     let model: string | undefined;
-    try { model = retry?.disposition === "fallback" ? retry.model : normalizeModel(options.model); }
+    try { model = retry && retry.disposition !== "wait" ? retry.model : normalizeModel(options.model); }
     catch (error) { return { ok: false, output: "", error: boundedText(error) }; }
     const effortValue = options.effort;
     const effort = effortValue === undefined ? undefined : String(effortValue) as EffortLevel;
@@ -1317,6 +1781,9 @@ export class WorkflowManager {
     if (options.independentOf !== undefined && (typeof options.independentOf !== "string" || !options.independentOf.trim() || options.independentOf.trim().length > 200)) return { ok: false, output: "", error: "independentOf must be a job ID containing 1–200 characters" };
     if (options.profile !== undefined && (typeof options.profile !== "string" || !options.profile.trim())) return { ok: false, output: "", error: "profile must be a non-empty string" };
     if (options.isolation !== undefined && options.isolation !== "worktree") return { ok: false, output: "", error: "isolation must be worktree when provided" };
+    if (options.isolation === "worktree" && continuationDeclaration.fallback) {
+      return { ok: false, output: "", error: "continuationFallback does not support isolation: worktree; progressed continuation requires the same shared checkout" };
+    }
     if ((access ?? "full") === "full") {
       const approved = await this.#authorizeMutation(entry, label(options.name ?? options.label, `agent-${callIndex + 1}`), prompt, signal);
       if (!approved) return { ok: false, output: "", error: entry.snapshot.approval === "plan"
@@ -1346,7 +1813,7 @@ export class WorkflowManager {
         error: record.error,
         // record.usage is already cumulative (prior retryUsage + this attempt's own
         // usage); isolate just this attempt's contribution for bounded provenance.
-        usage: subtractWorkflowUsage(record.usage, record.retryUsage),
+        usage: subtractWorkflowUsage(record.usage, retry.attemptUsageBase ?? record.retryUsage),
         endedAt: record.timestamps.endedAt,
         disposition: retry.disposition,
         trigger: retry.trigger ? { ...retry.trigger } : undefined,
@@ -1388,6 +1855,9 @@ export class WorkflowManager {
         name,
         access: access ?? "full",
         profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
+        requires: Array.isArray(options.requires) && options.requires.every((item) => typeof item === "string")
+          ? [...options.requires]
+          : undefined,
         independent: options.independent === true || options.independentOf !== undefined,
         independentOf: typeof options.independentOf === "string" ? options.independentOf.trim() : undefined,
         phase,
@@ -1395,11 +1865,13 @@ export class WorkflowManager {
         timestamps: { createdAt: now, updatedAt: now },
         harness: harness && harness !== "auto" ? harness : undefined,
         model,
+        objective: boundedText(prompt, 2 * 1024),
         prompt: boundedText(prompt, 2 * 1024),
         effort,
         tools: [],
         usage: workflowUsage(),
         providerFallback: fallbackDeclaration.fallback,
+        continuationFallback: continuationDeclaration.fallback,
       };
       entry.snapshot.agents.push(record);
       entry.snapshot.phases[phase]?.agents.push(index);
@@ -1407,7 +1879,10 @@ export class WorkflowManager {
     this.#touch(entry);
 
     if (retry) {
-      const retryPreflightError = this.#budgetPreflight(entry);
+      const retryPreflightError = this.#budgetPreflight(
+        entry,
+        retry.includeReplayCarriedUsage ? entry.snapshot.replay?.carriedUsage : undefined,
+      );
       if (retryPreflightError) {
         record.state = "failed";
         record.error = retryPreflightError;
@@ -1467,19 +1942,17 @@ export class WorkflowManager {
       }
     }
 
-    const replayIndependenceProvider = record.independentOf
-      ? entry.replay?.priorJobProviders.get(record.independentOf)
-      : undefined;
+    const independence = this.#resolveIndependenceTarget(entry, record.independentOf);
     let job: JobSnapshot;
     let structuredTransport: WorkflowStructuredTransport | undefined;
     // Persist the requested harness before routing so a fail-closed availability
     // error still records what was asked for.
     record.requestedHarness = harness ?? request.defaultHarness ?? "pi";
     try {
-      const routing = await routeCapabilities(this.#router, {
+      const resolveRouting = (routingSignal: AbortSignal) => routeCapabilities(this.#router, {
         request: {
           name,
-          task: prompt,
+          task: retry?.task ?? prompt,
           cwd: agentCwd,
           trusted: request.trusted,
           harness,
@@ -1488,34 +1961,38 @@ export class WorkflowManager {
           effort,
           access,
           independent: options.independent === true,
-          independentOf: record.independentOf,
-          independentOfProvider: replayIndependenceProvider,
+          independentOf: independence.jobId,
+          independentOfProvider: independence.provider,
           profile: record.profile,
           defaultHarness: request.defaultHarness,
           parentProvider: request.parentProvider,
         },
         profile: record.profile ? this.#resolveProfile?.(record.profile) : undefined,
-        independentOfProvider: replayIndependenceProvider,
+        independentOfProvider: independence.provider,
         preference: request.defaultHarness ? [request.defaultHarness] : undefined,
         availability: this.#availability,
-        requireAvailability: retry?.disposition === "fallback",
-        signal,
+        requireAvailability: retry?.disposition === "fallback" || retry?.disposition === "continuation",
+        signal: routingSignal,
       });
+      const applyRoutingEvidence = (observed: CapabilityRouting) => {
+        if (observed.availability) {
+          record.availability = observed.availability.status;
+          record.executableVersion = observed.availability.version;
+        }
+        record.capabilityRevision = observed.capabilityRoute?.revision;
+        record.availabilityChecks = observed.availabilityChecks?.map((availability) => ({
+          harness: availability.harness,
+          status: availability.status,
+          executableVersion: availability.version,
+        }));
+      };
+      const routing = await resolveRouting(signal);
       // Record the observed availability of the resolved route so the journal
       // can explain and safely replay it.
-      if (routing.availability) {
-        record.availability = routing.availability.status;
-        record.executableVersion = routing.availability.version;
-      }
-      record.capabilityRevision = routing.capabilityRoute?.revision;
-      record.availabilityChecks = routing.availabilityChecks?.map((availability) => ({
-        harness: availability.harness,
-        status: availability.status,
-        executableVersion: availability.version,
-      }));
-      const spawnRequest = {
+      applyRoutingEvidence(routing);
+      const spawnRequest: SpawnRequest = {
         name,
-        task: prompt,
+        task: retry?.task ?? prompt,
         cwd: agentCwd,
         trusted: request.trusted,
         harness: routing.harness ?? (harness === "auto" ? undefined : harness),
@@ -1525,8 +2002,8 @@ export class WorkflowManager {
         effort,
         access,
         independent: options.independent === true,
-        independentOf: record.independentOf,
-        independentOfProvider: replayIndependenceProvider,
+        independentOf: independence.jobId,
+        independentOfProvider: independence.provider,
         profile: record.profile,
         defaultHarness: request.defaultHarness,
         parentProvider: request.parentProvider,
@@ -1537,14 +2014,47 @@ export class WorkflowManager {
           label: record.name,
           phase: entry.snapshot.phases[phase]?.name,
         },
-        dispatchGate: () => this.#budgetPreflight(entry),
+        dispatchGate: () => this.#budgetPreflight(
+          entry,
+          retry?.includeReplayCarriedUsage ? entry.snapshot.replay?.carriedUsage : undefined,
+        ),
         // A workflow child may ask an authorized same-run peer, and may wake the
         // parent orchestrator only when this run is itself in the background:
         // a foreground workflow's parent turn is blocked awaiting the workflow
         // tool result and cannot safely start another turn.
         interaction: { orchestrator: entry.snapshot.background ? "allow" : "foregroundDenied", peers: true },
         interactionGate: (target) => this.#interactionGate(entry, target),
-      } satisfies SpawnRequest;
+      };
+      if (retry?.beforeStart) {
+        const admittedHarness = routing.harness ?? this.#jobs.resolveHarness(spawnRequest);
+        const admittedRequires = routing.requires ?? [];
+        spawnRequest.dispatchAdmission = async (admissionSignal) => {
+          try {
+            const admitted = await resolveRouting(admissionSignal);
+            const liveHarness = admitted.harness ?? this.#jobs.resolveHarness(spawnRequest);
+            if (liveHarness !== admittedHarness) {
+              throw new Error(`Continuation admission changed provider from ${admittedHarness} to ${liveHarness}`);
+            }
+            if (canonicalJson(admitted.requires ?? []) !== canonicalJson(admittedRequires)) {
+              throw new Error("Continuation admission changed the required capability policy");
+            }
+            // Routing may perform asynchronous readiness and capability probes.
+            // Prove the checkout only after those finish so backend startup can
+            // never consume workspace state that changed during admission.
+            await retry.beforeStart!(admissionSignal);
+            applyRoutingEvidence(admitted);
+            this.#touch(entry);
+            const budgetError = this.#budgetPreflight(
+              entry,
+              retry.includeReplayCarriedUsage ? entry.snapshot.replay?.carriedUsage : undefined,
+            );
+            if (budgetError) throw new Error(budgetError);
+            return { capabilityRoute: admitted.capabilityRoute };
+          } catch (error) {
+            return { error: boundedText(error) };
+          }
+        };
+      }
       if (schema) {
         // Transport is decided against the exact harness compilePolicy will
         // pick for this spawnRequest, never a re-derived guess: capability
@@ -1562,16 +2072,20 @@ export class WorkflowManager {
           spawnRequest.structuredOutput = { schema: schema as Record<string, unknown> };
           record.nativeStructuredSchema = schema as Record<string, unknown>;
         }
+        const task = retry?.task ?? prompt;
         spawnRequest.task = structuredTransport === "native"
-          ? prompt
-          : `${prompt}\n\nReturn ONLY valid JSON matching this JSON Schema (no markdown fences):\n${JSON.stringify(schema)}`;
+          ? task
+          : `${task}\n\nReturn ONLY valid JSON matching this JSON Schema (no markdown fences):\n${JSON.stringify(schema)}`;
         record.structuredTransport = structuredTransport;
         this.#touch(entry);
       }
       this.#jobs.assertSpendBudgetSupported(spawnRequest, entry.snapshot.budget);
+      await retry?.beforeSpawn?.();
+      if (signal.aborted) throw abortError(signal.reason);
       job = this.#jobs.spawn(spawnRequest);
     } catch (error) {
       await finishIsolation().catch(() => undefined);
+      if (signal.aborted) throw abortError(signal.reason);
       record.state = "failed";
       record.error = boundedText(error);
       let fallbackTrigger: WorkflowProviderFallbackTrigger | undefined;
@@ -1605,6 +2119,7 @@ export class WorkflowManager {
     }
 
     record.jobId = job.id;
+    record.logicalJobId ??= job.id;
     record.name = job.name;
     record.access = job.access;
     record.profile = job.profile;
@@ -1614,6 +2129,13 @@ export class WorkflowManager {
     record.model = job.model;
     record.timestamps.updatedAt = Date.now();
     this.#jobOwners.set(job.id, { runId: entry.snapshot.runId, agentIndex: index });
+    if (record.logicalJobId && record.logicalJobId !== job.id) {
+      this.#jobOwners.set(record.logicalJobId, { runId: entry.snapshot.runId, agentIndex: index });
+    }
+    if (record.continuation) {
+      record.continuation.state = "running";
+      record.continuation.replacementJobId = job.id;
+    }
     // spawn() may synchronously pump the job to running before ownership is
     // registered, so re-read the authoritative snapshot instead of applying
     // the stale queued value returned to the caller.
@@ -1629,6 +2151,7 @@ export class WorkflowManager {
         if (schema) {
           const outcome = resolveWorkflowStructured(schema, structuredTransport, final);
           if (!outcome.ok) {
+            if (record.continuation) record.continuation.state = "failed";
             record.state = "failed";
             record.error = outcome.error;
             record.timestamps.updatedAt = Date.now();
@@ -1638,11 +2161,14 @@ export class WorkflowManager {
             return { ok: false, output: final.output, jobId: final.id, error: outcome.error, usage: clone(final.usage) };
           }
           record.structured = outcome.value;
+          if (record.continuation) record.continuation.state = "completed";
           this.#touch(entry);
           return { ok: true, output: final.output, structured: outcome.value, jobId: final.id, usage: clone(final.usage) };
         }
+        if (record.continuation) record.continuation.state = "completed";
         return { ok: true, output: final.output, jobId: final.id, usage: clone(final.usage) };
       }
+      if (record.continuation) record.continuation.state = "failed";
       return {
         ok: false,
         output: final.output,
@@ -1656,7 +2182,14 @@ export class WorkflowManager {
       await this.#jobs.cancel(job.id, "Workflow agent wait aborted").catch(() => undefined);
       const final = this.#jobs.check(job.id);
       this.#updateAgentFromJob(final);
-      return { ok: false, output: final.output, jobId: final.id, error: boundedText(error), usage: clone(final.usage) };
+      return {
+        ok: false,
+        output: final.output,
+        jobId: final.id,
+        error: boundedText(error),
+        usage: clone(final.usage),
+        progressed: final.progressed,
+      };
     } finally {
       signal.removeEventListener("abort", abort);
       try { await finishIsolation(); }
@@ -1689,6 +2222,16 @@ export class WorkflowManager {
     };
   }
 
+  /** Recovers legacy provenance only while generation zero is still present. */
+  #originalObjective(record: WorkflowAgentRecord): string | undefined {
+    if (record.objective) return record.objective;
+    const original = record.generations?.find((generation) => generation.index === 0)?.prompt;
+    const recovered = original ?? (record.generations === undefined ? record.prompt : undefined);
+    if (!recovered) return undefined;
+    record.objective = boundedText(recovered, 2 * 1024);
+    return record.objective;
+  }
+
   async #runFreshFollowUp(
     entry: RunEntry,
     request: StartWorkflowRequest,
@@ -1698,7 +2241,7 @@ export class WorkflowManager {
     signal: AbortSignal,
     callIndex: number,
     fingerprint: string,
-  ): Promise<WorkflowAgentResult> {
+  ): Promise<WorkflowAttemptResult> {
     if (!prompt.trim()) return { ok: false, output: "", error: "followUp() requires a non-empty prompt" };
     const disallowed = Object.keys(options).filter((key) => !FOLLOWUP_OPTION_KEYS.has(key));
     if (disallowed.length) {
@@ -1711,16 +2254,34 @@ export class WorkflowManager {
     const record = entry.snapshot.agents[owner.agentIndex];
     if (!record) return { ok: false, output: "", error: `followUp() target ${jobId} is unknown` };
     if (record.isolation) {
-      return { ok: false, output: "", error: `followUp() target ${jobId} used an isolated worktree that already finalized (${record.isolation.state}) and cannot continue` };
+      return {
+        ok: false,
+        output: "",
+        error: `followUp() target ${jobId} used an isolated worktree that already finalized (${record.isolation.state}) and cannot continue`,
+        usage: clone(record.usage),
+      };
     }
     if (callIndex >= (entry.snapshot.budget?.maxAgents ?? 32)) {
-      return { ok: false, output: "", error: `Workflow agent budget exceeded (${entry.snapshot.budget?.maxAgents} calls)`, limit: "budget" };
+      return {
+        ok: false,
+        output: "",
+        error: `Workflow agent budget exceeded (${entry.snapshot.budget?.maxAgents} calls)`,
+        usage: clone(record.usage),
+        limit: "budget",
+      };
     }
     const preflightError = this.#budgetPreflight(entry);
-    if (preflightError) return { ok: false, output: "", error: preflightError, limit: "budget" };
+    if (preflightError) {
+      return { ok: false, output: "", error: preflightError, usage: clone(record.usage), limit: "budget" };
+    }
     const schema = options.schema === undefined ? undefined : workflowSchema(options.schema);
     if (options.schema !== undefined && !schema) {
-      return { ok: false, output: "", error: "followUp schema must be a bounded JSON Schema object" };
+      return {
+        ok: false,
+        output: "",
+        error: "followUp schema must be a bounded JSON Schema object",
+        usage: clone(record.usage),
+      };
     }
     // A retained native session is schema-bound at agent() time (the SDK
     // exposes no way to change outputFormat mid-session): followUp() may
@@ -1728,9 +2289,15 @@ export class WorkflowManager {
     // but cannot request a different one.
     const nativeLineage = record.structuredTransport === "native" && record.nativeStructuredSchema;
     if (nativeLineage && schema && canonicalJson(schema) !== canonicalJson(record.nativeStructuredSchema)) {
-      return { ok: false, output: "", error: "followUp() cannot change the schema of a native structured lineage; the retained session is bound to its agent() schema" };
+      return {
+        ok: false,
+        output: "",
+        error: "followUp() cannot change the schema of a native structured lineage; the retained session is bound to its agent() schema",
+        usage: clone(record.usage),
+      };
     }
     const effectiveSchema = nativeLineage ? workflowSchema(record.nativeStructuredSchema) : schema;
+    this.#originalObjective(record);
     // Snapshot generation 0 from the record's pre-follow-up fields before any
     // mutation below, then re-derive structuredTransport strictly for this
     // call: it must not linger from a schema-bearing agent() call now
@@ -1763,9 +2330,11 @@ export class WorkflowManager {
     record.timestamps.updatedAt = now;
     this.#touch(entry);
 
+    const retainedJobId = record.jobId ?? jobId;
+    const attemptUsageBase = clone(record.usage);
     let queued: JobSnapshot;
     try {
-      queued = await this.#jobs.continueWorkflowJob(jobId, message);
+      queued = await this.#jobs.continueWorkflowJob(retainedJobId, message);
     } catch (error) {
       const failure = boundedText(error);
       record.state = "failed";
@@ -1779,15 +2348,15 @@ export class WorkflowManager {
         generation.timestamps = { ...generation.timestamps, updatedAt: record.timestamps.updatedAt, endedAt: record.timestamps.endedAt };
       }
       this.#touch(entry);
-      return { ok: false, output: "", error: failure };
+      return { ok: false, output: "", error: failure, usage: clone(record.usage) };
     }
     this.#updateAgentFromJob(queued);
 
-    const abort = () => { void this.#jobs.cancel(jobId, "Workflow follow-up cancelled").catch(() => undefined); };
+    const abort = () => { void this.#jobs.cancel(retainedJobId, "Workflow follow-up cancelled").catch(() => undefined); };
     if (signal.aborted) abort();
     else signal.addEventListener("abort", abort, { once: true });
     try {
-      const final = await this.#jobs.wait(jobId, { signal });
+      const final = await this.#jobs.wait(retainedJobId, { signal });
       this.#updateAgentFromJob(final);
       if (final.status === "completed") {
         if (effectiveSchema) {
@@ -1807,7 +2376,7 @@ export class WorkflowManager {
               generation.timestamps = { ...generation.timestamps, updatedAt: record.timestamps.updatedAt, endedAt: record.timestamps.endedAt };
             }
             this.#touch(entry);
-            return { ok: false, output: final.output, jobId: final.id, error: outcome.error, usage: clone(final.usage) };
+            return { ok: false, output: final.output, jobId: final.id, error: outcome.error, usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)) };
           }
           record.structured = outcome.value;
           if (generation) {
@@ -1815,16 +2384,33 @@ export class WorkflowManager {
             generation.structuredTransport = nativeLineage ? "native" : "portable";
           }
           this.#touch(entry);
-          return { ok: true, output: final.output, structured: outcome.value, jobId: final.id, usage: clone(final.usage) };
+          return { ok: true, output: final.output, structured: outcome.value, jobId: final.id, usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)) };
         }
-        return { ok: true, output: final.output, jobId: final.id, usage: clone(final.usage) };
+        return { ok: true, output: final.output, jobId: final.id, usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)) };
       }
-      return { ok: false, output: final.output, jobId: final.id, error: final.error ?? `Agent ${final.status}`, usage: clone(final.usage) };
+      return {
+        ok: false,
+        output: final.output,
+        jobId: final.id,
+        error: final.error ?? `Agent ${final.status}`,
+        usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)),
+        unavailable: final.unavailable,
+        progressed: final.progressed,
+        attemptUsageBase,
+      };
     } catch (error) {
-      await this.#jobs.cancel(jobId, "Workflow follow-up wait aborted").catch(() => undefined);
-      const final = this.#jobs.check(jobId);
+      await this.#jobs.cancel(retainedJobId, "Workflow follow-up wait aborted").catch(() => undefined);
+      const final = this.#jobs.check(retainedJobId);
       this.#updateAgentFromJob(final);
-      return { ok: false, output: final.output, jobId: final.id, error: boundedText(error), usage: clone(final.usage) };
+      return {
+        ok: false,
+        output: final.output,
+        jobId: final.id,
+        error: boundedText(error),
+        usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)),
+        progressed: final.progressed,
+        attemptUsageBase,
+      };
     } finally {
       signal.removeEventListener("abort", abort);
     }
@@ -1847,7 +2433,7 @@ export class WorkflowManager {
       index: record.generations.length,
       callIndex,
       prompt: boundedText(prompt, 2 * 1024),
-      state: "completed",
+      state: replay.result.ok ? "completed" : "failed",
       output: replay.result.output,
       structured,
       structuredTransport: replay.result.transport,
@@ -1857,18 +2443,242 @@ export class WorkflowManager {
     if (record.generations.length > MAX_AGENT_GENERATIONS) record.generations.splice(0, record.generations.length - MAX_AGENT_GENERATIONS);
     record.callIndex = callIndex;
     record.callFingerprint = fingerprint;
+    if (replay.route) {
+      record.jobId = replay.route.jobId ?? record.jobId;
+      record.logicalJobId = replay.route.logicalJobId ?? record.logicalJobId;
+      record.harness = replay.route.harness ?? record.harness;
+      record.requestedHarness = replay.route.requestedHarness ?? record.requestedHarness;
+      record.availability = replay.route.availability ?? record.availability;
+      record.executableVersion = replay.route.executableVersion ?? record.executableVersion;
+      record.capabilityRevision = replay.route.capabilityRevision ?? record.capabilityRevision;
+      record.availabilityChecks = replay.route.availabilityChecks?.map((check) => ({ ...check })) ?? record.availabilityChecks;
+      record.model = replay.route.model ?? record.model;
+      record.providerFallback = replay.route.providerFallback ? { ...replay.route.providerFallback } : record.providerFallback;
+      record.continuationFallback = replay.route.continuationFallback ? { ...replay.route.continuationFallback } : record.continuationFallback;
+      record.continuation = replay.route.continuation ? clone(replay.route.continuation) : record.continuation;
+      record.attempts = replay.route.attempts?.map((attempt) => ({
+        ...attempt,
+        usage: { ...attempt.usage },
+        trigger: attempt.trigger ? { ...attempt.trigger } : undefined,
+      })) ?? record.attempts;
+    }
     record.outputProvenance = "replay";
     record.instructionShaped = looksInstructionShaped(replay.result.output);
     record.prompt = boundedText(prompt, 2 * 1024);
-    record.state = "completed";
+    record.state = replay.result.ok ? "completed" : "failed";
     record.output = replay.result.output;
     record.structured = structured;
     record.structuredTransport = replay.result.transport;
-    record.error = undefined;
+    record.error = replay.result.error;
+    if (replay.result.progressed === true || replay.route?.continuation !== undefined) {
+      record.progressedCheckpoint = true;
+    }
     record.timestamps.updatedAt = now;
     record.timestamps.endedAt = now;
     this.#touch(entry);
     return record;
+  }
+
+  async #appendReplayedContinuationProof(
+    entry: RunEntry,
+    callIndex: number,
+    fingerprint: string,
+    kind: "agent" | "followUp",
+    agentIndex: number,
+    replay: WorkflowReplayCall,
+  ): Promise<void> {
+    const proof = replay.continuationProof;
+    if (!proof) return;
+    await this.#appendJournal(entry, {
+      callIndex,
+      fingerprint,
+      kind,
+      state: "progressed",
+      at: Date.now(),
+      agentIndex,
+      replayProof: true,
+      route: clone(proof.progressRoute),
+      continuationProgress: { ...clone(proof.progress), agentIndex },
+    });
+    await this.#appendJournal(entry, {
+      callIndex,
+      fingerprint,
+      kind,
+      state: "handoff",
+      at: Date.now(),
+      agentIndex,
+      replayProof: true,
+      route: clone(proof.handoffRoute),
+      continuation: { ...clone(proof.handoff), agentIndex },
+    });
+  }
+
+  #applyHandoffCheckpoint(record: WorkflowAgentRecord, handoff: WorkflowReplayHandoff): void {
+    const checkpoint = handoff.checkpoint;
+    const route = handoff.route;
+    record.jobId = checkpoint.failedJobId;
+    record.logicalJobId ??= checkpoint.logicalJobId ?? checkpoint.failedJobId;
+    record.progressedCheckpoint = true;
+    record.state = "failed";
+    record.harness = route?.harness;
+    record.requestedHarness = route?.requestedHarness;
+    record.availability = route?.availability;
+    record.executableVersion = route?.executableVersion;
+    record.capabilityRevision = route?.capabilityRevision;
+    record.availabilityChecks = route?.availabilityChecks?.map((check) => ({ ...check }));
+    record.model = route?.model;
+    record.usage = clone(checkpoint.usage);
+    record.providerFallback = route?.providerFallback ? { ...route.providerFallback } : record.providerFallback;
+    record.continuationFallback = { ...checkpoint.target };
+    record.continuation = route?.continuation ? clone(route.continuation) : {
+      state: "handoff",
+      fromHarness: checkpoint.trigger.provider,
+      toHarness: checkpoint.target.harness,
+      failedJobId: checkpoint.failedJobId,
+      checkpointAt: Date.now(),
+      checkoutDigest: checkpoint.checkout.digest,
+      trigger: { ...checkpoint.trigger },
+      warning: CONTINUATION_WARNING,
+    };
+    record.error = `Authoritative ${checkpoint.trigger.provider} ${checkpoint.trigger.kind} failure; continuation checkpoint retained`;
+    record.timestamps.updatedAt = Date.now();
+    record.timestamps.endedAt = record.timestamps.updatedAt;
+  }
+
+  #recordHandoffAgent(
+    entry: RunEntry,
+    prompt: string,
+    options: Record<string, unknown>,
+    callIndex: number,
+    fingerprint: string,
+    handoff: WorkflowReplayHandoff,
+  ): WorkflowAgentRecord {
+    const phase = this.#resolveAgentPhase(entry, options.phase);
+    this.#markPhaseRunning(entry, phase);
+    const index = entry.snapshot.agents.length;
+    const now = Date.now();
+    const record: WorkflowAgentRecord = {
+      index,
+      callIndex,
+      callFingerprint: fingerprint,
+      name: label(options.name ?? options.label, `agent-${index + 1}`),
+      access: options.access === "readOnly" ? "readOnly" : "full",
+      profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
+      requires: Array.isArray(options.requires) && options.requires.every((item) => typeof item === "string") ? [...options.requires] : undefined,
+      independent: options.independent === true || options.independentOf !== undefined,
+      independentOf: typeof options.independentOf === "string" ? options.independentOf.trim() : undefined,
+      phase,
+      state: "failed",
+      timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now },
+      objective: boundedText(handoff.checkpoint.objective, 2 * 1024),
+      prompt: boundedText(prompt, 2 * 1024),
+      effort: typeof options.effort === "string" && EFFORTS.has(options.effort as EffortLevel) ? options.effort as EffortLevel : undefined,
+      tools: [],
+      usage: workflowUsage(),
+    };
+    this.#applyHandoffCheckpoint(record, handoff);
+    this.#claimReplayHandoffUsage(entry, handoff.checkpoint);
+    entry.snapshot.agents.push(record);
+    entry.snapshot.phases[phase]?.agents.push(index);
+    this.#jobOwners.set(record.logicalJobId!, { runId: entry.snapshot.runId, agentIndex: index });
+    this.#touch(entry);
+    return record;
+  }
+
+  #claimReplayHandoffUsage(entry: RunEntry, checkpoint: WorkflowContinuationHandoff): void {
+    const carried = entry.snapshot.replay?.carriedUsage;
+    if (!carried) return;
+    const remaining = subtractWorkflowUsageFloor(carried, checkpoint.usage);
+    entry.snapshot.replay!.carriedUsage = remaining;
+    if (entry.replay) entry.replay.carriedUsage = clone(remaining);
+  }
+
+  async #resumeContinuationHandoff(
+    entry: RunEntry,
+    request: StartWorkflowRequest,
+    record: WorkflowAgentRecord,
+    handoff: WorkflowReplayHandoff,
+    signal: AbortSignal,
+    callIndex: number,
+    fingerprint: string,
+    currentPrompt: string,
+  ): Promise<WorkflowAttemptResult> {
+    const checkpoint = { ...clone(handoff.checkpoint), agentIndex: record.index };
+    const progressRoute = journalRoute(record);
+    if (progressRoute) progressRoute.continuation = undefined;
+    await this.#appendJournal(entry, {
+      callIndex,
+      fingerprint,
+      kind: handoff.kind,
+      state: "progressed",
+      at: Date.now(),
+      agentIndex: record.index,
+      replayUsageClaim: true,
+      route: progressRoute,
+      continuationProgress: {
+        agentIndex: record.index,
+        logicalJobId: checkpoint.logicalJobId,
+        failedJobId: checkpoint.failedJobId,
+        target: { ...checkpoint.target },
+        trigger: { ...checkpoint.trigger },
+        attemptUsage: clone(checkpoint.attemptUsage ?? checkpoint.usage),
+        usage: clone(checkpoint.usage),
+      },
+    });
+    if (signal.aborted) throw abortError(signal.reason);
+    return this.#withDispatchSlot(entry, signal, () => this.#withMutationLock(request.cwd, signal, async () => {
+      try {
+        const replayCwd = await realpath(resolve(request.cwd));
+        if (replayCwd !== checkpoint.checkout.cwd) {
+          throw new Error("Workflow continuation cwd no longer resolves to its durable handoff checkout");
+        }
+        await this.#checkout.assert(checkpoint.checkout, signal);
+      } catch (error) {
+        record.continuation!.state = "failed";
+        record.error = boundedText(error);
+        this.#touch(entry);
+        return { ok: false, output: "", error: record.error, progressed: true, usage: clone(record.usage) };
+      }
+      await this.#appendJournal(entry, {
+        callIndex,
+        fingerprint,
+        kind: handoff.kind,
+        state: "handoff",
+        at: Date.now(),
+        agentIndex: record.index,
+        replayUsageClaim: true,
+        route: journalRoute(record),
+        continuation: clone(checkpoint),
+      });
+      await this.#flushCheckpoint(entry);
+      if (signal.aborted) throw abortError(signal.reason);
+      await this.#checkout.assert(checkpoint.checkout, signal);
+      const result = await this.#runFreshAgent(
+        entry,
+        { ...request, cwd: checkpoint.checkout.cwd },
+        currentPrompt,
+        this.#continuationPolicyOptions(record, checkpoint.target, checkpoint.schema),
+        signal,
+        callIndex,
+        fingerprint,
+        {
+          record,
+          attempt: 1,
+          pinnedHarness: checkpoint.target.harness,
+          model: checkpoint.target.model,
+          disposition: "continuation",
+          trigger: checkpoint.trigger,
+          task: checkpoint.handoffPrompt,
+          attemptUsageBase: subtractWorkflowUsage(checkpoint.usage, checkpoint.attemptUsage ?? checkpoint.usage),
+          includeReplayCarriedUsage: true,
+          beforeSpawn: () => this.#checkout.assert(checkpoint.checkout, signal),
+          beforeStart: (admissionSignal) => this.#checkout.assert(checkpoint.checkout, admissionSignal),
+        },
+      );
+      if (!result.ok && record.continuation) record.continuation.state = "failed";
+      this.#touch(entry);
+      return result;
+    }));
   }
 
   #recordReplayedAgent(
@@ -1898,11 +2708,15 @@ export class WorkflowManager {
       name: label(options.name ?? options.label, `agent-${index + 1}`),
       access,
       profile: typeof options.profile === "string" ? options.profile.trim() : undefined,
+      requires: Array.isArray(options.requires) && options.requires.every((item) => typeof item === "string")
+        ? [...options.requires]
+        : undefined,
       independent: options.independent === true || independentOf !== undefined,
       independentOf,
       phase,
-      jobId: replay.result.jobId ?? replay.route?.jobId,
-      state: "completed",
+      jobId: replay.route?.jobId ?? replay.result.jobId,
+      logicalJobId: replay.route?.logicalJobId ?? replay.result.jobId ?? replay.route?.jobId,
+      state: replay.result.ok ? "completed" : "failed",
       timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now },
       harness: replay.route?.harness,
       requestedHarness: replay.route?.requestedHarness,
@@ -1911,6 +2725,8 @@ export class WorkflowManager {
       capabilityRevision: replay.route?.capabilityRevision,
       availabilityChecks: replay.route?.availabilityChecks?.map((check) => ({ ...check })),
       providerFallback: replay.route?.providerFallback ? { ...replay.route.providerFallback } : undefined,
+      continuationFallback: replay.route?.continuationFallback ? { ...replay.route.continuationFallback } : undefined,
+      continuation: replay.route?.continuation ? clone(replay.route.continuation) : undefined,
       attempts: replay.route?.attempts?.map((attempt) => ({
         ...attempt,
         usage: { ...attempt.usage },
@@ -1918,11 +2734,14 @@ export class WorkflowManager {
       })),
       model: replay.route?.model,
       effort: replayEffort,
+      objective: boundedText(prompt, 2 * 1024),
       prompt: boundedText(prompt, 2 * 1024),
       tools: [],
       output: replay.result.output,
       structured: replay.result.structured === undefined ? undefined : clone(replay.result.structured),
       structuredTransport: replay.result.transport,
+      error: replay.result.error,
+      progressedCheckpoint: replay.result.progressed === true || replay.route?.continuation !== undefined ? true : undefined,
       // Replay restores route/attempt provenance but spends no usage again.
       usage: workflowUsage(),
     };
@@ -2002,6 +2821,20 @@ export class WorkflowManager {
 
   /* ── routed interactions ─────────────────────────────────────────────── */
 
+  #resolvePeerTargetJobId(source: JobSnapshot, targetJobId: string): string | undefined {
+    const sourceOwner = this.#jobOwners.get(source.id);
+    if (!sourceOwner) return undefined;
+    const entry = this.#runs.get(sourceOwner.runId);
+    if (!entry || terminalWorkflow(entry.snapshot.status)) return undefined;
+    const target = entry.snapshot.agents.find((candidate) =>
+      candidate.logicalJobId === targetJobId || candidate.jobId === targetJobId);
+    if (!target?.jobId) return undefined;
+    const targetOwner = this.#jobOwners.get(target.jobId);
+    return targetOwner?.runId === entry.snapshot.runId && targetOwner.agentIndex === target.index
+      ? target.jobId
+      : undefined;
+  }
+
   /**
    * Admission check for one routed question, run before any interaction state
    * exists. Bounds the run's interaction count and refuses to open a question
@@ -2071,7 +2904,8 @@ export class WorkflowManager {
     interaction: PendingInteraction,
   ): WorkflowInteractionSummary {
     const targetAgentIndex = interaction.target.jobId
-      ? entry.snapshot.agents.findIndex((candidate) => candidate.jobId === interaction.target.jobId)
+      ? entry.snapshot.agents.findIndex((candidate) =>
+        candidate.logicalJobId === interaction.target.jobId || candidate.jobId === interaction.target.jobId)
       : -1;
     return {
       ordinal: this.#interactionOrdinal(entry, interaction.requestId),
@@ -2108,7 +2942,8 @@ export class WorkflowManager {
     if (terminalWorkflow(entry.snapshot.status)) throw new Error(`Workflow ${entry.snapshot.runId} already ${entry.snapshot.status}`);
     const source = entry.snapshot.agents[owner.agentIndex];
     if (!source) throw new Error("The asking agent is no longer part of this workflow run");
-    const targetIndex = entry.snapshot.agents.findIndex((candidate) => candidate.jobId === request.targetJobId);
+    const targetIndex = entry.snapshot.agents.findIndex((candidate) =>
+      candidate.logicalJobId === request.targetJobId || candidate.jobId === request.targetJobId);
     const target = targetIndex >= 0 ? entry.snapshot.agents[targetIndex] : undefined;
     if (!target || targetIndex === owner.agentIndex) {
       throw new Error(`Peer agent ${request.targetJobId} does not belong to this workflow run`);
@@ -2153,17 +2988,20 @@ export class WorkflowManager {
     try {
       const replayed = this.#matchReplayedInteraction(entry, questionFingerprint, detail);
       if (replayed) {
-        await this.#appendJournal(entry, {
-          callIndex: ordinal,
-          fingerprint: questionFingerprint,
-          kind: "peerQuestion",
-          state: "completed",
-          at: Date.now(),
-          agentIndex: owner.agentIndex,
+        const commitAcceptance = await this.#persistPeerAnswer(entry, request, {
+          ordinal,
+          questionFingerprint,
+          sourceAgentIndex: owner.agentIndex,
           result: { ok: true, output: replayed.answer, usage: replayed.usage },
           interaction: { ...detail, targetGeneration: replayed.detail.targetGeneration, route: "replay" },
         });
-        return { answer: replayed.answer, targetGeneration: replayed.detail.targetGeneration, targetLabel: target.name, route: "replay" };
+        return {
+          answer: replayed.answer,
+          targetGeneration: replayed.detail.targetGeneration,
+          targetLabel: target.name,
+          route: "replay",
+          commitAcceptance,
+        };
       }
       if (!request.target) {
         if (target.replayedFrom) {
@@ -2184,18 +3022,21 @@ export class WorkflowManager {
           signal: request.signal,
         });
       });
-      await this.#appendJournal(entry, {
-        callIndex: ordinal,
-        fingerprint: questionFingerprint,
-        kind: "peerQuestion",
-        state: "completed",
-        at: Date.now(),
-        agentIndex: owner.agentIndex,
+      const commitAcceptance = await this.#persistPeerAnswer(entry, request, {
+        ordinal,
+        questionFingerprint,
+        sourceAgentIndex: owner.agentIndex,
         result: { ok: true, output: dispatched.answer, jobId: target.jobId, usage: dispatched.usage },
         route: journalRoute(target),
         interaction: { ...detail, targetGeneration: dispatched.targetGeneration, route: "peer" },
       });
-      return { answer: dispatched.answer, targetGeneration: dispatched.targetGeneration, targetLabel: target.name, route: "peer" };
+      return {
+        answer: dispatched.answer,
+        targetGeneration: dispatched.targetGeneration,
+        targetLabel: target.name,
+        route: "peer",
+        commitAcceptance,
+      };
     } catch (error) {
       await this.#appendJournal(entry, {
         callIndex: ordinal,
@@ -2204,11 +3045,53 @@ export class WorkflowManager {
         state: "failed",
         at: Date.now(),
         agentIndex: owner.agentIndex,
-        result: { ok: false, output: "", error: boundedText(error, 2_000) },
+        result: { ok: false, output: "", error: boundedText(error, 2_000), usage: clone(target.usage) },
+        route: journalRoute(target),
         interaction: { ...detail },
       }).catch(() => undefined);
       throw error;
     }
+  }
+
+  /**
+   * Persists an answer provisionally and returns its second-phase acceptance
+   * append. JobManager schedules that append only after the parked callback can
+   * resolve, so every earlier cancellation leaves a non-replayable prefix.
+   */
+  async #persistPeerAnswer(
+    entry: RunEntry,
+    request: PeerInteractionRequest,
+    input: {
+      ordinal: number;
+      questionFingerprint: string;
+      sourceAgentIndex: number;
+      result: WorkflowJournalResult;
+      route?: WorkflowJournalRoute;
+      interaction: WorkflowInteractionJournalDetail;
+    },
+  ): Promise<() => Promise<void>> {
+    await this.#appendJournal(entry, {
+      callIndex: input.ordinal,
+      fingerprint: input.questionFingerprint,
+      kind: "peerQuestion",
+      state: "completed",
+      at: Date.now(),
+      agentIndex: input.sourceAgentIndex,
+      result: clone(input.result),
+      route: input.route ? clone(input.route) : undefined,
+      interaction: { ...input.interaction },
+      interactionPending: true,
+    });
+    if (request.signal.aborted) throw abortError(request.signal.reason);
+    return () => this.#appendJournal(entry, {
+      callIndex: input.ordinal,
+      fingerprint: input.questionFingerprint,
+      kind: "peerQuestion",
+      state: "accepted",
+      at: Date.now(),
+      agentIndex: input.sourceAgentIndex,
+      interaction: { ...input.interaction },
+    });
   }
 
   /**
@@ -2274,6 +3157,7 @@ export class WorkflowManager {
       preview: target.preview,
       truncated: target.truncated,
       instructionShaped: target.instructionShaped,
+      progressedCheckpoint: target.progressedCheckpoint,
       error: target.error,
       endedAt: target.timestamps.endedAt,
     };
@@ -2293,6 +3177,7 @@ export class WorkflowManager {
       target.preview = settled.preview;
       target.truncated = settled.truncated;
       target.instructionShaped = settled.instructionShaped;
+      target.progressedCheckpoint = settled.progressedCheckpoint;
       target.error = settled.error;
       target.timestamps.updatedAt = at;
       target.timestamps.endedAt = settled.endedAt ?? at;
@@ -2307,13 +3192,18 @@ export class WorkflowManager {
     };
 
     let abort: (() => void) | undefined;
+    let cancellation: Promise<JobSnapshot> | undefined;
     try {
       const queued = await this.#jobs.continueWorkflowJob(jobId, prompt);
       this.#updateAgentFromJob(queued);
-      abort = () => { void this.#jobs.cancel(jobId, "Peer answer cancelled").catch(() => undefined); };
+      abort = () => {
+        cancellation ??= this.#jobs.cancel(jobId, "Peer answer cancelled");
+        void cancellation.catch(() => undefined);
+      };
       if (input.signal.aborted) abort();
       else input.signal.addEventListener("abort", abort, { once: true });
       const final = await this.#jobs.wait(jobId, { signal: input.signal });
+      if (input.signal.aborted) throw abortError(input.signal.reason);
       this.#updateAgentFromJob(final);
       if (final.status !== "completed") throw new Error(final.error ?? `Peer agent ${final.status} before answering`);
       if (!final.output.trim()) throw new Error(`Peer agent ${target.name} returned no answer text`);
@@ -2323,8 +3213,21 @@ export class WorkflowManager {
       if (generation) generation.outputProvenance = "peerAnswer";
       target.outputProvenance = "peerAnswer";
       this.#touch(entry);
-      return { answer: final.output, targetGeneration: generationIndex, usage: final.usage };
+      return {
+        answer: final.output,
+        targetGeneration: generationIndex,
+        usage: addWorkflowUsage(target.retryUsage, workflowUsage(final.usage)),
+      };
     } catch (error) {
+      if (input.signal.aborted) {
+        abort?.();
+        const cancelled = await cancellation?.catch(() => undefined);
+        if (cancelled) this.#updateAgentFromJob(cancelled);
+      }
+      if (!cancellation) {
+        try { this.#updateAgentFromJob(this.#jobs.check(jobId)); }
+        catch { /* a lost retained session has no newer usage to project */ }
+      }
       failGeneration(boundedText(error));
       throw error;
     } finally {
@@ -2334,10 +3237,10 @@ export class WorkflowManager {
     }
   }
 
-  #budgetPreflight(entry: RunEntry): string | undefined {
+  #budgetPreflight(entry: RunEntry, carriedUsage?: WorkflowUsage): string | undefined {
     const budget = entry.snapshot.budget;
     if (!budget) return undefined;
-    const usage = aggregateWorkflowUsage(entry.snapshot);
+    const usage = addWorkflowUsage(carriedUsage, aggregateWorkflowUsage(entry.snapshot));
     const tokens = usage.input + usage.output;
     if (budget.maxTokens !== undefined && tokens >= budget.maxTokens) return `Workflow token budget exhausted (${tokens}/${budget.maxTokens})`;
     if (budget.maxCost !== undefined && usage.cost >= budget.maxCost) return `Workflow cost budget exhausted ($${usage.cost.toFixed(4)}/$${budget.maxCost})`;
@@ -2421,6 +3324,228 @@ export class WorkflowManager {
     };
   }
 
+  #planContinuation(
+    record: WorkflowAgentRecord,
+    result: { unavailable?: ProviderUnavailability; progressed?: boolean },
+    primary: NativeWorkflowHarness,
+    target: WorkflowContinuationFallback,
+  ): WorkflowContinuationTrigger | undefined {
+    if (record.continuation || record.isolation || record.state !== "failed" || !record.jobId) return undefined;
+    if (result.progressed !== true || target.harness === primary || record.harness !== primary) return undefined;
+    const unavailable = result.unavailable;
+    if (!unavailable || !unavailable.authoritative || unavailable.preInference === true || unavailable.provider !== primary) return undefined;
+    return {
+      source: "continuation",
+      provider: primary,
+      kind: unavailable.kind,
+      retryAt: unavailable.retryAt,
+      scope: unavailable.scope,
+      detail: unavailable.detail,
+    };
+  }
+
+  #continuationPolicyOptions(
+    record: WorkflowAgentRecord,
+    target: WorkflowContinuationFallback,
+    schema?: Record<string, unknown>,
+  ): Record<string, unknown> {
+    return {
+      name: record.name,
+      harness: target.harness,
+      model: target.model,
+      effort: record.effort,
+      access: record.access,
+      independent: record.independentOf ? undefined : record.independent || undefined,
+      independentOf: record.independentOf,
+      profile: record.profile,
+      requires: record.requires ? [...record.requires] : undefined,
+      schema,
+    };
+  }
+
+  #continuationPrompt(
+    entry: RunEntry,
+    record: WorkflowAgentRecord,
+    objective: string,
+    currentPrompt: string,
+    trigger: WorkflowContinuationTrigger,
+    checkoutDigest: string,
+  ): string {
+    const phase = entry.snapshot.phases[record.phase]?.name ?? "unknown";
+    const tools = (record.tools ?? []).slice(-8).map((tool) => ({
+      name: boundedText(tool.name, 200),
+      status: tool.status,
+      summary: tool.summary ? boundedText(tool.summary, 500) : undefined,
+    }));
+    const convergence = entry.snapshot.convergence ? {
+      name: entry.snapshot.convergence.name,
+      round: entry.snapshot.convergence.round,
+      maxRounds: entry.snapshot.convergence.maxRounds,
+      verdict: entry.snapshot.convergence.verdict,
+      actionableCount: entry.snapshot.convergence.actionableCount,
+      fingerprint: entry.snapshot.convergence.fingerprint,
+    } : undefined;
+    const pendingFindings = entry.snapshot.convergence?.pendingFindings;
+    const objectiveLimit = pendingFindings ? 1_200 : 1_800;
+    const promptLimit = pendingFindings ? 1_000 : 4_200;
+    const outputLimit = pendingFindings ? 1_500 : 2_500;
+    const toolsLimit = pendingFindings ? 1_000 : 1_800;
+    const sections = [
+      "Continue the same logical workflow agent from the current checkout. Inspect the existing state first. Do not replay the original task from scratch and do not undo work merely because you did not author it.",
+      CONTINUATION_WARNING,
+      `Original objective:\n${boundedText(objective, objectiveLimit)}`,
+      `Current turn:\n${boundedText(currentPrompt, promptLimit)}`,
+      `Workflow phase: ${boundedText(phase, 160)}`,
+      `Authoritative provider failure: ${trigger.provider}/${trigger.kind}: ${boundedText(trigger.detail, 500)}`,
+      `Failed attempt output:\n${boundedText(record.output ?? record.preview ?? "(none)", outputLimit)}`,
+      `Recent tool state:\n${boundedText(JSON.stringify(tools), toolsLimit)}`,
+      convergence ? `Pending convergence state:\n${boundedText(JSON.stringify(convergence), 1_000)}` : "",
+      pendingFindings ? `Pending convergence findings:\n${boundedText(pendingFindings, 8_192)}` : "",
+      `Checkout checkpoint: ${checkoutDigest}`,
+      "Continue from the files and tool effects that are already present. Report the remaining work you completed and the verification you ran.",
+    ].filter(Boolean);
+    const prompt = sections.join("\n\n");
+    if (prompt.length > 16_384) throw new Error("Workflow continuation handoff exceeds its bounded contract");
+    return prompt;
+  }
+
+  async #continueProgressedCall(input: {
+    entry: RunEntry;
+    request: StartWorkflowRequest;
+    record: WorkflowAgentRecord;
+    kind: "agent" | "followUp";
+    logicalJobId?: string;
+    objective: string;
+    currentPrompt: string;
+    options: Record<string, unknown>;
+    schema?: Record<string, unknown>;
+    signal: AbortSignal;
+    callIndex: number;
+    fingerprint: string;
+    target: WorkflowContinuationFallback;
+    trigger: WorkflowContinuationTrigger;
+    attemptUsageBase?: WorkflowUsage;
+  }): Promise<WorkflowAttemptResult> {
+    const failedJobId = input.record.jobId;
+    const fromHarness = input.record.harness;
+    if (!failedJobId || (fromHarness !== "claude" && fromHarness !== "codex")) {
+      return { ok: false, output: input.record.output ? String(input.record.output) : "", error: "Workflow continuation lacks a failed native lineage", progressed: true };
+    }
+
+    const progress: WorkflowContinuationProgress = {
+      agentIndex: input.record.index,
+      logicalJobId: input.logicalJobId,
+      failedJobId,
+      target: { ...input.target },
+      trigger: { ...input.trigger },
+      attemptUsage: clone(subtractWorkflowUsage(input.record.usage, input.attemptUsageBase)),
+      usage: clone(input.record.usage),
+    };
+    await this.#appendJournal(input.entry, {
+      callIndex: input.callIndex,
+      fingerprint: input.fingerprint,
+      kind: input.kind,
+      state: "progressed",
+      at: Date.now(),
+      agentIndex: input.record.index,
+      route: journalRoute(input.record),
+      continuationProgress: progress,
+    });
+    input.record.progressedCheckpoint = true;
+    this.#touch(input.entry);
+
+    try {
+      await this.#jobs.settleFailedWorkflowJob(failedJobId);
+    } catch (error) {
+      input.record.error = `Workflow continuation could not settle the failed native process: ${boundedText(error)}`;
+      this.#touch(input.entry);
+      return { ok: false, output: String(input.record.output ?? ""), error: input.record.error, progressed: true, usage: clone(input.record.usage) };
+    }
+    if (input.signal.aborted) throw abortError(input.signal.reason);
+
+    return this.#withDispatchSlot(input.entry, input.signal, () => this.#withMutationLock(input.request.cwd, input.signal, async () => {
+      let checkout;
+      try {
+        checkout = await this.#checkout.capture(input.request.cwd, input.signal);
+      } catch (error) {
+        if (input.signal.aborted) throw abortError(input.signal.reason);
+        input.record.error = `Workflow continuation requires a provable Git checkout: ${boundedText(error)}`;
+        input.record.timestamps.updatedAt = Date.now();
+        input.record.timestamps.endedAt = input.record.timestamps.updatedAt;
+        this.#touch(input.entry);
+        return { ok: false, output: String(input.record.output ?? ""), error: input.record.error, progressed: true, usage: clone(input.record.usage) };
+      }
+
+      if (input.signal.aborted) throw abortError(input.signal.reason);
+      const checkpointAt = Date.now();
+      const handoffPrompt = this.#continuationPrompt(input.entry, input.record, input.objective, input.currentPrompt, input.trigger, checkout.digest);
+      input.record.continuation = {
+        state: "handoff",
+        fromHarness,
+        toHarness: input.target.harness,
+        failedJobId,
+        checkpointAt,
+        checkoutDigest: checkout.digest,
+        trigger: { ...input.trigger },
+        warning: CONTINUATION_WARNING,
+      };
+      input.record.continuationFallback ??= { ...input.target };
+      const checkpoint: WorkflowContinuationHandoff = {
+        agentIndex: input.record.index,
+        logicalJobId: input.logicalJobId,
+        failedJobId,
+        phase: input.entry.snapshot.phases[input.record.phase]?.name ?? "unknown",
+        objective: boundedText(input.objective, 2_048),
+        handoffPrompt,
+        schema: input.schema ? clone(input.schema) : undefined,
+        checkout,
+        target: { ...input.target },
+        trigger: { ...input.trigger },
+        attemptUsage: clone(progress.attemptUsage),
+        usage: clone(input.record.usage),
+      };
+      await this.#appendJournal(input.entry, {
+        callIndex: input.callIndex,
+        fingerprint: input.fingerprint,
+        kind: input.kind,
+        state: "handoff",
+        at: checkpointAt,
+        agentIndex: input.record.index,
+        route: journalRoute(input.record),
+        continuation: checkpoint,
+      });
+      await this.#flushCheckpoint(input.entry);
+      if (input.signal.aborted) throw abortError(input.signal.reason);
+      await this.#checkout.assert(checkout, input.signal);
+
+      const policyOptions = this.#continuationPolicyOptions(input.record, input.target, input.schema);
+      const result = await this.#runFreshAgent(
+        input.entry,
+        { ...input.request, cwd: checkout.cwd },
+        input.currentPrompt,
+        policyOptions,
+        input.signal,
+        input.callIndex,
+        input.fingerprint,
+        {
+          record: input.record,
+          attempt: 1,
+          pinnedHarness: input.target.harness,
+          model: input.target.model,
+          disposition: "continuation",
+          trigger: input.trigger,
+          task: handoffPrompt,
+          attemptUsageBase: input.attemptUsageBase,
+          beforeSpawn: () => this.#checkout.assert(checkout, input.signal),
+          beforeStart: (admissionSignal) => this.#checkout.assert(checkout, admissionSignal),
+        },
+      );
+      if (!result.ok && input.record.continuation) input.record.continuation.state = "failed";
+      this.#touch(input.entry);
+      return result;
+    }));
+  }
+
   #beginProviderWait(
     entry: RunEntry,
     record: WorkflowAgentRecord,
@@ -2493,7 +3618,7 @@ export class WorkflowManager {
       sequence: entry.journalSequence++,
       ...value,
     };
-    const write = entry.journalChain.then(() => appendWorkflowJournal(this.#artifactRoot, entry.snapshot.runId, record));
+    const write = entry.journalChain.then(() => this.#journalAppender(this.#artifactRoot, entry.snapshot.runId, record));
     entry.journalChain = write.catch(() => undefined);
     try { await write; }
     catch (error) {
@@ -2567,6 +3692,9 @@ export class WorkflowManager {
     agent.effort = job.effort;
     agent.preview = job.output.slice(-500);
     agent.error = job.error;
+    if (!agent.answering && job.progressed && (job.status === "failed" || job.status === "cancelled")) {
+      agent.progressedCheckpoint = true;
+    }
     agent.usage = addWorkflowUsage(agent.retryUsage, workflowUsage(job.usage));
     agent.context = job.context ? { ...job.context } : undefined;
     agent.timestamps.updatedAt = now;
@@ -2741,10 +3869,12 @@ export class WorkflowManager {
    * calls, so scheduling, budgets, journaling, and replay are untouched.
    */
   #recordConvergence(entry: RunEntry, progress: WorkflowConvergence): void {
+    const { pendingFindings, ...rest } = progress;
     entry.snapshot.convergence = {
-      ...progress,
+      ...rest,
       name: progress.name === undefined ? undefined : boundedText(progress.name, 200),
       stoppingReason: progress.stoppingReason === undefined ? undefined : boundedText(progress.stoppingReason, 2_000),
+      ...(pendingFindings === undefined ? {} : { pendingFindings: boundedText(pendingFindings, 8_192) }),
       rounds: progress.rounds.slice(-MAX_CONVERGENCE_ROUNDS),
     };
     this.#touch(entry);

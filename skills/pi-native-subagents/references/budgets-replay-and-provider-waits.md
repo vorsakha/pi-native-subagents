@@ -14,8 +14,8 @@ Fresh input plus output consumes `maxTokens`; cache reads do not. Never infer a 
 
 - `maxAgents` and `maxConcurrency` limit work shape. `maxTokens` limits aggregate fresh input plus output; cached reads remain visible but do not consume that budget. `maxTokensPerAgent` applies the same ceiling to one child. `maxCost` and `maxTurns` are aggregate, and `maxTurns` is not a per-agent allowance.
 - Workflow budgets are optional. An omitted or empty budget leaves spend open while the hard ceilings — 32 calls, four workers, global concurrency four, watchdogs, provider/context limits, bounded persistence, cancellation, and shutdown — remain in force.
-- Spend limits are soft dispatch boundaries. The runtime warns once per reached metric, lets already-running calls finish, accepts asynchronous overshoot, preserves natural child success, and blocks only later fresh dispatches. Workflow-owned jobs recheck the boundary when a global scheduler slot opens, so queued children cannot slip through after another child settles. A replayable completed journal call is replayed before fresh-dispatch budget checks. `maxTokensPerAgent` follows the same rule.
-- Use `>=` semantics: observed usage at the exact limit counts as reached. Workflow aggregate usage is cumulative across children; replayed calls do not spend again.
+- Spend limits are soft dispatch boundaries. The runtime warns once per metric, lets running calls finish, accepts overshoot, preserves their results, and blocks later fresh dispatches. Queued workflow jobs recheck when a global slot opens. Replayable completions bypass fresh-dispatch checks; `maxTokensPerAgent` follows the same rule.
+- `>=` is reached. Aggregate usage spans children. Exact replay is free; handoff admission adds carried source spend to checkpointed and journal-only current usage.
 
 ## Cost reporting is provider-dependent
 
@@ -56,16 +56,20 @@ Bounds and accounting:
 
 `providerFallback: { harness: "claude" | "codex", model?: string }` names one opposite native route for a fresh `agent()` call and overrides wait.
 
-After dispatch, fallback requires effective `readOnly` access, structured pre-inference proof, and zero usage. Full-access hooks, plugins, or MCP may mutate before visible progress, so a started full-access primary never falls back. Before dispatch, `missing`, `unauthenticated`, or `incompatible` readiness may fall back under either access mode. Other readiness, missing proof, usage, ordinary errors, cancellation, policy rejection, and unsafe worktrees stay terminal. The target must freshly report `ready`; fallback cannot wait, retry, or fall back again.
+After dispatch it requires `readOnly`, authoritative pre-inference proof, zero usage, and a freshly ready target. Safe missing/login/incompatibility readiness may fall back under either access. Other errors, cancellation, policy rejection, worktrees, waits, retries, and another fallback are terminal.
 
-Both attempts share one ordinal and cumulative usage record. Budget preflight runs again. Codex under `maxCost` fails before dispatch. Cancellation covers both jobs and their gap. Isolation must finish as `removed`.
+Both attempts share one ordinal and cumulative usage; budget preflight runs again. The journal and `/workflows` retain the declaration, trigger, attempts, and route. Exact completion replays without probing; an incomplete pre-inference attempt restarts at its primary.
 
-The journal stores the declaration, attempts, trigger, and final route. Exact completed replay restores it without probing; failed or incomplete replay restarts at the primary. `/workflows` shows fallback status and attempts.
+## Progressed continuation accounting
+
+`continuationFallback` opts into one opposite-provider handoff after authoritative unavailability and progress. Ineligible or pre-inference failure is terminal, never a same-provider wait. Usage stays cumulative on one logical ID, including retained-call refusal; attempts store only their generation delta. Budgets stay fixed.
+
+A progressed record forbids primary replay but cannot authorize replacement. The handoff proves checkout before dispatch. Admission rechecks readiness and capabilities, then checkout and budget under the startup deadline. Only a bound completion replays free; copied proof never dispatches, while an interrupted original handoff runs only the replacement. Carried, checkpointed, and journal-only usage all count once. Later ordinal corruption cannot erase durable progress and rerun the primary. Cancellation covers admission, replacement, and retained calls. `/workflows` keeps continued, fallback, and waiting distinct.
 
 ## Recovery
 
-- `Workflow ... budget exhausted`: active calls have already finished. Narrow the offending lane, raise the explicit boundary, or replay with a compatible larger budget so completed calls can be reused.
+- `Workflow ... budget exhausted`: narrow the lane or replay with a larger compatible budget; completed calls remain reusable.
 - `Budget maxCost is unsupported`: remove the cost boundary or select Pi/Claude.
-- "...already produced model or tool activity; it was not replayed automatically": a mutating (or otherwise unsafe) call was rejected for provider quota after doing observable work, so automatic retry was refused to avoid duplicating side effects. Inspect the partial result and use `resumeFromRunId` once the provider window has reset.
-- "Workflow provider wait exhausted (attempt N/M)" or "...retry window exceeds the workflow maxWaitMs allowance": the opted-in policy's attempt or wait budget ran out before the provider's reported reset time. Raise `maxAttempts`/`maxWaitMs` and use `resumeFromRunId` to continue, or fall back to `providerUnavailable: "fail"` and retry manually later.
-- A started full-access primary stays terminal even with zero visible progress. Inspect possible side effects, then retry manually after recovery. Use `readOnly` only for non-mutating work.
+- "...already produced model or tool activity": without an eligible continuation checkpoint, inspect partial effects and recover manually; replay never reruns that progressed primary.
+- Provider wait exhausted: raise the explicit attempt/time bound and replay, or retry manually later.
+- A started full-access pre-inference fallback stays terminal. Inspect possible side effects before manual recovery.

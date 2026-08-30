@@ -22,8 +22,12 @@ import type {
 import type { ProviderUnavailability } from "../src/provider-unavailability.ts";
 import { normalizeTarget, type InteractionAskResult, type PendingInteraction } from "../src/interactions.ts";
 import type { InteractionDeadlineClock } from "../src/manager.ts";
+import type { WorkflowCheckoutProof } from "../src/workflows/checkout.ts";
+import type { WorkflowCheckoutOperations } from "../src/workflows/manager.ts";
 import type { ProviderStatus, ProviderStatusReader, ProviderStatusRequest } from "../src/provider-status.ts";
-import type { WorkflowSnapshot } from "../src/workflows/types.ts";
+import type { ManagedProcess } from "../src/process-tree.ts";
+import type { WorkflowJournalRecord, WorkflowSnapshot } from "../src/workflows/types.ts";
+import { appendWorkflowJournal } from "../src/workflows/artifacts.ts";
 import {
   harnessAvailability,
   type HarnessAvailability,
@@ -40,6 +44,107 @@ export async function ticks(count = 1): Promise<void> {
 }
 
 export const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Managed native process whose tree-termination proof is held until released. */
+export class GatedManagedProcess implements ManagedProcess {
+  readonly child = {
+    stderr: { resume() {} },
+  } as unknown as ManagedProcess["child"];
+  #terminateReached = false;
+  #terminateReachedResolve!: () => void;
+  readonly #terminateReachedPromise = new Promise<void>((resolve) => { this.#terminateReachedResolve = resolve; });
+  #release!: () => void;
+  readonly #released = new Promise<void>((resolve) => { this.#release = resolve; });
+
+  terminate(): Promise<void> {
+    this.#terminateReached = true;
+    this.#terminateReachedResolve();
+    return this.#released;
+  }
+
+  waitUntilTerminate(): Promise<void> {
+    return this.#terminateReached ? Promise.resolve() : this.#terminateReachedPromise;
+  }
+
+  release(): void {
+    this.#release();
+  }
+}
+
+/** Persists one selected peer-answer record, then holds its append promise. */
+export class GatedWorkflowJournalAppender {
+  #armed = false;
+  #gateState: WorkflowJournalRecord["state"] = "completed";
+  #reached = false;
+  #failInvalidation = false;
+  #failAcceptance = false;
+  #resolveReached!: () => void;
+  #resolveRelease!: () => void;
+  readonly #reachedPromise = new Promise<void>((resolve) => { this.#resolveReached = resolve; });
+  readonly #releasePromise = new Promise<void>((resolve) => { this.#resolveRelease = resolve; });
+
+  readonly append = async (root: string, runId: string, record: WorkflowJournalRecord): Promise<void> => {
+    if (this.#failAcceptance && record.kind === "peerQuestion" && record.state === "accepted") {
+      this.#failAcceptance = false;
+      throw new Error("controlled peer-answer acceptance persistence failure");
+    }
+    if (this.#failInvalidation && record.kind === "peerQuestion" && record.state === "failed") {
+      this.#failInvalidation = false;
+      throw new Error("controlled peer-answer invalidation persistence failure");
+    }
+    await appendWorkflowJournal(root, runId, record);
+    if (!this.#armed || this.#reached || record.kind !== "peerQuestion" || record.state !== this.#gateState) return;
+    this.#reached = true;
+    this.#resolveReached();
+    await this.#releasePromise;
+  };
+
+  arm(state: WorkflowJournalRecord["state"] = "completed"): void {
+    this.#armed = true;
+    this.#gateState = state;
+  }
+
+  failNextInvalidation(): void {
+    this.#failInvalidation = true;
+  }
+
+  failNextAcceptance(): void {
+    this.#failAcceptance = true;
+  }
+
+  waitUntilReached(): Promise<void> {
+    return this.#reached ? Promise.resolve() : this.#reachedPromise;
+  }
+
+  release(): void {
+    this.#resolveRelease();
+  }
+}
+
+/** Controlled write for interaction persistence races. */
+export class GatedWrite {
+  #reached = false;
+  #resolveReached!: () => void;
+  #resolveRelease!: () => void;
+  readonly #reachedPromise = new Promise<void>((resolve) => { this.#resolveReached = resolve; });
+  readonly #releasePromise = new Promise<void>((resolve) => { this.#resolveRelease = resolve; });
+  calls = 0;
+
+  readonly persist = async (): Promise<void> => {
+    this.calls++;
+    this.#reached = true;
+    this.#resolveReached();
+    await this.#releasePromise;
+  };
+
+  waitUntilReached(): Promise<void> {
+    return this.#reached ? Promise.resolve() : this.#reachedPromise;
+  }
+
+  release(): void {
+    this.#resolveRelease();
+  }
+}
 
 /** Deterministic deadline clock for interaction lifecycle tests. */
 export class ControlledInteractionClock implements InteractionDeadlineClock {
@@ -86,6 +191,16 @@ export async function waitFor(
   }
 }
 
+export async function withTimeout<T>(promise: Promise<T>, description: string, timeoutMs = 3_000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), timeoutMs);
+    timer.unref();
+  });
+  try { return await Promise.race([promise, timeout]); }
+  finally { if (timer) clearTimeout(timer); }
+}
+
 /** Creates a unique temp directory. Callers are responsible for cleanup. */
 export function tempDir(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), `${prefix}-`));
@@ -124,6 +239,139 @@ export class ScriptedHarnessAvailability implements HarnessAvailabilityProbe {
     const state = this.states.get(harness);
     if (!state) throw new Error(`no scripted availability for ${harness}`);
     return state;
+  }
+}
+
+/** Scripted availability with one provider probe held until a test releases it. */
+export class GatedHarnessAvailability extends ScriptedHarnessAvailability {
+  readonly #gated: HarnessName;
+  #released = false;
+  #reached = false;
+  #release!: () => void;
+  #reachedResolve!: () => void;
+  #releasePromise!: Promise<void>;
+  #reachedPromise!: Promise<void>;
+
+  constructor(gated: HarnessName, states: Partial<Record<HarnessName, Partial<HarnessAvailabilityFacts> | HarnessAvailability>>) {
+    super(states);
+    this.#gated = gated;
+    this.#resetGate();
+  }
+
+  override async availability(harness: HarnessName, request: { refresh?: boolean }): Promise<HarnessAvailability> {
+    if (harness === this.#gated && !this.#released) {
+      this.#reached = true;
+      this.#reachedResolve();
+      await this.#releasePromise;
+    }
+    return super.availability(harness, request);
+  }
+
+  waitUntilReached(): Promise<void> {
+    return this.#reached ? Promise.resolve() : this.#reachedPromise;
+  }
+
+  release(): void {
+    if (this.#released) return;
+    this.#released = true;
+    this.#release();
+  }
+
+  /** Holds the next matching probe after a prior gate has been released. */
+  gateNext(): void {
+    if (!this.#released) throw new Error("Harness availability gate is already active");
+    this.#resetGate();
+  }
+
+  #resetGate(): void {
+    this.#released = false;
+    this.#reached = false;
+    this.#releasePromise = new Promise<void>((resolve) => { this.#release = resolve; });
+    this.#reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
+  }
+}
+
+/** Checkout proof double that blocks capture until its signal is cancelled. */
+export class CancellationGatedWorkflowCheckout implements WorkflowCheckoutOperations {
+  #reached = false;
+  #reachedResolve!: () => void;
+  readonly #reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
+
+  capture(_cwd: string, signal: AbortSignal): Promise<WorkflowCheckoutProof> {
+    this.#reached = true;
+    this.#reachedResolve();
+    return new Promise((_, reject) => {
+      const abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+    });
+  }
+
+  async assert(_proof: WorkflowCheckoutProof, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+  }
+
+  waitUntilReached(): Promise<void> {
+    return this.#reached ? Promise.resolve() : this.#reachedPromise;
+  }
+}
+
+/** Stable checkout proof double for tests whose risk boundary is not Git state. */
+export class StaticWorkflowCheckout implements WorkflowCheckoutOperations {
+  async capture(cwd: string, signal: AbortSignal): Promise<WorkflowCheckoutProof> {
+    signal.throwIfAborted();
+    return {
+      cwd,
+      root: cwd,
+      gitDir: join(cwd, ".git"),
+      head: "a".repeat(40),
+      headRef: "refs/heads/main",
+      changedPaths: 0,
+      digest: `sha256:${"b".repeat(64)}`,
+    };
+  }
+
+  async assert(_proof: WorkflowCheckoutProof, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+  }
+}
+
+/** Stable checkout proof whose scheduler-admission assertion is test-controlled. */
+export class AdmissionGatedWorkflowCheckout extends StaticWorkflowCheckout {
+  #assertions = 0;
+  #admissionReached = false;
+  #admissionReachedResolve!: () => void;
+  readonly #admissionReachedPromise = new Promise<void>((resolve) => { this.#admissionReachedResolve = resolve; });
+  #releaseAdmission!: () => void;
+  readonly #admissionRelease = new Promise<void>((resolve) => { this.#releaseAdmission = resolve; });
+
+  override async assert(proof: WorkflowCheckoutProof, signal: AbortSignal): Promise<void> {
+    await super.assert(proof, signal);
+    this.#assertions++;
+    if (this.#assertions < 3) return;
+    this.#admissionReached = true;
+    this.#admissionReachedResolve();
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+      const cleanup = () => signal.removeEventListener("abort", abort);
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      signal.addEventListener("abort", abort, { once: true });
+      void this.#admissionRelease.then(() => {
+        cleanup();
+        resolve();
+      });
+    });
+  }
+
+  waitUntilAdmission(): Promise<void> {
+    return this.#admissionReached ? Promise.resolve() : this.#admissionReachedPromise;
+  }
+
+  releaseAdmission(): void {
+    this.#releaseAdmission();
   }
 }
 
@@ -372,6 +620,10 @@ export class DiscoverableBackend extends ImmediateBackend {
   async discover(_request: DiscoveryRequest): Promise<DiscoveryResult> {
     return discovery(this.name, this.#capabilities);
   }
+
+  setCapabilities(capabilities: DiscoveredCapability[]): void {
+    this.#capabilities.splice(0, this.#capabilities.length, ...capabilities);
+  }
 }
 
 /** Backend whose runs stay active until the test completes or fails them. */
@@ -425,6 +677,20 @@ export interface FakeRun {
   settled: boolean;
 }
 
+interface ControlledCancellationGate {
+  usage?: Partial<Usage>;
+  reached: boolean;
+  reachedPromise: Promise<void>;
+  reach: () => void;
+  released: Promise<void>;
+  release: () => void;
+}
+
+export interface ControlledCancellationHandle {
+  waitUntilReached(): Promise<void>;
+  release(): void;
+}
+
 /**
  * Backend giving the test full control over every run's lifecycle, addressable
  * either by job id ({@link complete}) or by task text ({@link completeTask}).
@@ -438,6 +704,8 @@ export class ControlledBackend implements Backend {
   readonly sends: Array<{ id: string; message: string; behavior: string }> = [];
   readonly #startWaiters = new Set<() => void>();
   readonly #sendWaiters = new Set<() => void>();
+  readonly #cancellationGates = new Map<string, ControlledCancellationGate>();
+  readonly #closeFailures = new Map<string, Error>();
   active = 0;
   maxActive = 0;
 
@@ -507,10 +775,22 @@ export class ControlledBackend implements Backend {
       },
       cancel: async (reason) => {
         this.cancels.push({ jobId: request.jobId, reason });
+        const gate = this.#cancellationGates.get(request.jobId);
+        if (gate) {
+          gate.reached = true;
+          gate.reach();
+          await gate.released;
+          this.#cancellationGates.delete(request.jobId);
+          if (gate.usage) emit({ type: "usage", usage: gate.usage });
+        }
         emit({ type: "cancelled", reason });
         run.settle();
       },
-      close: async () => { this.closes.push(request.jobId); },
+      close: async () => {
+        this.closes.push(request.jobId);
+        const error = this.#closeFailures.get(request.jobId);
+        if (error) throw error;
+      },
     };
   }
 
@@ -524,6 +804,33 @@ export class ControlledBackend implements Backend {
     const request = this.requestForTask(task);
     assert.ok(request, `backend did not start task ${task}`);
     return askThroughBackend(this.requests, request.jobId, input);
+  }
+
+  /** Holds one native cancellation and can emit final usage before it settles. */
+  gateCancellation(jobId: string, usage?: Partial<Usage>): ControlledCancellationHandle {
+    assert.ok(this.runs.has(jobId), `backend never started job ${jobId}`);
+    assert.equal(this.#cancellationGates.has(jobId), false, `cancellation for ${jobId} is already gated`);
+    let reach!: () => void;
+    let release!: () => void;
+    const gate: ControlledCancellationGate = {
+      usage,
+      reached: false,
+      reachedPromise: new Promise<void>((resolve) => { reach = resolve; }),
+      reach: () => reach(),
+      released: new Promise<void>((resolve) => { release = resolve; }),
+      release: () => release(),
+    };
+    this.#cancellationGates.set(jobId, gate);
+    return {
+      waitUntilReached: () => gate.reached ? Promise.resolve() : gate.reachedPromise,
+      release: gate.release,
+    };
+  }
+
+  /** Makes strict retained-session cleanup fail for one job. */
+  failClose(jobId: string, message: string): void {
+    assert.ok(this.runs.has(jobId), `backend never started job ${jobId}`);
+    this.#closeFailures.set(jobId, new Error(message));
   }
 
   requestForTask(task: string): BackendRequest | undefined {

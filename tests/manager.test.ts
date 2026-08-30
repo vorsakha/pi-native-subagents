@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { JobManager } from "../src/manager.ts";
 import type { Backend, BackendRun, JobSnapshot, ProfileDefinition } from "../src/types.ts";
-import { ControlledBackend, ImmediateBackend, tick } from "./helpers.ts";
+import { ControlledBackend, ImmediateBackend, tick, withTimeout } from "./helpers.ts";
 
 function setup(concurrency = 4) {
   const backend = new ControlledBackend();
@@ -326,6 +326,50 @@ test("cancel removes queued jobs and tears down running backend", async () => {
   await manager.shutdown();
 });
 
+test("cancellation aborts scheduler admission before backend startup", async () => {
+  const { backend, manager } = setup(1);
+  let reached!: () => void;
+  const admissionReached = new Promise<void>((resolve) => { reached = resolve; });
+  const job = manager.spawn({
+    ...request(1),
+    dispatchAdmission: async (signal) => {
+      reached();
+      return new Promise<undefined>((_resolve, reject) => {
+        const abort = () => reject(signal.reason);
+        if (signal.aborted) abort();
+        else signal.addEventListener("abort", abort, { once: true });
+      });
+    },
+  });
+  await admissionReached;
+  assert.equal(manager.check(job.id).status, "queued", "admission does not claim backend startup");
+  const final = await manager.cancel(job.id, "cancel admission");
+  assert.equal(final.status, "cancelled");
+  assert.equal(backend.requests.length, 0, "cancelled admission never reaches the backend");
+  await manager.shutdown();
+});
+
+test("scheduler admission is bounded by the aggregate startup deadline", async () => {
+  const backend = new ControlledBackend("codex");
+  const manager = new JobManager({ backends: [backend], startupTimeoutMs: 20 });
+  let admissionAborted = false;
+  const job = manager.spawn({
+    ...request(1),
+    dispatchAdmission: (signal) => new Promise<undefined>((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        admissionAborted = true;
+        reject(signal.reason);
+      }, { once: true });
+    }),
+  });
+  const final = await manager.wait(job.id);
+  assert.equal(final.status, "failed");
+  assert.match(final.error ?? "", /Harness startup timed out after 20ms/);
+  assert.equal(admissionAborted, true);
+  assert.equal(backend.requests.length, 0, "timed-out admission never starts the backend");
+  await manager.shutdown();
+});
+
 test("cancellation aborts a pending backend start before returning", async () => {
   let startupAborted = false;
   const backend: Backend = {
@@ -384,6 +428,81 @@ test("manager bounds harness startup and direct cancellation waits", async (t) =
     assert.equal(forceCloses, 1);
     await manager.shutdown(20);
   });
+});
+
+test("strict workflow settlement bounds time already spent behind hanging cleanup", async () => {
+  let emitFailure!: () => void;
+  let settleCompleted!: () => void;
+  let closeReached!: () => void;
+  let forceCloses = 0;
+  const closeStarted = new Promise<void>((resolve) => { closeReached = resolve; });
+  const never = new Promise<void>(() => {});
+  const backend: Backend = {
+    name: "codex",
+    async start(_request, emit) {
+      emitFailure = () => emit({ type: "failed", error: "quota after progress" });
+      return {
+        completed: new Promise<void>((resolve) => { settleCompleted = resolve; }),
+        async send() {},
+        async cancel() {},
+        async close() {
+          closeReached();
+          await never;
+        },
+        async forceClose() { forceCloses++; },
+      };
+    },
+  };
+  const manager = new JobManager({ backends: [backend], operationTimeoutMs: 20 });
+  const job = manager.spawn({
+    ...request(1),
+    workflow: { runId: "wf_settlement_deadline", agentIndex: 0, label: "worker" },
+  });
+  await tick();
+  emitFailure();
+  settleCompleted();
+  await withTimeout(closeStarted, "launch finalizer entered hanging close");
+
+  await assert.rejects(
+    withTimeout(manager.settleFailedWorkflowJob(job.id), "strict settlement", 250),
+    /Harness force-close timed out after 20ms/,
+  );
+  assert.equal(forceCloses, 1, "strict settlement force-closes even while an earlier cleanup owns the queue");
+  await withTimeout(manager.releaseRun(job.id), "release after bounded settlement", 100);
+  await manager.shutdown(20);
+});
+
+test("strict workflow settlement propagates force-close proof failure without trapping workflow release", async () => {
+  let fail!: () => void;
+  let finish!: () => void;
+  let closeReached!: () => void;
+  const closeStarted = new Promise<void>((resolve) => { closeReached = resolve; });
+  const backend: Backend = {
+    name: "codex",
+    async start(_request, emit) {
+      fail = () => emit({ type: "failed", error: "quota after progress" });
+      return {
+        completed: new Promise<void>((resolve) => { finish = resolve; }),
+        async send() {},
+        async cancel() {},
+        async close() { closeReached(); await new Promise<void>(() => {}); },
+        async forceClose() { throw new Error("process descendants remain"); },
+      };
+    },
+  };
+  const manager = new JobManager({ backends: [backend], operationTimeoutMs: 20 });
+  const job = manager.spawn({
+    ...request(1),
+    workflow: { runId: "wf_settlement_failure", agentIndex: 0, label: "worker" },
+  });
+  await tick();
+  fail();
+  finish();
+  await withTimeout(closeStarted, "launch cleanup entered close");
+
+  await assert.rejects(manager.settleFailedWorkflowJob(job.id), /process descendants remain/);
+  await withTimeout(manager.releaseRun(job.id), "release after strict cleanup failure", 100);
+  await manager.shutdown(20);
 });
 
 test("shutdown aborts delayed startup with no late run or resource resurrection", async () => {
@@ -561,6 +680,29 @@ test("a follow-up's queued generation clears the prior generation's structured p
   backend.complete(job.id, "second result");
   const second = await manager.wait(job.id);
   assert.equal(second.structured, undefined, "a generation that reports no structured payload leaves it absent rather than reusing the prior generation's");
+  await manager.shutdown();
+});
+
+test("a retained follow-up starts with no progress evidence from the prior generation", async () => {
+  const { backend, manager } = setup(1);
+  const job = manager.spawn(request(1));
+  await tick();
+  backend.emit(job.id, { type: "message", text: "first generation progressed" });
+  backend.complete(job.id, "first result");
+  const first = await manager.wait(job.id);
+  assert.equal(first.progressed, true);
+
+  const queued = await manager.send(job.id, "continue", "followUp");
+  assert.equal(queued.progressed, undefined);
+  await tick();
+  backend.fail(job.id, "quota before new-turn progress", {
+    provider: "codex",
+    kind: "quota",
+    authoritative: true,
+    detail: "current turn produced no activity",
+  });
+  const second = await manager.wait(job.id);
+  assert.equal(second.progressed, undefined, "only activity from the failed generation can authorize continuation");
   await manager.shutdown();
 });
 

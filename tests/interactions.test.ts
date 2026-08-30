@@ -8,7 +8,7 @@ import {
   normalizeTarget,
   renderOrchestratorQuestion,
 } from "../src/interactions.ts";
-import { ControlledBackend, ControlledInteractionClock, interactionSnapshot, tick } from "./helpers.ts";
+import { ControlledBackend, ControlledInteractionClock, GatedWrite, interactionSnapshot, tick } from "./helpers.ts";
 
 function setup(concurrency = 4, interactionTimeoutMs?: number, interactionClock?: ControlledInteractionClock) {
   const backend = new ControlledBackend();
@@ -19,6 +19,65 @@ function setup(concurrency = 4, interactionTimeoutMs?: number, interactionClock?
 const base = { name: "worker", cwd: "/tmp", trusted: true, harness: "codex" as const };
 function askable(task: string, extra: Record<string, unknown> = {}) {
   return { ...base, task, interaction: { orchestrator: "allow" as const }, ...extra };
+}
+
+async function startPeerAcceptance(interactionClock?: ControlledInteractionClock, concurrency = 2) {
+  const backend = new ControlledBackend();
+  const manager = new JobManager({
+    backends: [backend],
+    concurrency,
+    interactionTimeoutMs: 1_000,
+    interactionClock,
+  });
+  const workflow = (agentIndex: number, label: string) => ({ runId: "wf_accept", agentIndex, label });
+  const target = manager.spawn({ ...base, task: "planner", workflow: workflow(0, "planner") });
+  const caller = manager.spawn({
+    ...base,
+    task: "implementer",
+    workflow: workflow(1, "implementer"),
+    interaction: { peers: true },
+  });
+  await tick();
+  backend.complete(target.id, "plan");
+  await tick();
+
+  const provisionalWrite = new GatedWrite();
+  const acceptanceWrite = new GatedWrite();
+  let signal: AbortSignal | undefined;
+  let abortEvents = 0;
+  manager.setPeerInteractionRouter(async (request) => {
+    signal = request.signal;
+    request.signal.addEventListener("abort", () => { abortEvents++; });
+    await provisionalWrite.persist();
+    if (request.signal.aborted) throw request.signal.reason;
+    return { answer: "durably accepted answer", commitAcceptance: acceptanceWrite.persist };
+  });
+  const terminalStates: string[] = [];
+  manager.subscribe((job, event) => {
+    if (job.id !== caller.id || event.type !== "interaction") return;
+    if (event.interaction.state === "expired" || event.interaction.state === "cancelled") {
+      terminalStates.push(event.interaction.state);
+    }
+  });
+
+  const asked = backend.ask(caller.id, {
+    question: "which plan?",
+    target: { type: "agent", jobId: target.id },
+  });
+  await provisionalWrite.waitUntilReached();
+  assert.ok(signal);
+  return {
+    backend,
+    manager,
+    target,
+    caller,
+    provisionalWrite,
+    acceptanceWrite,
+    signal,
+    asked,
+    terminalStates,
+    abortEvents: () => abortEvents,
+  };
 }
 
 test("a routed question parks the caller, frees its slot, and resolves with the answer", async () => {
@@ -272,6 +331,138 @@ test("a peer-answer turn cannot ask another agent or the orchestrator", async ()
   assert.equal(asked.route, "peer");
   backend.complete(caller.id);
   await manager.shutdown();
+});
+
+test("deadline expiry during provisional persistence clears the callback without accepting replay", async () => {
+  const clock = new ControlledInteractionClock();
+  const f = await startPeerAcceptance(clock);
+  const rejected = assert.rejects(f.asked, /expired after 1000ms/);
+
+  clock.advance(1_000);
+  await rejected;
+  assert.equal(f.signal.aborted, true);
+  assert.equal(f.abortEvents(), 1);
+  assert.deepEqual(f.terminalStates, ["expired"]);
+  assert.equal(f.manager.pendingInteractions().length, 0);
+  assert.equal(f.manager.check(f.caller.id).interaction, undefined);
+
+  f.provisionalWrite.release();
+  await tick();
+  assert.equal(f.acceptanceWrite.calls, 0);
+  assert.equal(f.manager.check(f.target.id).answeringInteraction, undefined);
+  f.backend.complete(f.caller.id);
+  await f.manager.shutdown();
+});
+
+test("caller cancellation during provisional persistence cannot accept replay", async () => {
+  const f = await startPeerAcceptance();
+  const rejected = assert.rejects(f.asked, /operator cancelled caller/);
+
+  await f.manager.cancel(f.caller.id, "operator cancelled caller");
+  await rejected;
+  assert.equal(f.signal.aborted, true);
+  assert.equal(f.abortEvents(), 1);
+  assert.deepEqual(f.terminalStates, ["cancelled"]);
+  assert.equal(f.manager.pendingInteractions().length, 0);
+  assert.equal(f.manager.check(f.caller.id).interaction, undefined);
+
+  f.provisionalWrite.release();
+  await tick();
+  assert.equal(f.acceptanceWrite.calls, 0);
+  assert.equal(f.manager.check(f.target.id).answeringInteraction, undefined);
+  await f.manager.shutdown();
+});
+
+test("caller cancellation while waiting to resume cannot append acceptance", async () => {
+  const f = await startPeerAcceptance(undefined, 1);
+  const blocker = f.manager.spawn({ ...base, task: "holds the only slot" });
+  await tick();
+  assert.equal(f.backend.starts.at(-1), blocker.id);
+
+  f.provisionalWrite.release();
+  await tick();
+  assert.equal(f.acceptanceWrite.calls, 0, "acceptance waits for the caller's scheduler lease");
+  const rejected = assert.rejects(f.asked, /cancel before caller resume/);
+  await f.manager.cancel(f.caller.id, "cancel before caller resume");
+  await rejected;
+  assert.equal(f.signal.aborted, true);
+  assert.equal(f.acceptanceWrite.calls, 0);
+  assert.equal(f.manager.pendingInteractions().length, 0);
+
+  f.backend.complete(blocker.id);
+  await f.manager.shutdown();
+});
+
+test("terminal caller settlement during provisional persistence cannot accept replay", async () => {
+  const f = await startPeerAcceptance();
+  const rejected = assert.rejects(f.asked, /Job completed before its question was answered/);
+
+  f.backend.complete(f.caller.id, "caller settled first");
+  await rejected;
+  assert.equal(f.signal.aborted, true);
+  assert.equal(f.abortEvents(), 1);
+  assert.deepEqual(f.terminalStates, ["cancelled"]);
+  assert.equal(f.manager.pendingInteractions().length, 0);
+  assert.equal(f.manager.check(f.caller.id).interaction, undefined);
+
+  f.provisionalWrite.release();
+  await tick();
+  assert.equal(f.acceptanceWrite.calls, 0);
+  assert.equal(f.manager.check(f.target.id).answeringInteraction, undefined);
+  await f.manager.shutdown();
+});
+
+test("session shutdown during provisional persistence cannot accept replay", async () => {
+  const f = await startPeerAcceptance();
+  const rejected = assert.rejects(f.asked, /Session shutdown/);
+
+  await f.manager.shutdown();
+  await rejected;
+  assert.equal(f.signal.aborted, true);
+  assert.equal(f.abortEvents(), 1);
+  assert.deepEqual(f.terminalStates, ["cancelled"]);
+  assert.equal(f.manager.pendingInteractions().length, 0);
+  assert.equal(f.manager.check(f.caller.id).interaction, undefined);
+
+  f.provisionalWrite.release();
+  await tick();
+  assert.equal(f.acceptanceWrite.calls, 0);
+});
+
+test("dismissal before caller settlement prevents the acceptance append", async () => {
+  const f = await startPeerAcceptance();
+  const requestId = f.manager.pendingInteractions()[0]!.requestId;
+  const rejected = assert.rejects(f.asked, /dismiss before settlement/);
+
+  f.manager.dismissInteraction(requestId, "dismiss before settlement");
+  await rejected;
+  f.provisionalWrite.release();
+  await tick();
+  assert.equal(f.acceptanceWrite.calls, 0);
+  f.backend.complete(f.caller.id);
+  await f.manager.shutdown();
+});
+
+test("successful caller settlement schedules one acceptance append without waiting for it", async () => {
+  const f = await startPeerAcceptance();
+  const requestId = f.manager.pendingInteractions()[0]!.requestId;
+
+  f.provisionalWrite.release();
+  assert.match((await f.asked).answer, /durably accepted answer/);
+  await f.acceptanceWrite.waitUntilReached();
+  assert.equal(f.acceptanceWrite.calls, 1);
+  assert.equal(f.signal.aborted, false);
+  assert.deepEqual(f.terminalStates, []);
+  assert.equal(f.manager.pendingInteractions().length, 0);
+  assert.equal(f.manager.check(f.caller.id).interaction, undefined);
+  assert.throws(
+    () => f.manager.dismissInteraction(requestId, "too late"),
+    /Unknown or already-resolved question/,
+  );
+
+  f.acceptanceWrite.release();
+  f.backend.complete(f.caller.id);
+  await f.manager.shutdown();
 });
 
 test("cancelling a completed target during peer routing cancels the correlated question", async () => {

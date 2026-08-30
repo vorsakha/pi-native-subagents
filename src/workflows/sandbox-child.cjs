@@ -17,6 +17,7 @@ const MAX_PHASE_CAPACITY_TITLES = 2;
 const MAX_CONVERGENCE_ROUNDS = 16;
 const MAX_CONVERGENCE_FINDINGS = 32;
 const MAX_LOG_MESSAGE_BYTES = 4 * KIB;
+const MAX_CONVERGENCE_PROGRESS_BYTES = 64 * KIB;
 const MAX_PIPELINE_ITEMS = 4096;
 const MAX_PIPELINE_CONCURRENCY = 4;
 const RESULT_CHUNK_BYTES = 256 * KIB;
@@ -140,7 +141,7 @@ function bridge(operation, payloadJson, resolve) {
   }
   if (operation === "convergence") {
     if (++convergenceEvents > MAX_CONVERGENCE_EVENTS) return `Workflow convergence event limit exceeded (${MAX_CONVERGENCE_EVENTS})`;
-    if (typeof payloadJson !== "string" || byteLength(payloadJson) > MAX_LOG_MESSAGE_BYTES) return "Convergence progress exceeds the 4 KiB limit";
+    if (typeof payloadJson !== "string" || byteLength(payloadJson) > MAX_CONVERGENCE_PROGRESS_BYTES) return "Convergence progress exceeds the 64 KiB limit";
     let payload;
     try { payload = JSON.parse(payloadJson); }
     catch { return "Convergence progress is not valid JSON"; }
@@ -481,6 +482,7 @@ function installApi(context, argsJson) {
         let verdict;
         let actionableCount;
         let fingerprint;
+        let pendingFindings;
         let stoppingReason;
         let implementerJobId;
         let reviewerJobId;
@@ -497,6 +499,7 @@ function installApi(context, argsJson) {
             verdict,
             actionableCount,
             fingerprint,
+            pendingFindings,
             stoppingReason,
             implementerJobId,
             reviewerJobId,
@@ -641,6 +644,7 @@ function installApi(context, argsJson) {
             verdict = parsed.value.verdict;
             actionableCount = actionable.length;
             fingerprint = convergenceFingerprint(canonical);
+            pendingFindings = verdict === "request_changes" ? fixPrompt(parsed.value, actionable) : undefined;
             rounds.push({ round, verdict, actionableCount, fingerprint });
             emit();
 
@@ -660,7 +664,7 @@ function installApi(context, argsJson) {
             if (round >= maxRounds) {
               return finish("limit-reached", "reached the configured maximum of " + maxRounds + " round(s) with changes still requested");
             }
-            fixText = fixPrompt(parsed.value, actionable);
+            fixText = pendingFindings;
             reviewAgainText = reviewAgainPrompt(round + 1, actionable);
           }
           return finish("limit-reached", "reached the configured maximum of " + maxRounds + " round(s)");

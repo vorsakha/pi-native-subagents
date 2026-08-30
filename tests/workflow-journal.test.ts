@@ -10,11 +10,14 @@ import {
 } from "../src/workflows/artifacts.ts";
 import {
   replayableJournalCalls,
+  replayableJournalHandoffs,
   replayableJournalInteractions,
   workflowCallFingerprint,
   workflowDefinitionFingerprint,
   workflowInteractionFingerprint,
+  workflowReplayReferenceKey,
 } from "../src/workflows/journal.ts";
+import type { WorkflowJournalRecord } from "../src/workflows/types.ts";
 
 const usage = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, cost: 0.5, turns: 1 };
 
@@ -108,6 +111,231 @@ test("journal loading replays valid completed calls independently across a faile
   }
 });
 
+test("continuation handoff replay requires a matching progressed-primary checkpoint", () => {
+  const fingerprint = workflowCallFingerprint("continue safely", {
+    harness: "claude",
+    continuationFallback: { harness: "codex" },
+  });
+  const trigger = {
+    source: "continuation" as const,
+    provider: "claude" as const,
+    kind: "quota" as const,
+    retryAt: 10_000,
+    detail: "authoritative quota",
+  };
+  const target = { harness: "codex" as const, model: "replacement-model" };
+  const attemptUsage = { ...usage };
+  const cumulativeUsage = { ...usage, input: 6, output: 8, turns: 3 };
+  const route = {
+    jobId: "failed-job",
+    logicalJobId: "logical-job",
+    harness: "claude" as const,
+    requestedHarness: "claude" as const,
+    model: "primary-model",
+    status: "failed" as const,
+    error: "quota",
+    continuationFallback: target,
+  };
+  const started: WorkflowJournalRecord = {
+    version: 1, sequence: 0, callIndex: 0, fingerprint, kind: "agent", state: "started", at: 1,
+  };
+  const progressed: WorkflowJournalRecord = {
+    version: 1, sequence: 1, callIndex: 0, fingerprint, kind: "agent", state: "progressed", at: 2,
+    agentIndex: 0,
+    route,
+    continuationProgress: {
+      agentIndex: 0,
+      logicalJobId: "logical-job",
+      failedJobId: "failed-job",
+      target,
+      trigger,
+      attemptUsage,
+      usage: cumulativeUsage,
+    },
+  };
+  const handoff: WorkflowJournalRecord = {
+    version: 1, sequence: 2, callIndex: 0, fingerprint, kind: "agent", state: "handoff", at: 3,
+    agentIndex: 0,
+    route: {
+      ...route,
+      continuation: {
+        state: "handoff",
+        fromHarness: "claude",
+        toHarness: "codex",
+        failedJobId: "failed-job",
+        checkpointAt: 3,
+        checkoutDigest: `sha256:${"b".repeat(64)}`,
+        trigger,
+        warning: "continuation warning",
+      },
+    },
+    continuation: {
+      agentIndex: 0,
+      logicalJobId: "logical-job",
+      failedJobId: "failed-job",
+      phase: "build",
+      objective: "finish the change",
+      handoffPrompt: "inspect existing state and continue",
+      checkout: {
+        cwd: "/repo",
+        root: "/repo",
+        gitDir: "/repo/.git",
+        head: "a".repeat(40),
+        headRef: "refs/heads/main",
+        changedPaths: 1,
+        digest: `sha256:${"b".repeat(64)}`,
+      },
+      target,
+      trigger,
+      attemptUsage,
+      usage: cumulativeUsage,
+    },
+  };
+
+  assert.equal(replayableJournalHandoffs([started, progressed, handoff]).length, 1);
+  assert.deepEqual(replayableJournalHandoffs([started, handoff]), [], "a handoff cannot replace its missing progress proof");
+  assert.match(
+    replayableJournalCalls([started, handoff])[0]?.result.error ?? "",
+    /lacks a matching progressed-primary checkpoint/,
+    "missing proof becomes a terminal replay refusal instead of a fresh primary dispatch",
+  );
+
+  const inconsistent = [
+    (record: WorkflowJournalRecord) => {
+      record.continuation!.failedJobId = "different-failed-job";
+      record.route!.jobId = "different-failed-job";
+      record.route!.continuation!.failedJobId = "different-failed-job";
+    },
+    (record: WorkflowJournalRecord) => { record.route!.model = "different-primary-route"; },
+    (record: WorkflowJournalRecord) => {
+      record.continuation!.trigger.detail = "different trigger";
+      record.route!.continuation!.trigger.detail = "different trigger";
+    },
+    (record: WorkflowJournalRecord) => { record.continuation!.usage.input += 1; },
+  ];
+  for (const mutate of inconsistent) {
+    const changed = structuredClone(handoff);
+    mutate(changed);
+    assert.deepEqual(replayableJournalHandoffs([started, progressed, changed]), []);
+    const refused = replayableJournalCalls([started, progressed, changed]);
+    assert.equal(refused.length, 1);
+    assert.equal(refused[0]?.result.progressed, true);
+    assert.match(refused[0]?.result.error ?? "", /stopped before a safe continuation handoff/);
+  }
+
+  const completed: WorkflowJournalRecord = {
+    version: 1, sequence: 3, callIndex: 0, fingerprint, kind: "agent", state: "completed", at: 4,
+    agentIndex: 0,
+    result: { ok: true, output: "replacement complete", jobId: "logical-job", usage: cumulativeUsage },
+    route: {
+      ...route,
+      jobId: "replacement-job",
+      logicalJobId: "logical-job",
+      harness: "codex",
+      model: "replacement-model",
+      status: "completed",
+      error: undefined,
+      continuation: {
+        ...handoff.route!.continuation!,
+        state: "completed",
+        replacementJobId: "replacement-job",
+      },
+    },
+  };
+  const accepted = replayableJournalCalls([started, progressed, handoff, completed])[0]!;
+  assert.equal(accepted.result.ok, true);
+  assert.deepEqual(accepted.continuationProof?.handoff, handoff.continuation);
+
+  const copiedProgress = { ...structuredClone(progressed), replayProof: true as const };
+  const copiedHandoff = { ...structuredClone(handoff), replayProof: true as const };
+  assert.deepEqual(
+    replayableJournalHandoffs([started, copiedProgress, copiedHandoff]),
+    [],
+    "copied replay provenance never grants live replacement authority",
+  );
+  const interruptedProofReplay = replayableJournalCalls([started, copiedProgress, copiedHandoff])[0]!;
+  assert.equal(interruptedProofReplay.result.ok, false);
+  assert.equal(interruptedProofReplay.result.progressed, true);
+  assert.match(interruptedProofReplay.result.error ?? "", /copied proof cannot authorize another replacement/);
+  assert.equal(
+    replayableJournalCalls([started, copiedProgress, copiedHandoff, completed])[0]?.result.ok,
+    true,
+    "the copied chain remains valid evidence when its terminal record is durable",
+  );
+
+  const duplicateProgress = { ...structuredClone(progressed), sequence: 2 };
+  const inconsistentAfterProgress = replayableJournalCalls([started, progressed, duplicateProgress]);
+  assert.equal(inconsistentAfterProgress.length, 1);
+  assert.equal(inconsistentAfterProgress[0]?.result.ok, false);
+  assert.equal(inconsistentAfterProgress[0]?.result.progressed, true);
+  assert.deepEqual(replayableJournalHandoffs([started, progressed, duplicateProgress]), []);
+
+  const duplicateTerminal = { ...structuredClone(completed), sequence: 4 };
+  const inconsistentAfterCompletion = replayableJournalCalls([started, progressed, handoff, completed, duplicateTerminal]);
+  assert.equal(inconsistentAfterCompletion.length, 1);
+  assert.equal(inconsistentAfterCompletion[0]?.result.ok, false);
+  assert.equal(inconsistentAfterCompletion[0]?.result.progressed, true);
+  assert.deepEqual(replayableJournalHandoffs([started, progressed, handoff, completed, duplicateTerminal]), []);
+
+  const progressedFailure: WorkflowJournalRecord = {
+    version: 1, sequence: 1, callIndex: 0, fingerprint, kind: "agent", state: "failed", at: 2,
+    agentIndex: 0,
+    result: { ok: false, output: "partial work", error: "failed after progress", progressed: true, usage: cumulativeUsage },
+  };
+  const duplicateFailure = { ...structuredClone(progressedFailure), sequence: 2 };
+  const inconsistentProgressedFailure = replayableJournalCalls([started, progressedFailure, duplicateFailure]);
+  assert.equal(inconsistentProgressedFailure.length, 1);
+  assert.equal(inconsistentProgressedFailure[0]?.result.ok, false);
+  assert.equal(inconsistentProgressedFailure[0]?.result.progressed, true);
+  assert.match(inconsistentProgressedFailure[0]?.result.error ?? "", /inconsistent after durable progress/);
+  assert.deepEqual(inconsistentProgressedFailure[0]?.result.usage, cumulativeUsage);
+
+  const replayedTerminal = structuredClone(completed);
+  replayedTerminal.replayedFrom = { runId: "source-run", callIndex: 0 };
+  const terminalOnly = [started, replayedTerminal];
+  const unprovedReplay = replayableJournalCalls(terminalOnly)[0]!;
+  assert.equal(unprovedReplay.result.ok, false);
+  assert.equal(unprovedReplay.result.progressed, true);
+  assert.match(unprovedReplay.result.error ?? "", /validated replay provenance/);
+
+  const validated = new Map([[workflowReplayReferenceKey(replayedTerminal.replayedFrom), accepted]]);
+  assert.equal(replayableJournalCalls(terminalOnly, validated)[0]?.result.ok, true);
+
+  const duplicateReplayedTerminal = { ...structuredClone(replayedTerminal), sequence: 2 };
+  const inconsistentValidatedTerminal = replayableJournalCalls(
+    [started, replayedTerminal, duplicateReplayedTerminal],
+    validated,
+  );
+  assert.equal(inconsistentValidatedTerminal.length, 1);
+  assert.equal(inconsistentValidatedTerminal[0]?.result.ok, false);
+  assert.equal(inconsistentValidatedTerminal[0]?.result.progressed, true);
+  assert.match(inconsistentValidatedTerminal[0]?.result.error ?? "", /inconsistent after durable progress/);
+
+  const mismatchedReplay = structuredClone(replayedTerminal);
+  mismatchedReplay.result!.output = "different replay output";
+  const refusedMismatch = replayableJournalCalls([started, mismatchedReplay], validated)[0]!;
+  assert.equal(refusedMismatch.result.ok, false);
+  assert.equal(refusedMismatch.result.progressed, true);
+
+  const missingHandoff = replayableJournalCalls([started, progressed, completed]);
+  assert.equal(missingHandoff[0]?.result.ok, false);
+  assert.equal(missingHandoff[0]?.result.progressed, true);
+
+  for (const mutate of [
+    (record: WorkflowJournalRecord) => { record.route!.continuation!.checkpointAt += 1; },
+    (record: WorkflowJournalRecord) => { record.route!.continuation!.replacementJobId = "other-replacement"; },
+    (record: WorkflowJournalRecord) => { record.route!.jobId = "other-replacement"; },
+    (record: WorkflowJournalRecord) => { record.route!.harness = "claude"; },
+  ]) {
+    const changed = structuredClone(completed);
+    mutate(changed);
+    const refused = replayableJournalCalls([started, progressed, handoff, changed]);
+    assert.equal(refused[0]?.result.ok, false);
+    assert.equal(refused[0]?.result.progressed, true);
+    assert.deepEqual(replayableJournalHandoffs([started, progressed, handoff, changed]), []);
+  }
+});
+
 test("peer-question journals require lineage provenance from started through settlement", async () => {
   const f = await fixture();
   const question = workflowInteractionFingerprint({ question: "Which flag stays?", context: "fixtures disagree" });
@@ -137,15 +365,33 @@ test("peer-question journals require lineage provenance from started through set
       agentIndex: 1,
       result: { ok: true, output: "keep the legacy flag", usage },
       interaction: { ...detail, targetGeneration: 1, route: "peer" },
+      interactionPending: true,
+    });
+    await appendWorkflowJournal(f.root, f.created.runId, {
+      version: 1, sequence: 2, callIndex: 0, fingerprint: question, kind: "peerQuestion", state: "accepted", at: 3,
+      agentIndex: 1,
+      interaction: { ...detail, targetGeneration: 1, route: "peer" },
     });
     // A second interaction has only a started record and must never replay.
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 2, callIndex: 1, fingerprint: workflowInteractionFingerprint({ question: "unfinished" }), kind: "peerQuestion", state: "started", at: 3,
+      version: 1, sequence: 3, callIndex: 1, fingerprint: workflowInteractionFingerprint({ question: "unfinished" }), kind: "peerQuestion", state: "started", at: 4,
       agentIndex: 1,
       interaction: detail,
     });
 
     const records = await loadWorkflowJournal(f.root, f.created.runId);
+    assert.deepEqual(
+      replayableJournalInteractions(records.slice(0, 2)),
+      [],
+      "a provisional answer is not replayable without its accepted record",
+    );
+    const mismatchedAcceptance = structuredClone(records.slice(0, 3));
+    mismatchedAcceptance[2]!.interaction!.targetGeneration = 2;
+    assert.deepEqual(
+      replayableJournalInteractions(mismatchedAcceptance),
+      [],
+      "acceptance must bind the exact provisional answer provenance",
+    );
     assert.deepEqual(replayableJournalInteractions(records), [{
       ordinal: 0,
       questionFingerprint: question,
@@ -153,6 +399,9 @@ test("peer-question journals require lineage provenance from started through set
       answer: "keep the legacy flag",
       usage,
     }]);
+    const legacyCompletion = structuredClone(records.slice(0, 2));
+    legacyCompletion[1]!.interactionPending = undefined;
+    assert.equal(replayableJournalInteractions(legacyCompletion)[0]?.answer, "keep the legacy flag");
     assert.deepEqual(replayableJournalCalls(records), [], "interaction ordinals never enter the sandbox call replay stream");
   } finally {
     await f.cleanup();
