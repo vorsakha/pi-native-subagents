@@ -99,7 +99,7 @@ agent("task", {
 });
 ```
 
-This permits one handoff after authoritative failure with progress. Cleanup, checkout identity, capability, budget, and handoff proofs fail closed. Copied proof cannot dispatch again, and journal corruption cannot erase durable progress. Replay admission adds carried source spend to checkpointed and synced current-run usage. The logical ID survives replacement and follow-ups; the primary never replays or waits. Do not combine this with `providerFallback` or worktree isolation. Read `references/progressed-continuation.md` first.
+One handoff follows authoritative progressed failure. Cleanup, checkout identity, capability, budget, and handoff proof fail closed. Copied proof cannot redispatch; corruption cannot erase durable progress. Replay adds carried spend to checkpointed and synced current usage, then rebinds checkpoint indexes to reconstructed lineages. The logical ID survives replacement and follow-ups; the primary never replays or waits. Do not combine this with `providerFallback` or worktree isolation. Read `references/progressed-continuation.md` first.
 
 ```js
 export const meta = { name: "parallel-review" };

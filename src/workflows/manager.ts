@@ -2586,7 +2586,7 @@ export class WorkflowManager {
     fingerprint: string,
     currentPrompt: string,
   ): Promise<WorkflowAttemptResult> {
-    const checkpoint = handoff.checkpoint;
+    const checkpoint = { ...clone(handoff.checkpoint), agentIndex: record.index };
     const progressRoute = journalRoute(record);
     if (progressRoute) progressRoute.continuation = undefined;
     await this.#appendJournal(entry, {

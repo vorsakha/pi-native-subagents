@@ -2474,7 +2474,7 @@ test("a progressed call is never replayed when continuation cannot prove the wor
   }
 });
 
-test("cancellation at a durable handoff prevents replacement, and replay resumes only the checkpointed continuation", async () => {
+test("cancelled fresh handoff replay rebinds a changed agent index before terminal replay", async () => {
   const availability = new GatedHarnessAvailability("codex", {
     claude: availabilityFixture("claude"),
     codex: availabilityFixture("codex"),
@@ -2499,9 +2499,21 @@ test("cancellation at a durable handoff prevents replacement, and replay resumes
     assert.equal(f.backend.requests.length, 0, "cancellation wins before replacement dispatch");
 
     const journalPath = join(cancelled.artifactDir, "journal.jsonl");
-    const records = (await readFile(journalPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { state: string });
+    const records = (await readFile(journalPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+      callIndex: number;
+      state: string;
+      agentIndex?: number;
+      continuation?: { agentIndex: number };
+      continuationProgress?: { agentIndex: number };
+    });
     assert.ok(records.some((record) => record.state === "handoff"));
     const interrupted = records.filter((record) => record.state !== "failed");
+    for (const record of interrupted) {
+      if (record.state !== "progressed" && record.state !== "handoff") continue;
+      record.agentIndex = 1;
+      if (record.continuationProgress) record.continuationProgress.agentIndex = 1;
+      if (record.continuation) record.continuation.agentIndex = 1;
+    }
     await writeFile(journalPath, `${interrupted.map((record) => JSON.stringify(record)).join("\n")}\n`);
 
     availability.gateNext();
@@ -2526,6 +2538,15 @@ test("cancellation at a durable handoff prevents replacement, and replay resumes
     const resumedCheckpoints = resumedJournal.filter((record) => record.state === "progressed" || record.state === "handoff");
     assert.ok(resumedCheckpoints.length >= 2);
     assert.ok(resumedCheckpoints.every((record) => record.replayUsageClaim === true), "resumed checkpoints claim their carried usage durably");
+    assert.ok(resumedCheckpoints.every((record) => (
+      record.continuationProgress?.agentIndex ?? record.continuation?.agentIndex
+    ) === record.agentIndex && record.agentIndex === 0), "resumed checkpoints rebind the source index to the reconstructed fresh agent");
+
+    const completedDispatches = f.backend.requests.length;
+    const completedReplay = await f.workflows.start(f.request(script, { resumeFromRunId: resumedFinal.runId }));
+    const completedReplayFinal = await completedReplay.completion;
+    assert.equal((completedReplayFinal.result as { ok: boolean }).ok, true);
+    assert.equal(f.backend.requests.length, completedDispatches, "the rebound terminal replays without another replacement");
 
     await writeFile(join(f.cwd, "tracked.txt"), "diverged after checkpoint\n");
     const targetDispatches = f.backend.requests.length;
@@ -2566,7 +2587,7 @@ test("agent cancellation follows a progressed lineage onto its active replacemen
   }
 });
 
-test("replayed follow-up handoff archives only the failed generation usage delta", async () => {
+test("replayed follow-up handoff rebinds a changed agent index and archives only failed-generation usage", async () => {
   const availability = new GatedHarnessAvailability("codex", {
     claude: availabilityFixture("claude"),
     codex: availabilityFixture("codex"),
@@ -2597,10 +2618,23 @@ test("replayed follow-up handoff archives only the failed generation usage delta
 
     const journalPath = join(source.artifactDir, "journal.jsonl");
     const records = (await readFile(journalPath, "utf8")).trim().split("\n")
-      .map((line) => JSON.parse(line) as { callIndex: number; state: string });
+      .map((line) => JSON.parse(line) as {
+        callIndex: number;
+        state: string;
+        agentIndex?: number;
+        continuation?: { agentIndex: number };
+        continuationProgress?: { agentIndex: number };
+      });
     const handoffIndex = records.findIndex((record) => record.callIndex === 1 && record.state === "handoff");
     assert.ok(handoffIndex >= 0);
-    await writeFile(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
+    const interrupted = records.slice(0, handoffIndex + 1);
+    for (const record of interrupted) {
+      if (record.callIndex !== 1 || (record.state !== "progressed" && record.state !== "handoff")) continue;
+      record.agentIndex = 1;
+      if (record.continuationProgress) record.continuationProgress.agentIndex = 1;
+      if (record.continuation) record.continuation.agentIndex = 1;
+    }
+    await writeFile(journalPath, `${interrupted.map((record) => JSON.stringify(record)).join("\n")}\n`);
 
     const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: source.runId }));
     await f.backend.waitForStart();
@@ -2615,6 +2649,22 @@ test("replayed follow-up handoff archives only the failed generation usage delta
     assert.deepEqual(final.agents[0]?.attempts?.[0]?.usage, {
       input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1,
     });
+    const finalJournal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const resumedFollowUpCheckpoints = finalJournal.filter((record) => (
+      record.callIndex === 1 && (record.state === "progressed" || record.state === "handoff")
+    ));
+    assert.equal(resumedFollowUpCheckpoints.length, 2);
+    assert.ok(resumedFollowUpCheckpoints.every((record) => (
+      record.continuationProgress?.agentIndex ?? record.continuation?.agentIndex
+    ) === record.agentIndex && record.agentIndex === 0), "retained follow-up checkpoints bind to the replayed lineage index");
+
+    const replacementDispatches = f.backend.requests.length;
+    const retainedTurns = f.backend.sends.length;
+    const completedReplay = await f.workflows.start(f.request(script, { resumeFromRunId: final.runId }));
+    const completedReplayFinal = await completedReplay.completion;
+    assert.equal((completedReplayFinal.result as { ok: boolean }).ok, true);
+    assert.equal(f.backend.requests.length, replacementDispatches, "the retained replacement is not dispatched again");
+    assert.equal(f.backend.sends.length, retainedTurns, "the replayed retained follow-up is not sent again");
   } finally {
     availability.release();
     await f.cleanup();
