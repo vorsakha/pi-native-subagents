@@ -428,6 +428,8 @@ export interface WorkflowJournalRecord {
   route?: WorkflowJournalRoute;
   replayedFrom?: WorkflowReplayReference;
   replacementOf?: WorkflowReplacementReference;
+  /** Copied checkpoint evidence for replay validation; never replacement-dispatch authority. */
+  replayProof?: true;
   /** Present only on a progressed continuation handoff checkpoint. */
   continuation?: WorkflowContinuationHandoff;
   /** Present only on the pre-settlement progressed-primary checkpoint. */
@@ -485,7 +487,7 @@ export interface WorkflowReplayState {
   sourceRunId: string;
   matchedCalls: number;
   invalidatedAt?: number;
-  /** Source usage not represented by reconstructed agents, charged only when an interrupted handoff dispatches its replacement. */
+  /** Durable source usage not represented by reconstructed agents, charged only when an interrupted handoff dispatches its replacement. */
   carriedUsage?: WorkflowUsage;
 }
 

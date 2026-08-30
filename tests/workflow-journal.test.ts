@@ -246,6 +246,37 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
   assert.equal(accepted.result.ok, true);
   assert.deepEqual(accepted.continuationProof?.handoff, handoff.continuation);
 
+  const copiedProgress = { ...structuredClone(progressed), replayProof: true as const };
+  const copiedHandoff = { ...structuredClone(handoff), replayProof: true as const };
+  assert.deepEqual(
+    replayableJournalHandoffs([started, copiedProgress, copiedHandoff]),
+    [],
+    "copied replay provenance never grants live replacement authority",
+  );
+  const interruptedProofReplay = replayableJournalCalls([started, copiedProgress, copiedHandoff])[0]!;
+  assert.equal(interruptedProofReplay.result.ok, false);
+  assert.equal(interruptedProofReplay.result.progressed, true);
+  assert.match(interruptedProofReplay.result.error ?? "", /copied proof cannot authorize another replacement/);
+  assert.equal(
+    replayableJournalCalls([started, copiedProgress, copiedHandoff, completed])[0]?.result.ok,
+    true,
+    "the copied chain remains valid evidence when its terminal record is durable",
+  );
+
+  const duplicateProgress = { ...structuredClone(progressed), sequence: 2 };
+  const inconsistentAfterProgress = replayableJournalCalls([started, progressed, duplicateProgress]);
+  assert.equal(inconsistentAfterProgress.length, 1);
+  assert.equal(inconsistentAfterProgress[0]?.result.ok, false);
+  assert.equal(inconsistentAfterProgress[0]?.result.progressed, true);
+  assert.deepEqual(replayableJournalHandoffs([started, progressed, duplicateProgress]), []);
+
+  const duplicateTerminal = { ...structuredClone(completed), sequence: 4 };
+  const inconsistentAfterCompletion = replayableJournalCalls([started, progressed, handoff, completed, duplicateTerminal]);
+  assert.equal(inconsistentAfterCompletion.length, 1);
+  assert.equal(inconsistentAfterCompletion[0]?.result.ok, false);
+  assert.equal(inconsistentAfterCompletion[0]?.result.progressed, true);
+  assert.deepEqual(replayableJournalHandoffs([started, progressed, handoff, completed, duplicateTerminal]), []);
+
   const replayedTerminal = structuredClone(completed);
   replayedTerminal.replayedFrom = { runId: "source-run", callIndex: 0 };
   const terminalOnly = [started, replayedTerminal];

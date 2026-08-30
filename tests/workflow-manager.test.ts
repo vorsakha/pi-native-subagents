@@ -1656,11 +1656,22 @@ test("progressed continuation settles the failed process, hands off current chec
         sequence: number;
         state: string;
         callIndex: number;
+        replayProof?: true;
         route?: { continuation?: unknown };
         replayedFrom?: { runId: string; callIndex: number };
       });
-    assert.ok(replayRecords.some((record) => record.state === "progressed"), "replayed continuation copies its accepted progress proof");
-    assert.ok(replayRecords.some((record) => record.state === "handoff"), "replayed continuation copies its accepted handoff proof");
+    assert.ok(replayRecords.some((record) => record.state === "progressed" && record.replayProof), "replayed continuation marks its copied progress proof");
+    assert.ok(replayRecords.some((record) => record.state === "handoff" && record.replayProof), "replayed continuation marks its copied handoff proof");
+
+    const interruptedProof = replayRecords
+      .filter((record) => record.callIndex === 0 && ["started", "progressed", "handoff"].includes(record.state))
+      .map((record, sequence) => ({ ...record, sequence }));
+    await writeFile(replayJournalPath, `${interruptedProof.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    const interruptedReplay = await f.workflows.start(f.request(script, { resumeFromRunId: replayFinal.runId }));
+    const interruptedFinal = await withTimeout(interruptedReplay.completion, "interrupted copied proof replay");
+    assert.equal((interruptedFinal.result as { ok: boolean }).ok, false);
+    assert.match((interruptedFinal.result as { error?: string }).error ?? "", /copied proof cannot authorize another replacement/);
+    assert.deepEqual({ starts: f.backend.requests.length, sends: f.backend.sends.length }, dispatches, "partial copied proof dispatches no replacement");
 
     const terminalOnly = replayRecords
       .filter((record) => record.state !== "progressed" && record.state !== "handoff")
@@ -2693,14 +2704,32 @@ test("handoff replay charges completed sibling usage before replacement admissio
       assert.ok(interrupted.some((record) => record.callIndex === 0 && record.state === "completed"));
       await writeFile(journalPath, `${interrupted.map((record) => JSON.stringify(record)).join("\n")}\n`);
 
+      const summaryPath = join(source.artifactDir, "workflow.json");
+      const staleSummary = JSON.parse(await readFile(summaryPath, "utf8")) as WorkflowSnapshot;
+      for (const agent of staleSummary.agents) {
+        agent.usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+      }
+      if (staleSummary.replay) delete staleSummary.replay.carriedUsage;
+      await writeFile(summaryPath, `${JSON.stringify(staleSummary)}\n`);
+
       const replacementDispatches = f.backend.requests.length;
-      const resumed = await f.workflows.start(f.request(script, { budget: scenario.budget, resumeFromRunId: source.runId }));
-      const final = await withTimeout(resumed.completion, "budget-denied handoff replay");
-      assert.equal((final.result as { ok: boolean }).ok, false);
-      assert.match((final.result as { error?: string }).error ?? "", scenario.error);
-      assert.equal(f.claude.requests.length, 2, "replay never reruns the progressed primary");
-      assert.equal(f.backend.requests.length, replacementDispatches, "prior sibling usage blocks replacement startup");
-      assert.ok(final.replay?.carriedUsage, "unrepresented source usage remains durable on the replay snapshot");
+      const diskWorkflows = new WorkflowManager({
+        jobs: f.jobs,
+        artifactRoot: f.artifactRoot,
+        sessionId: "session-1",
+        availability: fallbackAvailability(),
+      });
+      try {
+        const resumed = await diskWorkflows.start(f.request(script, { budget: scenario.budget, resumeFromRunId: source.runId }));
+        const final = await withTimeout(resumed.completion, "budget-denied handoff replay from stale checkpoint");
+        assert.equal((final.result as { ok: boolean }).ok, false);
+        assert.match((final.result as { error?: string }).error ?? "", scenario.error);
+        assert.equal(f.claude.requests.length, 2, "replay never reruns the progressed primary");
+        assert.equal(f.backend.requests.length, replacementDispatches, "journaled sibling usage blocks replacement startup");
+        assert.ok(final.replay?.carriedUsage, "journal-derived source usage remains durable on the replay snapshot");
+      } finally {
+        await diskWorkflows.shutdown(200).catch(() => undefined);
+      }
     } finally {
       availability.release();
       await f.cleanup();

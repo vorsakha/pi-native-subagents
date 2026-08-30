@@ -458,6 +458,10 @@ export class JobManager {
   async releaseRun(id: string): Promise<void> {
     const job = this.#jobs.get(id);
     if (!job || !job.run) return;
+    // Strict workflow settlement already surfaced this cleanup failure. Do
+    // not queue ordinary release behind the same stuck operation and prevent
+    // the containing workflow from reaching its fail-closed terminal state.
+    if (job.cleanupError) return;
     const run = job.run;
     await this.#serialize(job, async () => {
       if (job.run !== run) return;
@@ -482,26 +486,41 @@ export class JobManager {
       if (job.cleanupError) throw job.cleanupError;
       return clone(job.snapshot);
     }
-    await this.#serialize(job, async () => {
+    const settlement = this.#serialize(job, async () => {
       if (job.run !== run) {
         if (job.cleanupError) throw job.cleanupError;
         return;
       }
-      try {
-        await withDeadline(Promise.all([run.close(), run.completed]).then(() => undefined), this.#operationTimeoutMs, "Harness settlement");
-      } catch (error) {
-        try {
-          if (!(error instanceof OperationDeadlineError)) throw error;
-          if (!run.forceClose) throw error;
-          await withDeadline(Promise.all([run.forceClose(), run.completed]).then(() => undefined), Math.min(1_000, this.#operationTimeoutMs), "Harness force-close");
-        } catch (cleanupError) {
-          job.cleanupError = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError));
-          throw cleanupError;
-        }
-      }
+      await Promise.all([run.close(), run.completed]);
       job.cleanupError = undefined;
       if (job.run === run) job.run = undefined;
     });
+    const settlementTail = job.operation;
+    try {
+      await withDeadline(settlement, this.#operationTimeoutMs, "Harness settlement");
+    } catch (error) {
+      if (!(error instanceof OperationDeadlineError) || !run.forceClose) {
+        job.cleanupError = error instanceof Error ? error : new Error(String(error));
+        throw error;
+      }
+
+      let forceClosed = false;
+      try {
+        await withDeadline((async () => {
+          await run.forceClose!();
+          forceClosed = true;
+          await run.completed;
+          await settlement;
+        })(), Math.min(1_000, this.#operationTimeoutMs), "Harness force-close");
+      } catch (cleanupError) {
+        job.cleanupError = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError));
+        if (forceClosed) {
+          if (job.run === run) job.run = undefined;
+          if (job.operation === settlementTail) job.operation = undefined;
+        }
+        throw cleanupError;
+      }
+    }
     return clone(job.snapshot);
   }
 

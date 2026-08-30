@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { JobManager } from "../src/manager.ts";
 import type { Backend, BackendRun, JobSnapshot, ProfileDefinition } from "../src/types.ts";
-import { ControlledBackend, ImmediateBackend, tick } from "./helpers.ts";
+import { ControlledBackend, ImmediateBackend, tick, withTimeout } from "./helpers.ts";
 
 function setup(concurrency = 4) {
   const backend = new ControlledBackend();
@@ -428,6 +428,81 @@ test("manager bounds harness startup and direct cancellation waits", async (t) =
     assert.equal(forceCloses, 1);
     await manager.shutdown(20);
   });
+});
+
+test("strict workflow settlement bounds time already spent behind hanging cleanup", async () => {
+  let emitFailure!: () => void;
+  let settleCompleted!: () => void;
+  let closeReached!: () => void;
+  let forceCloses = 0;
+  const closeStarted = new Promise<void>((resolve) => { closeReached = resolve; });
+  const never = new Promise<void>(() => {});
+  const backend: Backend = {
+    name: "codex",
+    async start(_request, emit) {
+      emitFailure = () => emit({ type: "failed", error: "quota after progress" });
+      return {
+        completed: new Promise<void>((resolve) => { settleCompleted = resolve; }),
+        async send() {},
+        async cancel() {},
+        async close() {
+          closeReached();
+          await never;
+        },
+        async forceClose() { forceCloses++; },
+      };
+    },
+  };
+  const manager = new JobManager({ backends: [backend], operationTimeoutMs: 20 });
+  const job = manager.spawn({
+    ...request(1),
+    workflow: { runId: "wf_settlement_deadline", agentIndex: 0, label: "worker" },
+  });
+  await tick();
+  emitFailure();
+  settleCompleted();
+  await withTimeout(closeStarted, "launch finalizer entered hanging close");
+
+  await assert.rejects(
+    withTimeout(manager.settleFailedWorkflowJob(job.id), "strict settlement", 250),
+    /Harness force-close timed out after 20ms/,
+  );
+  assert.equal(forceCloses, 1, "strict settlement force-closes even while an earlier cleanup owns the queue");
+  await withTimeout(manager.releaseRun(job.id), "release after bounded settlement", 100);
+  await manager.shutdown(20);
+});
+
+test("strict workflow settlement propagates force-close proof failure without trapping workflow release", async () => {
+  let fail!: () => void;
+  let finish!: () => void;
+  let closeReached!: () => void;
+  const closeStarted = new Promise<void>((resolve) => { closeReached = resolve; });
+  const backend: Backend = {
+    name: "codex",
+    async start(_request, emit) {
+      fail = () => emit({ type: "failed", error: "quota after progress" });
+      return {
+        completed: new Promise<void>((resolve) => { finish = resolve; }),
+        async send() {},
+        async cancel() {},
+        async close() { closeReached(); await new Promise<void>(() => {}); },
+        async forceClose() { throw new Error("process descendants remain"); },
+      };
+    },
+  };
+  const manager = new JobManager({ backends: [backend], operationTimeoutMs: 20 });
+  const job = manager.spawn({
+    ...request(1),
+    workflow: { runId: "wf_settlement_failure", agentIndex: 0, label: "worker" },
+  });
+  await tick();
+  fail();
+  finish();
+  await withTimeout(closeStarted, "launch cleanup entered close");
+
+  await assert.rejects(manager.settleFailedWorkflowJob(job.id), /process descendants remain/);
+  await withTimeout(manager.releaseRun(job.id), "release after strict cleanup failure", 100);
+  await manager.shutdown(20);
 });
 
 test("shutdown aborts delayed startup with no late run or resource resurrection", async () => {

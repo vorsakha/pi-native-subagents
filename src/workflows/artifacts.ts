@@ -548,6 +548,7 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || !["started", "progressed", "handoff", "completed", "failed"].includes(record.state ?? "")
       || typeof record.at !== "number" || !Number.isFinite(record.at)) return false;
   if (record.kind !== undefined && !["agent", "followUp", "peerQuestion"].includes(record.kind)) return false;
+  if (record.replayProof !== undefined && (record.replayProof !== true || record.kind === "peerQuestion")) return false;
   // Every peer-question state carries the same bounded lineage provenance.
   // Without it, a `started` record cannot prove what was in flight when a
   // crash occurred. Other record kinds must never acquire that authority.
@@ -599,7 +600,8 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || record.replacementOf.sourceError !== undefined && (typeof record.replacementOf.sourceError !== "string" || record.replacementOf.sourceError.length > 2_000)
       || typeof record.replacementOf.reason !== "string" || !record.replacementOf.reason || record.replacementOf.reason.length > 200)) return false;
   if (record.state === "started") return record.result === undefined && record.route === undefined && record.replayedFrom === undefined
-    && record.replacementOf === undefined && record.continuation === undefined && record.continuationProgress === undefined;
+    && record.replacementOf === undefined && record.replayProof === undefined
+    && record.continuation === undefined && record.continuationProgress === undefined;
   if (record.state === "progressed") {
     return record.result === undefined && record.replayedFrom === undefined && record.replacementOf === undefined
       && record.continuation === undefined && isContinuationProgress(record.continuationProgress) && record.route !== undefined;
@@ -608,6 +610,7 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
     return record.result === undefined && record.replayedFrom === undefined && record.replacementOf === undefined
       && record.continuationProgress === undefined && isContinuationHandoff(record.continuation) && record.route !== undefined;
   }
+  if (record.replayProof !== undefined) return false;
   if (record.continuation !== undefined || record.continuationProgress !== undefined) return false;
   if (!record.result || typeof record.result !== "object" || typeof record.result.ok !== "boolean"
       || typeof record.result.output !== "string" || record.result.output.length > JOURNAL_RECORD_BYTES

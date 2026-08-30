@@ -100,7 +100,8 @@ function continuationCheckpointsMatch(
   const handoff = handoffRecord.continuation;
   const progressRoute = progressRecord.route;
   const handoffRoute = handoffRecord.route;
-  if (!progress || !handoff || !progressRoute || !handoffRoute) return false;
+  if (!progress || !handoff || !progressRoute || !handoffRoute
+      || progressRecord.replayProof !== handoffRecord.replayProof) return false;
   if (callKind(progressRecord) !== callKind(handoffRecord)
       || progressRecord.agentIndex !== progress.agentIndex
       || handoffRecord.agentIndex !== handoff.agentIndex
@@ -269,6 +270,7 @@ export function replayableJournalCalls(
   const continuationProofs = new Map<number, NonNullable<WorkflowReplayCall["continuationProof"]>>();
   const acceptedLineageProofs: Array<NonNullable<WorkflowReplayCall["continuationProof"]>> = [];
   const invalid = new Set<number>();
+  const failClosedProgress = new Set<number>();
 
   for (const record of records) {
     // Peer questions carry their own ordinal namespace in `callIndex`; they are
@@ -342,7 +344,9 @@ export function replayableJournalCalls(
 
   const replayable = new Map(completed);
   for (const [callIndex, record] of progressed) {
-    if (invalid.has(callIndex) || handoffs.has(callIndex) || completed.has(callIndex)) continue;
+    const handoff = handoffs.get(callIndex);
+    if (!invalid.has(callIndex) && completed.has(callIndex)) continue;
+    if (!invalid.has(callIndex) && handoff && handoff.replayProof !== true) continue;
     const progress = record.continuationProgress!;
     const route = record.route ? structuredClone(record.route) : undefined;
     if (route && !route.attempts?.length) {
@@ -358,6 +362,9 @@ export function replayableJournalCalls(
         trigger: { ...progress.trigger },
       }];
     }
+    const error = handoff?.replayProof === true
+      ? "Replayed continuation proof stopped before its terminal record; copied proof cannot authorize another replacement"
+      : "Progressed primary stopped before a safe continuation handoff; the original prompt was not replayed";
     replayable.set(callIndex, {
       ...record,
       state: "failed",
@@ -365,11 +372,12 @@ export function replayableJournalCalls(
       result: {
         ok: false,
         output: "",
-        error: "Progressed primary stopped before a safe continuation handoff; the original prompt was not replayed",
+        error,
         progressed: true,
         usage: { ...progress.usage },
       },
     });
+    failClosedProgress.add(callIndex);
   }
   for (const [callIndex, record] of rejectedHandoffs) {
     if (invalid.has(callIndex) || progressed.has(callIndex)) continue;
@@ -401,7 +409,7 @@ export function replayableJournalCalls(
   }
 
   return [...replayable.entries()]
-    .filter(([callIndex, record]) => !invalid.has(callIndex) && !!record.result)
+    .filter(([callIndex, record]) => (!invalid.has(callIndex) || failClosedProgress.has(callIndex)) && !!record.result)
     .sort(([left], [right]) => left - right)
     .map(([callIndex, record]) => ({
       callIndex,
@@ -410,7 +418,7 @@ export function replayableJournalCalls(
       agentIndex: record.agentIndex,
       result: structuredClone(record.result) as WorkflowJournalResult,
       route: record.route ? { ...record.route } : undefined,
-      ...(continuationProofs.get(callIndex)
+      ...(!failClosedProgress.has(callIndex) && continuationProofs.get(callIndex)
         ? { continuationProof: structuredClone(continuationProofs.get(callIndex)!) }
         : {}),
     }));
@@ -457,7 +465,7 @@ export function replayableJournalHandoffs(records: WorkflowJournalRecord[]): Wor
   }
 
   return [...handoffs.entries()]
-    .filter(([callIndex]) => !invalid.has(callIndex) && !terminal.has(callIndex))
+    .filter(([callIndex, record]) => record.replayProof !== true && !invalid.has(callIndex) && !terminal.has(callIndex))
     .sort(([left], [right]) => left - right)
     .map(([callIndex, record]) => ({
       callIndex,

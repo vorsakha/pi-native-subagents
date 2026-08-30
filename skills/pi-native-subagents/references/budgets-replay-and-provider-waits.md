@@ -15,7 +15,7 @@ Fresh input plus output consumes `maxTokens`; cache reads do not. Never infer a 
 - `maxAgents` and `maxConcurrency` limit work shape. `maxTokens` limits aggregate fresh input plus output; cached reads remain visible but do not consume that budget. `maxTokensPerAgent` applies the same ceiling to one child. `maxCost` and `maxTurns` are aggregate, and `maxTurns` is not a per-agent allowance.
 - Workflow budgets are optional. An omitted or empty budget leaves spend open while the hard ceilings — 32 calls, four workers, global concurrency four, watchdogs, provider/context limits, bounded persistence, cancellation, and shutdown — remain in force.
 - Spend limits are soft dispatch boundaries. The runtime warns once per metric, lets running calls finish, accepts overshoot, preserves their results, and blocks later fresh dispatches. Queued workflow jobs recheck when a global slot opens. Replayable completions bypass fresh-dispatch checks; `maxTokensPerAgent` follows the same rule.
-- `>=` is reached. Aggregate usage spans children. Exact replay is free, but interrupted-handoff replacement admission includes completed sibling usage from the source run.
+- `>=` is reached. Aggregate usage spans children. Exact replay is free; interrupted-handoff admission includes journaled source usage even if its snapshot lags.
 
 ## Cost reporting is provider-dependent
 
@@ -64,7 +64,7 @@ Both attempts share one ordinal and cumulative usage; budget preflight runs agai
 
 `continuationFallback` opts into one opposite-provider handoff after authoritative unavailability and progress. Ineligible or pre-inference failure is terminal, never a same-provider wait. Usage stays cumulative on one logical ID, including retained-call refusal; attempts store only their generation delta. Budgets stay fixed.
 
-A progressed record forbids primary replay but cannot authorize replacement. The handoff proves checkout before dispatch. Admission rechecks readiness and capabilities, then checkout and budget under the startup deadline. Only a bound completion replays free; interrupted handoff replay runs only the replacement and requires the source budget. Missing/diverged proof fails closed. Manual suffix restart cannot discard an agent progressed checkpoint; peer-question ordinals do not count. Cancellation covers admission, replacement, and retained calls. `/workflows` keeps continued, fallback, and waiting distinct.
+A progressed record forbids primary replay but cannot authorize replacement. The handoff proves checkout before dispatch. Admission rechecks readiness and capabilities, then checkout and budget under the startup deadline. Only a bound completion replays free; copied replay proof never dispatches, while an interrupted original handoff runs only the replacement and charges journaled source usage. Missing, duplicate, or diverged proof fails closed without rerunning the primary. Cancellation covers admission, replacement, and retained calls. `/workflows` keeps continued, fallback, and waiting distinct.
 
 ## Recovery
 
