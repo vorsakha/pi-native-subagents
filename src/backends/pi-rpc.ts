@@ -554,9 +554,14 @@ export class PiRpcBackend implements Backend {
     emit({ type: "user_message", text: initialMessage });
     void command("get_state")
       .then((state) => {
-        const sessionFile = typeof state.sessionFile === "string" && state.sessionFile
+        const reportedSessionFile = typeof state.sessionFile === "string" && state.sessionFile
           ? state.sessionFile
-          : request.continuation?.harness === "pi" ? request.continuation.sessionFile : undefined;
+          : undefined;
+        if (request.continuation?.harness === "pi"
+          && reportedSessionFile !== request.continuation.sessionFile) {
+          throw new Error("Pi resumed a different native session identity");
+        }
+        const sessionFile = reportedSessionFile;
         const sessionId = typeof state.sessionId === "string" && state.sessionId ? state.sessionId : undefined;
         emit({ type: "started", backendSessionId: sessionId, sessionFile });
         return command("prompt", { message: initialMessage });

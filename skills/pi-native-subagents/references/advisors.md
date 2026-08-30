@@ -33,11 +33,11 @@ Public states are `defined`, `consulting`, `idle`, `hibernated`, `unavailable`, 
 
 - `defined`: registered, no native turn yet.
 - `idle`: retained native session resident after consultation.
-- `hibernated`: idle resource released; the next consultation resumes the exact recorded Pi session, Claude session, or Codex thread.
+- `hibernated`: idle resource released; the next consultation resumes the exact recorded Pi session, Claude session, or Codex thread. Both the native adapter and registry verify the reported identity; a mismatch is never accepted as a replacement.
 - `unavailable`: continuation, route, or provider recovery failed. Identity is not replaced.
 - `closed`: removed from the roster and private continuation deleted.
 
-The roster, bounded 32-entry ledger, cumulative usage, lineage, frozen profile behavior, and typed native continuation survive parent-session reload. The store rejects symlinked state directories and files, uses exclusive mode-0600 temporary files, syncs writes, and atomically replaces regular state files. Native paths/IDs stay in private machine state; model tools, dashboards, workflow artifacts, journals, and Git never receive them. An answer without a continuation is preserved, but the advisor becomes unavailable afterward.
+The roster, bounded 32-entry ledger, cumulative usage, lineage, frozen profile behavior, and typed native continuation survive parent-session reload. A malformed or wrong-harness continuation restores the same roster entry as unavailable; it does not disappear. The store rejects symlinked state directories and files, uses exclusive mode-0600 temporary files, syncs writes, and atomically replaces regular state files. Native paths/IDs stay in private machine state; public errors redact every recorded continuation field before reaching model tools, dashboards, workflow artifacts, journals, or Git. An answer without a continuation is preserved, but the advisor becomes unavailable afterward.
 
 `advisor_reset` is explicit identity replacement. It preserves stable ID, immutable policy, cumulative spend, and ledger, increments lineage, and clears only continuation/generation. Never reset to bypass an exhausted budget. `advisor_close` deletes the entry and immediately frees its aliases and roster capacity; active or queued consultations must settle or be cancelled first.
 
@@ -58,13 +58,13 @@ export default async function () {
 }
 ```
 
-`consult()`, `agent()`, and `followUp()` share the hard 32-call ordinal and workflow `maxAgents` boundary. Advisor usage contributes to aggregate token/cost/turn budgets as well as the advisor's own cumulative budget, and dispatch uses the global four-turn scheduler. Dispatch and lazy resume recheck both boundaries before a native turn. Calls are journaled with stable identity, lineage/generation, route, usage, queue delay, bounded result, and provenance. Exact completed replay reuses the answer without spend. A live replay suffix requires a compatible lineage; reset-induced incompatibility fails explicitly.
+`consult()`, `agent()`, and `followUp()` share the hard 32-call ordinal and workflow `maxAgents` boundary. Advisor usage contributes to aggregate token/cost/turn budgets as well as the advisor's own cumulative budget, and dispatch uses the workflow lane of the global four-turn scheduler, preserving direct-work priority. Dispatch and lazy resume recheck both boundaries before a native turn. Calls are journaled with stable identity, lineage/generation, route, usage, queue delay, bounded result, and provenance. A completed advisor record missing identity, lineage, generation, usage, or route is corrupt and stops replay. Exact completed replay reuses the answer without spend. A live replay suffix requires a compatible lineage; reset-induced incompatibility fails explicitly.
 
 Workflow cancellation reaches queued or active consultations. `/workflows` shows advisor calls as distinct phase children. The sandbox exposes `consult()` only to workflow source; child agents never receive advisor tools.
 
 ## Recovery
 
-- `Advisor is unavailable`: use `retryUnavailable: true` only for the same recorded continuation. If missing or invalid, reset or close explicitly.
+- `Advisor is unavailable`: use `retryUnavailable: true` only for the same recorded continuation. Retry state changes only after serialized admission; cancellation while queued leaves the recovery gate intact. If the continuation is missing, invalid, or reports a different native identity, reset or close explicitly.
 - route/capability unavailable: restore the recorded environment or close and reopen the advisor. Reset changes only the native lineage and cannot change policy.
 - cwd unavailable or changed: restore the exact canonical directory or close and reopen with a new cwd. Never retry through a replacement symlink.
 - lineage incompatible: replay names an older identity. Re-run without replay; never substitute another advisor under the call.

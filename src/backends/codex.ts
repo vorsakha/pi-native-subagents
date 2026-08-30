@@ -711,6 +711,9 @@ export class CodexAppServerBackend implements Backend {
         }
         threadId = String(thread.id ?? "");
         if (!threadId) throw new Error("Codex thread/start returned no thread id");
+        if (request.continuation?.harness === "codex" && threadId !== request.continuation.threadId) {
+          throw new Error("Codex resumed a different native thread identity");
+        }
         emit({ type: "started", backendSessionId: threadId, sessionFile: typeof thread.path === "string" ? thread.path : undefined });
         emitContext();
         await startTurn(`Task: ${request.task}`);

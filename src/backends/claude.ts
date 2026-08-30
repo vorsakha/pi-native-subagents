@@ -557,7 +557,16 @@ export class ClaudeBackend implements Backend {
       try {
         for await (const message of stream) {
           watchdog.touch();
-          const result = handleMessage(message, emit, controller, request.policy.access === "readOnly", hostTools, telemetry, structuredRequested);
+          const result = handleMessage(
+            message,
+            emit,
+            controller,
+            request.policy.access === "readOnly",
+            hostTools,
+            telemetry,
+            structuredRequested,
+            request.continuation?.harness === "claude" ? request.continuation.sessionId : undefined,
+          );
           if (!result) continue;
           resultCount++;
           if (queuedMessages.length) {
@@ -730,6 +739,7 @@ function handleMessage(
   hostTools: string[],
   telemetry: ClaudeTelemetry,
   structuredRequested = false,
+  expectedSessionId?: string,
 ): ClaudeResult | undefined {
   if (message.type === "rate_limit_event") {
     telemetry.rateLimit = message.rate_limit_info;
@@ -741,6 +751,10 @@ function handleMessage(
       emit({ type: "failed", error: "Claude subscription OAuth required; CLI reported a non-subscription auth source" });
       controller.abort();
       return { success: false, output: "", error: "Claude subscription OAuth required" };
+    }
+    if (expectedSessionId !== undefined && message.session_id !== expectedSessionId) {
+      controller.abort();
+      return { success: false, output: "", error: "Claude resumed a different native session identity" };
     }
     const forbidden = forbiddenInitTools(message.tools, readOnly, hostTools);
     if (forbidden.length > 0) {

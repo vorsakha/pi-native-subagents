@@ -650,6 +650,13 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || record.result.advisorLineage !== undefined && (!Number.isSafeInteger(record.result.advisorLineage) || record.result.advisorLineage < 0)
       || record.result.advisorGeneration !== undefined && (!Number.isSafeInteger(record.result.advisorGeneration) || record.result.advisorGeneration < 0)
       || record.result.queuedMs !== undefined && (typeof record.result.queuedMs !== "number" || !Number.isFinite(record.result.queuedMs) || record.result.queuedMs < 0)) return false;
+  if (record.kind === "advisor" && record.state === "completed" && (
+      typeof record.result.advisorId !== "string" || !/^adv_[a-f0-9]{32}$/.test(record.result.advisorId)
+      || typeof record.result.advisorName !== "string" || !record.result.advisorName || record.result.advisorName.length > 160
+      || !Number.isSafeInteger(record.result.advisorLineage) || record.result.advisorLineage! < 0
+      || !Number.isSafeInteger(record.result.advisorGeneration) || record.result.advisorGeneration! < 1
+      || !isWorkflowUsage(record.result.usage)
+      || !record.route || !["pi", "claude", "codex"].includes(record.route.harness ?? ""))) return false;
   return record.state === "completed" ? record.result.ok : !record.result.ok;
 }
 

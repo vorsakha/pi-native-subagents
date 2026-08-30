@@ -251,6 +251,8 @@ export interface WorkflowJobReference {
 export interface AdvisorJobReference {
   advisorId: string;
   threadId: string;
+  /** Workflow origin keeps this advisor turn in the workflow scheduler lane. */
+  workflow?: { runId: string; callIndex: number };
 }
 
 /** Private profile behavior captured when an advisor is opened. */

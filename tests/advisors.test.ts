@@ -10,6 +10,7 @@ import {
   ScriptedAdvisorRouter,
   delay,
   tempDir,
+  waitFor,
 } from "./helpers.ts";
 
 const threadId = "thread-advisors";
@@ -267,6 +268,180 @@ test("route failure preserves identity and continuation for an explicit same-lin
   await jobs.shutdown();
 });
 
+test("restoration preserves the unavailable retry gate and its redacted public error", async () => {
+  const store = new MemoryAdvisorStore();
+  const first = setup({ store });
+  const opened = await openSecurity(first.registry);
+  const initial = first.registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "establish restorable lineage",
+    sender: "human",
+    trusted: true,
+  });
+  await first.backend.waitForStart();
+  first.backend.emitContinuation(first.backend.starts[0]!, "persisted-retry-secret");
+  first.backend.complete(first.backend.starts[0]!, "established");
+  await initial;
+  await first.registry.hibernate(threadId, opened.id);
+  first.router.error = new Error("failed /private/persisted-retry-secret.jsonl for persisted-retry-secret");
+  assert.equal((await first.registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "persist unavailable",
+    sender: "human",
+    trusted: true,
+  })).ok, false);
+  await first.registry.shutdown();
+  await first.jobs.shutdown();
+
+  const restored = setup({ store });
+  await restored.registry.initialize();
+  const snapshot = restored.registry.get(threadId, opened.id);
+  assert.equal(snapshot.state, "unavailable");
+  assert.doesNotMatch(snapshot.error ?? "", /persisted-retry-secret|\/private\/persisted-retry-secret\.jsonl/);
+  await assert.rejects(restored.registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "cannot bypass after restore",
+    sender: "human",
+    trusted: true,
+  }), /retryUnavailable/);
+  assert.equal(restored.backend.starts.length, 0);
+  await restored.registry.shutdown();
+  await restored.jobs.shutdown();
+});
+
+test("resume failures preserve exact lineage, redact private identities, and keep retry admission explicit", async () => {
+  const { backend, jobs, registry, router } = setup();
+  const opened = await openSecurity(registry);
+  const first = registry.consult({ threadId, advisorId: opened.id, question: "establish private lineage", sender: "human", trusted: true });
+  await backend.waitForStart();
+  const firstJob = backend.starts[0]!;
+  backend.emitContinuation(firstJob, "codex-recorded-secret");
+  backend.complete(firstJob, "established");
+  await first;
+  await registry.hibernate(threadId, opened.id);
+
+  router.error = new Error("cannot resume codex-recorded-secret at /private/codex-recorded-secret.jsonl");
+  const failed = await registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "route failure",
+    sender: "human",
+    trusted: true,
+  });
+  assert.equal(failed.ok, false);
+  assert.doesNotMatch(failed.error ?? "", /codex-recorded-secret|\/private\/codex-recorded-secret\.jsonl/);
+  const unavailable = registry.get(threadId, opened.id);
+  assert.equal(unavailable.state, "unavailable");
+  assert.doesNotMatch(JSON.stringify(unavailable.ledger), /codex-recorded-secret|\/private\/codex-recorded-secret\.jsonl/);
+
+  router.error = undefined;
+  const aborted = new AbortController();
+  aborted.abort(new Error("cancel before admission"));
+  await assert.rejects(registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "cancelled retry",
+    sender: "human",
+    trusted: true,
+    retryUnavailable: true,
+    signal: aborted.signal,
+  }), /cancel before admission/);
+  const afterAbort = registry.get(threadId, opened.id);
+  assert.equal(afterAbort.state, "unavailable", "cancelled admission cannot clear the unavailable recovery gate");
+  assert.equal(afterAbort.error, unavailable.error);
+  assert.equal(afterAbort.generation, unavailable.generation);
+  await assert.rejects(registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "retry flag remains required",
+    sender: "human",
+    trusted: true,
+  }), /retryUnavailable/);
+
+  const drifted = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "provider identity drift",
+    sender: "human",
+    trusted: true,
+    retryUnavailable: true,
+  });
+  await backend.waitForStart(2);
+  backend.emitContinuation(backend.starts[1]!, "codex-replacement-secret");
+  backend.complete(backend.starts[1]!, "wrong lineage");
+  const driftedResult = await drifted;
+  assert.equal(driftedResult.ok, false);
+  assert.match(driftedResult.error ?? "", /different native advisor identity/);
+  assert.doesNotMatch(JSON.stringify(registry.get(threadId, opened.id)), /codex-(?:recorded|replacement)-secret/);
+
+  const recovered = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "resume the recorded lineage",
+    sender: "human",
+    trusted: true,
+    retryUnavailable: true,
+  });
+  await backend.waitForStart(3);
+  const recoveryRequest = backend.requests[2]!;
+  assert.deepEqual(recoveryRequest.continuation, {
+    harness: "codex",
+    threadId: "codex-recorded-secret",
+    sessionFile: "/private/codex-recorded-secret.jsonl",
+  });
+  backend.emitContinuation(recoveryRequest.jobId, "codex-recorded-secret");
+  backend.complete(recoveryRequest.jobId, "same lineage");
+  assert.equal((await recovered).ok, true);
+  await registry.shutdown();
+  await jobs.shutdown();
+});
+
+test("workflow advisor turns remain in the workflow scheduler lane behind direct work", async () => {
+  const backend = new ControlledBackend("codex");
+  const jobs = new JobManager({ backends: [backend], concurrency: 1 });
+  const registry = new AdvisorRegistry({
+    jobs,
+    store: new MemoryAdvisorStore(),
+    router: new ScriptedAdvisorRouter("codex", ["codex:skill:security"]),
+    threadId,
+    projectRoot: process.cwd(),
+  });
+  const opened = await openSecurity(registry);
+  const blocker = jobs.spawn({ task: "active direct blocker", cwd: process.cwd(), trusted: true, harness: "codex" });
+  await backend.waitForStart();
+
+  const advisor = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "queued workflow advice",
+    sender: "workflow",
+    trusted: true,
+    workflow: { runId: "wf_priority", callIndex: 0 },
+  });
+  await waitFor(() => registry.get(threadId, opened.id).state === "consulting", "advisor consultation admission");
+  const direct = jobs.spawn({ task: "later direct work", cwd: process.cwd(), trusted: true, harness: "codex" });
+
+  backend.complete(blocker.id);
+  await backend.waitForStart(2);
+  assert.equal(backend.starts[1], direct.id, "direct work wins the next global slot");
+  backend.complete(direct.id);
+  await backend.waitForStart(3);
+  const advisorJob = backend.starts[2]!;
+  assert.deepEqual(jobs.checkAdvisorJob(advisorJob, opened.id).advisor, {
+    advisorId: opened.id,
+    threadId,
+    workflow: { runId: "wf_priority", callIndex: 0 },
+  });
+  backend.emitContinuation(advisorJob, "workflow-advisor-thread");
+  backend.complete(advisorJob, "advice");
+  assert.equal((await advisor).ok, true);
+  await registry.shutdown();
+  await jobs.shutdown();
+});
+
 test("thread rosters persist privately with typed continuations while public state remains bounded", async () => {
   const root = await tempDir("advisor-store");
   try {
@@ -322,6 +497,70 @@ test("thread rosters persist privately with typed continuations while public sta
     await restoredRuntime.jobs.shutdown();
     await runtime.jobs.shutdown();
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("malformed stored continuations preserve the advisor roster as explicitly unavailable", async () => {
+  const root = await tempDir("advisor-invalid-continuation");
+  const store = new FileAdvisorStore(root);
+  const first = setup();
+  try {
+    const registry = new AdvisorRegistry({
+      jobs: first.jobs,
+      store,
+      router: first.router,
+      threadId,
+      projectRoot: process.cwd(),
+    });
+    const opened = await openSecurity(registry);
+    const consulted = registry.consult({
+      threadId,
+      advisorId: opened.id,
+      question: "persist stable identity",
+      sender: "human",
+      trusted: true,
+    });
+    await first.backend.waitForStart();
+    first.backend.emitContinuation(first.backend.starts[0]!, "stored-valid-thread");
+    first.backend.complete(first.backend.starts[0]!, "preserved answer", { input: 9, output: 2, turns: 1 });
+    await consulted;
+    await registry.shutdown();
+
+    const [file] = await readdir(root);
+    assert.ok(file);
+    const path = join(root, file);
+    const payload = JSON.parse(await readFile(path, "utf8")) as { advisors: Array<Record<string, unknown>> };
+    payload.advisors[0]!.continuation = { harness: "claude", sessionId: "wrong-harness-private-id" };
+    await writeFile(path, JSON.stringify(payload), { mode: 0o600 });
+
+    const restoredBackend = new ControlledBackend("codex");
+    const restoredJobs = new JobManager({ backends: [restoredBackend] });
+    const restored = new AdvisorRegistry({
+      jobs: restoredJobs,
+      store,
+      router: new ScriptedAdvisorRouter("codex", ["codex:skill:security"]),
+      threadId,
+      projectRoot: process.cwd(),
+    });
+    await restored.initialize();
+    const snapshot = restored.get(threadId, opened.id);
+    assert.equal(snapshot.id, opened.id);
+    assert.equal(snapshot.state, "unavailable");
+    assert.match(snapshot.error ?? "", /continuation is invalid.*reset or close/i);
+    assert.equal(snapshot.generation, 1);
+    assert.equal(snapshot.usage.input, 9);
+    assert.equal(snapshot.ledger[0]?.output, "preserved answer");
+    assert.equal(restoredBackend.starts.length, 0);
+    const reset = await restored.reset(threadId, opened.id);
+    assert.equal(reset.id, opened.id);
+    assert.equal(reset.state, "defined");
+    assert.equal(reset.lineage, 1);
+    assert.equal(reset.usage.input, 9);
+    await restored.shutdown();
+    await restoredJobs.shutdown();
+  } finally {
+    await first.jobs.shutdown();
     await rm(root, { recursive: true, force: true });
   }
 });

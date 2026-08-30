@@ -17,6 +17,8 @@ import { askThroughInteractionBridge, openInteractionBridge } from "../src/inter
 
 const PI_FIXTURE = `#!/usr/bin/env node
 import fs from "node:fs";
+const sessionAt = process.argv.indexOf("--session");
+const resumedSession = sessionAt >= 0 ? process.argv[sessionAt + 1] : undefined;
 if (process.env.ARG_FILE) fs.writeFileSync(process.env.ARG_FILE, JSON.stringify(process.argv.slice(2)));
 if (process.env.ENV_FILE) fs.writeFileSync(process.env.ENV_FILE, JSON.stringify({
   openai: process.env.OPENAI_API_KEY,
@@ -40,7 +42,7 @@ process.stdin.on("data", chunk => {
     if (process.env.MODE === "hang") continue;
     if (value.id) {
       let data;
-      if (value.type === "get_state") data = { model: { provider: "fixture", id: "fixture-model" }, sessionFile: "/sessions/pi-fixture.jsonl", sessionId: "pi-fixture" };
+      if (value.type === "get_state") data = { model: { provider: "fixture", id: "fixture-model" }, sessionFile: process.env.PI_SESSION_FILE || resumedSession || "/sessions/pi-fixture.jsonl", sessionId: "pi-fixture" };
       if (value.type === "get_available_models") data = { models: process.env.MODE === "unauthenticated" ? [] : [{ provider: "fixture", id: "fixture-model" }] };
       if (value.type === "get_commands") data = { commands: [{ name: "review", source: "skill" }] };
       process.stdout.write(JSON.stringify({ type: "response", id: value.id, command: value.type, success: true, data }) + "\\n");
@@ -127,7 +129,7 @@ process.stdin.on("data", chunk => {
     }
     else if (value.method === "thread/resume") {
       if (process.env.THREAD_PARAM_FILE) fs.writeFileSync(process.env.THREAD_PARAM_FILE, JSON.stringify(value.params));
-      reply(value.id, { thread: { id: value.params.threadId } });
+      reply(value.id, { thread: { id: process.env.RESUME_THREAD_ID || value.params.threadId } });
     }
     else if (value.method === "turn/start") {
       if (process.env.PARAM_FILE) fs.appendFileSync(process.env.PARAM_FILE, JSON.stringify(value.params) + "\\n");
@@ -786,6 +788,57 @@ test("Claude resumes only the explicitly typed native session identity", async (
   assert.equal(options?.resume, "claude-retained");
   assert.ok(events.some((event) => event.type === "started" && event.backendSessionId === "claude-retained"));
   await run.close();
+});
+
+test("native adapters reject a provider-reported continuation identity drift", async () => {
+  const piFixture = await fixture(PI_FIXTURE);
+  const codexFixture = await fixture(CODEX_FIXTURE);
+  let piRun: BackendRun | undefined;
+  let codexRun: BackendRun | undefined;
+  try {
+    const piEvents: BackendEvent[] = [];
+    const piRequest = request("pi", piFixture.dir, {
+      ...process.env,
+      MODE: "complete",
+      PI_SESSION_FILE: "/sessions/replacement.jsonl",
+    });
+    piRequest.continuation = { harness: "pi", sessionFile: "/sessions/recorded.jsonl" };
+    piRun = await new PiRpcBackend(piFixture.command, { requestTimeoutMs: 5_000 })
+      .start(piRequest, (event) => piEvents.push(event));
+    await piRun.completed;
+    assert.match((terminal(piEvents) as Extract<BackendEvent, { type: "failed" }>).error, /different native session identity/);
+
+    async function* messages() {
+      yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-replacement", tools: [] };
+    }
+    const claudeEvents: BackendEvent[] = [];
+    const claudeRequest = request("claude", process.cwd(), process.env);
+    claudeRequest.continuation = { harness: "claude", sessionId: "claude-recorded" };
+    const claudeRun = await new ClaudeBackend("fixture-claude", {
+      verifyAuth: async () => undefined,
+      queryFn: (() => Object.assign(messages(), { close() {} })) as never,
+    }).start(claudeRequest, (event) => claudeEvents.push(event));
+    await claudeRun.completed;
+    assert.match((terminal(claudeEvents) as Extract<BackendEvent, { type: "failed" }>).error, /different native session identity/);
+    await claudeRun.close();
+
+    const codexEvents: BackendEvent[] = [];
+    const codexRequest = request("codex", codexFixture.dir, {
+      ...process.env,
+      MODE: "normal",
+      RESUME_THREAD_ID: "thread-replacement",
+    });
+    codexRequest.continuation = { harness: "codex", threadId: "thread-recorded" };
+    codexRun = await new CodexAppServerBackend(codexFixture.command, { requestTimeoutMs: 5_000 })
+      .start(codexRequest, (event) => codexEvents.push(event));
+    await codexRun.completed;
+    assert.match((terminal(codexEvents) as Extract<BackendEvent, { type: "failed" }>).error, /different native thread identity/);
+  } finally {
+    await piRun?.close();
+    await codexRun?.close();
+    await rm(piFixture.dir, { recursive: true, force: true });
+    await rm(codexFixture.dir, { recursive: true, force: true });
+  }
 });
 
 test("Claude fails closed if a read-only CLI init exposes mutating tools", async () => {

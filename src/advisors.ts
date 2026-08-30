@@ -133,6 +133,8 @@ export interface AdvisorRouteResolver {
 interface StoredAdvisor extends Omit<AdvisorSnapshot, "queued"> {
   continuation?: NativeContinuation;
   profileBinding?: AdvisorProfileBinding;
+  /** Set only while normalizing a malformed private continuation from disk. */
+  invalidContinuation?: true;
 }
 
 interface AdvisorStorePayload {
@@ -163,7 +165,19 @@ export class FileAdvisorStore implements AdvisorStore {
       if (!info.isFile()) throw new Error("Advisor state path is not a regular file");
       const parsed = JSON.parse(await handle.readFile("utf8")) as AdvisorStorePayload;
       if (parsed.version !== 1 || parsed.threadId !== threadId || !Array.isArray(parsed.advisors)) return [];
-      return parsed.advisors.slice(0, MAX_ADVISORS_PER_THREAD).filter(validStoredAdvisor).map(cloneStored);
+      return parsed.advisors
+        .slice(0, MAX_ADVISORS_PER_THREAD)
+        .filter(validStoredAdvisor)
+        .map((record) => {
+          const invalidContinuation = record.continuation !== undefined
+            && !validContinuation(record.continuation, record.policy.harness);
+          const cloned = cloneStored({
+            ...record,
+            continuation: invalidContinuation ? undefined : record.continuation,
+          });
+          if (invalidContinuation) cloned.invalidContinuation = true;
+          return cloned;
+        });
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
@@ -177,7 +191,11 @@ export class FileAdvisorStore implements AdvisorStore {
     const payload: AdvisorStorePayload = {
       version: 1,
       threadId,
-      advisors: advisors.slice(0, MAX_ADVISORS_PER_THREAD).map(cloneStored),
+      advisors: advisors.slice(0, MAX_ADVISORS_PER_THREAD).map((record) => {
+        const cloned = cloneStored(record);
+        delete cloned.invalidContinuation;
+        return cloned;
+      }),
     };
     await atomicPrivateWrite(this.#path(threadId), JSON.stringify(payload));
   }
@@ -238,6 +256,7 @@ export class AdvisorRegistry {
       if (value.threadId !== this.#threadId) continue;
       const record: InternalAdvisor = { ...cloneStored(value), queued: 0, tail: Promise.resolve() };
       if (record.state === "closed") continue;
+      const storedUnavailable = record.state === "unavailable";
       try {
         record.policy.cwd = await containedCwd(this.#projectRoot, record.policy.cwd, true);
       } catch (error) {
@@ -246,9 +265,15 @@ export class AdvisorRegistry {
       }
       if (record.state === "unavailable" && record.error?.startsWith("Stored advisor cwd")) {
         // Keep the roster entry visible, but never dispatch it from a changed path.
+      } else if (record.invalidContinuation) {
+        record.state = "unavailable";
+        record.error = "Stored native continuation is invalid; explicitly reset or close this advisor.";
       } else if (record.generation > 0 && !record.continuation) {
         record.state = "unavailable";
         record.error = "Native continuation is missing; explicitly reset or close this advisor.";
+      } else if (storedUnavailable) {
+        record.state = "unavailable";
+        record.error = publicAdvisorError(record.error ?? "Advisor is unavailable", record.continuation);
       } else if (record.continuation) {
         record.state = "hibernated";
         record.error = undefined;
@@ -352,11 +377,11 @@ export class AdvisorRegistry {
     if (request.requiredLineage !== undefined && request.requiredLineage !== record.lineage) {
       throw new Error(`Advisor lineage is incompatible: workflow requires ${request.requiredLineage}, current lineage is ${record.lineage}`);
     }
-    if (record.state === "unavailable") {
-      if (!request.retryUnavailable) throw new Error(`${record.error ?? "Advisor is unavailable"} Pass retryUnavailable only to retry the recorded continuation, or reset explicitly.`);
-      if (!record.continuation) throw new Error("Advisor continuation is missing; retry cannot reconstruct it. Reset or close the advisor explicitly.");
-      record.state = "hibernated";
-      record.error = undefined;
+    if (record.state === "unavailable" && !request.retryUnavailable) {
+      throw new Error(`${record.error ?? "Advisor is unavailable"} Pass retryUnavailable only to retry the recorded continuation, or reset explicitly.`);
+    }
+    if (record.state === "unavailable" && !record.continuation) {
+      throw new Error("Advisor continuation is missing; retry cannot reconstruct it. Reset or close the advisor explicitly.");
     }
     if (record.state === "closed") throw new Error("Advisor is closed");
 
@@ -391,6 +416,7 @@ export class AdvisorRegistry {
     const now = Date.now();
     record.jobId = undefined;
     record.continuation = undefined;
+    record.invalidContinuation = undefined;
     record.lineage++;
     record.generation = 0;
     record.state = "defined";
@@ -459,7 +485,7 @@ export class AdvisorRegistry {
       if (record.idleTimer) clearTimeout(record.idleTimer);
       if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
       record.jobId = undefined;
-      if (record.state !== "closed") {
+      if (record.state !== "closed" && record.state !== "unavailable") {
         record.state = record.continuation ? "hibernated" : record.generation ? "unavailable" : "defined";
         if (record.state === "unavailable") record.error = "Native continuation is missing; explicitly reset or close this advisor.";
       }
@@ -534,7 +560,12 @@ export class AdvisorRegistry {
         }
       }
       if (jobId) {
-        await this.#jobs.continueAdvisorJob(jobId, record.id, prompt);
+        await this.#jobs.continueAdvisorJob(
+          jobId,
+          record.id,
+          prompt,
+          request.workflow ? { runId: request.workflow.runId, callIndex: request.workflow.callIndex } : undefined,
+        );
       } else {
         const spawned = this.#jobs.spawn({
           ...spawnRequestForPolicy(record.policy, prompt, record.name, record.profileBinding),
@@ -543,7 +574,13 @@ export class AdvisorRegistry {
           continuation: record.continuation,
           initialUsage: record.usage,
           initialGeneration: record.generation,
-          advisor: { advisorId: record.id, threadId: record.threadId },
+          advisor: {
+            advisorId: record.id,
+            threadId: record.threadId,
+            ...(request.workflow ? {
+              workflow: { runId: request.workflow.runId, callIndex: request.workflow.callIndex },
+            } : {}),
+          },
         });
         jobId = spawned.id;
         record.jobId = jobId;
@@ -571,12 +608,20 @@ export class AdvisorRegistry {
         record.continuation = previousContinuation;
         record.jobId = undefined;
         record.state = "unavailable";
-        record.error = final.error ?? `Advisor consultation ${final.status}`;
+        record.error = publicAdvisorError(final.error ?? `Advisor consultation ${final.status}`, previousContinuation);
         this.#appendLedger(record, request, request.signal?.aborted ? "cancelled" : "failed", startedAt, endedAt, usage, final.output, record.error);
         await this.#persist();
         return resultFor(record, false, final.output, record.error, usage, Date.now() - queuedAt);
       }
-      record.continuation = this.#jobs.continuation(jobId, record.id) ?? record.continuation;
+      const observedContinuation = this.#jobs.continuation(jobId, record.id);
+      if (previousContinuation) {
+        if (!observedContinuation || !sameNativeIdentity(previousContinuation, observedContinuation)) {
+          throw new Error("Provider resumed a different native advisor identity; explicitly reset or close this advisor.");
+        }
+        record.continuation = previousContinuation;
+      } else {
+        record.continuation = observedContinuation;
+      }
       record.generation++;
       record.lastConsultedAt = endedAt;
       record.updatedAt = endedAt;
@@ -591,7 +636,7 @@ export class AdvisorRegistry {
       return resultFor(record, true, final.output, undefined, usage, startedAt - queuedAt);
     } catch (error) {
       const endedAt = Date.now();
-      const message = error instanceof Error ? error.message : String(error);
+      const message = publicAdvisorError(error, previousContinuation);
       if (jobId) {
         try { record.usage = { ...this.#jobs.checkAdvisorJob(jobId, record.id).usage }; }
         catch { /* a released/evicted job leaves the last persisted cumulative usage */ }
@@ -813,8 +858,7 @@ function validStoredAdvisor(value: unknown): value is StoredAdvisor {
     && Array.isArray(record.ledger) && record.ledger.length <= MAX_ADVISOR_LEDGER
     && (record.policy!.profile === undefined
       ? record.profileBinding === undefined
-      : validProfileBinding(record.profileBinding, record.policy!.profile))
-    && (record.continuation === undefined || validContinuation(record.continuation, record.policy!.harness));
+      : validProfileBinding(record.profileBinding, record.policy!.profile));
 }
 
 function validProfileBinding(value: unknown, profileName: string): value is AdvisorProfileBinding {
@@ -857,11 +901,49 @@ function validBudget(value: unknown): boolean {
 
 function validContinuation(value: unknown, harness: HarnessName): value is NativeContinuation {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
-  const continuation = value as Partial<NativeContinuation>;
+  const continuation = value as Record<string, unknown>;
   if (continuation.harness !== harness) return false;
-  if (harness === "pi") return typeof (continuation as { sessionFile?: unknown }).sessionFile === "string";
-  if (harness === "claude") return typeof (continuation as { sessionId?: unknown }).sessionId === "string";
-  return typeof (continuation as { threadId?: unknown }).threadId === "string";
+  if (harness === "pi") {
+    return Object.keys(continuation).every((key) => key === "harness" || key === "sessionFile")
+      && privateContinuationValue(continuation.sessionFile, 4_096);
+  }
+  if (harness === "claude") {
+    return Object.keys(continuation).every((key) => key === "harness" || key === "sessionId")
+      && privateContinuationValue(continuation.sessionId, 1_000);
+  }
+  return Object.keys(continuation).every((key) => key === "harness" || key === "threadId" || key === "sessionFile")
+    && privateContinuationValue(continuation.threadId, 1_000)
+    && (continuation.sessionFile === undefined || privateContinuationValue(continuation.sessionFile, 4_096));
+}
+
+function privateContinuationValue(value: unknown, max: number): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= max;
+}
+
+function sameNativeIdentity(expected: NativeContinuation, observed: NativeContinuation): boolean {
+  if (expected.harness !== observed.harness) return false;
+  if (expected.harness === "pi") {
+    return observed.harness === "pi" && observed.sessionFile === expected.sessionFile;
+  }
+  if (expected.harness === "claude") {
+    return observed.harness === "claude" && observed.sessionId === expected.sessionId;
+  }
+  return observed.harness === "codex" && observed.threadId === expected.threadId;
+}
+
+function publicAdvisorError(error: unknown, continuation: NativeContinuation | undefined): string {
+  let message = error instanceof Error ? error.message : String(error);
+  if (continuation) {
+    const privateValues = continuation.harness === "pi"
+      ? [continuation.sessionFile]
+      : continuation.harness === "claude"
+        ? [continuation.sessionId]
+        : [continuation.threadId, continuation.sessionFile];
+    for (const value of privateValues) {
+      if (value) message = message.split(value).join("[redacted native continuation]");
+    }
+  }
+  return boundedText(message, 2_000);
 }
 
 function validUsage(value: unknown): value is Usage {

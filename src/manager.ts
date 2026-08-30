@@ -18,7 +18,7 @@ import {
   type InteractionTargetKind,
   type PendingInteraction,
 } from "./interactions.ts";
-import type { Backend, BackendEvent, BackendRun, BoundAdvisorProfile, HarnessName, JobSnapshot, NativeContinuation, ProfileDefinition, ProviderFamily, SendBehavior, SpawnRequest, Usage } from "./types.ts";
+import type { AdvisorJobReference, Backend, BackendEvent, BackendRun, BoundAdvisorProfile, HarnessName, JobSnapshot, NativeContinuation, ProfileDefinition, ProviderFamily, SendBehavior, SpawnRequest, Usage } from "./types.ts";
 
 const GENERIC_SYSTEM_PROMPT = `You are an isolated, task-driven subagent. Work only on the supplied task and return a concise, evidence-based result. You do not have access to parent conversation context beyond the task. Before recommending structural changes, inspect applicable repository instructions, scripts, CI, and nearby conventions. Distinguish acceptance failures, convention violations, verification gaps, and optional improvements; do not prescribe an implementation mechanism that the acceptance wording does not require. Treat absent tests as a defect only when repository convention or concrete regression risk justifies it. Do not spawn subagents or workflows.`;
 
@@ -58,6 +58,8 @@ interface InternalJob {
   lease?: ActiveTurnLease;
   /** Full generation lifecycle, including native teardown and scheduler release. */
   launch?: Promise<void>;
+  /** Native identity actually reported by this provider process, never seeded from a resume request. */
+  reportedContinuation?: NativeContinuation;
   /** The one outstanding question this generation is parked on. */
   interaction?: InternalInteraction;
   /** Set while this job's retained session is producing a peer answer. */
@@ -106,7 +108,9 @@ function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: J
       ? previous.value.queuedMessages
       : snapshot.queuedMessages.map((message) => ({ ...message })),
     workflow: snapshot.workflow ? { ...snapshot.workflow } : undefined,
-    advisor: snapshot.advisor ? { ...snapshot.advisor } : undefined,
+    advisor: snapshot.advisor
+      ? { ...snapshot.advisor, ...(snapshot.advisor.workflow ? { workflow: { ...snapshot.advisor.workflow } } : {}) }
+      : undefined,
     peer: snapshot.peer ? { ...snapshot.peer } : undefined,
     requires: snapshot.requires ? [...snapshot.requires] : undefined,
     capabilities: snapshot.capabilities
@@ -119,6 +123,25 @@ function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: J
       : undefined,
     answeringInteraction: snapshot.answeringInteraction ? { ...snapshot.answeringInteraction } : undefined,
   };
+}
+
+function workflowOwned(snapshot: JobSnapshot): boolean {
+  return snapshot.workflow !== undefined || snapshot.advisor?.workflow !== undefined;
+}
+
+function continuationFromStarted(
+  harness: HarnessName,
+  event: Extract<BackendEvent, { type: "started" }>,
+): NativeContinuation | undefined {
+  if (harness === "pi") {
+    return event.sessionFile ? { harness: "pi", sessionFile: event.sessionFile } : undefined;
+  }
+  if (harness === "claude") {
+    return event.backendSessionId ? { harness: "claude", sessionId: event.backendSessionId } : undefined;
+  }
+  return event.backendSessionId
+    ? { harness: "codex", threadId: event.backendSessionId, sessionFile: event.sessionFile }
+    : undefined;
 }
 
 function normalizeInitialUsage(value: Usage | undefined): Usage {
@@ -388,7 +411,9 @@ export class JobManager {
       liveThinking: "",
       queuedMessages: [],
       workflow: request.workflow ? { ...request.workflow } : undefined,
-      advisor: request.advisor ? { ...request.advisor } : undefined,
+      advisor: request.advisor
+        ? { ...request.advisor, ...(request.advisor.workflow ? { workflow: { ...request.advisor.workflow } } : {}) }
+        : undefined,
       sessionFile: request.peer?.sessionFile
         ?? (request.continuation?.harness === "pi" ? request.continuation.sessionFile : request.continuation?.harness === "codex" ? request.continuation.sessionFile : undefined),
       peer: request.peer
@@ -500,10 +525,20 @@ export class JobManager {
   }
 
   /** Continue only a retained advisor lineage; ordinary direct/workflow jobs are rejected. */
-  async continueAdvisorJob(id: string, advisorId: string, message: string): Promise<JobSnapshot> {
+  async continueAdvisorJob(
+    id: string,
+    advisorId: string,
+    message: string,
+    workflow?: AdvisorJobReference["workflow"],
+  ): Promise<JobSnapshot> {
     if (!message.trim()) throw new Error("Advisor question must not be empty");
     const job = this.#advisorJob(id, advisorId);
     if (job.snapshot.status !== "completed") throw new Error(`Cannot continue ${id}: job is ${job.snapshot.status}`);
+    job.snapshot.advisor = {
+      ...job.snapshot.advisor!,
+      ...(workflow ? { workflow: { ...workflow } } : {}),
+    };
+    if (!workflow) delete job.snapshot.advisor.workflow;
     return this.#queueFollowUp(job, message);
   }
 
@@ -528,16 +563,7 @@ export class JobManager {
   /** Private host-only projection of the native continuation for an advisor job. */
   continuation(id: string, advisorId: string): NativeContinuation | undefined {
     const job = this.#advisorJob(id, advisorId);
-    switch (job.snapshot.harness) {
-      case "pi":
-        return job.snapshot.sessionFile ? { harness: "pi", sessionFile: job.snapshot.sessionFile } : undefined;
-      case "claude":
-        return job.snapshot.backendSessionId ? { harness: "claude", sessionId: job.snapshot.backendSessionId } : undefined;
-      case "codex":
-        return job.snapshot.backendSessionId
-          ? { harness: "codex", threadId: job.snapshot.backendSessionId, sessionFile: job.snapshot.sessionFile }
-          : undefined;
-    }
+    return job.reportedContinuation ? { ...job.reportedContinuation } : undefined;
   }
 
   /**
@@ -805,7 +831,7 @@ export class JobManager {
 
   #createLease(job: InternalJob): ActiveTurnLease {
     this.#active++;
-    return new ActiveTurnLease(!job.snapshot.workflow, {
+    return new ActiveTurnLease(!workflowOwned(job.snapshot), {
       release: () => {
         this.#active--;
         this.#pump();
@@ -835,7 +861,7 @@ export class JobManager {
       // resume after a question.
       const directIndex = this.#queue.findIndex((id) => {
         const candidate = this.#jobs.get(id);
-        return candidate?.snapshot.status === "queued" && !candidate.inFlight && !candidate.snapshot.workflow;
+        return candidate?.snapshot.status === "queued" && !candidate.inFlight && !workflowOwned(candidate.snapshot);
       });
       if (directIndex < 0) {
         // With no direct work waiting, resume a workflow caller before launching
@@ -1423,6 +1449,10 @@ export class JobManager {
       job.snapshot = reduceJob(job.snapshot, event);
       job.deferredStartupTerminal = { event, generation };
       return;
+    }
+    if (event.type === "started") {
+      const continuation = continuationFromStarted(job.snapshot.harness, event);
+      if (continuation) job.reportedContinuation = continuation;
     }
     this.#emit(job, event);
     if (event.type === "usage") this.#recordBudgetWarnings(job);
