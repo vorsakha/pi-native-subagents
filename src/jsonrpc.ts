@@ -50,7 +50,7 @@ export class JsonRpcPeer {
     this.#process.child.stdin.on("error", (error) => {
       this.#closed = true;
       this.#failPending(new Error(`JSON-RPC stdin failed: ${error.message}`));
-      void this.#process.terminate();
+      void this.#process.terminate().catch(() => undefined);
     });
     this.#process.child.on("error", (error) => {
       this.#closed = true;
@@ -176,7 +176,7 @@ export class JsonRpcPeer {
     const failure = new Error(`JSON-RPC framing failed: ${error instanceof Error ? error.message : String(error)}`);
     this.#failPending(failure);
     try { this.#onProtocolError(failure); } catch { /* observers cannot break teardown */ }
-    void this.#process.terminate();
+    void this.#process.terminate().catch(() => undefined);
   }
 }
 

@@ -220,6 +220,45 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
     assert.equal(refused[0]?.result.progressed, true);
     assert.match(refused[0]?.result.error ?? "", /stopped before a safe continuation handoff/);
   }
+
+  const completed: WorkflowJournalRecord = {
+    version: 1, sequence: 3, callIndex: 0, fingerprint, kind: "agent", state: "completed", at: 4,
+    agentIndex: 0,
+    result: { ok: true, output: "replacement complete", jobId: "logical-job", usage: cumulativeUsage },
+    route: {
+      ...route,
+      jobId: "replacement-job",
+      logicalJobId: "logical-job",
+      harness: "codex",
+      model: "replacement-model",
+      status: "completed",
+      error: undefined,
+      continuation: {
+        ...handoff.route!.continuation!,
+        state: "completed",
+        replacementJobId: "replacement-job",
+      },
+    },
+  };
+  assert.equal(replayableJournalCalls([started, progressed, handoff, completed])[0]?.result.ok, true);
+
+  const missingHandoff = replayableJournalCalls([started, progressed, completed]);
+  assert.equal(missingHandoff[0]?.result.ok, false);
+  assert.equal(missingHandoff[0]?.result.progressed, true);
+
+  for (const mutate of [
+    (record: WorkflowJournalRecord) => { record.route!.continuation!.checkpointAt += 1; },
+    (record: WorkflowJournalRecord) => { record.route!.continuation!.replacementJobId = "other-replacement"; },
+    (record: WorkflowJournalRecord) => { record.route!.jobId = "other-replacement"; },
+    (record: WorkflowJournalRecord) => { record.route!.harness = "claude"; },
+  ]) {
+    const changed = structuredClone(completed);
+    mutate(changed);
+    const refused = replayableJournalCalls([started, progressed, handoff, changed]);
+    assert.equal(refused[0]?.result.ok, false);
+    assert.equal(refused[0]?.result.progressed, true);
+    assert.deepEqual(replayableJournalHandoffs([started, progressed, handoff, changed]), []);
+  }
 });
 
 test("peer-question journals require lineage provenance from started through settlement", async () => {

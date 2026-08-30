@@ -2,13 +2,9 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnManaged } from "../src/process-tree.ts";
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-async function assertGone(pid: number): Promise<void> {
-  for (let attempt = 0; attempt < 40; attempt++) {
-    try { process.kill(pid, 0); await sleep(50); }
-    catch { return; }
-  }
-  assert.fail(`descendant ${pid} survived process-tree teardown`);
+function processExists(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
 async function readPid(managed: ReturnType<typeof spawnManaged>): Promise<number> {
@@ -28,5 +24,6 @@ test("managed process teardown terminates the spawned process group", { skip: pr
   const managed = spawnManaged(process.execPath, ["-e", script]);
   const grandchildPid = await readPid(managed);
   await managed.terminate(100);
-  await assertGone(grandchildPid);
+  assert.equal(processExists(grandchildPid), false, "terminate resolves only after the descendant is gone");
+  assert.equal(processExists(managed.child.pid!), false, "terminate resolves only after the process-group leader is gone");
 });

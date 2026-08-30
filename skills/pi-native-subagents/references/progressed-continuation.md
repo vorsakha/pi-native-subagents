@@ -23,7 +23,7 @@ Continuation opens only when all of these are true:
 
 - the failed fresh `agent()` or retained `followUp()` reported structured, authoritative provider unavailability for the provider actually running it;
 - the failed generation itself recorded model or tool progress, and the failure is not marked pre-inference; activity from an earlier retained generation never qualifies a new turn;
-- the failed native process tree has exited and its retained resources are closed;
+- the runtime has proved the failed native process group is absent and its retained resources are closed; bounded cleanup failure authorizes no replacement;
 - the target freshly reports ready and satisfies the original fixed policy, including every required capability;
 - the shared cwd is a provable Git checkout whose HEAD, staged entries, index flags, status, and changed worktree contents can be checkpointed; assume-unchanged, skip-worktree, and fsmonitor-valid flags are unsupported;
 - this logical lineage has not already used its one continuation.
@@ -50,7 +50,7 @@ When a queued replacement wins a global scheduler slot, admission revalidates ta
 
 ## Durability, accounting, and inspection
 
-The journal first stores progressed-primary proof before process settlement, scheduler admission, locking, or checkout capture. That record forbids replay of the primary but does not authorize replacement. After the process is settled, a second durable handoff stores the structured trigger, effective schema, checkout proof, bounded prompt, target route, and usage before replacement dispatch. Replay requires both records in order and binds their lineage, failed job, route, target, trigger, and usage fields. A missing or inconsistent pair authorizes no replacement. Replacement job ID and validated terminal result follow.
+The journal first stores progressed-primary proof before process settlement, scheduler admission, locking, or checkout capture. That record forbids replay of the primary but does not authorize replacement. After the process is settled, a second durable handoff stores the structured trigger, effective schema, checkout proof, bounded prompt, target route, and usage before replacement dispatch. Replay requires both records in order and binds their lineage, failed job, route, target, trigger, and usage fields. A successful terminal record must bind its replacement route and continuation provenance to that accepted handoff. Missing or inconsistent proof authorizes no replacement or successful replay.
 
 On exact `resumeFromRunId` replay:
 
@@ -68,4 +68,5 @@ Usage is cumulative across the failed turn, replacement, and later logical gener
 - `requires a provable Git checkout`: continuation did not dispatch. Inspect the partial work and continue manually or move it into a safe Git checkout.
 - `checkout is missing or diverged`: the durable handoff no longer describes the current checkout. Do not force replay; inspect the source run and current changes, then choose a manual recovery.
 - target readiness or policy error: the replacement did not start. Restore the declared target or continue manually; the one route never silently changes.
+- failed process-tree cleanup: descendants may remain. No replacement started; inspect and terminate the failed provider tree before manual recovery.
 - replacement provider failure: inspect its cumulative partial state. The automatic route is exhausted and cannot loop back.

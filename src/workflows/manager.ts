@@ -501,6 +501,7 @@ export class WorkflowManager {
   readonly #maxRetainedRuns: number;
   readonly #providerWaitClock: ProviderWaitClock;
   readonly #checkout: WorkflowCheckoutOperations;
+  readonly #journalAppender: typeof appendWorkflowJournal;
 
   constructor(options: {
     jobs: JobManager;
@@ -518,6 +519,8 @@ export class WorkflowManager {
     providerWaitClock?: ProviderWaitClock;
     /** Test-only checkout proof injection; production uses abortable Git-backed proof operations. */
     checkout?: WorkflowCheckoutOperations;
+    /** Test-only journal injection for deterministic persistence races. */
+    journalAppender?: typeof appendWorkflowJournal;
   }) {
     this.#jobs = options.jobs;
     this.#artifactRoot = resolve(options.artifactRoot);
@@ -534,6 +537,7 @@ export class WorkflowManager {
       capture: captureWorkflowCheckout,
       assert: assertWorkflowCheckout,
     };
+    this.#journalAppender = options.journalAppender ?? appendWorkflowJournal;
     this.#unsubscribeJobs = this.#jobs.subscribe((job, event) => this.#updateAgentFromJob(job, event));
     // Same-run peer routing is workflow policy; JobManager owns only the
     // generic lifecycle rules and hands the authorized request over here.
@@ -2809,6 +2813,7 @@ export class WorkflowManager {
           result: { ok: true, output: replayed.answer, usage: replayed.usage },
           interaction: { ...detail, targetGeneration: replayed.detail.targetGeneration, route: "replay" },
         });
+        if (request.signal.aborted) throw abortError(request.signal.reason);
         return { answer: replayed.answer, targetGeneration: replayed.detail.targetGeneration, targetLabel: target.name, route: "replay" };
       }
       if (!request.target) {
@@ -2841,6 +2846,7 @@ export class WorkflowManager {
         route: journalRoute(target),
         interaction: { ...detail, targetGeneration: dispatched.targetGeneration, route: "peer" },
       });
+      if (request.signal.aborted) throw abortError(request.signal.reason);
       return { answer: dispatched.answer, targetGeneration: dispatched.targetGeneration, targetLabel: target.name, route: "peer" };
     } catch (error) {
       await this.#appendJournal(entry, {
@@ -3382,7 +3388,7 @@ export class WorkflowManager {
       sequence: entry.journalSequence++,
       ...value,
     };
-    const write = entry.journalChain.then(() => appendWorkflowJournal(this.#artifactRoot, entry.snapshot.runId, record));
+    const write = entry.journalChain.then(() => this.#journalAppender(this.#artifactRoot, entry.snapshot.runId, record));
     entry.journalChain = write.catch(() => undefined);
     try { await write; }
     catch (error) {

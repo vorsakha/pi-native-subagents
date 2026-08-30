@@ -418,7 +418,7 @@ export class CodexAppServerBackend implements Backend {
     const watchdog = createActivityWatchdog(this.#inactivityTimeoutMs, () => {
       closing = true;
       finish({ type: "failed", error: `Codex produced no activity for ${this.#inactivityTimeoutMs}ms` });
-      void closePeer();
+      void closePeer().catch(() => undefined);
     });
     const finish = (event: BackendEvent) => {
       if (settled) return;

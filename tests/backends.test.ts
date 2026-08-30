@@ -94,10 +94,15 @@ setInterval(() => {}, 1000);
 
 const CODEX_FIXTURE = `#!/usr/bin/env node
 import fs from "node:fs";
+import { spawn } from "node:child_process";
 let buffer = "";
 let turns = 0;
 process.stdin.setEncoding("utf8");
 if (process.env.MODE === "exit") process.exit(7);
+if (process.env.DESCENDANT_PID_FILE) {
+  const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM',()=>{}); setInterval(()=>{},1000)"], { stdio: "ignore" });
+  fs.writeFileSync(process.env.DESCENDANT_PID_FILE, String(descendant.pid));
+}
 process.stdin.on("data", chunk => {
   buffer += chunk;
   for (;;) {
@@ -234,6 +239,11 @@ async function fixture(source: string): Promise<{ dir: string; command: string }
   await writeFile(command, source);
   await chmod(command, 0o755);
   return { dir, command };
+}
+
+function processExists(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "EPERM"; }
 }
 
 function request(harness: HarnessName, cwd: string, env: NodeJS.ProcessEnv): BackendRequest {
@@ -1290,6 +1300,30 @@ test("Codex exposes authoritative quota failure as progressed after current-turn
     assert.equal(failed.unavailable?.preInference, undefined);
     assert.ok(events.some((event) => event.type === "message" && event.text === "PARTIAL"));
     await run.close();
+  } finally {
+    await rm(f.dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex failed-turn close proves its native descendants are gone before resolving", { skip: process.platform === "win32" }, async () => {
+  const f = await fixture(CODEX_FIXTURE);
+  const descendantFile = join(f.dir, "descendant.pid");
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(f.command, { inactivityTimeoutMs: 2_000 }).start(
+      request("codex", f.dir, {
+        ...process.env,
+        MODE: "quota-progress",
+        DESCENDANT_PID_FILE: descendantFile,
+      }),
+      (event) => events.push(event),
+    );
+    await run.completed;
+    assert.equal(terminal(events)?.type, "failed");
+    const descendantPid = Number(await readFile(descendantFile, "utf8"));
+    assert.equal(processExists(descendantPid), true, "fixture descendant is alive before close");
+    await run.close();
+    assert.equal(processExists(descendantPid), false, "close resolves only after the failed process group is absent");
   } finally {
     await rm(f.dir, { recursive: true, force: true });
   }

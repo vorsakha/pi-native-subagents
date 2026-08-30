@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
-import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, ScriptedHarnessAvailability, tempDir, tick, waitFor } from "./helpers.ts";
+import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, GatedWorkflowJournalAppender, ScriptedHarnessAvailability, tempDir, tick, waitFor } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import { replayableJournalInteractions, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint, workflowInteractionFingerprint } from "../src/workflows/journal.ts";
 import {
@@ -77,6 +77,7 @@ async function fixture(
   providerWaitClock?: ProviderWaitClock,
   availability?: ScriptedHarnessAvailability,
   checkout?: ConstructorParameters<typeof WorkflowManager>[0]["checkout"],
+  journalAppender?: ConstructorParameters<typeof WorkflowManager>[0]["journalAppender"],
 ) {
   const parent = await tempDir("workflow-manager");
   const cwd = join(parent, "cwd");
@@ -98,6 +99,7 @@ async function fixture(
     providerWaitClock,
     availability,
     checkout,
+    journalAppender,
   });
   return {
     parent,
@@ -1647,6 +1649,32 @@ test("progressed continuation settles the failed process, hands off current chec
     assert.equal(replayFinal.agents[0]?.jobId, replacement.jobId);
     assert.equal(replayFinal.agents[0]?.continuation?.replacementJobId, replacement.jobId);
     assert.deepEqual(aggregateWorkflowUsage(replayFinal), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("progressed continuation fails closed when native process-tree cleanup cannot be proved", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const started = await f.workflows.start(f.request(`export default async () => agent("cleanup proof", {
+      harness: "claude",
+      access: "readOnly",
+      continuationFallback: { harness: "codex" }
+    });`));
+    await f.claude.waitForStart();
+    const failedJobId = f.claude.starts[0]!;
+    f.claude.failClose(failedJobId, "process group descendants remain after SIGKILL");
+    f.claude.emit(failedJobId, { type: "message", text: "partial work" });
+    f.claude.fail(failedJobId, "quota", progressedQuota("claude"));
+
+    const final = await started.completion;
+    assert.equal(f.backend.requests.length, 0, "cleanup failure never dispatches the replacement provider");
+    assert.match(final.agents[0]?.error ?? "", /could not settle.*descendants remain after SIGKILL/i);
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    assert.deepEqual(journal.filter((record) => record.state === "handoff"), []);
+    assert.equal(journal.at(-1)?.result?.progressed, true, "replay remains barred from rerunning the progressed primary");
   } finally {
     await f.cleanup();
   }
@@ -5025,6 +5053,99 @@ test("a peer answer completed before dismissal is rejected before journaling or 
     assert.match(peerRecords[1]?.result?.error ?? "", /discard late peer answer/);
     assert.deepEqual(replayableJournalInteractions(journal), [], "an undelivered answer cannot become replay evidence");
   } finally {
+    await f.cleanup();
+  }
+});
+
+test("a live peer answer dismissed during completed-journal persistence is invalidated for replay", async () => {
+  const gate = new GatedWorkflowJournalAppender();
+  gate.arm();
+  const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, gate.append);
+  try {
+    const started = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "ORIGINAL PLAN");
+    await waitFor(() => f.backend.requests.length === 2, "implementer dispatch");
+    const implementerJobId = f.backend.requests[1]!.jobId;
+
+    const asked = f.backend.ask(implementerJobId, {
+      question: "which plan?",
+      target: { type: "agent", jobId: plannerJobId },
+    });
+    const rejected = assert.rejects(asked, /dismiss during persisted live answer/);
+    await waitFor(() => f.backend.sends.length === 1, "peer follow-up dispatch");
+    f.backend.complete(plannerJobId, "PERSISTED BUT UNDELIVERED");
+    await gate.waitUntilReached();
+
+    const requestId = f.jobs.pendingInteractions()[0]?.requestId;
+    assert.ok(requestId, "the source stays dismissible while completed persistence is in flight");
+    f.jobs.dismissInteraction(requestId, "dismiss during persisted live answer");
+    gate.release();
+    await rejected;
+
+    f.backend.complete(implementerJobId, "IMPLEMENTED");
+    const final = await started.completion;
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    assert.deepEqual(
+      journal.filter((record) => record.kind === "peerQuestion").map((record) => record.state),
+      ["started", "completed", "failed"],
+    );
+    assert.deepEqual(replayableJournalInteractions(journal), [], "the later failure invalidates the persisted success");
+  } finally {
+    gate.release();
+    await f.cleanup();
+  }
+});
+
+test("a replayed peer answer dismissed during completed-journal persistence is invalidated again", async () => {
+  const gate = new GatedWorkflowJournalAppender();
+  const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, gate.append);
+  try {
+    const first = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "source planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "ORIGINAL PLAN");
+    await waitFor(() => f.backend.requests.length === 2, "source implementer dispatch");
+    const implementerJobId = f.backend.requests[1]!.jobId;
+    const question = "which plan?";
+    const sourceAnswer = f.backend.ask(implementerJobId, {
+      question,
+      target: { type: "agent", jobId: plannerJobId },
+    });
+    await waitFor(() => f.backend.sends.length === 1, "source peer answer dispatch");
+    f.backend.complete(plannerJobId, "RECORDED ANSWER");
+    await sourceAnswer;
+    f.backend.fail(implementerJobId, "rerun the asker");
+    const source = await first.completion;
+
+    gate.arm();
+    const replay = await f.workflows.start(f.request(PEER_SCRIPT, { resumeFromRunId: source.runId }));
+    await waitFor(() => f.backend.requests.length === 3, "replayed implementer dispatch");
+    const replayedImplementer = f.backend.requests[2]!.jobId;
+    const asked = f.backend.ask(replayedImplementer, {
+      question,
+      target: { type: "agent", jobId: plannerJobId },
+    });
+    const rejected = assert.rejects(asked, /dismiss during persisted replay answer/);
+    await gate.waitUntilReached();
+
+    const requestId = f.jobs.pendingInteractions()[0]?.requestId;
+    assert.ok(requestId, "the replay source stays dismissible while its success record is in flight");
+    f.jobs.dismissInteraction(requestId, "dismiss during persisted replay answer");
+    gate.release();
+    await rejected;
+
+    f.backend.complete(replayedImplementer, "IMPLEMENTED");
+    const final = await replay.completion;
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    assert.deepEqual(
+      journal.filter((record) => record.kind === "peerQuestion").map((record) => record.state),
+      ["started", "completed", "failed"],
+    );
+    assert.deepEqual(replayableJournalInteractions(journal), [], "dismissed replay persistence cannot become new replay evidence");
+  } finally {
+    gate.release();
     await f.cleanup();
   }
 });

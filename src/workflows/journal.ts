@@ -144,6 +144,46 @@ function continuationCheckpointsMatch(
     && canonicalJson(continuation.trigger) === canonicalJson(progress.trigger);
 }
 
+/**
+ * A successful terminal record may replace a progressed primary only when its
+ * route proves that it completed the exact replacement authorized by the
+ * accepted handoff. A terminal result on its own cannot establish that link.
+ */
+function continuationTerminalMatches(
+  handoffRecord: WorkflowJournalRecord,
+  terminalRecord: WorkflowJournalRecord,
+): boolean {
+  const handoff = handoffRecord.continuation;
+  const handoffRoute = handoffRecord.route;
+  const terminalRoute = terminalRecord.route;
+  const authorized = handoffRoute?.continuation;
+  const completed = terminalRoute?.continuation;
+  if (!handoff || !handoffRoute || !terminalRoute || !authorized || !completed
+      || terminalRecord.result?.ok !== true
+      || callKind(handoffRecord) !== callKind(terminalRecord)
+      || terminalRecord.agentIndex !== handoff.agentIndex
+      || terminalRecord.agentIndex !== handoffRecord.agentIndex) return false;
+
+  const logicalJobId = handoff.logicalJobId ?? handoff.failedJobId;
+  const authorizedProvenance = {
+    ...authorized,
+    state: "completed",
+    replacementJobId: completed.replacementJobId,
+  };
+  return authorized.state === "handoff"
+    && authorized.replacementJobId === undefined
+    && completed.state === "completed"
+    && typeof completed.replacementJobId === "string"
+    && completed.replacementJobId.length > 0
+    && canonicalJson(completed) === canonicalJson(authorizedProvenance)
+    && terminalRoute.jobId === completed.replacementJobId
+    && terminalRoute.logicalJobId === logicalJobId
+    && terminalRoute.harness === handoff.target.harness
+    && terminalRecord.result.jobId === logicalJobId
+    && canonicalJson(terminalRoute.continuationFallback ?? null) === canonicalJson(handoff.target)
+    && (handoff.target.model === undefined || terminalRoute.model === handoff.target.model);
+}
+
 /** Return every independently replayable completed call. Failed, incomplete,
  * duplicated, or fingerprint-inconsistent ordinals are excluded without
  * discarding later parallel calls whose own journal pairs remain valid. */
@@ -152,6 +192,7 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
   const progressed = new Map<number, WorkflowJournalRecord>();
   const handoffs = new Map<number, WorkflowJournalRecord>();
   const rejectedHandoffs = new Map<number, WorkflowJournalRecord>();
+  const rejectedTerminals = new Set<number>();
   const completed = new Map<number, WorkflowJournalRecord>();
   const invalid = new Set<number>();
 
@@ -179,6 +220,7 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
       if (!priorStart || priorStart.fingerprint !== record.fingerprint || !record.continuation) {
         invalid.add(record.callIndex);
       } else if (!progress || handoffs.has(record.callIndex) || completed.has(record.callIndex)
+          || rejectedTerminals.has(record.callIndex)
           || !continuationCheckpointsMatch(progress, record)) {
         rejectedHandoffs.set(record.callIndex, record);
         handoffs.delete(record.callIndex);
@@ -191,7 +233,14 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
       invalid.add(record.callIndex);
       continue;
     }
-    if (record.state === "completed" && record.result?.ok === true) completed.set(record.callIndex, record);
+    if (record.state === "completed" && record.result?.ok === true) {
+      const progress = progressed.get(record.callIndex);
+      const handoff = handoffs.get(record.callIndex);
+      if (progress && (!handoff || !continuationTerminalMatches(handoff, record))) {
+        rejectedTerminals.add(record.callIndex);
+        handoffs.delete(record.callIndex);
+      } else completed.set(record.callIndex, record);
+    }
     else if (record.state === "failed" && record.result?.ok === false
         && (progressed.has(record.callIndex) || handoffs.has(record.callIndex) || record.result.progressed === true)) completed.set(record.callIndex, record);
     else invalid.add(record.callIndex);

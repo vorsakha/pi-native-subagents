@@ -64,7 +64,7 @@ Both attempts share one ordinal and cumulative usage; budget preflight runs agai
 
 `continuationFallback` opts into one opposite-provider handoff after authoritative unavailability and progress. Ineligible or pre-inference failure is terminal, never a same-provider wait. Usage stays cumulative on one logical ID, including retained-call refusal; attempts store only their generation delta. Budgets stay fixed.
 
-A progressed record forbids primary replay but cannot authorize replacement. The handoff proves checkout before dispatch. Admission rechecks readiness and capabilities, then checkout and budget under the startup deadline. Completed replay spends nothing; interrupted handoff replay runs only the replacement and requires the exact source budget. Missing/diverged proof fails closed. Manual suffix restart cannot discard an agent progressed checkpoint; peer-question ordinals do not count. Cancellation covers admission, replacement, and retained calls. `/workflows` keeps continued, fallback, and waiting distinct.
+A progressed record forbids primary replay but cannot authorize replacement. The handoff proves checkout before dispatch. Admission rechecks readiness and capabilities, then checkout and budget under the startup deadline. Only a bound completion replays free; interrupted handoff replay runs only the replacement and requires the source budget. Missing/diverged proof fails closed. Manual suffix restart cannot discard an agent progressed checkpoint; peer-question ordinals do not count. Cancellation covers admission, replacement, and retained calls. `/workflows` keeps continued, fallback, and waiting distinct.
 
 ## Recovery
 

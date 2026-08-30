@@ -26,7 +26,8 @@ import type { WorkflowCheckoutProof } from "../src/workflows/checkout.ts";
 import type { WorkflowCheckoutOperations } from "../src/workflows/manager.ts";
 import type { ProviderStatus, ProviderStatusReader, ProviderStatusRequest } from "../src/provider-status.ts";
 import type { ManagedProcess } from "../src/process-tree.ts";
-import type { WorkflowSnapshot } from "../src/workflows/types.ts";
+import type { WorkflowJournalRecord, WorkflowSnapshot } from "../src/workflows/types.ts";
+import { appendWorkflowJournal } from "../src/workflows/artifacts.ts";
 import {
   harnessAvailability,
   type HarnessAvailability,
@@ -67,6 +68,37 @@ export class GatedManagedProcess implements ManagedProcess {
 
   release(): void {
     this.#release();
+  }
+}
+
+/** Persists one completed peer answer, then holds its append promise so tests
+ * can dismiss the source interaction in the exact post-write race window. */
+export class GatedWorkflowJournalAppender {
+  #armed = false;
+  #reached = false;
+  #resolveReached!: () => void;
+  #resolveRelease!: () => void;
+  readonly #reachedPromise = new Promise<void>((resolve) => { this.#resolveReached = resolve; });
+  readonly #releasePromise = new Promise<void>((resolve) => { this.#resolveRelease = resolve; });
+
+  readonly append = async (root: string, runId: string, record: WorkflowJournalRecord): Promise<void> => {
+    await appendWorkflowJournal(root, runId, record);
+    if (!this.#armed || this.#reached || record.kind !== "peerQuestion" || record.state !== "completed") return;
+    this.#reached = true;
+    this.#resolveReached();
+    await this.#releasePromise;
+  };
+
+  arm(): void {
+    this.#armed = true;
+  }
+
+  waitUntilReached(): Promise<void> {
+    return this.#reached ? Promise.resolve() : this.#reachedPromise;
+  }
+
+  release(): void {
+    this.#resolveRelease();
   }
 }
 
@@ -618,6 +650,7 @@ export class ControlledBackend implements Backend {
   readonly #startWaiters = new Set<() => void>();
   readonly #sendWaiters = new Set<() => void>();
   readonly #cancellationGates = new Map<string, ControlledCancellationGate>();
+  readonly #closeFailures = new Map<string, Error>();
   active = 0;
   maxActive = 0;
 
@@ -698,7 +731,11 @@ export class ControlledBackend implements Backend {
         emit({ type: "cancelled", reason });
         run.settle();
       },
-      close: async () => { this.closes.push(request.jobId); },
+      close: async () => {
+        this.closes.push(request.jobId);
+        const error = this.#closeFailures.get(request.jobId);
+        if (error) throw error;
+      },
     };
   }
 
@@ -733,6 +770,12 @@ export class ControlledBackend implements Backend {
       waitUntilReached: () => gate.reached ? Promise.resolve() : gate.reachedPromise,
       release: gate.release,
     };
+  }
+
+  /** Makes strict retained-session cleanup fail for one job. */
+  failClose(jobId: string, message: string): void {
+    assert.ok(this.runs.has(jobId), `backend never started job ${jobId}`);
+    this.#closeFailures.set(jobId, new Error(message));
   }
 
   requestForTask(task: string): BackendRequest | undefined {

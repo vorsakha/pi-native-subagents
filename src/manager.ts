@@ -32,6 +32,8 @@ interface InternalJob {
   request: SpawnRequest;
   policy: ReturnType<typeof compilePolicy>["policy"];
   run?: BackendRun;
+  /** Failed automatic teardown retained for strict workflow settlement. */
+  cleanupError?: Error;
   cancelRequested?: string;
   operation?: Promise<void>;
   cancelling?: boolean;
@@ -476,16 +478,28 @@ export class JobManager {
     if (!job.snapshot.workflow) throw new Error(`Cannot settle ${id}: job is not workflow-owned`);
     if (job.snapshot.status !== "failed") throw new Error(`Cannot settle ${id}: job is ${job.snapshot.status}`);
     const run = job.run;
-    if (!run) return clone(job.snapshot);
+    if (!run) {
+      if (job.cleanupError) throw job.cleanupError;
+      return clone(job.snapshot);
+    }
     await this.#serialize(job, async () => {
-      if (job.run !== run) return;
+      if (job.run !== run) {
+        if (job.cleanupError) throw job.cleanupError;
+        return;
+      }
       try {
         await withDeadline(Promise.all([run.close(), run.completed]).then(() => undefined), this.#operationTimeoutMs, "Harness settlement");
       } catch (error) {
-        if (!(error instanceof OperationDeadlineError)) throw error;
-        if (!run.forceClose) throw error;
-        await withDeadline(Promise.all([run.forceClose(), run.completed]).then(() => undefined), Math.min(1_000, this.#operationTimeoutMs), "Harness force-close");
+        try {
+          if (!(error instanceof OperationDeadlineError)) throw error;
+          if (!run.forceClose) throw error;
+          await withDeadline(Promise.all([run.forceClose(), run.completed]).then(() => undefined), Math.min(1_000, this.#operationTimeoutMs), "Harness force-close");
+        } catch (cleanupError) {
+          job.cleanupError = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError));
+          throw cleanupError;
+        }
       }
+      job.cleanupError = undefined;
       if (job.run === run) job.run = undefined;
     });
     return clone(job.snapshot);
@@ -796,6 +810,7 @@ export class JobManager {
         return;
       }
       job.run = startedRun;
+      job.cleanupError = undefined;
       job.startupController = undefined;
       this.#resolveRunWaiters(job, job.run);
       const deferredTerminal = job.deferredStartupTerminal;
@@ -824,7 +839,17 @@ export class JobManager {
       const run = job.run;
       const advanced = job.snapshot.generation !== generation;
       if (!advanced && (job.snapshot.status !== "completed" || !run || job.cancelRequested)) {
-        if (run) await this.#serialize(job, () => run.close()).catch(() => undefined);
+        if (run) {
+          await this.#serialize(job, async () => {
+            try {
+              await run.close();
+              job.cleanupError = undefined;
+            } catch (error) {
+              job.cleanupError = error instanceof Error ? error : new Error(String(error));
+              throw error;
+            }
+          }).catch(() => undefined);
+        }
         job.run = undefined;
       }
       this.#releaseLease(job);
@@ -852,7 +877,15 @@ export class JobManager {
     } finally {
       const advanced = job.snapshot.generation !== generation;
       if (!advanced && (job.snapshot.status !== "completed" || job.run !== run)) {
-        await this.#serialize(job, () => run.close()).catch(() => undefined);
+        await this.#serialize(job, async () => {
+          try {
+            await run.close();
+            job.cleanupError = undefined;
+          } catch (error) {
+            job.cleanupError = error instanceof Error ? error : new Error(String(error));
+            throw error;
+          }
+        }).catch(() => undefined);
         if (job.run === run) job.run = undefined;
       }
       this.#releaseLease(job);
