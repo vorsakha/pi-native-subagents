@@ -1575,9 +1575,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
       ...(advisor.context ? [this.theme.fg("dim", `Context · ${boundedInline(advisor.context, 2_000)}`)] : []),
     ];
     const visiblePinned = pinned.slice(0, Math.max(0, rows - MIN_SCROLLABLE_DETAIL_ROWS));
-    const body = String(advisor.output ?? "(no advisor output)")
-      .split("\n")
-      .map((line) => truncateWorkflowDashboardLine(this.theme.fg("toolOutput", line), width));
+    const body = this.renderMarkdownLines(String(advisor.output ?? "(no advisor output)"), width);
     const resultRows = this.renderScrollableBody(
       body,
       rows - visiblePinned.length,

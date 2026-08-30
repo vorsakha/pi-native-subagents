@@ -140,6 +140,8 @@ export interface BackendRequest {
   signal: AbortSignal;
   /** Existing native lineage to resume. The harness must match `policy.harness`. */
   continuation?: NativeContinuation;
+  /** Previously accounted cumulative usage for that exact native lineage. */
+  initialUsage?: Usage;
   /** When true, the initial message is sent verbatim instead of prefixed with the generic "Task:" wrapper. */
   rawInitialMessage?: boolean;
   /** Read-only spawn-time snapshot available only to human /subagent jobs through parent_thread_context. */

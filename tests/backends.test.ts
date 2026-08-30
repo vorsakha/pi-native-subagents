@@ -157,6 +157,13 @@ process.stdin.on("data", chunk => {
         process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params }) + "\\n");
         process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params }) + "\\n");
       }
+      if (process.env.MODE === "resume-usage") {
+        process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: id, tokenUsage: {
+          total: { inputTokens: 925, outputTokens: 230, cachedInputTokens: 325, cacheWriteInputTokens: 50 },
+          last: { inputTokens: 75, outputTokens: 30, cachedInputTokens: 25, cacheWriteInputTokens: 0, totalTokens: 105 },
+          modelContextWindow: 200000,
+        } } }) + "\\n");
+      }
       if (process.env.MODE === "latest-turn") {
         process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: id, tokenUsage: {
           total: { inputTokens: 900000, outputTokens: 50000, cachedInputTokens: 800000 },
@@ -1647,6 +1654,31 @@ test("Codex resumes an exact native thread without silently starting a replaceme
     });
     assert.match(resumeParams.developerInstructions, /remain read-only/);
     assert.ok(events.some((event) => event.type === "started" && event.backendSessionId === "thread-1"));
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex resume subtracts already-accounted native thread usage", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
+  try {
+    const resumed = request("codex", fake.dir, { ...process.env, MODE: "resume-usage" });
+    resumed.continuation = { harness: "codex", threadId: "thread-1" };
+    resumed.initialUsage = { input: 500, output: 200, cacheRead: 300, cacheWrite: 50, cost: 0, turns: 4 };
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 5_000 })
+      .start(resumed, (event) => events.push(event));
+    await run.completed;
+    const usage = events.filter((event): event is Extract<BackendEvent, { type: "usage" }> => event.type === "usage")
+      .reduce((total, event) => ({
+        input: total.input + (event.usage.input ?? 0),
+        output: total.output + (event.usage.output ?? 0),
+        cacheRead: total.cacheRead + (event.usage.cacheRead ?? 0),
+        cacheWrite: total.cacheWrite + (event.usage.cacheWrite ?? 0),
+      }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+    assert.deepEqual(usage, { input: 50, output: 30, cacheRead: 25, cacheWrite: 0 });
   } finally {
     await run?.close();
     await rm(fake.dir, { recursive: true, force: true });

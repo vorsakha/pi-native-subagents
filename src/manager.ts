@@ -956,6 +956,7 @@ export class JobManager {
           signal: startupController.signal,
           continuation: job.request.continuation
             ?? (job.request.peer ? { harness: "pi", sessionFile: job.request.peer.sessionFile } : undefined),
+          initialUsage: job.request.initialUsage,
           rawInitialMessage: job.request.peer ? true : undefined,
           parentThread: job.request.parentThread,
           interactions: job.request.interaction ? this.#interactionHandler(job) : undefined,

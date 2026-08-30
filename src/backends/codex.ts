@@ -399,7 +399,14 @@ export class CodexAppServerBackend implements Backend {
     let closing = false;
     let cancellingReason: string | undefined;
     let protocolFailure: string | undefined;
-    let previousTokenTotals: CodexTokenTotals | undefined;
+    let previousTokenTotals: CodexTokenTotals | undefined = request.continuation?.harness === "codex" && request.initialUsage
+      ? {
+          input: request.initialUsage.input + request.initialUsage.cacheRead + request.initialUsage.cacheWrite,
+          output: request.initialUsage.output,
+          cacheRead: request.initialUsage.cacheRead,
+          cacheWrite: request.initialUsage.cacheWrite,
+        }
+      : undefined;
     /** Model identity reported by the runtime; never seeded from configured policy. */
     let servingModel: string | undefined;
     /** Latest occupancy gauge; carried over (not recomputed) by events that are not a new reading, e.g. a reroute. */

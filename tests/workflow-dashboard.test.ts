@@ -436,6 +436,42 @@ test("workflow advisor output uses the shared scroll viewport instead of truncat
   assert.match(state.overlay.render(72).join("\n"), /advisor output [1-9]/);
 });
 
+test("workflow advisor output wraps wide lines before scrolling", (t) => {
+  const run = workflow("advisor-wide", "completed");
+  run.agents = [];
+  run.phases[0]!.agents = [];
+  run.phases[0]!.advisorConsultations = [0];
+  const suffix = "WIDE-ADVISOR-SUFFIX";
+  run.advisorConsultations = [{
+    index: 0,
+    callIndex: 0,
+    callFingerprint: `sha256:${"b".repeat(64)}`,
+    advisorId: "adv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    advisorName: "Architecture advisor",
+    lineage: 0,
+    generation: 1,
+    phase: 0,
+    state: "completed",
+    timestamps: { createdAt: 1_000, startedAt: 2_000, updatedAt: 3_000, endedAt: 3_000 },
+    prompt: "Inspect the wide result",
+    output: `${"wide paragraph ".repeat(80)}${suffix}`,
+    harness: "codex",
+    usage: { input: 10, output: 40, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+    queuedMs: 1,
+    outputProvenance: "advisor",
+  }];
+  const state = harness([run], 16, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+  openOutline(state.overlay, 52);
+  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput(ENTER);
+  assert.match(state.overlay.render(52).join("\n"), new RegExp(suffix));
+  state.overlay.handleInput("g");
+  assert.doesNotMatch(state.overlay.render(52).join("\n"), new RegExp(suffix));
+  state.overlay.handleInput("G");
+  assert.match(state.overlay.render(52).join("\n"), new RegExp(suffix));
+});
+
 test("minimum-width live run and agent cancellation keep Unicode controls visible through confirmation", (t) => {
   const runState = harness([workflow("cancel-run")], 30, () => {}, { fullscreen: true });
   runState.manager.list()[0]!.name = "Release 你好👩🏽‍💻";

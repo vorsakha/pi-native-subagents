@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, readFile, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { AdvisorRegistry, FileAdvisorStore } from "../src/advisors.ts";
+import { AdvisorRegistry, FileAdvisorStore, relativePathEscapesRoot } from "../src/advisors.ts";
 import { JobManager } from "../src/manager.ts";
 import {
   ControlledBackend,
@@ -186,7 +186,7 @@ test("idle advisors release provider resources and lazily resume only their reco
   await backend.waitForStart();
   const firstJob = backend.starts[0]!;
   backend.emitContinuation(firstJob, "codex-hibernate");
-  backend.complete(firstJob, "remembered");
+  backend.complete(firstJob, "remembered", { input: 12, output: 3, turns: 1 });
   await first;
   await delay(40);
   assert.equal(registry.get(threadId, opened.id, true).state, "hibernated");
@@ -200,6 +200,7 @@ test("idle advisors release provider resources and lazily resume only their reco
     threadId: "codex-hibernate",
     sessionFile: "/private/codex-hibernate.jsonl",
   });
+  assert.deepEqual(request.initialUsage, { input: 12, output: 3, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 });
   assert.equal(jobs.checkAdvisorJob(request.jobId, opened.id).generation, 1);
   backend.emitContinuation(request.jobId, "codex-hibernate");
   backend.complete(request.jobId, "remember this");
@@ -216,6 +217,7 @@ test("missing or failed continuation becomes explicitly unavailable until retry 
   await firstRuntime.backend.waitForStart();
   firstRuntime.backend.complete(firstRuntime.backend.starts[0]!, "answer without continuation", { input: 7, output: 2, turns: 1 });
   assert.equal((await first).ok, true, "the completed answer remains usable");
+  assert.ok(firstRuntime.backend.closes.includes(firstRuntime.backend.starts[0]!), "an unusable continuation-free native run is released immediately");
   assert.equal(firstRuntime.registry.get(threadId, opened.id, true).state, "unavailable");
   await assert.rejects(
     firstRuntime.registry.consult({ threadId, advisorId: opened.id, question: "again", sender: "human", trusted: true }),
@@ -270,6 +272,47 @@ test("route failure preserves identity and continuation for an explicit same-lin
   backend.complete(request.jobId, "recovered");
   assert.equal((await retry).ok, true);
   assert.equal(registry.get(threadId, opened.id, true).lineage, 0);
+  await registry.shutdown();
+  await jobs.shutdown();
+});
+
+test("an unavailable retry cannot clear its recovery gate before cumulative budget admission", async () => {
+  const { backend, jobs, registry } = setup();
+  const opened = await openSecurity(registry);
+  const first = registry.consult({ threadId, advisorId: opened.id, question: "establish budgeted lineage", sender: "human", trusted: true });
+  await backend.waitForStart();
+  const jobId = backend.starts[0]!;
+  backend.emitContinuation(jobId, "budgeted-retry-thread");
+  backend.complete(jobId, "established", { input: 20, turns: 1 });
+  await first;
+
+  const failed = registry.consult({ threadId, advisorId: opened.id, question: "consume the remaining budget", sender: "human", trusted: true });
+  await waitFor(() => backend.sends.length === 1, "retained advisor follow-up");
+  backend.emit(jobId, { type: "usage", usage: { input: 60 } });
+  backend.fail(jobId, "provider failure at the immutable budget");
+  assert.equal((await failed).ok, false);
+  const unavailable = registry.get(threadId, opened.id, true);
+  assert.equal(unavailable.state, "unavailable");
+  assert.equal(unavailable.usage.input, 80);
+
+  await assert.rejects(registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "explicit retry cannot pass budget admission",
+    sender: "human",
+    trusted: true,
+    retryUnavailable: true,
+  }), /budget.*tokens limit/i);
+  const afterBudgetRejection = registry.get(threadId, opened.id, true);
+  assert.equal(afterBudgetRejection.state, "unavailable");
+  assert.equal(afterBudgetRejection.error, unavailable.error);
+  await assert.rejects(registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "retry gate remains explicit",
+    sender: "human",
+    trusted: true,
+  }), /retryUnavailable/);
   await registry.shutdown();
   await jobs.shutdown();
 });
@@ -531,6 +574,48 @@ test("thread rosters persist privately with typed continuations while public sta
   }
 });
 
+test("restoration rejects malformed bounded records and ambiguous advisor identities", async () => {
+  const store = new MemoryAdvisorStore();
+  const first = setup({ store });
+  const opened = await openSecurity(first.registry);
+  const consultation = first.registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "create a bounded ledger entry",
+    sender: "human",
+    trusted: true,
+  });
+  await first.backend.waitForStart();
+  first.backend.emitContinuation(first.backend.starts[0]!, "validation-thread");
+  first.backend.complete(first.backend.starts[0]!, "bounded answer");
+  await consultation;
+  await first.registry.open({
+    threadId,
+    name: "Privacy",
+    aliases: ["private-review"],
+    description: "Review persisted privacy constraints",
+    cwd: process.cwd(),
+    trusted: true,
+    harness: "codex",
+  });
+  await first.registry.shutdown();
+  await first.jobs.shutdown();
+  const valid = structuredClone(store.records.get(threadId)!);
+
+  const expectInvalid = async (mutate: (records: typeof valid) => void) => {
+    const records = structuredClone(valid);
+    mutate(records);
+    store.records.set(threadId, records);
+    const runtime = setup({ store });
+    await assert.rejects(runtime.registry.initialize(), /Invalid advisor state/);
+    await runtime.jobs.shutdown();
+  };
+  await expectInvalid((records) => { records[0]!.ledger[0]!.output = "x".repeat(4_001); });
+  await expectInvalid((records) => { records[0]!.updatedAt = -1; });
+  await expectInvalid((records) => { records[0]!.name = "x".repeat(161); });
+  await expectInvalid((records) => { records[1]!.aliases = [...records[1]!.aliases, records[0]!.aliases[0]!]; });
+});
+
 test("malformed stored continuations preserve the advisor roster as explicitly unavailable", async () => {
   const root = await tempDir("advisor-invalid-continuation");
   const store = new FileAdvisorStore(root);
@@ -561,7 +646,7 @@ test("malformed stored continuations preserve the advisor roster as explicitly u
     assert.ok(file);
     const path = join(root, file);
     const payload = JSON.parse(await readFile(path, "utf8")) as { advisors: Array<Record<string, unknown>> };
-    payload.advisors[0]!.continuation = { harness: "claude", sessionId: "wrong-harness-private-id" };
+    payload.advisors[0]!.continuation = { harness: "claude", sessionId: 7 };
     await writeFile(path, JSON.stringify(payload), { mode: 0o600 });
 
     const restoredBackend = new ControlledBackend("codex");
@@ -718,6 +803,12 @@ test("restored advisors trim only profile boundaries and preserve internal white
   await restored.jobs.shutdown();
 });
 
+test("Windows cross-volume relative paths fail advisor cwd containment", () => {
+  assert.equal(relativePathEscapesRoot("D:\\outside", "win32"), true);
+  assert.equal(relativePathEscapesRoot("review\\nested", "win32"), false);
+  assert.equal(relativePathEscapesRoot("..\\outside", "win32"), true);
+});
+
 test("advisor private persistence rejects symlinked roots and state files", async () => {
   const base = await tempDir("advisor-symlink-store");
   const redirected = await tempDir("advisor-symlink-target");
@@ -739,9 +830,10 @@ test("advisor private persistence rejects symlinked roots and state files", asyn
     const portable = new FileAdvisorStore(portableRoot, portableBase, { descriptorAnchoring: false });
     await portable.save(threadId, []);
     assert.deepEqual(await portable.load(threadId), [], "platforms without descriptor paths retain private-store functionality");
-    await rm(join(portableBase, "native-subagents"), { recursive: true });
     await symlink(redirected, join(portableBase, "native-subagents"), "dir");
-    await assert.rejects(portable.save(threadId, []), /private directory|identity changed/i);
+    await portable.save(threadId, []);
+    assert.deepEqual(await portable.load(threadId), []);
+    assert.deepEqual(await readdir(redirected), [], "portable storage never traverses replaceable nested components");
 
     const root = join(base, "private");
     const store = new FileAdvisorStore(root);

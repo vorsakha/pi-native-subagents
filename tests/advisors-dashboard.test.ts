@@ -7,7 +7,7 @@ import { advisorSnapshotFixture, theme, tick } from "./helpers.ts";
 const ENTER = "\r";
 const ESCAPE = "\u001b";
 
-function harness(options: { advisors?: number; rows?: number } = {}) {
+function harness(options: { advisors?: number; rows?: number; answer?: string } = {}) {
   const count = options.advisors ?? 1;
   const roster = Array.from({ length: count }, (_, index) => advisorSnapshotFixture(count === 1 ? {} : {
     id: `adv_${index.toString(16).padStart(32, "0")}`,
@@ -30,7 +30,7 @@ function harness(options: { advisors?: number; rows?: number } = {}) {
         advisorName: roster[0]!.name,
         lineage: 1,
         generation: 4,
-        output: "Keep it read-only.",
+        output: options.answer ?? "Keep it read-only.",
         route: { harness: "claude" },
         queuedMs: 0,
       };
@@ -92,7 +92,8 @@ test("advisor dashboard keeps ask, explicit reset, close confirmation, and Escap
   state.dashboard.handleInput(ENTER);
   await tick();
   assert.deepEqual(state.calls, ["Review this"]);
-  assert.match(state.dashboard.render(72).join("\n"), /Answer.*Keep it read-only/);
+  assert.match(state.dashboard.render(72).join("\n"), /Advisor answer[\s\S]*Keep it read-only/);
+  state.dashboard.handleInput(ESCAPE);
 
   state.dashboard.handleInput("r");
   assert.match(state.dashboard.render(72).join("\n"), /Reset this lineage explicitly/);
@@ -112,6 +113,28 @@ test("advisor dashboard keeps ask, explicit reset, close confirmation, and Escap
 
   state.dashboard.handleInput(ESCAPE);
   assert.equal(state.closed, 1);
+});
+
+test("advisor answers and persisted latest results remain readable through a wrapped scroll viewport", async () => {
+  const suffix = "HUMAN-ADVISOR-SUFFIX";
+  const answer = `${"substantive advisor guidance ".repeat(80)}${suffix}`;
+  const state = harness({ rows: 12, answer });
+  state.dashboard.handleInput("a");
+  for (const character of "Review this boundary") state.dashboard.handleInput(character);
+  state.dashboard.handleInput(ENTER);
+  await tick();
+  assert.doesNotMatch(state.dashboard.render(48).join("\n"), new RegExp(suffix));
+  state.dashboard.handleInput("G");
+  assert.match(state.dashboard.render(48).join("\n"), new RegExp(suffix));
+  state.dashboard.handleInput("g");
+  assert.doesNotMatch(state.dashboard.render(48).join("\n"), new RegExp(suffix));
+  state.dashboard.handleInput(ESCAPE);
+
+  state.roster[0]!.ledger.at(-1)!.output = answer;
+  state.dashboard.handleInput(ENTER);
+  state.dashboard.handleInput("G");
+  assert.match(state.dashboard.render(48).join("\n"), new RegExp(suffix), "Enter reopens the persisted latest ledger result");
+  state.dashboard.dispose();
 });
 
 test("advisor dashboard keeps the selected roster row and inspector visible in a short viewport", () => {

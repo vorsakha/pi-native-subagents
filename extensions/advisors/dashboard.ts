@@ -3,6 +3,7 @@ import { Input, Key, matchesKey, truncateToWidth, type Focusable, type Keybindin
 import type { AdvisorConsultResult, AdvisorSnapshot } from "../../src/advisors.ts";
 import { createDashboardFrame, dashboardLayout, dashboardOverlayRows, isFullscreenTui } from "../dashboard-style.ts";
 import { formatUsage, sanitizeInline, shortId } from "../subagents/render.ts";
+import { boundedHeadTailText, renderWorkflowMarkdown } from "../workflows/dashboard-detail.ts";
 
 export interface AdvisorsDashboardManager {
   list(threadId: string, trusted: boolean): AdvisorSnapshot[];
@@ -18,7 +19,7 @@ export interface AdvisorsDashboardManager {
   reset(threadId: string, advisorId: string, trusted: boolean): Promise<AdvisorSnapshot>;
 }
 
-type Mode = "list" | "ask" | "confirm-close" | "confirm-reset";
+type Mode = "list" | "ask" | "answer" | "confirm-close" | "confirm-reset";
 
 export function advisorViewport(
   roster: string[],
@@ -61,6 +62,10 @@ export class AdvisorsDashboard implements Focusable {
   #mode: Mode = "list";
   #input = new Input();
   #message?: string;
+  #answer?: { advisorName: string; text: string };
+  #answerScroll = 0;
+  #answerRows = 0;
+  #answerTotal = 0;
   #focused = false;
 
   constructor(tui: TUI, theme: Theme, keybindings: KeybindingsManager, manager: AdvisorsDashboardManager, threadId: string, isTrusted: () => boolean, done: () => void) {
@@ -108,6 +113,19 @@ export class AdvisorsDashboard implements Focusable {
       this.#tui.requestRender();
       return;
     }
+    if (this.#mode === "answer") {
+      if (cancel) {
+        this.#mode = "list";
+        this.#answer = undefined;
+      } else if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.#scrollAnswer(-1);
+      else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.#scrollAnswer(1);
+      else if (matchesKey(data, Key.pageUp)) this.#scrollAnswer(-Math.max(1, this.#answerRows - 1));
+      else if (matchesKey(data, Key.pageDown)) this.#scrollAnswer(Math.max(1, this.#answerRows - 1));
+      else if (matchesKey(data, "g")) this.#answerScroll = 0;
+      else if (matchesKey(data, Key.shift("g"))) this.#answerScroll = Math.max(0, this.#answerTotal - this.#answerRows);
+      this.#tui.requestRender();
+      return;
+    }
     if (this.#mode === "confirm-close" || this.#mode === "confirm-reset") {
       if (cancel) this.#mode = "list";
       else if (matchesKey(data, Key.enter) || this.#keybindings.matches(data, "tui.select.confirm")) void this.#confirm();
@@ -129,6 +147,7 @@ export class AdvisorsDashboard implements Focusable {
       this.#message = undefined;
     } else if (matchesKey(data, "x") && this.#selected()) this.#mode = "confirm-close";
     else if (matchesKey(data, "r") && this.#selected()) this.#mode = "confirm-reset";
+    else if ((matchesKey(data, Key.enter) || matchesKey(data, "v")) && this.#selected()) this.#showLatest();
     this.#tui.requestRender();
   }
 
@@ -144,6 +163,7 @@ export class AdvisorsDashboard implements Focusable {
       lines.push(frame.bottom(), frame.hint("Esc close"));
       return lines.slice(0, rows);
     }
+    if (this.#mode === "answer" && this.#answer) return this.#renderAnswer(frame, layout.contentRows, rows);
     const roster = this.#manager.list(this.#threadId, this.#isTrusted());
     const selected = this.#selected();
     const title = `Thread advisors · ${roster.length}/${16}`;
@@ -176,7 +196,7 @@ export class AdvisorsDashboard implements Focusable {
     const lines = [frame.header(title, "read-only retained specialists"), frame.top("roster / inspector")];
     for (let index = 0; index < layout.contentRows; index++) lines.push(frame.row(truncateToWidth(visible[index] ?? "", frame.innerWidth, "…")));
     lines.push(frame.bottom());
-    lines.push(frame.hint(this.#mode === "list" ? "Esc close · j/k move · a ask · x close · r reset" : "Esc cancel · Enter confirm/submit"));
+    lines.push(frame.hint(this.#mode === "list" ? "Esc close · j/k move · Enter latest · a ask · x close · r reset" : "Esc cancel · Enter confirm/submit"));
     return lines.slice(0, rows);
   }
 
@@ -202,11 +222,54 @@ export class AdvisorsDashboard implements Focusable {
     this.#tui.requestRender();
     try {
       const result = await this.#manager.consult({ threadId: this.#threadId, advisorId: advisor.id, question, sender: "human", trusted: this.#isTrusted() });
-      this.#message = result.ok ? `Answer · ${sanitizeInline(result.output)}` : this.#theme.fg("error", `Error · ${sanitizeInline(result.error ?? "consultation failed")}`);
+      if (result.ok) {
+        this.#answer = { advisorName: result.advisorName, text: result.output || "(no advisor output)" };
+        this.#answerScroll = 0;
+        this.#mode = "answer";
+        this.#message = undefined;
+      } else this.#message = this.#theme.fg("error", `Error · ${sanitizeInline(result.error ?? "consultation failed")}`);
     } catch (error) {
       this.#message = this.#theme.fg("error", `Error · ${sanitizeInline(error instanceof Error ? error.message : String(error))}`);
     }
     this.#tui.requestRender();
+  }
+
+  #showLatest(): void {
+    const advisor = this.#selected();
+    const latest = advisor?.ledger.at(-1);
+    if (!advisor || !latest) return;
+    this.#answer = {
+      advisorName: advisor.name,
+      text: latest.output ?? latest.error ?? latest.question,
+    };
+    this.#answerScroll = 0;
+    this.#mode = "answer";
+  }
+
+  #scrollAnswer(delta: number): void {
+    const max = Math.max(0, this.#answerTotal - this.#answerRows);
+    this.#answerScroll = Math.max(0, Math.min(max, this.#answerScroll + delta));
+  }
+
+  #renderAnswer(frame: ReturnType<typeof createDashboardFrame>, contentRows: number, rows: number): string[] {
+    const answer = this.#answer!;
+    const body = renderWorkflowMarkdown(boundedHeadTailText(answer.text, 16 * 1024, "advisor answer"), frame.innerWidth);
+    this.#answerRows = Math.max(0, contentRows - 1);
+    this.#answerTotal = body.length;
+    this.#answerScroll = Math.min(this.#answerScroll, Math.max(0, body.length - this.#answerRows));
+    const end = Math.min(body.length, this.#answerScroll + this.#answerRows);
+    const range = this.#answerRows ? `${this.#answerScroll + 1}–${end}` : "0";
+    const visible = [
+      this.#theme.fg("dim", `Answer ${range}/${body.length} · j/k/PgUp/PgDn · g/G`),
+      ...body.slice(this.#answerScroll, end),
+    ];
+    const lines = [
+      frame.header(`Advisor answer · ${sanitizeInline(answer.advisorName)}`, "read-only specialist"),
+      frame.top("answer detail"),
+    ];
+    for (let index = 0; index < contentRows; index++) lines.push(frame.row(truncateToWidth(visible[index] ?? "", frame.innerWidth, "")));
+    lines.push(frame.bottom(), frame.hint("Esc back · j/k scroll · PgUp/PgDn · g/G"));
+    return lines.slice(0, rows);
   }
 
   async #confirm(): Promise<void> {
