@@ -8,7 +8,7 @@ import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
 import { availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, ScriptedHarnessAvailability, tempDir, tick, waitFor } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
-import { workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint } from "../src/workflows/journal.ts";
+import { workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint, workflowInteractionFingerprint } from "../src/workflows/journal.ts";
 import {
   aggregateWorkflowUsage,
   WorkflowManager,
@@ -1181,6 +1181,61 @@ test("restarts a selected agent by replaying its prefix and invalidating its suf
   }
 });
 
+test("peer-question continuation provenance cannot block an unrelated agent suffix restart", async () => {
+  const f = await fixture();
+  const script = `export default async () => {
+    const first = await agent("peer ordinal first", { access: "readOnly" });
+    return agent("peer ordinal second:" + first.output, { access: "readOnly" });
+  };`;
+  try {
+    const source = await f.workflows.start(f.request(script));
+    await waitFor(() => f.backend.requests.length === 1, "first source call");
+    f.backend.completeTask("peer ordinal first", "one");
+    await waitFor(() => f.backend.requests.length === 2, "second source call");
+    f.backend.completeTask("peer ordinal second:one", "two");
+    const sourceFinal = await source.completion;
+    const journal = await loadWorkflowJournal(f.artifactRoot, sourceFinal.runId);
+    const sequence = Math.max(...journal.map((record) => record.sequence)) + 1;
+    const question = workflowInteractionFingerprint({ question: "peer ordinal collision" });
+    const interaction = {
+      sourceAgentIndex: 0,
+      sourceGeneration: 0,
+      targetAgentIndex: 0,
+      targetJobId: sourceFinal.agents[0]!.jobId,
+      targetCallFingerprint: sourceFinal.agents[0]!.callFingerprint,
+    };
+    await appendWorkflowJournal(f.artifactRoot, sourceFinal.runId, {
+      version: 1, sequence, callIndex: 1, fingerprint: question, kind: "peerQuestion", state: "started", at: Date.now(),
+      agentIndex: 0, interaction,
+    });
+    await appendWorkflowJournal(f.artifactRoot, sourceFinal.runId, {
+      version: 1, sequence: sequence + 1, callIndex: 1, fingerprint: question, kind: "peerQuestion", state: "completed", at: Date.now(),
+      agentIndex: 0,
+      interaction: { ...interaction, targetGeneration: 1, route: "peer" },
+      result: { ok: true, output: "peer answer" },
+      route: {
+        jobId: sourceFinal.agents[0]!.jobId,
+        logicalJobId: sourceFinal.agents[0]!.logicalJobId,
+        harness: "codex",
+        continuation: {
+          state: "completed", fromHarness: "claude", toHarness: "codex",
+          failedJobId: "historical-failed-job", replacementJobId: sourceFinal.agents[0]!.jobId,
+          checkpointAt: Date.now(), checkoutDigest: `sha256:${"a".repeat(64)}`,
+          trigger: { source: "continuation", provider: "claude", kind: "quota", detail: "historical peer continuation" },
+          warning: "historical peer continuation",
+        },
+      },
+    });
+
+    const restarted = await f.workflows.restartAgent(sourceFinal.runId, sourceFinal.agents[1]!.index);
+    await waitFor(() => f.backend.activeRuns().length === 1, "restarted suffix after peer record");
+    f.backend.complete(f.backend.activeRuns()[0]!.request.jobId, "restarted second");
+    assert.equal((await restarted.completion).status, "completed");
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("cancels both running and queued workflow jobs", async () => {
   const f = await fixture(1);
   try {
@@ -2085,6 +2140,7 @@ test("cancellation at a durable handoff prevents replacement, and replay resumes
     f.backend.complete(f.backend.starts[0]!, "resumed continuation");
     const resumedFinal = await resumed.completion;
     assert.equal((resumedFinal.result as { ok: boolean }).ok, true);
+    assert.equal((resumedFinal.result as { jobId: string }).jobId, primary, "handoff replay preserves the original logical ID");
 
     await writeFile(join(f.cwd, "tracked.txt"), "diverged after checkpoint\n");
     const targetDispatches = f.backend.requests.length;
@@ -2137,7 +2193,9 @@ test("replayed follow-up handoff archives only the failed generation usage delta
       const first = await agent("usage lineage", {
         harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
       });
-      return followUp(first.jobId, "progressed follow-up");
+      const continued = await followUp(first.jobId, "progressed follow-up");
+      if (!continued.ok) return continued;
+      return followUp(continued.jobId, "follow replayed continuation");
     };`;
     const started = await f.workflows.start(f.request(script));
     await f.claude.waitForStart();
@@ -2161,12 +2219,74 @@ test("replayed follow-up handoff archives only the failed generation usage delta
 
     const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: source.runId }));
     await f.backend.waitForStart();
-    f.backend.complete(f.backend.starts[0]!, "continued", { input: 3, output: 2, turns: 1 });
+    const replacement = f.backend.starts[0]!;
+    f.backend.complete(replacement, "continued", { input: 3, output: 2, turns: 1 });
+    await f.backend.waitForSend();
+    assert.equal(f.backend.sends[0]?.id, replacement, "logical owner rebinds to the retained replacement");
+    f.backend.complete(replacement, "followed", { input: 1, output: 1, turns: 1 });
     const final = await resumed.completion;
     assert.equal((final.result as { ok: boolean }).ok, true);
+    assert.equal((final.result as { jobId: string }).jobId, primary);
     assert.deepEqual(final.agents[0]?.attempts?.[0]?.usage, {
       input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1,
     });
+  } finally {
+    availability.release();
+    await f.cleanup();
+  }
+});
+
+test("interrupted continuation handoffs keep every original workflow budget ceiling", async () => {
+  const availability = new GatedHarnessAvailability("codex", {
+    claude: availabilityFixture("claude"),
+    codex: availabilityFixture("codex"),
+  });
+  const f = await fixture(4, undefined, undefined, undefined, availability);
+  const budget = {
+    maxAgents: 2,
+    maxConcurrency: 1,
+    maxTokens: 100,
+    maxTokensPerAgent: 50,
+    maxCost: 10,
+    maxTurns: 5,
+  };
+  try {
+    await initializeGitCheckout(f.cwd);
+    const script = `export default async () => agent("fixed continuation budget", {
+      harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+    });`;
+    const started = await f.workflows.start(f.request(script, { budget }));
+    await f.claude.waitForStart();
+    const primary = f.claude.starts[0]!;
+    f.claude.emit(primary, { type: "message", text: "progress" });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+    await availability.waitUntilReached();
+    const cancellation = f.workflows.cancel(started.snapshot.runId, "retain interrupted handoff");
+    availability.release();
+    const source = await cancellation;
+    const journalPath = join(source.artifactDir, "journal.jsonl");
+    const records = (await readFile(journalPath, "utf8")).trim().split("\n")
+      .map((line) => JSON.parse(line) as { state: string });
+    const handoffIndex = records.findIndex((record) => record.state === "handoff");
+    assert.ok(handoffIndex >= 0);
+    await writeFile(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
+
+    const widened = [
+      undefined,
+      { ...budget, maxAgents: 3 },
+      { ...budget, maxConcurrency: 2 },
+      { ...budget, maxTokens: 101 },
+      { ...budget, maxTokensPerAgent: 51 },
+      { ...budget, maxCost: 11 },
+      { ...budget, maxTurns: 6 },
+    ];
+    for (const candidate of widened) {
+      await assert.rejects(
+        f.workflows.start(f.request(script, { resumeFromRunId: source.runId, budget: candidate })),
+        /does not match the replay source.*budget/i,
+      );
+    }
+    assert.equal(f.backend.requests.length, 0, "no widened replay dispatches the replacement");
   } finally {
     availability.release();
     await f.cleanup();

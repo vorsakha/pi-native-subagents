@@ -162,6 +162,14 @@ interface RenderedAgentProof {
   focus: AgentRenderFocus;
 }
 
+function agentCanRestart(agent: WorkflowAgentRecord | undefined): agent is WorkflowAgentRecord {
+  return !!agent
+    && agent.callIndex !== undefined
+    && agent.progressedCheckpoint !== true
+    && agent.continuation === undefined
+    && !agent.attempts?.some((attempt) => attempt.disposition === "continuation");
+}
+
 export function createWorkflowsDashboardOverlay(
   tui: Pick<TUI, "requestRender" | "terminal">,
   theme: Theme,
@@ -665,7 +673,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
    */
   private restartAgent(run: WorkflowSnapshot | undefined): void {
     const agent = this.selectedAgent(run);
-    if (!run || agent?.callIndex === undefined || !this.agentActionsVisible(run)) return;
+    if (!run || !agentCanRestart(agent) || !this.agentActionsVisible(run)) return;
     if (!this.agentProofMatches(this.#renderedAgentRestart, run, agent)) return;
     const agentName = sanitizeInline(agent.name);
     const agentIndex = agent.index;
@@ -1181,7 +1189,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const line = (color: Parameters<Theme["fg"]>[0], value: string) =>
       truncateWorkflowDashboardLine(this.theme.fg(color, value), width);
     if (summary.kind === "failure") {
-      const failed = [...run.agents].reverse().find((agent) => agent.state === "failed" && agent.callIndex !== undefined);
+      const failed = [...run.agents].reverse().find((agent) => agent.state === "failed" && agentCanRestart(agent));
       const recovery = failed
         ? `select ${sanitizeInline(failed.name)}, then press r to restart that agent`
         : "no run restart action is available here; inspect the failed agent or result";
@@ -1220,7 +1228,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const line = (color: Parameters<Theme["fg"]>[0], value: string) =>
       truncateWorkflowDashboardLine(this.theme.fg(color, value), width);
     if (summary.kind === "failure") {
-      const recovery = agent.callIndex === undefined
+      const recovery = !agentCanRestart(agent)
         ? "no restart action is available for this agent"
         : "press r to restart this agent";
       return [line("error", `Error · ${summary.text}`), line("text", `Recovery · ${recovery}`)];
@@ -1236,12 +1244,12 @@ export class WorkflowsDashboardOverlay implements Focusable {
       return [line("accent", `Latest · ${summary.text}`), line("muted", "Next · monitor here; no human action required")];
     }
     if (agent.state === "completed") {
-      const next = agent.callIndex === undefined
+      const next = !agentCanRestart(agent)
         ? "no human action required"
         : "no human action required; press r only to start a replacement run";
       return [line("success", `Result · ${summary.text}`), line("muted", `Next · ${next}`)];
     }
-    const recovery = agent.callIndex === undefined
+    const recovery = !agentCanRestart(agent)
       ? "no recovery action is available for this agent"
       : "press r to restart this agent";
     return [line("muted", `State · ${summary.text}`), line("muted", `Recovery · ${recovery}`)];
@@ -1686,7 +1694,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
       ? [
         agentActionable ? agentCancelLabel : "",
         live ? runCancelLabel : "",
-        agentVisible && agent?.callIndex !== undefined ? agentRestartLabel : "",
+        agentVisible && agentCanRestart(agent) ? agentRestartLabel : "",
         `t ${this.#toolDisplay === "compact" ? "full" : "compact"}`,
         `i ${this.#showInfo ? "hide info" : "info"}`,
         "Esc/← outline",
@@ -1697,7 +1705,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
         agentActionable ? agentCancelLabel : "",
         live ? runCancelLabel : "",
         live ? `p ${run?.status === "paused" ? "resume" : "pause"}` : "",
-        agentVisible && agent?.callIndex !== undefined ? agentRestartLabel : "",
+        agentVisible && agentCanRestart(agent) ? agentRestartLabel : "",
         `↑↓/jk nodes · ${confirm}/→ drill · f filter`,
         `i ${this.#showInfo ? "hide info" : "info"}`,
         "Esc/← runs",
@@ -1708,7 +1716,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     if (proof && agentActionable && rendered.includes(agentCancelLabel)) {
       this.#renderedAgentCancel = proof;
     }
-    if (proof && agentVisible && agent?.callIndex !== undefined) {
+    if (proof && agentVisible && agentCanRestart(agent)) {
       this.#renderedAgentRestart = proof;
     }
     if (live && rendered.includes(runCancelLabel)) this.#renderedRunCancelId = run!.runId;

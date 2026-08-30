@@ -232,6 +232,8 @@ export interface WorkflowAgentRecord {
   jobId?: string;
   /** Stable script-visible lineage ID; `jobId` may move to a replacement native session. */
   logicalJobId?: string;
+  /** Durable proof that manual replay of this agent suffix could repeat progressed effects. */
+  progressedCheckpoint?: true;
   state: WorkflowAgentState;
   timestamps: WorkflowTimestamps;
   harness?: string;

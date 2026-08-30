@@ -725,34 +725,58 @@ export class JobManager {
     const startupController = new AbortController();
     job.startupController = startupController;
     try {
-      if (job.request.dispatchAdmission) {
-        const admissionError = await job.request.dispatchAdmission(startupController.signal);
-        if (admissionError) throw new Error(admissionError);
-      }
-      startupController.signal.throwIfAborted();
-      this.#emit(job, { type: "started" });
-      const basePrompt = job.request.peer
-        ? PEER_SYSTEM_PROMPT
-        : job.request.parentThread ? HUMAN_SYSTEM_PROMPT : GENERIC_SYSTEM_PROMPT;
-      const capabilityPrompt = job.request.capabilityRoute?.matched.length
-        ? `The parent live-verified these required native capabilities for this task: ${job.request.capabilityRoute.matched.join(", ")}. Use the relevant skill or tool when the task calls for it; do not substitute an unverified capability.`
-        : undefined;
-      const systemPrompt = [basePrompt, capabilityPrompt, job.profile?.systemPrompt].filter(Boolean).join("\n\n");
-      const startup = backend.start({
-        jobId: job.snapshot.id,
-        name: job.snapshot.name,
-        task: job.request.task,
-        systemPrompt,
-        cwd: job.request.cwd,
-        policy: job.policy,
-        env: process.env,
-        signal: startupController.signal,
-        resumeSessionFile: job.request.peer?.sessionFile,
-        rawInitialMessage: job.request.peer ? true : undefined,
-        parentThread: job.request.parentThread,
-        interactions: job.request.interaction ? this.#interactionHandler(job) : undefined,
-        interactionTargets: job.request.interaction ? interactionTargetKinds(job.request.interaction) : undefined,
-      }, (event) => this.#handleBackendEvent(job, event));
+      const applyAdmission = (admission: Awaited<ReturnType<NonNullable<SpawnRequest["dispatchAdmission"]>>>) => {
+        if (admission?.error) throw new Error(admission.error);
+        if (admission?.capabilityRoute) {
+          if (admission.capabilityRoute.harness !== job.policy.harness) {
+            throw new Error(`Capability admission was validated for ${admission.capabilityRoute.harness} but this job routes to ${job.policy.harness}`);
+          }
+          job.request.capabilityRoute = {
+            ...admission.capabilityRoute,
+            matched: [...admission.capabilityRoute.matched],
+            warnings: admission.capabilityRoute.warnings ? [...admission.capabilityRoute.warnings] : undefined,
+          };
+          job.snapshot.capabilities = {
+            ...job.request.capabilityRoute,
+            matched: [...job.request.capabilityRoute.matched],
+            warnings: job.request.capabilityRoute.warnings ? [...job.request.capabilityRoute.warnings] : undefined,
+          };
+        }
+      };
+      const startBackend = (): Promise<BackendRun> => {
+        startupController.signal.throwIfAborted();
+        this.#emit(job, { type: "started" });
+        const basePrompt = job.request.peer
+          ? PEER_SYSTEM_PROMPT
+          : job.request.parentThread ? HUMAN_SYSTEM_PROMPT : GENERIC_SYSTEM_PROMPT;
+        const capabilityPrompt = job.request.capabilityRoute?.matched.length
+          ? `The parent live-verified these required native capabilities for this task: ${job.request.capabilityRoute.matched.join(", ")}. Use the relevant skill or tool when the task calls for it; do not substitute an unverified capability.`
+          : undefined;
+        const systemPrompt = [basePrompt, capabilityPrompt, job.profile?.systemPrompt].filter(Boolean).join("\n\n");
+        return backend.start({
+          jobId: job.snapshot.id,
+          name: job.snapshot.name,
+          task: job.request.task,
+          systemPrompt,
+          cwd: job.request.cwd,
+          policy: job.policy,
+          env: process.env,
+          signal: startupController.signal,
+          resumeSessionFile: job.request.peer?.sessionFile,
+          rawInitialMessage: job.request.peer ? true : undefined,
+          parentThread: job.request.parentThread,
+          interactions: job.request.interaction ? this.#interactionHandler(job) : undefined,
+          interactionTargets: job.request.interaction ? interactionTargetKinds(job.request.interaction) : undefined,
+        }, (event) => this.#handleBackendEvent(job, event));
+      };
+      // Keep the common no-admission launch synchronous through backend.start;
+      // only continuation admission adds an async pre-start boundary.
+      const startup = job.request.dispatchAdmission
+        ? (async () => {
+          applyAdmission(await job.request.dispatchAdmission!(startupController.signal));
+          return startBackend();
+        })()
+        : startBackend();
       let startedRun: BackendRun;
       try {
         startedRun = await withDeadline(startup, this.#startupTimeoutMs, "Harness startup");

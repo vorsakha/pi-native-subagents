@@ -467,6 +467,10 @@ export class DiscoverableBackend extends ImmediateBackend {
   async discover(_request: DiscoveryRequest): Promise<DiscoveryResult> {
     return discovery(this.name, this.#capabilities);
   }
+
+  setCapabilities(capabilities: DiscoveredCapability[]): void {
+    this.#capabilities.splice(0, this.#capabilities.length, ...capabilities);
+  }
 }
 
 /** Backend whose runs stay active until the test completes or fails them. */

@@ -62,9 +62,9 @@ Both attempts share one ordinal and cumulative usage; budget preflight runs agai
 
 ## Progressed continuation accounting
 
-`continuationFallback` opts into one opposite-provider handoff after authoritative unavailability and observed progress. It owns recovery: ineligible or pre-inference failure is terminal, never a same-provider wait. Usage stays cumulative on one stable logical ID; archived attempts store only their generation delta, including on handoff replay. Original budgets remain fixed and are checked before replacement.
+`continuationFallback` opts into one opposite-provider handoff after authoritative unavailability and progress. Ineligible or pre-inference failure is terminal, never a same-provider wait. Usage stays cumulative on one logical ID; attempts store only their generation delta. Original budgets remain fixed.
 
-A pre-settlement progressed record forbids primary replay but cannot authorize replacement. The durable handoff proves the index/worktree checkout before target dispatch and again at scheduler admission. Completed replay spends nothing; interrupted handoff replay runs only the replacement. Missing/diverged proof fails closed. Manual suffix restart cannot discard a progressed checkpoint. Cancellation covers records, admission, replacement, and retained calls. `/workflows` separates continued, fallback, and waiting routes.
+A progressed record forbids primary replay but cannot authorize replacement. The handoff proves checkout before dispatch. Admission rechecks checkout, readiness, capabilities, and budget under the startup deadline. Completed replay spends nothing; interrupted handoff replay runs only the replacement and requires the exact source budget. Missing/diverged proof fails closed. Manual suffix restart cannot discard an agent progressed checkpoint; peer-question ordinals do not count. Cancellation covers admission, replacement, and retained calls. `/workflows` keeps continued, fallback, and waiting distinct.
 
 ## Recovery
 

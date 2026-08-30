@@ -1009,6 +1009,38 @@ test("continuation handoff dashboard never labels the settled primary as retaine
   assert.doesNotMatch(inspector, /retained job/, "no replacement session exists during the durable handoff");
 });
 
+test("dashboard never offers restart for progressed or continued agent checkpoints", (t) => {
+  for (const checkpoint of ["progressed", "continued"] as const) {
+    const run = workflow(`restart-refused-${checkpoint}`, "failed");
+    const agent = run.agents[0]!;
+    agent.state = "failed";
+    agent.error = "provider failed after progress";
+    if (checkpoint === "progressed") {
+      agent.progressedCheckpoint = true;
+    } else {
+      agent.continuation = {
+        state: "failed",
+        fromHarness: "claude",
+        toHarness: "codex",
+        failedJobId: agent.jobId!,
+        replacementJobId: "replacement-job",
+        checkpointAt: 1_000,
+        checkoutDigest: `sha256:${"a".repeat(64)}`,
+        trigger: { source: "continuation", provider: "claude", kind: "quota", detail: "quota after progress" },
+        warning: "exactly-once is not guaranteed",
+      };
+    }
+    const state = harness([run], 30);
+    t.after(() => state.overlay.dispose());
+    openAgentDetail(state.overlay, 72);
+    const rendered = state.overlay.render(72).join("\n");
+    assert.match(rendered, /no restart action is available/);
+    assert.doesNotMatch(rendered, /press r|r restart agent/);
+    state.overlay.handleInput("r");
+    assert.deepEqual(state.actions, [], `${checkpoint} checkpoint cannot dispatch a refused restart`);
+  }
+});
+
 test("metadata-rich standalone workflow results keep a scrollable result row", (t) => {
   const standalone = workflow("metadata-standalone", "completed");
   standalone.agents = [];

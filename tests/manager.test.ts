@@ -334,7 +334,7 @@ test("cancellation aborts scheduler admission before backend startup", async () 
     ...request(1),
     dispatchAdmission: async (signal) => {
       reached();
-      return new Promise<string | undefined>((_resolve, reject) => {
+      return new Promise<undefined>((_resolve, reject) => {
         const abort = () => reject(signal.reason);
         if (signal.aborted) abort();
         else signal.addEventListener("abort", abort, { once: true });
@@ -346,6 +346,27 @@ test("cancellation aborts scheduler admission before backend startup", async () 
   const final = await manager.cancel(job.id, "cancel admission");
   assert.equal(final.status, "cancelled");
   assert.equal(backend.requests.length, 0, "cancelled admission never reaches the backend");
+  await manager.shutdown();
+});
+
+test("scheduler admission is bounded by the aggregate startup deadline", async () => {
+  const backend = new ControlledBackend("codex");
+  const manager = new JobManager({ backends: [backend], startupTimeoutMs: 20 });
+  let admissionAborted = false;
+  const job = manager.spawn({
+    ...request(1),
+    dispatchAdmission: (signal) => new Promise<undefined>((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        admissionAborted = true;
+        reject(signal.reason);
+      }, { once: true });
+    }),
+  });
+  const final = await manager.wait(job.id);
+  assert.equal(final.status, "failed");
+  assert.match(final.error ?? "", /Harness startup timed out after 20ms/);
+  assert.equal(admissionAborted, true);
+  assert.equal(backend.requests.length, 0, "timed-out admission never starts the backend");
   await manager.shutdown();
 });
 

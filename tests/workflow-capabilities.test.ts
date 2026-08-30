@@ -4,7 +4,7 @@ import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CapabilityService } from "../src/capability-service.ts";
 import { JobManager } from "../src/manager.ts";
-import { availabilityFixture, ControlledBackend, DiscoverableBackend, ImmediateBackend, ScriptedHarnessAvailability, StaticWorkflowCheckout, tempDir } from "./helpers.ts";
+import { availabilityFixture, ControlledBackend, DiscoverableBackend, ImmediateBackend, ScriptedHarnessAvailability, StaticWorkflowCheckout, tempDir, waitFor } from "./helpers.ts";
 import { WorkflowManager } from "../src/workflows/manager.ts";
 import { loadWorkflowJournal } from "../src/workflows/artifacts.ts";
 
@@ -132,6 +132,73 @@ test("replayed follow-up continuation retains and revalidates the original capab
     await workflows.shutdown(200).catch(() => undefined);
     await jobs.shutdown(200).catch(() => undefined);
     await rm(parent, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+  }
+});
+
+test("queued continuation revalidates readiness and capabilities at scheduler admission", async () => {
+  for (const stale of ["readiness", "capability"] as const) {
+    const parent = await tempDir(`workflow-continuation-admission-${stale}`);
+    const cwd = join(parent, "cwd");
+    await mkdir(cwd);
+    const artifactRoot = join(parent, "artifacts");
+    const codex = new ControlledBackend("codex");
+    const claude = new ControlledBackend("claude");
+    const jobs = new JobManager({ backends: [codex, claude], concurrency: 1 });
+    const lint = [{ kind: "tool" as const, name: "lint", effect: "inspect" as const }];
+    const codexProbe = new DiscoverableBackend("codex", lint);
+    const claudeProbe = new DiscoverableBackend("claude", lint);
+    const router = new CapabilityService({ backends: [codexProbe, claudeProbe], fingerprint: () => "stable" });
+    const availability = new ScriptedHarnessAvailability({
+      codex: availabilityFixture("codex"),
+      claude: availabilityFixture("claude"),
+    });
+    const workflows = new WorkflowManager({
+      jobs,
+      artifactRoot,
+      sessionId: "session-1",
+      router,
+      availability,
+      checkout: new StaticWorkflowCheckout(),
+    });
+    try {
+      const started = await workflows.start({
+        sessionId: "session-1",
+        name: `${stale} admission`,
+        cwd,
+        trusted: true,
+        defaultHarness: "codex",
+        script: `export default async () => agent("queued policy proof", {
+          harness: "claude", access: "readOnly", requires: ["tool:lint"],
+          continuationFallback: { harness: "codex" }
+        });`,
+      });
+      await claude.waitForStart();
+      const primary = claude.starts[0]!;
+      const blocker = jobs.spawn({ name: "direct blocker", task: "hold slot", cwd, trusted: true, harness: "codex" });
+      claude.emit(primary, { type: "message", text: "progress" });
+      claude.fail(primary, "quota", { provider: "claude", kind: "quota", authoritative: true, detail: "quota after progress" });
+      await codex.waitForStart();
+      assert.equal(codex.starts[0], blocker.id);
+      await waitFor(() => jobs.list().some((job) => job.workflow?.runId === started.snapshot.runId && job.status === "queued"), "queued replacement");
+
+      if (stale === "readiness") {
+        availability.states.set("codex", availabilityFixture("codex", { ready: false, authenticated: false }));
+      } else {
+        codexProbe.setCapabilities([]);
+      }
+      codex.complete(blocker.id, "release");
+
+      const final = await started.completion;
+      const outcome = final.result as { ok: boolean; error?: string };
+      assert.equal(outcome.ok, false);
+      assert.match(outcome.error ?? "", stale === "readiness" ? /codex.*unauthenticated|not ready|login/i : /required capabilities: tool:lint/i);
+      assert.equal(codex.requests.length, 1, `${stale} proof fails before replacement backend startup`);
+      assert.equal(final.agents[0]?.continuation?.state, "failed");
+    } finally {
+      await workflows.shutdown(200).catch(() => undefined);
+      await jobs.shutdown(200).catch(() => undefined);
+      await rm(parent, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+    }
   }
 });
 

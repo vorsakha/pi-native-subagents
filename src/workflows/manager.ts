@@ -1,6 +1,6 @@
 import { realpath } from "node:fs/promises";
 import { resolve } from "node:path";
-import { isRequestedHarness, routeCapabilities, type RequestedHarness } from "../capability-routing.ts";
+import { isRequestedHarness, routeCapabilities, type CapabilityRouting, type RequestedHarness } from "../capability-routing.ts";
 import type { CapabilityRouter } from "../capability-service.ts";
 import { HarnessAutoUnavailableError, HarnessUnavailableError, type HarnessAvailabilityProbe, type HarnessAvailabilityStatus } from "../harness-availability.ts";
 import type { JobManager, PeerInteractionRequest, PeerInteractionResult } from "../manager.ts";
@@ -185,12 +185,12 @@ interface ReplaySource {
 
 function progressedJournalCalls(records: WorkflowJournalRecord[]): Set<number> {
   return new Set(records.flatMap((record) =>
-    record.state === "progressed"
+    record.kind !== "peerQuestion" && (record.state === "progressed"
       || record.state === "handoff"
       || record.result?.progressed === true
       || record.continuationProgress !== undefined
       || record.continuation !== undefined
-      || record.route?.continuation !== undefined
+      || record.route?.continuation !== undefined)
       ? [record.callIndex]
       : []));
 }
@@ -463,6 +463,11 @@ function budgetsAllowReplay(source: WorkflowBudgetPolicy | undefined, next: Work
   return true;
 }
 
+function budgetsMatch(source: WorkflowBudgetPolicy | undefined, next: WorkflowBudgetPolicy | undefined): boolean {
+  return (["maxAgents", "maxConcurrency", "maxTokens", "maxTokensPerAgent", "maxCost", "maxTurns"] as const)
+    .every((key) => source?.[key] === next?.[key]);
+}
+
 function abortError(reason: unknown): Error {
   const error = reason instanceof Error ? reason : new Error(String(reason ?? "Workflow aborted"));
   error.name = "AbortError";
@@ -606,7 +611,9 @@ export class WorkflowManager {
       if (!terminalWorkflow(source.snapshot.status)) throw new Error("Cannot resume from an active workflow");
       if (!source.snapshot.definitionFingerprint) throw new Error("Workflow predates durable replay and cannot be resumed");
       const sameDefinition = source.snapshot.replayBaseFingerprint
-        ? source.snapshot.replayBaseFingerprint === replayBaseFingerprint && budgetsAllowReplay(source.snapshot.budget, budget)
+        ? source.snapshot.replayBaseFingerprint === replayBaseFingerprint
+          && budgetsAllowReplay(source.snapshot.budget, budget)
+          && (!source.handoffs.length || budgetsMatch(source.snapshot.budget, budget))
         : source.snapshot.definitionFingerprint === definitionFingerprint;
       if (!sameDefinition) {
         throw new Error("Workflow definition or execution context does not match the replay source (including budget)");
@@ -1107,7 +1114,7 @@ export class WorkflowManager {
       const sanitized: WorkflowAgentResult = {
         ok: result.ok,
         output: result.output,
-        jobId: result.jobId,
+        jobId: record.logicalJobId ?? handoff.checkpoint.logicalJobId ?? result.jobId,
         error: result.error,
         usage: clone(record.usage),
         structured: result.structured,
@@ -1801,7 +1808,7 @@ export class WorkflowManager {
     // error still records what was asked for.
     record.requestedHarness = harness ?? request.defaultHarness ?? "pi";
     try {
-      const routing = await routeCapabilities(this.#router, {
+      const resolveRouting = (routingSignal: AbortSignal) => routeCapabilities(this.#router, {
         request: {
           name,
           task: retry?.task ?? prompt,
@@ -1824,21 +1831,25 @@ export class WorkflowManager {
         preference: request.defaultHarness ? [request.defaultHarness] : undefined,
         availability: this.#availability,
         requireAvailability: retry?.disposition === "fallback" || retry?.disposition === "continuation",
-        signal,
+        signal: routingSignal,
       });
+      const applyRoutingEvidence = (observed: CapabilityRouting) => {
+        if (observed.availability) {
+          record.availability = observed.availability.status;
+          record.executableVersion = observed.availability.version;
+        }
+        record.capabilityRevision = observed.capabilityRoute?.revision;
+        record.availabilityChecks = observed.availabilityChecks?.map((availability) => ({
+          harness: availability.harness,
+          status: availability.status,
+          executableVersion: availability.version,
+        }));
+      };
+      const routing = await resolveRouting(signal);
       // Record the observed availability of the resolved route so the journal
       // can explain and safely replay it.
-      if (routing.availability) {
-        record.availability = routing.availability.status;
-        record.executableVersion = routing.availability.version;
-      }
-      record.capabilityRevision = routing.capabilityRoute?.revision;
-      record.availabilityChecks = routing.availabilityChecks?.map((availability) => ({
-        harness: availability.harness,
-        status: availability.status,
-        executableVersion: availability.version,
-      }));
-      const spawnRequest = {
+      applyRoutingEvidence(routing);
+      const spawnRequest: SpawnRequest = {
         name,
         task: retry?.task ?? prompt,
         cwd: agentCwd,
@@ -1863,23 +1874,35 @@ export class WorkflowManager {
           phase: entry.snapshot.phases[phase]?.name,
         },
         dispatchGate: () => this.#budgetPreflight(entry),
-        dispatchAdmission: retry?.beforeStart
-          ? async (admissionSignal) => {
-            try {
-              await retry.beforeStart!(admissionSignal);
-              return undefined;
-            } catch (error) {
-              return boundedText(error);
-            }
-          }
-          : undefined,
         // A workflow child may ask an authorized same-run peer, and may wake the
         // parent orchestrator only when this run is itself in the background:
         // a foreground workflow's parent turn is blocked awaiting the workflow
         // tool result and cannot safely start another turn.
         interaction: { orchestrator: entry.snapshot.background ? "allow" : "foregroundDenied", peers: true },
         interactionGate: (target) => this.#interactionGate(entry, target),
-      } satisfies SpawnRequest;
+      };
+      if (retry?.beforeStart) {
+        const admittedHarness = routing.harness ?? this.#jobs.resolveHarness(spawnRequest);
+        const admittedRequires = routing.requires ?? [];
+        spawnRequest.dispatchAdmission = async (admissionSignal) => {
+          try {
+            await retry.beforeStart!(admissionSignal);
+            const admitted = await resolveRouting(admissionSignal);
+            const liveHarness = admitted.harness ?? this.#jobs.resolveHarness(spawnRequest);
+            if (liveHarness !== admittedHarness) {
+              throw new Error(`Continuation admission changed provider from ${admittedHarness} to ${liveHarness}`);
+            }
+            if (canonicalJson(admitted.requires ?? []) !== canonicalJson(admittedRequires)) {
+              throw new Error("Continuation admission changed the required capability policy");
+            }
+            applyRoutingEvidence(admitted);
+            this.#touch(entry);
+            return { capabilityRoute: admitted.capabilityRoute };
+          } catch (error) {
+            return { error: boundedText(error) };
+          }
+        };
+      }
       if (schema) {
         // Transport is decided against the exact harness compilePolicy will
         // pick for this spawnRequest, never a re-derived guess: capability
@@ -1954,6 +1977,9 @@ export class WorkflowManager {
     record.model = job.model;
     record.timestamps.updatedAt = Date.now();
     this.#jobOwners.set(job.id, { runId: entry.snapshot.runId, agentIndex: index });
+    if (record.logicalJobId && record.logicalJobId !== job.id) {
+      this.#jobOwners.set(record.logicalJobId, { runId: entry.snapshot.runId, agentIndex: index });
+    }
     if (record.continuation) {
       record.continuation.state = "running";
       record.continuation.replacementJobId = job.id;
@@ -2254,6 +2280,7 @@ export class WorkflowManager {
     const route = handoff.route;
     record.jobId = checkpoint.failedJobId;
     record.logicalJobId ??= checkpoint.logicalJobId ?? checkpoint.failedJobId;
+    record.progressedCheckpoint = true;
     record.state = "failed";
     record.harness = route?.harness;
     record.requestedHarness = route?.requestedHarness;
@@ -2460,6 +2487,7 @@ export class WorkflowManager {
       structured: replay.result.structured === undefined ? undefined : clone(replay.result.structured),
       structuredTransport: replay.result.transport,
       error: replay.result.error,
+      progressedCheckpoint: replay.result.progressed === true || replay.route?.continuation !== undefined ? true : undefined,
       // Replay restores route/attempt provenance but spends no usage again.
       usage: workflowUsage(),
     };
@@ -3085,6 +3113,8 @@ export class WorkflowManager {
       route: journalRoute(input.record),
       continuationProgress: progress,
     });
+    input.record.progressedCheckpoint = true;
+    this.#touch(input.entry);
 
     try {
       await this.#jobs.settleFailedWorkflowJob(failedJobId);

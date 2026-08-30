@@ -24,7 +24,7 @@ Continuation opens only when all of these are true:
 - the failed fresh `agent()` or retained `followUp()` reported structured, authoritative provider unavailability for the provider actually running it;
 - the failed generation itself recorded model or tool progress, and the failure is not marked pre-inference; activity from an earlier retained generation never qualifies a new turn;
 - the failed native process has settled and its retained resources are closed;
-- the target freshly reports ready and satisfies the original fixed policy;
+- the target freshly reports ready and satisfies the original fixed policy, including every required capability;
 - the shared cwd is a provable Git checkout whose HEAD, staged entries, index flags, status, and changed worktree contents can be checkpointed; assume-unchanged, skip-worktree, and fsmonitor-valid flags are unsupported;
 - this logical lineage has not already used its one continuation.
 
@@ -46,7 +46,7 @@ Each required section has its own bound, so large objective, prompt, output, or 
 
 External commands, hooks, plugins, MCP calls, and services may have completed before the failed provider stopped. Continuation cannot guarantee exactly-once behavior for those effects. The replacement must inspect state and continue remaining work, not repeat commands merely because it did not author the partial result.
 
-The checkout is revalidated after target probing and again when a queued replacement wins a global scheduler slot, immediately before native startup. After replacement starts, future `followUp()` calls and later `converge()` rounds target its retained session, and every result keeps the original script-visible job ID. `independentOf` and `independentReview` resolve against the replacement provider, not the closed primary. Cancellation covers settlement, checkout capture, handoff creation, queued admission, replacement execution, and retained follow-ups.
+When a queued replacement wins a global scheduler slot, admission revalidates checkout, target readiness, and required capabilities immediately before native startup. Admission and backend startup share one deadline. After replacement starts, future `followUp()` calls and later `converge()` rounds target its retained session, including after handoff replay, and every result keeps the original script-visible job ID. `independentOf` and `independentReview` resolve against the replacement provider, not the closed primary. Cancellation covers settlement, checkout capture, handoff creation, admission, replacement execution, and retained follow-ups.
 
 ## Durability, accounting, and inspection
 
@@ -59,7 +59,7 @@ On exact `resumeFromRunId` replay:
 - a progressed-primary record with no safe handoff is returned as failed and is never rerun;
 - missing proof or checkout divergence fails closed without either provider dispatch.
 
-Usage is cumulative across the failed turn, replacement, and later logical generations. Archived attempts show their own delta, including after handoff replay; replay adds no usage and earlier generations are never counted twice. Reconstructed calls retain the original capability requirements. Call ordinals, budgets, cancellation, approvals, journal order, convergence state, and replay provenance remain attached to the logical call. Manual suffix restart is refused if it would discard any progressed checkpoint; use its durable handoff or recover manually.
+Usage is cumulative across the failed turn, replacement, and later logical generations. Archived attempts show their own delta, including after handoff replay; replay adds no usage and earlier generations are never counted twice. Reconstructed calls retain the original capability requirements. An interrupted handoff must resume with the source workflow budget unchanged. Call ordinals, cancellation, approvals, journal order, convergence state, and replay provenance remain attached to the logical call. Manual suffix restart is refused if it would discard an agent-call progressed checkpoint; peer-question ordinals never affect that decision.
 
 `/workflows` shows the declaration as unused or used, `claude → codex (continued)` (or the reverse), the trigger, checkpoint, failed and replacement job provenance, and attempts. Replacement IDs are historical provenance; the dashboard does not claim a persisted or terminal replacement is retained. Provider waiting and pre-inference fallback keep separate labels.
 
