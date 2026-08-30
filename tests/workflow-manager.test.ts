@@ -458,26 +458,58 @@ test("workflow replay reuses journaled advisor answers and cancellation reaches 
     assert.equal(replayFinal.advisorConsultations?.[0]?.outputProvenance, "replay");
     assert.equal(replayFinal.advisorConsultations?.[0]?.lineage, 2);
 
-    advisors.consultHandler = (request) => new Promise((resolveConsult) => {
-      request.signal.addEventListener("abort", () => resolveConsult({
+    let releaseSettlement!: () => void;
+    const settlement = new Promise<void>((resolve) => { releaseSettlement = resolve; });
+    let advisorAborted = false;
+    advisors.consultHandler = async (request) => {
+      await new Promise<void>((resolveAbort) => {
+        request.signal.addEventListener("abort", () => {
+          advisorAborted = true;
+          resolveAbort();
+        }, { once: true });
+      });
+      await settlement;
+      return {
         ok: false,
         advisorId,
         advisorName: "Security advisor",
         lineage: 2,
         output: "",
         error: "cancelled",
+        usage: { input: 3, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
         route: { harness: "claude" },
         queuedMs: 0,
-      }), { once: true });
-    });
+      };
+    };
     const active = await f.workflows.start(f.request(
       `export default async () => consult(${JSON.stringify(advisorId)}, "cancel me");`,
       { advisors: [advisorId] },
     ));
     await waitFor(() => advisors.requests.length === 2, "advisor consultation dispatch");
-    const cancelled = await f.workflows.cancel(active.snapshot.runId, "stop advisor consultation");
+    let cancelSettled = false;
+    const cancellation = f.workflows.cancel(active.snapshot.runId, "stop advisor consultation")
+      .then((snapshot) => {
+        cancelSettled = true;
+        return snapshot;
+      });
+    await waitFor(() => advisorAborted, "advisor cancellation signal");
+    await delay(1_100);
+    assert.equal(cancelSettled, false, "terminal workflow publication waits beyond the sandbox drain grace for advisor settlement");
+    const settling = (await loadWorkflowSummaries(f.artifactRoot, { sessionId: "session-1" }))
+      .find((snapshot) => snapshot.runId === active.snapshot.runId);
+    assert.notEqual(settling?.status, "aborted", "the durable checkpoint remains non-terminal while advisor teardown is pending");
+    releaseSettlement();
+    const cancelled = await cancellation;
     assert.equal(cancelled.status, "aborted");
     assert.equal(cancelled.advisorConsultations?.[0]?.state, "cancelled");
+    assert.equal(cancelled.advisorConsultations?.[0]?.usage.turns, 1);
+    const persisted = (await loadWorkflowSummaries(f.artifactRoot, { sessionId: "session-1" }))
+      .find((snapshot) => snapshot.runId === active.snapshot.runId);
+    assert.equal(persisted?.status, "aborted");
+    assert.equal(persisted?.advisorConsultations?.[0]?.state, "cancelled");
+    const advisorJournal = (await loadWorkflowJournal(f.artifactRoot, active.snapshot.runId))
+      .filter((record) => record.kind === "advisor");
+    assert.equal(advisorJournal.at(-1)?.state, "failed", "terminal checkpoint follows the advisor settlement journal record");
   } finally { await f.cleanup(); }
 });
 

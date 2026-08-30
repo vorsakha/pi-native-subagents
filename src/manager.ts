@@ -597,7 +597,10 @@ export class JobManager {
   }
 
   async releaseAdvisorRun(id: string, advisorId: string): Promise<void> {
-    await this.#releaseJobRun(this.#advisorJob(id, advisorId));
+    const job = this.#advisorJob(id, advisorId);
+    await this.#releaseJobRun(job);
+    this.#jobs.delete(id);
+    this.#waiters.delete(id);
   }
 
   async #releaseJobRun(job: InternalJob): Promise<void> {
@@ -831,7 +834,7 @@ export class JobManager {
   #evictOldJobs(): void {
     if (this.#jobs.size < MAX_RETAINED_JOBS) return;
     const terminal = [...this.#jobs.values()]
-      .filter((job) => isTerminal(job.snapshot.status))
+      .filter((job) => !job.snapshot.advisor && isTerminal(job.snapshot.status))
       .sort((a, b) => (a.snapshot.endedAt ?? a.snapshot.createdAt) - (b.snapshot.endedAt ?? b.snapshot.createdAt));
     while (this.#jobs.size >= MAX_RETAINED_JOBS && terminal.length > 0) {
       const job = terminal.shift()!;

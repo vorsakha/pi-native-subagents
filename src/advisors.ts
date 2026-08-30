@@ -494,19 +494,20 @@ export class AdvisorRegistry {
     const record = this.#resolve(threadId, idOrAlias);
     return this.#withLifecycleTransition(record, "reset", async () => {
       if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
-      const now = Date.now();
       record.jobId = undefined;
-      record.continuation = undefined;
-      record.invalidContinuation = undefined;
-      record.lineage++;
-      record.generation = 0;
-      record.lineageUsage = emptyUsage();
-      record.state = "defined";
-      record.error = undefined;
-      record.updatedAt = now;
-      record.ledger.push({
+      const now = Date.now();
+      const next = storedSnapshot(record);
+      next.continuation = undefined;
+      next.invalidContinuation = undefined;
+      next.lineage++;
+      next.generation = 0;
+      next.lineageUsage = emptyUsage();
+      next.state = "defined";
+      next.error = undefined;
+      next.updatedAt = now;
+      next.ledger.push({
         index: record.ledger.length ? record.ledger.at(-1)!.index + 1 : 0,
-        lineage: record.lineage,
+        lineage: next.lineage,
         generation: 0,
         sender: "system",
         question: "Explicit advisor lineage reset",
@@ -514,8 +515,19 @@ export class AdvisorRegistry {
         startedAt: now,
         endedAt: now,
       });
-      record.ledger = record.ledger.slice(-MAX_ADVISOR_LEDGER);
-      await this.#persist();
+      next.ledger = next.ledger.slice(-MAX_ADVISOR_LEDGER);
+      await this.#persist(() => [...this.#records.values()]
+        .filter((candidate) => candidate.state !== "closed")
+        .map((candidate) => candidate === record ? next : storedSnapshot(candidate)));
+      record.continuation = undefined;
+      record.invalidContinuation = undefined;
+      record.lineage = next.lineage;
+      record.generation = next.generation;
+      record.lineageUsage = emptyUsage();
+      record.state = next.state;
+      record.error = undefined;
+      record.updatedAt = next.updatedAt;
+      record.ledger = next.ledger.map(cloneLedger);
       this.#publish(record);
       return publicSnapshot(record);
     });
@@ -527,17 +539,17 @@ export class AdvisorRegistry {
     const record = this.#resolve(threadId, idOrAlias);
     return this.#withLifecycleTransition(record, "close", async () => {
       if (record.jobId) {
-        try {
-          const job = this.#jobs.checkAdvisorJob(record.jobId, record.id);
-          if (job.status === "queued" || job.status === "running") await this.#jobs.cancelAdvisorJob(record.jobId, record.id, "Advisor closed");
-          await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
-        } catch { /* the job may already be evicted */ }
+        const job = this.#jobs.checkAdvisorJob(record.jobId, record.id);
+        if (job.status === "queued" || job.status === "running") await this.#jobs.cancelAdvisorJob(record.jobId, record.id, "Advisor closed");
+        await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
       }
       record.jobId = undefined;
+      await this.#persist(() => [...this.#records.values()]
+        .filter((candidate) => candidate !== record && candidate.state !== "closed")
+        .map(storedSnapshot));
       record.continuation = undefined;
       record.state = "closed";
       record.updatedAt = Date.now();
-      await this.#persist();
       this.#records.delete(record.id);
       this.#publish(record);
       return publicSnapshot(record);
@@ -869,9 +881,13 @@ export class AdvisorRegistry {
     if (threadId !== this.#threadId) throw new Error("Advisor belongs to a different parent thread");
   }
 
-  #persist(): Promise<void> {
-    const values = [...this.#records.values()].filter((record) => record.state !== "closed").map(storedSnapshot);
-    const write = this.#persistChain.catch(() => undefined).then(() => this.#store.save(this.#threadId, values));
+  #persist(
+    snapshot: () => StoredAdvisor[] = () => [...this.#records.values()]
+      .filter((record) => record.state !== "closed")
+      .map(storedSnapshot),
+  ): Promise<void> {
+    const write = this.#persistChain.catch(() => undefined)
+      .then(() => this.#store.save(this.#threadId, snapshot()));
     this.#persistChain = write;
     return write;
   }

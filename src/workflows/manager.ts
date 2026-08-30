@@ -215,6 +215,8 @@ interface RunEntry {
   settlingProviderCalls: Set<string>;
   /** Interaction ordinal assigned to each routed question, keyed by host request ID. */
   interactionOrdinals: Map<string, number>;
+  /** Advisor host calls owned by this run, retained through teardown and journal settlement. */
+  advisorCalls: Set<Promise<WorkflowAgentResult>>;
 }
 
 interface ProviderSettlementOwner {
@@ -853,6 +855,7 @@ export class WorkflowManager {
       settlingProviderCalls: new Set(),
       providerWaitBudgetMs: retry?.maxWaitMs ?? 0,
       interactionOrdinals: new Map(),
+      advisorCalls: new Set(),
     };
     this.#runs.set(snapshot.runId, entry);
     entry.completion = this.#execute(entry, request);
@@ -905,6 +908,7 @@ export class WorkflowManager {
       settlingProviderCalls: new Set(),
       providerWaitBudgetMs: snapshot.retry?.maxWaitMs ?? 0,
       interactionOrdinals: new Map(),
+      advisorCalls: new Set(),
     };
     this.#runs.set(snapshot.runId, entry);
     return entry;
@@ -1202,10 +1206,11 @@ export class WorkflowManager {
       await writeWorkflowResult(this.#artifactRoot, entry.snapshot.runId, sandbox.result);
     } catch (error) {
       const aborted = entry.controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
-      entry.snapshot.status = aborted ? "aborted" : "failed";
+      const status = aborted ? "aborted" : "failed";
       entry.snapshot.error = boundedText(entry.snapshot.error || error);
       await this.#cancelMemberJobs(entry, entry.snapshot.error);
-      this.#finishPhases(entry, entry.snapshot.status);
+      entry.snapshot.status = status;
+      this.#finishPhases(entry, status);
     } finally {
       this.#releasePause(entry);
       await this.#releaseMemberRuns(entry);
@@ -1855,7 +1860,25 @@ export class WorkflowManager {
     };
   }
 
-  async #runAdvisorCall(
+  #runAdvisorCall(
+    entry: RunEntry,
+    request: StartWorkflowRequest,
+    advisorId: string,
+    question: string,
+    options: Record<string, unknown>,
+    signal: AbortSignal,
+    callIndex: number,
+  ): Promise<WorkflowAgentResult> {
+    const call = this.#runAdvisorCallOwned(entry, request, advisorId, question, options, signal, callIndex);
+    entry.advisorCalls.add(call);
+    void call.then(
+      () => entry.advisorCalls.delete(call),
+      () => entry.advisorCalls.delete(call),
+    );
+    return call;
+  }
+
+  async #runAdvisorCallOwned(
     entry: RunEntry,
     request: StartWorkflowRequest,
     advisorId: string,
@@ -4583,7 +4606,10 @@ export class WorkflowManager {
         catch { return []; }
       })
       .filter((job) => !isTerminal(job.status));
-    await Promise.allSettled(jobs.map((job) => this.#jobs.cancel(job.id, reason)));
+    await Promise.allSettled([
+      ...jobs.map((job) => this.#jobs.cancel(job.id, reason)),
+      ...entry.advisorCalls,
+    ]);
   }
 
   /** A completed workflow-owned job keeps its retained native session only for

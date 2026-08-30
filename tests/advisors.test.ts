@@ -271,6 +271,11 @@ test("idle advisors release provider resources and lazily resume only their reco
   await delay(40);
   assert.equal(registry.get(threadId, opened.id, true).state, "hibernated");
   assert.ok(backend.closes.includes(firstJob), "idle hibernation closes the resident provider process");
+  assert.throws(
+    () => jobs.checkAdvisorJob(firstJob, opened.id),
+    /Unknown job/,
+    "the registry releases obsolete advisor job records instead of accumulating retention-exempt entries",
+  );
 
   const resumed = registry.consult({ threadId, advisorId: opened.id, question: "what did I say?", sender: "human", trusted: true });
   await backend.waitForStart(2);
@@ -1103,6 +1108,65 @@ test("concurrent advisor opens reserve aliases and capacity atomically and roll 
   assert.equal((await openSecurity(rollback.registry)).aliases.includes("sec"), true);
   await rollback.registry.shutdown();
   await rollback.jobs.shutdown();
+});
+
+test("failed reset and close keep the durable advisor lineage open and retryable", async () => {
+  for (const transition of ["reset", "close"] as const) {
+    const { backend, jobs, store, registry } = setup();
+    const opened = await openSecurity(registry);
+    const first = registry.consult({
+      threadId,
+      advisorId: opened.id,
+      question: `retain before failed ${transition}`,
+      sender: "human",
+      trusted: true,
+    });
+    await backend.waitForStart();
+    const firstJobId = backend.starts[0]!;
+    const continuationId = `codex-failed-${transition}`;
+    backend.emitContinuation(firstJobId, continuationId);
+    backend.complete(firstJobId, "retained", { input: 4, output: 1, turns: 1 });
+    await first;
+
+    const publicBefore = registry.get(threadId, opened.id, true);
+    const durableBefore = structuredClone(store.records.get(threadId));
+    store.saveError = new Error(`${transition} persistence failed`);
+    await assert.rejects(registry[transition](threadId, opened.id, true), new RegExp(`${transition} persistence failed`));
+
+    assert.deepEqual(registry.get(threadId, "sec", true), publicBefore, "failed lifecycle persistence cannot change the visible lineage");
+    assert.deepEqual(store.records.get(threadId), durableBefore, "failed lifecycle persistence cannot change the durable lineage");
+    assert.equal(registry.list(threadId, true).length, 1, "failed close still occupies its roster slot and alias");
+    assert.ok(backend.closes.includes(firstJobId), "the released native process is not resurrected after persistence failure");
+
+    store.saveError = undefined;
+    const recovered = registry.consult({
+      threadId,
+      advisorId: "sec",
+      question: `recover after failed ${transition}`,
+      sender: "human",
+      trusted: true,
+    });
+    await backend.waitForStart(2);
+    assert.deepEqual(backend.requests[1]?.continuation, {
+      harness: "codex",
+      threadId: continuationId,
+      sessionFile: `/private/${continuationId}.jsonl`,
+    });
+    backend.emitContinuation(backend.starts[1]!, continuationId);
+    backend.complete(backend.starts[1]!, "recovered", { input: 6, output: 2, turns: 2 });
+    assert.equal((await recovered).ok, true);
+
+    const retried = await registry[transition](threadId, opened.id, true);
+    if (transition === "reset") {
+      assert.equal(retried.lineage, 1);
+      assert.equal(retried.state, "defined");
+    } else {
+      assert.equal(retried.state, "closed");
+      assert.throws(() => registry.get(threadId, opened.id, true), /Unknown advisor/);
+    }
+    await registry.shutdown();
+    await jobs.shutdown();
+  }
 });
 
 test("advisor lifecycle transitions exclude new consultation admission while native release is pending", async () => {

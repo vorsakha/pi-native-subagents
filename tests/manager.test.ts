@@ -103,6 +103,34 @@ test("an evicted terminal job closes a native run that returns after eviction", 
   await manager.shutdown();
 });
 
+test("generic retention never evicts a registry-owned advisor run", async () => {
+  const { backend, manager } = setup(1);
+  const advisorId = "adv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  const advisor = manager.spawn({
+    ...request(-1),
+    access: "readOnly",
+    advisor: { advisorId, threadId: "thread-retention" },
+  });
+  await backend.waitForStart();
+  backend.complete(advisor.id, "advisor ready");
+  await manager.waitAdvisorJob(advisor.id, advisorId);
+
+  for (let index = 0; index < 100; index++) {
+    const job = manager.spawn(request(index));
+    await backend.waitForStart(index + 2);
+    backend.complete(job.id);
+    await manager.wait(job.id);
+  }
+
+  assert.equal(manager.checkAdvisorJob(advisor.id, advisorId).status, "completed");
+  assert.equal(backend.closes.includes(advisor.id), false, "unrelated churn cannot close the registry-owned native run");
+  await manager.continueAdvisorJob(advisor.id, advisorId, "retained follow-up");
+  await backend.waitForSend();
+  backend.complete(advisor.id, "advisor continued");
+  assert.equal((await manager.waitAdvisorJob(advisor.id, advisorId)).generation, 1);
+  await manager.shutdown();
+});
+
 test("manager forwards caller models and labels omitted models as native defaults", async () => {
   const backend = new ControlledBackend();
   const manager = new JobManager({ backends: [backend] });
