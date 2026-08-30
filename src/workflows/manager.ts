@@ -31,6 +31,7 @@ import {
   workflowDefinitionFingerprint,
   workflowFollowUpFingerprint,
   workflowInteractionFingerprint,
+  workflowReplayReferenceKey,
 } from "./journal.ts";
 import { resolveWorkflowStructured, workflowSchema } from "./schema.ts";
 import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
@@ -145,6 +146,8 @@ interface ReplayRuntime {
   usedInteractions: Set<number>;
   active: boolean;
   priorJobProviders: Map<string, ProviderFamily>;
+  /** Source usage not represented by replayed agents, retained for interrupted-handoff admission. */
+  carriedUsage?: WorkflowUsage;
 }
 
 interface RunEntry {
@@ -181,6 +184,7 @@ interface ReplaySource {
   handoffs: WorkflowReplayHandoff[];
   interactions: WorkflowReplayInteraction[];
   progressedCalls: Set<number>;
+  usage: WorkflowUsage;
 }
 
 function progressedJournalCalls(records: WorkflowJournalRecord[]): Set<number> {
@@ -228,6 +232,17 @@ function subtractWorkflowUsage(total: WorkflowUsage, base: WorkflowUsage | undef
     cacheWrite: total.cacheWrite - base.cacheWrite,
     cost: total.cost - base.cost,
     turns: total.turns - base.turns,
+  };
+}
+
+function subtractWorkflowUsageFloor(total: WorkflowUsage, base: WorkflowUsage): WorkflowUsage {
+  return {
+    input: Math.max(0, total.input - base.input),
+    output: Math.max(0, total.output - base.output),
+    cacheRead: Math.max(0, total.cacheRead - base.cacheRead),
+    cacheWrite: Math.max(0, total.cacheWrite - base.cacheWrite),
+    cost: Math.max(0, total.cost - base.cost),
+    turns: Math.max(0, total.turns - base.turns),
   };
 }
 
@@ -645,6 +660,9 @@ export class WorkflowManager {
           const harness = call.route?.harness;
           return jobId && (harness === "claude" || harness === "codex") ? [[jobId, harness] as const] : [];
         })),
+        carriedUsage: restartAt === undefined && source.handoffs.length
+          ? clone(source.usage)
+          : undefined,
       };
     }
     const warnings = workflowBudgetWarnings(budget);
@@ -672,6 +690,7 @@ export class WorkflowManager {
         sourceRunId: replay.sourceRunId,
         matchedCalls: 0,
         invalidatedAt: request.restartFromCallIndex,
+        ...(replay.carriedUsage ? { carriedUsage: clone(replay.carriedUsage) } : {}),
       } : undefined,
     };
     await this.#evictOldRuns();
@@ -766,37 +785,64 @@ export class WorkflowManager {
    * summary and journal read, so a concurrent retention pass cannot delete a
    * source between those reads. Terminal sources remain claimed by this
    * manager while an explicit replay references them. */
-  async #loadReplaySource(runId: string): Promise<ReplaySource | undefined> {
+  async #loadReplaySource(runId: string, ancestors = new Set<string>()): Promise<ReplaySource | undefined> {
+    if (ancestors.has(runId)) return undefined;
+    const nextAncestors = new Set(ancestors).add(runId);
     const inMemory = this.#runs.get(runId);
+    let snapshot: WorkflowSnapshot | undefined;
+    let records: WorkflowJournalRecord[] = [];
     if (inMemory) {
-      const records = await loadWorkflowJournal(this.#artifactRoot, runId);
-      return {
-        snapshot: inMemory.snapshot,
-        calls: replayableJournalCalls(records),
-        handoffs: replayableJournalHandoffs(records),
-        interactions: replayableJournalInteractions(records),
-        progressedCalls: progressedJournalCalls(records),
-      };
+      snapshot = inMemory.snapshot;
+      if (terminalWorkflow(snapshot.status)) records = await loadWorkflowJournal(this.#artifactRoot, runId);
+    } else {
+      const lease = this.#retentionLease;
+      if (!lease) throw new Error("Workflow session lease is unavailable");
+      const loaded = await withWorkflowRetentionLock(this.#artifactRoot, async () => {
+        const source = await readWorkflowRunSummary(this.#artifactRoot, runId);
+        if (!source) return undefined;
+        if (!terminalWorkflow(source.status)) return { snapshot: source, records: [] as WorkflowJournalRecord[] };
+        await lease.claimWhileLocked([runId]);
+        this.#replaySourceRunIds.add(runId);
+        return { snapshot: source, records: await loadWorkflowJournal(this.#artifactRoot, runId) };
+      });
+      snapshot = loaded?.snapshot;
+      records = loaded?.records ?? [];
     }
-    const lease = this.#retentionLease;
-    if (!lease) throw new Error("Workflow session lease is unavailable");
-    return withWorkflowRetentionLock(this.#artifactRoot, async () => {
-      const snapshot = await readWorkflowRunSummary(this.#artifactRoot, runId);
-      if (!snapshot) return undefined;
-      if (!terminalWorkflow(snapshot.status)) {
-        return { snapshot, calls: [], handoffs: [], interactions: [], progressedCalls: new Set() };
-      }
-      await lease.claimWhileLocked([runId]);
-      this.#replaySourceRunIds.add(runId);
-      const records = await loadWorkflowJournal(this.#artifactRoot, runId);
+    if (!snapshot) return undefined;
+    if (!terminalWorkflow(snapshot.status)) {
       return {
         snapshot,
-        calls: replayableJournalCalls(records),
-        handoffs: replayableJournalHandoffs(records),
-        interactions: replayableJournalInteractions(records),
-        progressedCalls: progressedJournalCalls(records),
+        calls: [],
+        handoffs: [],
+        interactions: [],
+        progressedCalls: new Set(),
+        usage: workflowUsage(),
       };
-    });
+    }
+
+    const sourceRuns = new Map<string, ReplaySource | undefined>();
+    const replaySources = new Map<string, WorkflowReplayCall>();
+    for (const record of records) {
+      if (record.state !== "completed" || record.result?.ok !== true
+          || !record.route?.continuation || !record.replayedFrom) continue;
+      let source = sourceRuns.get(record.replayedFrom.runId);
+      if (!sourceRuns.has(record.replayedFrom.runId)) {
+        source = await this.#loadReplaySource(record.replayedFrom.runId, nextAncestors);
+        sourceRuns.set(record.replayedFrom.runId, source);
+      }
+      const call = source?.calls.find((candidate) => candidate.callIndex === record.replayedFrom!.callIndex);
+      if (call) replaySources.set(workflowReplayReferenceKey(record.replayedFrom), call);
+    }
+    const calls = replayableJournalCalls(records, replaySources);
+    const carriedUsage = snapshot.replay?.carriedUsage;
+    return {
+      snapshot,
+      calls,
+      handoffs: replayableJournalHandoffs(records),
+      interactions: replayableJournalInteractions(records),
+      progressedCalls: progressedJournalCalls(records),
+      usage: addWorkflowUsage(carriedUsage, aggregateWorkflowUsage(snapshot)),
+    };
   }
 
   /** Enumerates every preserved/orphaned worktree across this manager's artifact root. */
@@ -1078,6 +1124,7 @@ export class WorkflowManager {
     if (entry.replay?.active && expected?.fingerprint === fingerprint && expected.kind === "agent") {
       const record = this.#recordReplayedAgent(entry, prompt, options, callIndex, fingerprint, expected);
       entry.snapshot.replay!.matchedCalls++;
+      await this.#appendReplayedContinuationProof(entry, callIndex, fingerprint, "agent", record.index, expected);
       await this.#appendJournal(entry, {
         callIndex,
         fingerprint,
@@ -1410,6 +1457,7 @@ export class WorkflowManager {
       entry.snapshot.replay!.matchedCalls++;
       const replayedResult = clone(expected.result);
       replayedResult.jobId = record.logicalJobId ?? jobId;
+      await this.#appendReplayedContinuationProof(entry, callIndex, fingerprint, "followUp", record.index, expected);
       await this.#appendJournal(entry, {
         callIndex,
         fingerprint,
@@ -1436,6 +1484,7 @@ export class WorkflowManager {
         return { ok: false, output: "", error };
       }
       this.#applyHandoffCheckpoint(record, handoff);
+      this.#claimReplayHandoffUsage(entry, handoff.checkpoint);
       const callController = new AbortController();
       entry.callControllers.set(callIndex, callController);
       const bridgeCallAbort = () => callController.abort(signal.reason);
@@ -1632,6 +1681,7 @@ export class WorkflowManager {
       trigger?: WorkflowProviderFallbackTrigger | WorkflowContinuationTrigger;
       task?: string;
       attemptUsageBase?: WorkflowUsage;
+      includeReplayCarriedUsage?: true;
       beforeSpawn?: () => Promise<void>;
       beforeStart?: (signal: AbortSignal) => Promise<void>;
     },
@@ -1762,7 +1812,10 @@ export class WorkflowManager {
     this.#touch(entry);
 
     if (retry) {
-      const retryPreflightError = this.#budgetPreflight(entry);
+      const retryPreflightError = this.#budgetPreflight(
+        entry,
+        retry.includeReplayCarriedUsage ? entry.snapshot.replay?.carriedUsage : undefined,
+      );
       if (retryPreflightError) {
         record.state = "failed";
         record.error = retryPreflightError;
@@ -1894,7 +1947,10 @@ export class WorkflowManager {
           label: record.name,
           phase: entry.snapshot.phases[phase]?.name,
         },
-        dispatchGate: () => this.#budgetPreflight(entry),
+        dispatchGate: () => this.#budgetPreflight(
+          entry,
+          retry?.includeReplayCarriedUsage ? entry.snapshot.replay?.carriedUsage : undefined,
+        ),
         // A workflow child may ask an authorized same-run peer, and may wake the
         // parent orchestrator only when this run is itself in the background:
         // a foreground workflow's parent turn is blocked awaiting the workflow
@@ -1921,7 +1977,10 @@ export class WorkflowManager {
             await retry.beforeStart!(admissionSignal);
             applyRoutingEvidence(admitted);
             this.#touch(entry);
-            const budgetError = this.#budgetPreflight(entry);
+            const budgetError = this.#budgetPreflight(
+              entry,
+              retry.includeReplayCarriedUsage ? entry.snapshot.replay?.carriedUsage : undefined,
+            );
             if (budgetError) throw new Error(budgetError);
             return { capabilityRoute: admitted.capabilityRoute };
           } catch (error) {
@@ -2342,6 +2401,38 @@ export class WorkflowManager {
     return record;
   }
 
+  async #appendReplayedContinuationProof(
+    entry: RunEntry,
+    callIndex: number,
+    fingerprint: string,
+    kind: "agent" | "followUp",
+    agentIndex: number,
+    replay: WorkflowReplayCall,
+  ): Promise<void> {
+    const proof = replay.continuationProof;
+    if (!proof) return;
+    await this.#appendJournal(entry, {
+      callIndex,
+      fingerprint,
+      kind,
+      state: "progressed",
+      at: Date.now(),
+      agentIndex,
+      route: clone(proof.progressRoute),
+      continuationProgress: { ...clone(proof.progress), agentIndex },
+    });
+    await this.#appendJournal(entry, {
+      callIndex,
+      fingerprint,
+      kind,
+      state: "handoff",
+      at: Date.now(),
+      agentIndex,
+      route: clone(proof.handoffRoute),
+      continuation: { ...clone(proof.handoff), agentIndex },
+    });
+  }
+
   #applyHandoffCheckpoint(record: WorkflowAgentRecord, handoff: WorkflowReplayHandoff): void {
     const checkpoint = handoff.checkpoint;
     const route = handoff.route;
@@ -2405,11 +2496,20 @@ export class WorkflowManager {
       usage: workflowUsage(),
     };
     this.#applyHandoffCheckpoint(record, handoff);
+    this.#claimReplayHandoffUsage(entry, handoff.checkpoint);
     entry.snapshot.agents.push(record);
     entry.snapshot.phases[phase]?.agents.push(index);
     this.#jobOwners.set(record.logicalJobId!, { runId: entry.snapshot.runId, agentIndex: index });
     this.#touch(entry);
     return record;
+  }
+
+  #claimReplayHandoffUsage(entry: RunEntry, checkpoint: WorkflowContinuationHandoff): void {
+    const carried = entry.snapshot.replay?.carriedUsage;
+    if (!carried) return;
+    const remaining = subtractWorkflowUsageFloor(carried, checkpoint.usage);
+    entry.snapshot.replay!.carriedUsage = remaining;
+    if (entry.replay) entry.replay.carriedUsage = clone(remaining);
   }
 
   async #resumeContinuationHandoff(
@@ -2487,6 +2587,7 @@ export class WorkflowManager {
           trigger: checkpoint.trigger,
           task: checkpoint.handoffPrompt,
           attemptUsageBase: subtractWorkflowUsage(checkpoint.usage, checkpoint.attemptUsage ?? checkpoint.usage),
+          includeReplayCarriedUsage: true,
           beforeSpawn: () => this.#checkout.assert(checkpoint.checkout, signal),
           beforeStart: (admissionSignal) => this.#checkout.assert(checkpoint.checkout, admissionSignal),
         },
@@ -3007,10 +3108,10 @@ export class WorkflowManager {
     }
   }
 
-  #budgetPreflight(entry: RunEntry): string | undefined {
+  #budgetPreflight(entry: RunEntry, carriedUsage?: WorkflowUsage): string | undefined {
     const budget = entry.snapshot.budget;
     if (!budget) return undefined;
-    const usage = aggregateWorkflowUsage(entry.snapshot);
+    const usage = addWorkflowUsage(carriedUsage, aggregateWorkflowUsage(entry.snapshot));
     const tokens = usage.input + usage.output;
     if (budget.maxTokens !== undefined && tokens >= budget.maxTokens) return `Workflow token budget exhausted (${tokens}/${budget.maxTokens})`;
     if (budget.maxCost !== undefined && usage.cost >= budget.maxCost) return `Workflow cost budget exhausted ($${usage.cost.toFixed(4)}/$${budget.maxCost})`;

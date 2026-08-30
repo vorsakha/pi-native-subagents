@@ -14,8 +14,8 @@ Fresh input plus output consumes `maxTokens`; cache reads do not. Never infer a 
 
 - `maxAgents` and `maxConcurrency` limit work shape. `maxTokens` limits aggregate fresh input plus output; cached reads remain visible but do not consume that budget. `maxTokensPerAgent` applies the same ceiling to one child. `maxCost` and `maxTurns` are aggregate, and `maxTurns` is not a per-agent allowance.
 - Workflow budgets are optional. An omitted or empty budget leaves spend open while the hard ceilings — 32 calls, four workers, global concurrency four, watchdogs, provider/context limits, bounded persistence, cancellation, and shutdown — remain in force.
-- Spend limits are soft dispatch boundaries. The runtime warns once per reached metric, lets already-running calls finish, accepts asynchronous overshoot, preserves natural child success, and blocks only later fresh dispatches. Workflow-owned jobs recheck the boundary when a global scheduler slot opens, so queued children cannot slip through after another child settles. A replayable completed journal call is replayed before fresh-dispatch budget checks. `maxTokensPerAgent` follows the same rule.
-- Use `>=` semantics: observed usage at the exact limit counts as reached. Workflow aggregate usage is cumulative across children; replayed calls do not spend again.
+- Spend limits are soft dispatch boundaries. The runtime warns once per metric, lets running calls finish, accepts overshoot, preserves their results, and blocks later fresh dispatches. Queued workflow jobs recheck when a global slot opens. Replayable completions bypass fresh-dispatch checks; `maxTokensPerAgent` follows the same rule.
+- `>=` is reached. Aggregate usage spans children. Exact replay is free, but interrupted-handoff replacement admission includes completed sibling usage from the source run.
 
 ## Cost reporting is provider-dependent
 

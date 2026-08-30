@@ -1005,6 +1005,7 @@ test("continuation handoff dashboard never labels the settled primary as retaine
   state.overlay.handleInput("i");
   state.overlay.handleInput("g");
   const inspector = state.overlay.render(140).join("\n");
+  assert.match(inspector, /Progressed continuation · used · declared codex\/native default/);
   assert.match(inspector, /Continuation · handoff · claude → codex · failed job/);
   assert.doesNotMatch(inspector, /retained job/, "no replacement session exists during the durable handoff");
 });

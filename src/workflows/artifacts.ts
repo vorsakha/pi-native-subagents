@@ -440,6 +440,7 @@ function isCheckoutProof(value: unknown): boolean {
     && typeof proof.root === "string" && !!proof.root && proof.root.length <= 4_096
     && typeof proof.gitDir === "string" && !!proof.gitDir && proof.gitDir.length <= 4_096
     && typeof proof.head === "string" && /^[a-f0-9]{40,64}$/i.test(proof.head)
+    && (proof.headRef === null || typeof proof.headRef === "string" && !!proof.headRef && proof.headRef.length <= 4_096 && !proof.headRef.includes("\0"))
     && Number.isSafeInteger(proof.changedPaths) && (proof.changedPaths as number) >= 0 && (proof.changedPaths as number) <= 4_096
     && typeof proof.digest === "string" && /^sha256:[a-f0-9]{64}$/.test(proof.digest);
 }
@@ -853,6 +854,19 @@ function validReplacementReference(value: unknown): boolean {
     && reference.reason.length <= 200;
 }
 
+function validReplayState(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const replay = value as Record<string, unknown>;
+  return typeof replay.sourceRunId === "string"
+    && RUN_ID_PATTERN.test(replay.sourceRunId)
+    && Number.isSafeInteger(replay.matchedCalls)
+    && (replay.matchedCalls as number) >= 0
+    && (replay.matchedCalls as number) <= 32
+    && (replay.invalidatedAt === undefined || Number.isSafeInteger(replay.invalidatedAt)
+      && (replay.invalidatedAt as number) >= 0 && (replay.invalidatedAt as number) < 32)
+    && (replay.carriedUsage === undefined || isWorkflowUsage(replay.carriedUsage));
+}
+
 function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
   if (!value || typeof value !== "object") return false;
   const candidate = value as Partial<WorkflowSnapshot>;
@@ -877,6 +891,7 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
     && typeof candidate.timestamps.updatedAt === "number"
     && (candidate.approval === undefined || candidate.approval === "auto" || candidate.approval === "plan" || candidate.approval === "onMutate")
     && (candidate.replacementOf === undefined || validReplacementReference(candidate.replacementOf))
+    && (candidate.replay === undefined || validReplayState(candidate.replay))
     && (candidate.convergence === undefined || isWorkflowConvergence(candidate.convergence))
     && (candidate.budget === undefined || !!candidate.budget && typeof candidate.budget === "object" && !Array.isArray(candidate.budget)
       && Object.keys(candidate.budget).every((key) => ["maxAgents", "maxConcurrency", "maxTokens", "maxTokensPerAgent", "maxCost", "maxTurns"].includes(key))

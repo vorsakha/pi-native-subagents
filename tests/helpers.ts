@@ -147,6 +147,16 @@ export async function waitFor(
   }
 }
 
+export async function withTimeout<T>(promise: Promise<T>, description: string, timeoutMs = 3_000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), timeoutMs);
+    timer.unref();
+  });
+  try { return await Promise.race([promise, timeout]); }
+  finally { if (timer) clearTimeout(timer); }
+}
+
 /** Creates a unique temp directory. Callers are responsible for cleanup. */
 export function tempDir(prefix: string): Promise<string> {
   return mkdtemp(join(tmpdir(), `${prefix}-`));
@@ -271,6 +281,7 @@ export class StaticWorkflowCheckout implements WorkflowCheckoutOperations {
       root: cwd,
       gitDir: join(cwd, ".git"),
       head: "a".repeat(40),
+      headRef: "refs/heads/main",
       changedPaths: 0,
       digest: `sha256:${"b".repeat(64)}`,
     };

@@ -15,6 +15,7 @@ import {
   workflowCallFingerprint,
   workflowDefinitionFingerprint,
   workflowInteractionFingerprint,
+  workflowReplayReferenceKey,
 } from "../src/workflows/journal.ts";
 import type { WorkflowJournalRecord } from "../src/workflows/types.ts";
 
@@ -180,6 +181,7 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
         root: "/repo",
         gitDir: "/repo/.git",
         head: "a".repeat(40),
+        headRef: "refs/heads/main",
         changedPaths: 1,
         digest: `sha256:${"b".repeat(64)}`,
       },
@@ -240,7 +242,26 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
       },
     },
   };
-  assert.equal(replayableJournalCalls([started, progressed, handoff, completed])[0]?.result.ok, true);
+  const accepted = replayableJournalCalls([started, progressed, handoff, completed])[0]!;
+  assert.equal(accepted.result.ok, true);
+  assert.deepEqual(accepted.continuationProof?.handoff, handoff.continuation);
+
+  const replayedTerminal = structuredClone(completed);
+  replayedTerminal.replayedFrom = { runId: "source-run", callIndex: 0 };
+  const terminalOnly = [started, replayedTerminal];
+  const unprovedReplay = replayableJournalCalls(terminalOnly)[0]!;
+  assert.equal(unprovedReplay.result.ok, false);
+  assert.equal(unprovedReplay.result.progressed, true);
+  assert.match(unprovedReplay.result.error ?? "", /validated replay provenance/);
+
+  const validated = new Map([[workflowReplayReferenceKey(replayedTerminal.replayedFrom), accepted]]);
+  assert.equal(replayableJournalCalls(terminalOnly, validated)[0]?.result.ok, true);
+
+  const mismatchedReplay = structuredClone(replayedTerminal);
+  mismatchedReplay.result!.output = "different replay output";
+  const refusedMismatch = replayableJournalCalls([started, mismatchedReplay], validated)[0]!;
+  assert.equal(refusedMismatch.result.ok, false);
+  assert.equal(refusedMismatch.result.progressed, true);
 
   const missingHandoff = replayableJournalCalls([started, progressed, completed]);
   assert.equal(missingHandoff[0]?.result.ok, false);

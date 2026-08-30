@@ -14,6 +14,8 @@ export interface WorkflowCheckoutProof {
   root: string;
   gitDir: string;
   head: string;
+  /** Full symbolic ref, or null when HEAD is detached. */
+  headRef: string | null;
   changedPaths: number;
   digest: string;
 }
@@ -33,6 +35,19 @@ async function git(
   });
   signal?.throwIfAborted();
   return stdout;
+}
+
+async function symbolicHead(cwd: string, signal?: AbortSignal): Promise<string | null> {
+  try {
+    const reference = String(await git(cwd, ["symbolic-ref", "--quiet", "HEAD"], "utf8", signal)).trim();
+    if (!reference || reference.length > 4_096 || reference.includes("\0")) {
+      throw new Error("Workflow continuation requires a valid symbolic HEAD reference");
+    }
+    return reference;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === 1) return null;
+    throw error;
+  }
 }
 
 function containedPath(root: string, path: string): string {
@@ -75,6 +90,7 @@ export async function captureWorkflowCheckout(cwd: string, signal?: AbortSignal)
   const gitDir = await realpath(gitDirText);
   const head = String(await git(canonicalCwd, ["rev-parse", "HEAD"], "utf8", signal)).trim();
   if (!/^[a-f0-9]{40,64}$/i.test(head)) throw new Error("Workflow continuation requires a checkout with a valid HEAD commit");
+  const headRef = await symbolicHead(canonicalCwd, signal);
 
   const index = await git(canonicalCwd, ["ls-files", "--stage", "-z"], "buffer", signal) as Buffer;
   const indexFlags = await git(canonicalCwd, ["ls-files", "-v", "-z"], "buffer", signal) as Buffer;
@@ -95,8 +111,9 @@ export async function captureWorkflowCheckout(cwd: string, signal?: AbortSignal)
   }
 
   const hash = createHash("sha256");
-  hash.update("workflow-checkout-v4\0");
+  hash.update("workflow-checkout-v5\0");
   hash.update(canonicalCwd).update("\0").update(root).update("\0").update(gitDir).update("\0").update(head).update("\0");
+  hash.update("head-ref\0").update(headRef ?? "DETACHED").update("\0");
   hash.update("index\0").update(index).update("\0");
   hash.update("index-flags\0").update(indexFlags).update("\0");
   hash.update("index-fsmonitor\0").update(fsmonitorFlags).update("\0");
@@ -113,13 +130,17 @@ export async function captureWorkflowCheckout(cwd: string, signal?: AbortSignal)
     else await hashRegularFile(hash, absolute, signal);
   }
 
-  const [stableIndex, stableIndexFlags, stableFsmonitorFlags, stableStatus] = await Promise.all([
+  const [stableHead, stableHeadRef, stableIndex, stableIndexFlags, stableFsmonitorFlags, stableStatus] = await Promise.all([
+    git(canonicalCwd, ["rev-parse", "HEAD"], "utf8", signal) as Promise<string>,
+    symbolicHead(canonicalCwd, signal),
     git(canonicalCwd, ["ls-files", "--stage", "-z"], "buffer", signal) as Promise<Buffer>,
     git(canonicalCwd, ["ls-files", "-v", "-z"], "buffer", signal) as Promise<Buffer>,
     git(canonicalCwd, ["ls-files", "-f", "-z"], "buffer", signal) as Promise<Buffer>,
     git(canonicalCwd, statusArgs, "buffer", signal) as Promise<Buffer>,
   ]);
-  if (!index.equals(stableIndex)
+  if (stableHead.trim() !== head
+      || stableHeadRef !== headRef
+      || !index.equals(stableIndex)
       || !indexFlags.equals(stableIndexFlags)
       || !fsmonitorFlags.equals(stableFsmonitorFlags)
       || !raw.equals(stableStatus)) {
@@ -131,6 +152,7 @@ export async function captureWorkflowCheckout(cwd: string, signal?: AbortSignal)
     root,
     gitDir,
     head,
+    headRef,
     changedPaths: entries.length,
     digest: `sha256:${hash.digest("hex")}`,
   };
@@ -142,6 +164,7 @@ export async function assertWorkflowCheckout(proof: WorkflowCheckoutProof, signa
       || current.root !== proof.root
       || current.gitDir !== proof.gitDir
       || current.head !== proof.head
+      || current.headRef !== proof.headRef
       || current.changedPaths !== proof.changedPaths
       || current.digest !== proof.digest) {
     throw new Error("Workflow continuation checkout is missing or diverged from its durable handoff checkpoint");

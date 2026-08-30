@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
-import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, GatedWorkflowJournalAppender, ScriptedHarnessAvailability, tempDir, tick, waitFor } from "./helpers.ts";
+import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, GatedWorkflowJournalAppender, ScriptedHarnessAvailability, tempDir, tick, waitFor, withTimeout } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import { replayableJournalInteractions, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint, workflowInteractionFingerprint } from "../src/workflows/journal.ts";
 import {
@@ -1641,7 +1641,7 @@ test("progressed continuation settles the failed process, hands off current chec
 
     const dispatches = { starts: f.backend.requests.length, sends: f.backend.sends.length };
     const replayed = await f.workflows.start(f.request(script, { resumeFromRunId: final.runId }));
-    const replayFinal = await replayed.completion;
+    const replayFinal = await withTimeout(replayed.completion, "completed continuation replay");
     assert.equal(replayFinal.status, "completed");
     assert.equal(replayFinal.replay?.matchedCalls, 2);
     assert.deepEqual({ starts: f.backend.requests.length, sends: f.backend.sends.length }, dispatches, "completed continuation replay performs no native dispatch");
@@ -1649,6 +1649,38 @@ test("progressed continuation settles the failed process, hands off current chec
     assert.equal(replayFinal.agents[0]?.jobId, replacement.jobId);
     assert.equal(replayFinal.agents[0]?.continuation?.replacementJobId, replacement.jobId);
     assert.deepEqual(aggregateWorkflowUsage(replayFinal), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+
+    const replayJournalPath = join(replayFinal.artifactDir, "journal.jsonl");
+    const replayRecords = (await readFile(replayJournalPath, "utf8")).trim().split("\n")
+      .map((line) => JSON.parse(line) as {
+        sequence: number;
+        state: string;
+        callIndex: number;
+        route?: { continuation?: unknown };
+        replayedFrom?: { runId: string; callIndex: number };
+      });
+    assert.ok(replayRecords.some((record) => record.state === "progressed"), "replayed continuation copies its accepted progress proof");
+    assert.ok(replayRecords.some((record) => record.state === "handoff"), "replayed continuation copies its accepted handoff proof");
+
+    const terminalOnly = replayRecords
+      .filter((record) => record.state !== "progressed" && record.state !== "handoff")
+      .map((record, sequence) => ({ ...record, sequence }));
+    await writeFile(replayJournalPath, `${terminalOnly.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    const replayOfReplay = await f.workflows.start(f.request(script, { resumeFromRunId: replayFinal.runId }));
+    const replayOfReplayFinal = await withTimeout(replayOfReplay.completion, "validated replay of replay");
+    assert.equal((replayOfReplayFinal.result as { ok: boolean }).ok, true, "terminal-only replay validates its referenced source checkpoint chain");
+    assert.deepEqual({ starts: f.backend.requests.length, sends: f.backend.sends.length }, dispatches);
+
+    const mismatched = structuredClone(terminalOnly);
+    const continuationTerminal = mismatched.find((record) => record.state === "completed" && record.route?.continuation);
+    assert.ok(continuationTerminal?.replayedFrom);
+    continuationTerminal.replayedFrom.callIndex = 31;
+    await writeFile(replayJournalPath, `${mismatched.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    const refused = await f.workflows.start(f.request(script, { resumeFromRunId: replayFinal.runId }));
+    const refusedFinal = await withTimeout(refused.completion, "refused mismatched replay");
+    assert.equal((refusedFinal.result as { ok: boolean }).ok, false);
+    assert.match((refusedFinal.result as { error?: string }).error ?? "", /validated replay provenance/);
+    assert.deepEqual({ starts: f.backend.requests.length, sends: f.backend.sends.length }, dispatches, "mismatched provenance dispatches neither provider");
   } finally {
     await f.cleanup();
   }
@@ -2614,6 +2646,65 @@ test("interrupted continuation handoffs keep every original workflow budget ceil
   } finally {
     availability.release();
     await f.cleanup();
+  }
+});
+
+test("handoff replay charges completed sibling usage before replacement admission", async () => {
+  const scenarios = [
+    { name: "tokens", budget: { maxTokens: 10 }, sibling: { input: 6 }, primary: { input: 4 }, error: /token budget exhausted/i },
+    { name: "cost", budget: { maxCost: 2 }, sibling: { cost: 1 }, primary: { cost: 1 }, error: /cost budget exhausted/i },
+    { name: "turns", budget: { maxTurns: 2 }, sibling: { turns: 1 }, primary: { turns: 1 }, error: /turn budget exhausted/i },
+  ] as const;
+  for (const scenario of scenarios) {
+    const availability = new GatedHarnessAvailability("codex", {
+      claude: availabilityFixture("claude"),
+      codex: availabilityFixture("codex"),
+    });
+    const f = await fixture(4, undefined, undefined, undefined, availability);
+    try {
+      await initializeGitCheckout(f.cwd);
+      const script = `export default async () => {
+        const [sibling, primary] = await parallel([
+          () => agent("spent sibling ${scenario.name}", { harness: "claude", access: "readOnly" }),
+          () => agent("continued primary ${scenario.name}", {
+            harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+          })
+        ], 2);
+        return primary.ok ? sibling : primary;
+      };`;
+      const started = await f.workflows.start(f.request(script, { budget: scenario.budget }));
+      await withTimeout(f.claude.waitForStart(2), "progressed primary start");
+      const primary = f.claude.requestForTask(`continued primary ${scenario.name}`)!.jobId;
+      f.claude.emit(primary, { type: "message", text: "progressed primary" });
+      f.claude.emit(primary, { type: "usage", usage: scenario.primary });
+      f.claude.fail(primary, "quota", progressedQuota("claude"));
+      await withTimeout(availability.waitUntilReached(), "continuation target probe");
+      f.claude.complete(f.claude.requestForTask(`spent sibling ${scenario.name}`)!.jobId, "sibling complete", scenario.sibling);
+      const cancellation = f.workflows.cancel(started.snapshot.runId, "retain budget handoff");
+      availability.release();
+      const source = await withTimeout(cancellation, "source cancellation");
+
+      const journalPath = join(source.artifactDir, "journal.jsonl");
+      const records = (await readFile(journalPath, "utf8")).trim().split("\n")
+        .map((line) => JSON.parse(line) as { callIndex: number; state: string });
+      const handoffIndex = records.findIndex((record) => record.callIndex === 1 && record.state === "handoff");
+      assert.ok(handoffIndex >= 0);
+      const interrupted = records.filter((record) => record.callIndex !== 1 || record.state !== "failed");
+      assert.ok(interrupted.some((record) => record.callIndex === 0 && record.state === "completed"));
+      await writeFile(journalPath, `${interrupted.map((record) => JSON.stringify(record)).join("\n")}\n`);
+
+      const replacementDispatches = f.backend.requests.length;
+      const resumed = await f.workflows.start(f.request(script, { budget: scenario.budget, resumeFromRunId: source.runId }));
+      const final = await withTimeout(resumed.completion, "budget-denied handoff replay");
+      assert.equal((final.result as { ok: boolean }).ok, false);
+      assert.match((final.result as { error?: string }).error ?? "", scenario.error);
+      assert.equal(f.claude.requests.length, 2, "replay never reruns the progressed primary");
+      assert.equal(f.backend.requests.length, replacementDispatches, "prior sibling usage blocks replacement startup");
+      assert.ok(final.replay?.carriedUsage, "unrepresented source usage remains durable on the replay snapshot");
+    } finally {
+      availability.release();
+      await f.cleanup();
+    }
   }
 });
 

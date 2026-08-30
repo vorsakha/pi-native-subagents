@@ -451,6 +451,13 @@ export interface WorkflowReplayCall {
   agentIndex?: number;
   result: WorkflowJournalResult;
   route?: WorkflowJournalRoute;
+  /** Accepted checkpoint chain copied into a replay journal before its terminal record. */
+  continuationProof?: {
+    progress: WorkflowContinuationProgress;
+    progressRoute: WorkflowJournalRoute;
+    handoff: WorkflowContinuationHandoff;
+    handoffRoute: WorkflowJournalRoute;
+  };
 }
 
 export interface WorkflowReplayHandoff {
@@ -478,6 +485,8 @@ export interface WorkflowReplayState {
   sourceRunId: string;
   matchedCalls: number;
   invalidatedAt?: number;
+  /** Source usage not represented by reconstructed agents, charged only when an interrupted handoff dispatches its replacement. */
+  carriedUsage?: WorkflowUsage;
 }
 
 /** Machine-readable review verdict a bounded convergence loop branches on. */

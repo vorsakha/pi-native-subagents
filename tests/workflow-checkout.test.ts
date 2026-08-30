@@ -72,6 +72,36 @@ test("checkout proof observes an already-cancelled signal before invoking Git", 
   await assert.rejects(captureWorkflowCheckout("/path/that/does/not/exist", controller.signal), /operator cancelled/);
 });
 
+test("checkout proof binds the attached branch and detached HEAD state at the same commit", async () => {
+  const parent = await tempDir("workflow-checkout-head-identity");
+  const cwd = join(parent, "repo");
+  try {
+    await mkdir(cwd);
+    await writeFile(join(cwd, "tracked.txt"), "base\n");
+    await execFileAsync("git", ["init", "-q"], { cwd });
+    await execFileAsync("git", ["config", "user.email", "workflow-tests@example.invalid"], { cwd });
+    await execFileAsync("git", ["config", "user.name", "Workflow Tests"], { cwd });
+    await execFileAsync("git", ["add", "tracked.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "fixture"], { cwd });
+
+    const original = await captureWorkflowCheckout(cwd);
+    assert.match(original.headRef ?? "", /^refs\/heads\//);
+    await execFileAsync("git", ["switch", "-qc", "same-commit-branch"], { cwd });
+    await assert.rejects(assertWorkflowCheckout(original), /checkout is missing or diverged/);
+
+    const attached = await captureWorkflowCheckout(cwd);
+    assert.equal(attached.head, original.head);
+    assert.equal(attached.headRef, "refs/heads/same-commit-branch");
+    await execFileAsync("git", ["switch", "--detach", "-q", "HEAD"], { cwd });
+    const detached = await captureWorkflowCheckout(cwd);
+    assert.equal(detached.head, attached.head);
+    assert.equal(detached.headRef, null);
+    await assert.rejects(assertWorkflowCheckout(attached), /checkout is missing or diverged/);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});
+
 test("checkout proof rejects fsmonitor-valid entries that can hide worktree divergence", async () => {
   const parent = await tempDir("workflow-checkout-fsmonitor");
   const cwd = join(parent, "repo");

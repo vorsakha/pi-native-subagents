@@ -184,16 +184,90 @@ function continuationTerminalMatches(
     && (handoff.target.model === undefined || terminalRoute.model === handoff.target.model);
 }
 
+export function workflowReplayReferenceKey(reference: { runId: string; callIndex: number }): string {
+  return `${reference.runId}\0${reference.callIndex}`;
+}
+
+function bindContinuationProof(
+  proof: NonNullable<WorkflowReplayCall["continuationProof"]>,
+  agentIndex: number,
+): NonNullable<WorkflowReplayCall["continuationProof"]> {
+  return {
+    progress: { ...structuredClone(proof.progress), agentIndex },
+    progressRoute: structuredClone(proof.progressRoute),
+    handoff: { ...structuredClone(proof.handoff), agentIndex },
+    handoffRoute: structuredClone(proof.handoffRoute),
+  };
+}
+
+function localContinuationProof(
+  progressRecord: WorkflowJournalRecord,
+  handoffRecord: WorkflowJournalRecord,
+): NonNullable<WorkflowReplayCall["continuationProof"]> | undefined {
+  if (!progressRecord.continuationProgress || !progressRecord.route
+      || !handoffRecord.continuation || !handoffRecord.route) return undefined;
+  return {
+    progress: structuredClone(progressRecord.continuationProgress),
+    progressRoute: structuredClone(progressRecord.route),
+    handoff: structuredClone(handoffRecord.continuation),
+    handoffRoute: structuredClone(handoffRecord.route),
+  };
+}
+
+function validatedReplayContinuationProof(
+  record: WorkflowJournalRecord,
+  replaySources: ReadonlyMap<string, WorkflowReplayCall>,
+): NonNullable<WorkflowReplayCall["continuationProof"]> | undefined {
+  const reference = record.replayedFrom;
+  if (!reference || record.agentIndex === undefined) return undefined;
+  const source = replaySources.get(workflowReplayReferenceKey(reference));
+  if (!source?.continuationProof
+      || source.callIndex !== reference.callIndex
+      || source.fingerprint !== record.fingerprint
+      || source.kind !== callKind(record)
+      || canonicalJson(source.result) !== canonicalJson(record.result)
+      || canonicalJson(source.route ?? null) !== canonicalJson(record.route ?? null)) return undefined;
+
+  const proof = bindContinuationProof(source.continuationProof, record.agentIndex);
+  return continuationProofMatchesTerminal(proof, record) ? proof : undefined;
+}
+
+function continuationProofMatchesTerminal(
+  proof: NonNullable<WorkflowReplayCall["continuationProof"]>,
+  record: WorkflowJournalRecord,
+): boolean {
+  if (record.agentIndex === undefined) return false;
+  const handoffRecord: WorkflowJournalRecord = {
+    version: 1,
+    sequence: record.sequence,
+    callIndex: record.callIndex,
+    fingerprint: record.fingerprint,
+    kind: record.kind,
+    state: "handoff",
+    at: record.at,
+    agentIndex: record.agentIndex,
+    route: proof.handoffRoute,
+    continuation: proof.handoff,
+  };
+  return continuationTerminalMatches(handoffRecord, record);
+}
+
 /** Return every independently replayable completed call. Failed, incomplete,
  * duplicated, or fingerprint-inconsistent ordinals are excluded without
  * discarding later parallel calls whose own journal pairs remain valid. */
-export function replayableJournalCalls(records: WorkflowJournalRecord[]): WorkflowReplayCall[] {
+export function replayableJournalCalls(
+  records: WorkflowJournalRecord[],
+  replaySources: ReadonlyMap<string, WorkflowReplayCall> = new Map(),
+): WorkflowReplayCall[] {
   const started = new Map<number, WorkflowJournalRecord>();
   const progressed = new Map<number, WorkflowJournalRecord>();
   const handoffs = new Map<number, WorkflowJournalRecord>();
   const rejectedHandoffs = new Map<number, WorkflowJournalRecord>();
   const rejectedTerminals = new Set<number>();
+  const rejectedContinuationTerminals = new Map<number, WorkflowJournalRecord>();
   const completed = new Map<number, WorkflowJournalRecord>();
+  const continuationProofs = new Map<number, NonNullable<WorkflowReplayCall["continuationProof"]>>();
+  const acceptedLineageProofs: Array<NonNullable<WorkflowReplayCall["continuationProof"]>> = [];
   const invalid = new Set<number>();
 
   for (const record of records) {
@@ -236,10 +310,30 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
     if (record.state === "completed" && record.result?.ok === true) {
       const progress = progressed.get(record.callIndex);
       const handoff = handoffs.get(record.callIndex);
-      if (progress && (!handoff || !continuationTerminalMatches(handoff, record))) {
+      const carriesContinuation = record.route?.continuation !== undefined;
+      const localProof = progress && handoff && continuationTerminalMatches(handoff, record)
+        ? localContinuationProof(progress, handoff)
+        : undefined;
+      const replayProof = !progress && carriesContinuation
+        ? validatedReplayContinuationProof(record, replaySources)
+        : undefined;
+      const lineageProof = !progress && carriesContinuation && record.agentIndex !== undefined
+        ? acceptedLineageProofs
+          .map((proof) => bindContinuationProof(proof, record.agentIndex!))
+          .find((proof) => continuationProofMatchesTerminal(proof, record))
+        : undefined;
+      if ((carriesContinuation && !localProof && !replayProof && !lineageProof) || (progress && !localProof)) {
         rejectedTerminals.add(record.callIndex);
+        rejectedContinuationTerminals.set(record.callIndex, record);
         handoffs.delete(record.callIndex);
-      } else completed.set(record.callIndex, record);
+      } else {
+        completed.set(record.callIndex, record);
+        const proof = localProof ?? replayProof ?? lineageProof;
+        if (proof) {
+          continuationProofs.set(record.callIndex, proof);
+          acceptedLineageProofs.push(proof);
+        }
+      }
     }
     else if (record.state === "failed" && record.result?.ok === false
         && (progressed.has(record.callIndex) || handoffs.has(record.callIndex) || record.result.progressed === true)) completed.set(record.callIndex, record);
@@ -291,6 +385,20 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
       },
     });
   }
+  for (const [callIndex, record] of rejectedContinuationTerminals) {
+    if (invalid.has(callIndex) || progressed.has(callIndex)) continue;
+    replayable.set(callIndex, {
+      ...record,
+      state: "failed",
+      route: undefined,
+      result: {
+        ok: false,
+        output: "",
+        error: "Continuation completion lacks durable checkpoint or validated replay provenance; neither provider was dispatched",
+        progressed: true,
+      },
+    });
+  }
 
   return [...replayable.entries()]
     .filter(([callIndex, record]) => !invalid.has(callIndex) && !!record.result)
@@ -302,6 +410,9 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
       agentIndex: record.agentIndex,
       result: structuredClone(record.result) as WorkflowJournalResult,
       route: record.route ? { ...record.route } : undefined,
+      ...(continuationProofs.get(callIndex)
+        ? { continuationProof: structuredClone(continuationProofs.get(callIndex)!) }
+        : {}),
     }));
 }
 
