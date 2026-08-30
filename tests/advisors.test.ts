@@ -1170,7 +1170,14 @@ test("consultation persistence failure keeps one pending settlement without corr
   assert.equal(failed.ok, false);
   assert.match(failed.error ?? "", /private state could not be persisted/i);
   assert.deepEqual(failed.usage, { input: 4, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 });
-  assert.deepEqual(registry.get(threadId, opened.id, true), publicBefore, "public accounting remains at the last durable generation");
+  const pending = registry.get(threadId, opened.id, true);
+  assert.equal(pending.state, "hibernated", "the released native run cannot remain publicly idle");
+  assert.match(pending.error ?? "", /private state could not be persisted/i);
+  assert.deepEqual(
+    { ...pending, state: publicBefore.state, error: publicBefore.error },
+    publicBefore,
+    "public accounting remains at the last durable generation",
+  );
   assert.deepEqual(store.records.get(threadId), durableBefore, "a rejected save cannot partially charge durable accounting");
   assert.equal(store.saves.length, 2, "the storage error is not reinterpreted as a second provider failure save");
   assert.ok(backend.closes.includes(backend.starts[0]!), "the uncommitted retained process is released");
@@ -1183,7 +1190,7 @@ test("consultation persistence failure keeps one pending settlement without corr
     trusted: true,
   }), /consultation persistence failed/);
   assert.equal(backend.starts.length, 1, "a repeated persistence failure blocks before another provider turn");
-  assert.deepEqual(registry.get(threadId, opened.id, true), publicBefore);
+  assert.deepEqual(registry.get(threadId, opened.id, true), pending);
   assert.deepEqual(store.records.get(threadId), durableBefore);
 
   store.saveError = undefined;
@@ -1219,6 +1226,77 @@ test("consultation persistence failure keeps one pending settlement without corr
   assert.equal(durable?.generation, 2);
   assert.deepEqual(durable?.usage, settled.usage);
   assert.deepEqual(durable?.ledger.map((entry) => entry.state), ["completed", "completed"]);
+  await registry.shutdown();
+  await jobs.shutdown();
+});
+
+test("failed follow-up persistence reports a released idle advisor and recovers before redispatch", async () => {
+  const { backend, jobs, store, registry } = setup();
+  const opened = await openSecurity(registry);
+  const first = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "establish a resident advisor",
+    sender: "human",
+    trusted: true,
+  });
+  await backend.waitForStart();
+  const retainedJob = backend.starts[0]!;
+  backend.emitContinuation(retainedJob, "codex-idle-pending");
+  backend.complete(retainedJob, "resident", { input: 5, output: 1, turns: 1 });
+  assert.equal((await first).ok, true);
+  const durableBefore = registry.get(threadId, opened.id, true);
+  assert.equal(durableBefore.state, "idle");
+
+  store.saveError = new Error("follow-up persistence failed");
+  const followUp = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "settle while storage is unavailable",
+    sender: "human",
+    trusted: true,
+  });
+  await backend.waitForSend();
+  backend.complete(retainedJob, "unpersisted follow-up", { input: 3, output: 1, turns: 1 });
+  const failed = await followUp;
+
+  assert.equal(failed.ok, false);
+  assert.match(failed.error ?? "", /private state could not be persisted/i);
+  const pending = registry.get(threadId, opened.id, true);
+  assert.equal(pending.state, "hibernated");
+  assert.match(pending.error ?? "", /private state could not be persisted/i);
+  assert.equal(pending.generation, durableBefore.generation);
+  assert.deepEqual(pending.usage, durableBefore.usage);
+  assert.deepEqual(pending.ledger, durableBefore.ledger);
+  assert.throws(() => jobs.checkAdvisorJob(retainedJob, opened.id), /Unknown job/);
+
+  store.saveError = undefined;
+  const recovered = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "continue after storage recovery",
+    sender: "human",
+    trusted: true,
+  });
+  await backend.waitForStart(2);
+  const recoveryRequest = backend.requests[1]!;
+  assert.deepEqual(recoveryRequest.continuation, {
+    harness: "codex",
+    threadId: "codex-idle-pending",
+    sessionFile: "/private/codex-idle-pending.jsonl",
+  });
+  assert.deepEqual(recoveryRequest.providerUsageBaseline, {
+    input: 8, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2,
+  });
+  backend.emitContinuation(recoveryRequest.jobId, "codex-idle-pending");
+  backend.complete(recoveryRequest.jobId, "recovered", { input: 2, output: 1, turns: 1 });
+  assert.equal((await recovered).ok, true);
+
+  const settled = registry.get(threadId, opened.id, true);
+  assert.equal(settled.state, "idle");
+  assert.equal(settled.generation, 3);
+  assert.deepEqual(settled.usage, { input: 10, output: 3, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 3 });
+  assert.deepEqual(settled.ledger.map((entry) => entry.state), ["completed", "completed", "completed"]);
   await registry.shutdown();
   await jobs.shutdown();
 });

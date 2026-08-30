@@ -454,10 +454,10 @@ export class AdvisorRegistry {
     if (request.requiredLineage !== undefined && request.requiredLineage !== record.lineage) {
       throw new Error(`Advisor lineage is incompatible: workflow requires ${request.requiredLineage}, current lineage is ${record.lineage}`);
     }
-    if (record.state === "unavailable" && !request.retryUnavailable) {
+    if (!record.pendingSettlement && record.state === "unavailable" && !request.retryUnavailable) {
       throw new Error(`${record.error ?? "Advisor is unavailable"} Pass retryUnavailable only to retry the recorded continuation, or reset explicitly.`);
     }
-    if (record.state === "unavailable" && !record.continuation) {
+    if (!record.pendingSettlement && record.state === "unavailable" && !record.continuation) {
       throw new Error("Advisor continuation is missing; retry cannot reconstruct it. Reset or close the advisor explicitly.");
     }
     if (record.state === "closed") throw new Error("Advisor is closed");
@@ -845,9 +845,11 @@ export class AdvisorRegistry {
     } catch {
       if (jobId) await this.#jobs.releaseAdvisorRun(jobId, record.id).catch(() => undefined);
       record.jobId = undefined;
+      const message = "Advisor consultation settled, but its private state could not be persisted. Restore advisor storage or close the advisor before continuing.";
       applyStored(record, before);
       record.pendingSettlement = cloneStored(next);
-      const message = "Advisor consultation settled, but its private state could not be persisted. Restore advisor storage or close the advisor before continuing.";
+      record.state = next.continuation ? "hibernated" : "unavailable";
+      record.error = message;
       this.#publish(record);
       return resultFor(record, false, "", message, usage, queuedMs);
     }
@@ -924,6 +926,7 @@ export class AdvisorRegistry {
     if (!pending) return;
     await this.#persistRecord(pending);
     applyStored(record, pending);
+    if (record.state === "idle" && !record.jobId) record.state = "hibernated";
     record.pendingSettlement = undefined;
     this.#publish(record);
   }
