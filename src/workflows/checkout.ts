@@ -65,15 +65,18 @@ export async function captureWorkflowCheckout(cwd: string): Promise<WorkflowChec
   const head = String(await git(canonicalCwd, ["rev-parse", "HEAD"])).trim();
   if (!/^[a-f0-9]{40,64}$/i.test(head)) throw new Error("Workflow continuation requires a checkout with a valid HEAD commit");
 
-  const raw = await git(canonicalCwd, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"], "buffer") as Buffer;
+  const index = await git(canonicalCwd, ["ls-files", "--stage", "-z"], "buffer") as Buffer;
+  const statusArgs = ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"];
+  const raw = await git(canonicalCwd, statusArgs, "buffer") as Buffer;
   const entries = raw.toString("utf8").split("\0").filter(Boolean);
   if (entries.length > MAX_CHANGED_PATHS) {
     throw new Error(`Workflow continuation checkout has more than ${MAX_CHANGED_PATHS} changed paths`);
   }
 
   const hash = createHash("sha256");
-  hash.update("workflow-checkout-v1\0");
+  hash.update("workflow-checkout-v2\0");
   hash.update(canonicalCwd).update("\0").update(root).update("\0").update(gitDir).update("\0").update(head).update("\0");
+  hash.update("index\0").update(index).update("\0");
   for (const entry of entries) {
     if (entry.length < 4 || entry[2] !== " ") throw new Error("Workflow continuation could not parse Git checkout status");
     const status = entry.slice(0, 2);
@@ -84,6 +87,14 @@ export async function captureWorkflowCheckout(cwd: string): Promise<WorkflowChec
     const info = await lstat(absolute);
     if (info.isSymbolicLink()) hash.update("symlink\0").update(await readlink(absolute)).update("\0");
     else await hashRegularFile(hash, absolute);
+  }
+
+  const [stableIndex, stableStatus] = await Promise.all([
+    git(canonicalCwd, ["ls-files", "--stage", "-z"], "buffer") as Promise<Buffer>,
+    git(canonicalCwd, statusArgs, "buffer") as Promise<Buffer>,
+  ]);
+  if (!index.equals(stableIndex) || !raw.equals(stableStatus)) {
+    throw new Error("Workflow checkout changed while continuation state was being recorded");
   }
 
   return {

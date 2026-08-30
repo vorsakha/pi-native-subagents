@@ -502,6 +502,7 @@ export class JobManager {
       error: undefined,
       output: "",
       structured: undefined,
+      progressed: undefined,
       truncated: false,
       tools: [],
       liveThinking: "",

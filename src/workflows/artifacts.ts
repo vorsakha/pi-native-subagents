@@ -484,7 +484,20 @@ function isContinuationHandoff(value: unknown): boolean {
     && isCheckoutProof(handoff.checkout)
     && isContinuationFallback(handoff.target)
     && isContinuationTrigger(handoff.trigger)
+    && (handoff.attemptUsage === undefined || isWorkflowUsage(handoff.attemptUsage))
     && isWorkflowUsage(handoff.usage);
+}
+
+function isContinuationProgress(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const progress = value as Record<string, unknown>;
+  return Number.isSafeInteger(progress.agentIndex) && (progress.agentIndex as number) >= 0 && (progress.agentIndex as number) < 32
+    && (progress.logicalJobId === undefined || typeof progress.logicalJobId === "string" && !!progress.logicalJobId && progress.logicalJobId.length <= 200)
+    && typeof progress.failedJobId === "string" && !!progress.failedJobId && progress.failedJobId.length <= 200
+    && isContinuationFallback(progress.target)
+    && isContinuationTrigger(progress.trigger)
+    && isWorkflowUsage(progress.attemptUsage)
+    && isWorkflowUsage(progress.usage);
 }
 
 function isWorkflowUsage(value: unknown): boolean {
@@ -530,7 +543,7 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
   if (record.version !== 1 || !Number.isSafeInteger(record.sequence) || record.sequence! < 0 || record.sequence! >= MAX_JOURNAL_RECORDS
       || !Number.isSafeInteger(record.callIndex) || record.callIndex! < 0 || record.callIndex! >= 32
       || typeof record.fingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(record.fingerprint)
-      || !["started", "handoff", "completed", "failed"].includes(record.state ?? "")
+      || !["started", "progressed", "handoff", "completed", "failed"].includes(record.state ?? "")
       || typeof record.at !== "number" || !Number.isFinite(record.at)) return false;
   if (record.kind !== undefined && !["agent", "followUp", "peerQuestion"].includes(record.kind)) return false;
   // Every peer-question state carries the same bounded lineage provenance.
@@ -583,12 +596,17 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || !["queued", "running", "completed", "failed", "cancelled", "aborted"].includes(record.replacementOf.sourceState)
       || record.replacementOf.sourceError !== undefined && (typeof record.replacementOf.sourceError !== "string" || record.replacementOf.sourceError.length > 2_000)
       || typeof record.replacementOf.reason !== "string" || !record.replacementOf.reason || record.replacementOf.reason.length > 200)) return false;
-  if (record.state === "started") return record.result === undefined && record.route === undefined && record.replayedFrom === undefined && record.replacementOf === undefined && record.continuation === undefined;
+  if (record.state === "started") return record.result === undefined && record.route === undefined && record.replayedFrom === undefined
+    && record.replacementOf === undefined && record.continuation === undefined && record.continuationProgress === undefined;
+  if (record.state === "progressed") {
+    return record.result === undefined && record.replayedFrom === undefined && record.replacementOf === undefined
+      && record.continuation === undefined && isContinuationProgress(record.continuationProgress) && record.route !== undefined;
+  }
   if (record.state === "handoff") {
     return record.result === undefined && record.replayedFrom === undefined && record.replacementOf === undefined
-      && isContinuationHandoff(record.continuation) && record.route !== undefined;
+      && record.continuationProgress === undefined && isContinuationHandoff(record.continuation) && record.route !== undefined;
   }
-  if (record.continuation !== undefined) return false;
+  if (record.continuation !== undefined || record.continuationProgress !== undefined) return false;
   if (!record.result || typeof record.result !== "object" || typeof record.result.ok !== "boolean"
       || typeof record.result.output !== "string" || record.result.output.length > JOURNAL_RECORD_BYTES
       || record.result.jobId !== undefined && (typeof record.result.jobId !== "string" || !record.result.jobId || record.result.jobId.length > 200)

@@ -73,6 +73,7 @@ import type {
   WorkflowProviderFallbackTrigger,
   WorkflowContinuationFallback,
   WorkflowContinuationHandoff,
+  WorkflowContinuationProgress,
   WorkflowContinuationTrigger,
   WorkflowReplayHandoff,
 } from "./types.ts";
@@ -1041,7 +1042,27 @@ export class WorkflowManager {
       : undefined;
     if (handoff) {
       const record = this.#recordHandoffAgent(entry, prompt, options, callIndex, fingerprint, handoff);
-      const result = await this.#resumeContinuationHandoff(entry, request, record, handoff, signal, callIndex, fingerprint, prompt);
+      const callController = new AbortController();
+      entry.callControllers.set(callIndex, callController);
+      const bridgeCallAbort = () => callController.abort(signal.reason);
+      if (signal.aborted) bridgeCallAbort();
+      else signal.addEventListener("abort", bridgeCallAbort, { once: true });
+      let result: WorkflowAttemptResult;
+      try {
+        result = await this.#resumeContinuationHandoff(entry, request, record, handoff, callController.signal, callIndex, fingerprint, prompt);
+      } catch (error) {
+        const cancelled = callController.signal.aborted;
+        record.state = cancelled ? "cancelled" : "failed";
+        record.error = boundedText(cancelled ? callController.signal.reason ?? error : error);
+        if (record.continuation) record.continuation.state = "failed";
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt = record.timestamps.updatedAt;
+        this.#touch(entry);
+        result = { ok: false, output: "", error: record.error, progressed: true, usage: clone(record.usage) };
+      } finally {
+        entry.callControllers.delete(callIndex);
+        signal.removeEventListener("abort", bridgeCallAbort);
+      }
       const sanitized: WorkflowAgentResult = {
         ok: result.ok,
         output: result.output,
@@ -1173,6 +1194,8 @@ export class WorkflowManager {
             objective: prompt,
             currentPrompt: prompt,
             options,
+            schema: record.nativeStructuredSchema
+              ?? (options.schema === undefined ? undefined : workflowSchema(options.schema) as Record<string, unknown> | undefined),
             signal: attemptSignal,
             callIndex,
             fingerprint,
@@ -1345,7 +1368,27 @@ export class WorkflowManager {
         return { ok: false, output: "", error };
       }
       this.#applyHandoffCheckpoint(record, handoff);
-      const result = await this.#resumeContinuationHandoff(entry, request, record, handoff, signal, callIndex, fingerprint, prompt);
+      const callController = new AbortController();
+      entry.callControllers.set(callIndex, callController);
+      const bridgeCallAbort = () => callController.abort(signal.reason);
+      if (signal.aborted) bridgeCallAbort();
+      else signal.addEventListener("abort", bridgeCallAbort, { once: true });
+      let result: WorkflowAttemptResult;
+      try {
+        result = await this.#resumeContinuationHandoff(entry, request, record, handoff, callController.signal, callIndex, fingerprint, prompt);
+      } catch (error) {
+        const cancelled = callController.signal.aborted;
+        record.state = cancelled ? "cancelled" : "failed";
+        record.error = boundedText(cancelled ? callController.signal.reason ?? error : error);
+        if (record.continuation) record.continuation.state = "failed";
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt = record.timestamps.updatedAt;
+        this.#touch(entry);
+        result = { ok: false, output: "", error: record.error, progressed: true, usage: clone(record.usage) };
+      } finally {
+        entry.callControllers.delete(callIndex);
+        signal.removeEventListener("abort", bridgeCallAbort);
+      }
       const sanitized: WorkflowAgentResult = {
         ok: result.ok,
         output: result.output,
@@ -1839,10 +1882,10 @@ export class WorkflowManager {
       const final = await this.#jobs.wait(job.id, { signal });
       this.#updateAgentFromJob(final);
       if (final.status === "completed") {
-        if (record.continuation) record.continuation.state = "completed";
         if (schema) {
           const outcome = resolveWorkflowStructured(schema, structuredTransport, final);
           if (!outcome.ok) {
+            if (record.continuation) record.continuation.state = "failed";
             record.state = "failed";
             record.error = outcome.error;
             record.timestamps.updatedAt = Date.now();
@@ -1852,9 +1895,11 @@ export class WorkflowManager {
             return { ok: false, output: final.output, jobId: final.id, error: outcome.error, usage: clone(final.usage) };
           }
           record.structured = outcome.value;
+          if (record.continuation) record.continuation.state = "completed";
           this.#touch(entry);
           return { ok: true, output: final.output, structured: outcome.value, jobId: final.id, usage: clone(final.usage) };
         }
+        if (record.continuation) record.continuation.state = "completed";
         return { ok: true, output: final.output, jobId: final.id, usage: clone(final.usage) };
       }
       if (record.continuation) record.continuation.state = "failed";
@@ -2196,6 +2241,25 @@ export class WorkflowManager {
     currentPrompt: string,
   ): Promise<WorkflowAttemptResult> {
     const checkpoint = handoff.checkpoint;
+    await this.#appendJournal(entry, {
+      callIndex,
+      fingerprint,
+      kind: handoff.kind,
+      state: "progressed",
+      at: Date.now(),
+      agentIndex: record.index,
+      route: journalRoute(record),
+      continuationProgress: {
+        agentIndex: record.index,
+        logicalJobId: checkpoint.logicalJobId,
+        failedJobId: checkpoint.failedJobId,
+        target: { ...checkpoint.target },
+        trigger: { ...checkpoint.trigger },
+        attemptUsage: clone(checkpoint.attemptUsage ?? checkpoint.usage),
+        usage: clone(checkpoint.usage),
+      },
+    });
+    if (signal.aborted) throw abortError(signal.reason);
     return this.#withDispatchSlot(entry, signal, () => this.#withMutationLock(request.cwd, signal, async () => {
       try {
         const replayCwd = await realpath(resolve(request.cwd));
@@ -2865,17 +2929,19 @@ export class WorkflowManager {
     const sections = [
       "Continue the same logical workflow agent from the current checkout. Inspect the existing state first. Do not replay the original task from scratch and do not undo work merely because you did not author it.",
       CONTINUATION_WARNING,
-      `Original objective:\n${boundedText(objective, 2_048)}`,
-      `Current turn and pending findings:\n${boundedText(currentPrompt, 8_192)}`,
+      `Original objective:\n${boundedText(objective, 1_800)}`,
+      `Current turn and pending findings:\n${boundedText(currentPrompt, 4_200)}`,
       `Workflow phase: ${boundedText(phase, 160)}`,
       `Authoritative provider failure: ${trigger.provider}/${trigger.kind}: ${boundedText(trigger.detail, 500)}`,
-      `Failed attempt output:\n${boundedText(record.output ?? record.preview ?? "(none)", 3_000)}`,
-      `Recent tool state:\n${boundedText(JSON.stringify(tools), 2_000)}`,
+      `Failed attempt output:\n${boundedText(record.output ?? record.preview ?? "(none)", 2_500)}`,
+      `Recent tool state:\n${boundedText(JSON.stringify(tools), 1_800)}`,
       convergence ? `Pending convergence state:\n${boundedText(JSON.stringify(convergence), 1_000)}` : "",
       `Checkout checkpoint: ${checkoutDigest}`,
       "Continue from the files and tool effects that are already present. Report the remaining work you completed and the verification you ran.",
     ].filter(Boolean);
-    return boundedText(sections.join("\n\n"), 16_384);
+    const prompt = sections.join("\n\n");
+    if (prompt.length > 16_384) throw new Error("Workflow continuation handoff exceeds its bounded contract");
+    return prompt;
   }
 
   async #continueProgressedCall(input: {
@@ -2900,6 +2966,26 @@ export class WorkflowManager {
     if (!failedJobId || (fromHarness !== "claude" && fromHarness !== "codex")) {
       return { ok: false, output: input.record.output ? String(input.record.output) : "", error: "Workflow continuation lacks a failed native lineage", progressed: true };
     }
+
+    const progress: WorkflowContinuationProgress = {
+      agentIndex: input.record.index,
+      logicalJobId: input.logicalJobId,
+      failedJobId,
+      target: { ...input.target },
+      trigger: { ...input.trigger },
+      attemptUsage: clone(subtractWorkflowUsage(input.record.usage, input.attemptUsageBase)),
+      usage: clone(input.record.usage),
+    };
+    await this.#appendJournal(input.entry, {
+      callIndex: input.callIndex,
+      fingerprint: input.fingerprint,
+      kind: input.kind,
+      state: "progressed",
+      at: Date.now(),
+      agentIndex: input.record.index,
+      route: journalRoute(input.record),
+      continuationProgress: progress,
+    });
 
     try {
       await this.#jobs.settleFailedWorkflowJob(failedJobId);
@@ -2946,6 +3032,7 @@ export class WorkflowManager {
         checkout,
         target: { ...input.target },
         trigger: { ...input.trigger },
+        attemptUsage: clone(progress.attemptUsage),
         usage: clone(input.record.usage),
       };
       await this.#appendJournal(input.entry, {

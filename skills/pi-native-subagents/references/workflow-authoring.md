@@ -44,7 +44,7 @@ The plan accepts 1–64 unique names; names are trimmed and internal whitespace 
 
 ## parallel versus pipeline
 
-`parallel` receives functions, not already-started promises — the runner owns invocation order, concurrency, call numbering, cancellation, and replay. Concurrency is an integer from 1 to 4 and defaults to 4. Use `parallel` when the next step needs the complete result set; check every returned result's `ok`.
+`parallel` receives functions, not started promises. The runner owns order, concurrency, call numbers, cancellation, and replay. Concurrency is 1 to 4 and defaults to 4. Use it when the next step needs all results; check every result's `ok`.
 
 `pipeline(items, ...stages)` accepts at most 4096 items, advances each item through the ordered stages independently with up to four concurrent lanes, and needs no global barrier between stages. **A stage that throws does not fail the run: that item's slot in the returned array becomes `null`.** Filter or branch on `null` explicitly, and never assume the returned array is item-shaped throughout:
 
@@ -84,7 +84,7 @@ Rules:
 
 A fresh explicit Claude/Codex `agent()` may set one opposite native route. `providerFallback: { harness, model? }` handles authoritative pre-inference failure with zero usage; after dispatch it also requires `readOnly`.
 
-`continuationFallback: { harness, model? }` instead permits one handoff after authoritative unavailability and progress, including follow-ups. It checkpoints the shared Git checkout, continues without replay, and retains the replacement. Policy, budgets, usage, and cancellation stay fixed. Ambiguity, unsafe state, unavailable target, worktree isolation, or replacement failure is terminal. Never combine or loop these options.
+`continuationFallback: { harness, model? }` permits one handoff after authoritative unavailability and current-turn progress, including follow-ups. Pre-settlement proof blocks primary replay; a later full index/worktree checkpoint authorizes the replacement. It continues with the same schema and fixed policy, budget, usage, and cancellation. Ambiguity, unsafe state, unavailable target, isolation, or replacement failure is terminal. Never combine or loop these options.
 
 ## Sandbox limits and determinism
 

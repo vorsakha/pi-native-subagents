@@ -10,8 +10,8 @@ Read this when reporting a running job or interpreting usage or model numbers. D
 - Direct jobs and workflow-owned child jobs remain in the shared editor activity widget. Workflow runs use one session-level widget keyed by stable run ID. Opening it uses `/workflows`; it never creates a second dashboard.
 - Workflow calls and results keep durable transcript cards, run IDs, and artifact references. Activity is keyboard reachable, textual, and narrow-width safe.
 - Workflow-owned jobs stay tagged in `/subagents`; the activity widget counts them separately.
-- Inspectors default to state plus outline, transcript, or result. Press `i` for route/model, usage/budget, context, availability, provenance, isolation, replay, and replacement telemetry. Errors, questions, waits, warnings, and recovery stay pinned. Previews omit full tool calls and result bodies.
-- Continued routes read `primary → replacement (continued)`. Detail has declaration, trigger, checkout proof, attempts, jobs and route.
+- Inspectors default to state plus outline, transcript, or result. Press `i` for route/model, usage/budget, context, provenance, isolation, replay, and replacement telemetry. Errors, questions, waits, warnings, and recovery stay pinned. Previews omit full tool calls and result bodies.
+- Continued routes read `primary → replacement (continued)`. Detail shows trigger, checkout, attempts, and jobs; handoff does not label the closed primary retained.
 - Transcripts default to compact tool-call groups with counts and running/failed visibility; full native rendering is a toggle. Workflow inspection preserves run and node identities through refresh, filtering, reordering, replacement, and resize. Missing nodes fall back to their phase, then the current phase, then the first visible node.
 - Wide dashboards keep the grouped run rail beside either the outline or agent detail. Medium dashboards keep a short grouped run list above it. Narrow dashboards show one focus layer at a time. Backtracking restores the prior node identity; no layout adds a permanent third column.
 - Phase rows, omission rows, headers, and filtered or hidden agents are never agent-action targets. Restart and agent cancellation require an eligible selected agent that survived the final rendered outline/detail viewport. Run cancellation remains a separate confirmed action.
@@ -40,7 +40,7 @@ Four non-failure states are reported separately and must not be summarized as fa
 
 - **Configured model** — routing intent recorded on the job at spawn time.
 - **Effective serving model** (`serving …`) — the model identity the native runtime itself reports for the current turn. Codex reports it only via `model`/`rerouted`; `thread/start`'s model field just echoes the requested or resolved routing intent, not observed serving behavior. Claude reports it on init, assistant, and refusal-fallback events. Pi reports it as `responseModel`, never its `model` alias. When the runtime does not report it, it is omitted — never guessed from the configured model.
-- **Aggregate usage** — cumulative across every retained follow-up, and what budgets bind.
+- **Aggregate usage** — cumulative across follow-ups and bound by budgets.
 - **Context occupancy** — the latest request/turn gauge. It is replaced rather than summed on each reading, cleared at the start of every retained follow-up so a prior generation's reading is never shown as current, and shown as `unknown` rather than zero when the runtime omits it.
 
 ## Reporting rules

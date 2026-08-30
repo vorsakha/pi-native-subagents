@@ -564,6 +564,29 @@ test("a follow-up's queued generation clears the prior generation's structured p
   await manager.shutdown();
 });
 
+test("a retained follow-up starts with no progress evidence from the prior generation", async () => {
+  const { backend, manager } = setup(1);
+  const job = manager.spawn(request(1));
+  await tick();
+  backend.emit(job.id, { type: "message", text: "first generation progressed" });
+  backend.complete(job.id, "first result");
+  const first = await manager.wait(job.id);
+  assert.equal(first.progressed, true);
+
+  const queued = await manager.send(job.id, "continue", "followUp");
+  assert.equal(queued.progressed, undefined);
+  await tick();
+  backend.fail(job.id, "quota before new-turn progress", {
+    provider: "codex",
+    kind: "quota",
+    authoritative: true,
+    detail: "current turn produced no activity",
+  });
+  const second = await manager.wait(job.id);
+  assert.equal(second.progressed, undefined, "only activity from the failed generation can authorize continuation");
+  await manager.shutdown();
+});
+
 test("continueWorkflowJob is the workflow-only follow-up path: it retains and reuses a completed job's session, accumulates usage, and releaseRun later closes it", async () => {
   const { backend, manager } = setup(1);
   const owned = manager.spawn({ ...request(1), workflow: { runId: "wf-1", agentIndex: 0, label: "planner" } });

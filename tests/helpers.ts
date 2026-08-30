@@ -134,12 +134,13 @@ export class GatedHarnessAvailability extends ScriptedHarnessAvailability {
   #reached = false;
   #release!: () => void;
   #reachedResolve!: () => void;
-  readonly #releasePromise = new Promise<void>((resolve) => { this.#release = resolve; });
-  readonly #reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
+  #releasePromise!: Promise<void>;
+  #reachedPromise!: Promise<void>;
 
   constructor(gated: HarnessName, states: Partial<Record<HarnessName, Partial<HarnessAvailabilityFacts> | HarnessAvailability>>) {
     super(states);
     this.#gated = gated;
+    this.#resetGate();
   }
 
   override async availability(harness: HarnessName, request: { refresh?: boolean }): Promise<HarnessAvailability> {
@@ -159,6 +160,19 @@ export class GatedHarnessAvailability extends ScriptedHarnessAvailability {
     if (this.#released) return;
     this.#released = true;
     this.#release();
+  }
+
+  /** Holds the next matching probe after a prior gate has been released. */
+  gateNext(): void {
+    if (!this.#released) throw new Error("Harness availability gate is already active");
+    this.#resetGate();
+  }
+
+  #resetGate(): void {
+    this.#released = false;
+    this.#reached = false;
+    this.#releasePromise = new Promise<void>((resolve) => { this.#release = resolve; });
+    this.#reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
   }
 }
 

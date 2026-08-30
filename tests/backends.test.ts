@@ -204,7 +204,15 @@ process.stdin.on("data", chunk => {
         } } }) + "\\n");
         setTimeout(() => process.exit(0), 30);
       }
-      if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool" && process.env.MODE !== "ask-tool" && process.env.MODE !== "exit-mid-turn") setTimeout(() => {
+      if (process.env.MODE === "quota-progress") {
+        setTimeout(() => {
+          process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { type: "agentMessage", text: "PARTIAL" } } }) + "\\n");
+          process.stdout.write(JSON.stringify({ method: "turn/completed", params: { turn: {
+            id, status: "failed", error: { code: "usage_limit_reached", resetsAt: new Date(Date.now() + 60000).toISOString() },
+          } } }) + "\\n");
+        }, 20);
+      }
+      if (process.env.MODE !== "silent" && process.env.MODE !== "dynamic-tool" && process.env.MODE !== "ask-tool" && process.env.MODE !== "exit-mid-turn" && process.env.MODE !== "quota-progress") setTimeout(() => {
         if (process.env.MODE === "tool-events") {
           process.stdout.write(JSON.stringify({ method: "item/started", params: { item: { id: "command-1", type: "commandExecution", command: "pwd" } } }) + "\\n");
           process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: { id: "command-1", type: "commandExecution", command: "pwd", aggregatedOutput: "/tmp", status: "completed" } } }) + "\\n");
@@ -1201,6 +1209,8 @@ test("Codex classifies a structured usage-limit error only when a plausible rese
   assert.equal(withReset?.preInference, true);
   assert.equal(withReset?.scope, undefined, "Codex's error.window has no verified schema and must never reach scope");
   assert.ok(!withReset?.detail.includes("@"));
+  const afterProgress = classifyCodexUnavailability({ code: "usage_limit_reached", resetsAt: now + 60_000 }, now, true);
+  assert.equal(afterProgress?.preInference, undefined, "current-turn activity makes the same structured rejection eligible for progressed continuation");
 
   const withoutReset = classifyCodexUnavailability({ code: "usage_limit_reached", message: "quota exhausted" }, now);
   assert.ok(withoutReset, "still classified as a quota rejection, but not authoritative");
@@ -1215,6 +1225,26 @@ test("Codex classifies a structured usage-limit error only when a plausible rese
 
   const relativeDelayField = classifyCodexUnavailability({ code: "usage_limit_reached", retryAfter: 120 }, now);
   assert.equal(relativeDelayField?.authoritative, false, "retryAfter is a relative delay by convention and must never be read as an absolute reset time");
+});
+
+test("Codex exposes authoritative quota failure as progressed after current-turn assistant activity", async () => {
+  const f = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const run = await new CodexAppServerBackend(f.command, { inactivityTimeoutMs: 2_000 }).start(
+      request("codex", f.dir, { ...process.env, MODE: "quota-progress" }),
+      (event) => events.push(event),
+    );
+    await run.completed;
+    const failed = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+    assert.equal(failed.type, "failed");
+    assert.equal(failed.unavailable?.authoritative, true);
+    assert.equal(failed.unavailable?.preInference, undefined);
+    assert.ok(events.some((event) => event.type === "message" && event.text === "PARTIAL"));
+    await run.close();
+  } finally {
+    await rm(f.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex never copies unverified error.window data into scope, even when oversized or account-bearing", () => {

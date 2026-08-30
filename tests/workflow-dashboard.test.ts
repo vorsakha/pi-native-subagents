@@ -980,6 +980,34 @@ test("progressed continuation dashboard exposes checkpoint, trigger, retained ro
   assert.doesNotMatch(inspector, /\u001b\[(?:31|32|33)m/);
 });
 
+test("continuation handoff dashboard never labels the settled primary as retained", (t) => {
+  const run = workflow("continuation-handoff", "running");
+  const agent = run.agents[0]!;
+  agent.state = "failed";
+  agent.harness = "claude";
+  agent.jobId = "settled-primary-123456";
+  agent.continuationFallback = { harness: "codex" };
+  agent.continuation = {
+    state: "handoff",
+    fromHarness: "claude",
+    toHarness: "codex",
+    failedJobId: "settled-primary-123456",
+    checkpointAt: 1_000,
+    checkoutDigest: "sha256:" + "a".repeat(64),
+    trigger: { source: "continuation", provider: "claude", kind: "quota", detail: "quota after progress" },
+    warning: "exactly-once is not guaranteed",
+  };
+  const state = harness([run], 34, () => {}, { theme });
+  t.after(() => state.overlay.dispose());
+
+  openAgentDetail(state.overlay, 140);
+  state.overlay.handleInput("i");
+  state.overlay.handleInput("g");
+  const inspector = state.overlay.render(140).join("\n");
+  assert.match(inspector, /Continuation · handoff · claude → codex · failed job/);
+  assert.doesNotMatch(inspector, /retained job/, "no replacement session exists during the durable handoff");
+});
+
 test("metadata-rich standalone workflow results keep a scrollable result row", (t) => {
   const standalone = workflow("metadata-standalone", "completed");
   standalone.agents = [];

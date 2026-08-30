@@ -357,6 +357,26 @@ export interface WorkflowContinuationHandoff {
   checkout: WorkflowCheckoutProof;
   target: WorkflowContinuationFallback;
   trigger: WorkflowContinuationTrigger;
+  /** Usage from only the failed generation, for attempt provenance. */
+  attemptUsage?: WorkflowUsage;
+  /** Cumulative logical-lineage usage through the failed generation. */
+  usage: WorkflowUsage;
+}
+
+/**
+ * First durable proof that a failed primary made progress and must never be
+ * replayed. This checkpoint does not authorize a replacement: checkout proof
+ * and the bounded continuation prompt arrive in the later handoff record.
+ */
+export interface WorkflowContinuationProgress {
+  agentIndex: number;
+  logicalJobId?: string;
+  failedJobId: string;
+  target: WorkflowContinuationFallback;
+  trigger: WorkflowContinuationTrigger;
+  /** Usage from only the failed generation, for replay provenance. */
+  attemptUsage: WorkflowUsage;
+  /** Cumulative logical-lineage usage through the failed generation. */
   usage: WorkflowUsage;
 }
 
@@ -395,7 +415,7 @@ export interface WorkflowJournalRecord {
   callIndex: number;
   /** Call fingerprint, or the question fingerprint for `peerQuestion` records. */
   fingerprint: string;
-  state: "started" | "handoff" | "completed" | "failed";
+  state: "started" | "progressed" | "handoff" | "completed" | "failed";
   at: number;
   /** Absent means "agent" for journals written before followUp() existed. */
   kind?: "agent" | "followUp" | "peerQuestion";
@@ -408,6 +428,8 @@ export interface WorkflowJournalRecord {
   replacementOf?: WorkflowReplacementReference;
   /** Present only on a progressed continuation handoff checkpoint. */
   continuation?: WorkflowContinuationHandoff;
+  /** Present only on the pre-settlement progressed-primary checkpoint. */
+  continuationProgress?: WorkflowContinuationProgress;
 }
 
 /** A completed peer answer that may be replayed without dispatching the target again. */

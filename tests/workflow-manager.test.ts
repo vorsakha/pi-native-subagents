@@ -1590,6 +1590,144 @@ test("progressed continuation settles the failed process, hands off current chec
   }
 });
 
+test("fresh progressed continuation retains portable structured policy and completes only after validation", async () => {
+  for (const valid of [true, false]) {
+    const f = await fallbackFixture();
+    try {
+      await initializeGitCheckout(f.cwd);
+      const script = `export default async () => agent("structured continuation", {
+        harness: "claude",
+        access: "readOnly",
+        continuationFallback: { harness: "codex" },
+        schema: {
+          type: "object",
+          properties: { ok: { type: "boolean" } },
+          required: ["ok"],
+          additionalProperties: false
+        }
+      });`;
+      const started = await f.workflows.start(f.request(script));
+      await f.claude.waitForStart();
+      const primary = f.claude.starts[0]!;
+      f.claude.emit(primary, { type: "message", text: "partial structured work" });
+      f.claude.fail(primary, "quota", progressedQuota("claude"));
+
+      await f.backend.waitForStart();
+      const replacement = f.backend.starts[0]!;
+      assert.match(f.backend.requests[0]!.task, /Return ONLY valid JSON matching this JSON Schema/);
+      assert.match(f.backend.requests[0]!.task, /"required":\["ok"\]/);
+      f.backend.complete(replacement, valid ? JSON.stringify({ ok: true }) : "not-json");
+
+      const final = await started.completion;
+      const result = final.result as { ok: boolean; structured?: unknown; error?: string };
+      assert.equal(result.ok, valid);
+      assert.equal(final.agents[0]?.continuation?.state, valid ? "completed" : "failed");
+      if (valid) assert.deepEqual(result.structured, { ok: true });
+      else assert.match(result.error ?? "", /valid JSON|JSON Schema|structured/i);
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test("maximum continuation evidence keeps every required handoff section and final instruction", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const started = await f.workflows.start(f.request(`export default async () => agent("objective-" + "o".repeat(7900), {
+      harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+    });`));
+    await f.claude.waitForStart();
+    const primary = f.claude.starts[0]!;
+    for (let index = 0; index < 8; index++) {
+      f.claude.emit(primary, { type: "tool_start", id: `tool-${index}`, name: `tool-${index}`, summary: "s".repeat(1_000) });
+      f.claude.emit(primary, { type: "tool_end", id: `tool-${index}`, name: `tool-${index}`, output: "done" });
+    }
+    f.claude.emit(primary, { type: "message", text: "failed-output-" + "z".repeat(5_000) });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+
+    await f.backend.waitForStart();
+    const handoff = f.backend.requests[0]!.task;
+    assert.ok(handoff.length <= 16_384);
+    assert.match(handoff, /Original objective:/);
+    assert.match(handoff, /Current turn and pending findings:/);
+    assert.match(handoff, /Workflow phase:/);
+    assert.match(handoff, /Authoritative provider failure:/);
+    assert.match(handoff, /Failed attempt output:/);
+    assert.match(handoff, /Recent tool state:/);
+    assert.match(handoff, /Checkout checkpoint: sha256:/);
+    assert.match(handoff, /Continue from the files and tool effects that are already present/);
+    f.backend.complete(f.backend.starts[0]!, "continued");
+    await started.completion;
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("retained follow-up progress cannot leak from an earlier generation into continuation", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const started = await f.workflows.start(f.request(`export default async () => {
+      const first = await agent("first generation", {
+        harness: "codex", access: "readOnly", continuationFallback: { harness: "claude" }
+      });
+      return followUp(first.jobId, "second generation");
+    };`));
+    await f.backend.waitForStart();
+    const lineage = f.backend.starts[0]!;
+    f.backend.emit(lineage, { type: "message", text: "first generation progress" });
+    f.backend.complete(lineage, "first done");
+    await f.backend.waitForSend();
+    f.backend.fail(lineage, "quota before current-turn progress", progressedQuota("codex"));
+
+    const final = await started.completion;
+    assert.equal((final.result as { ok: boolean }).ok, false);
+    assert.equal(f.claude.requests.length, 0);
+    assert.equal(final.agents[0]?.continuation, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("replay after a crash between progressed proof and handoff never reruns the primary", async () => {
+  const f = await fallbackFixture();
+  try {
+    const script = `export default async () => agent("progress before crash", {
+      harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+    });`;
+    const started = await f.workflows.start(f.request(script));
+    await f.claude.waitForStart();
+    const primary = f.claude.starts[0]!;
+    f.claude.emit(primary, { type: "message", text: "work with side effects" });
+    f.claude.emit(primary, { type: "usage", usage: { input: 3, output: 2, turns: 1 } });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+    const failed = await started.completion;
+
+    const journalPath = join(failed.artifactDir, "journal.jsonl");
+    const records = (await readFile(journalPath, "utf8")).trim().split("\n")
+      .map((line) => JSON.parse(line) as { state: string });
+    const crashWindow = records.filter((record) => record.state === "started" || record.state === "progressed");
+    assert.deepEqual(crashWindow.map((record) => record.state), ["started", "progressed"]);
+    await writeFile(journalPath, `${crashWindow.map((record) => JSON.stringify(record)).join("\n")}\n`);
+
+    const primaryDispatches = f.claude.requests.length;
+    const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: failed.runId }));
+    const resumedFinal = await resumed.completion;
+    assert.equal((resumedFinal.result as { ok: boolean }).ok, false);
+    assert.match((resumedFinal.result as { error?: string }).error ?? "", /original prompt was not replayed/);
+    assert.deepEqual(resumedFinal.agents[0]?.usage, { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+    assert.deepEqual(resumedFinal.agents[0]?.attempts?.[0]?.usage, {
+      input: 3, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1,
+    }, "failed-turn usage remains visible as attempt provenance without being charged to replay");
+    assert.deepEqual(aggregateWorkflowUsage(resumedFinal), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+    assert.equal(f.claude.requests.length, primaryDispatches);
+    assert.equal(f.backend.requests.length, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("continuation declarations are explicit, native, opposite, and incompatible with fallback or worktree isolation", async () => {
   const f = await fallbackFixture();
   try {
@@ -1776,6 +1914,16 @@ test("cancellation at a durable handoff prevents replacement, and replay resumes
     assert.ok(records.some((record) => record.state === "handoff"));
     const interrupted = records.filter((record) => record.state !== "failed");
     await writeFile(journalPath, `${interrupted.map((record) => JSON.stringify(record)).join("\n")}\n`);
+
+    availability.gateNext();
+    const cancelledReplay = await f.workflows.start(f.request(script, { resumeFromRunId: cancelled.runId }));
+    await availability.waitUntilReached();
+    await f.workflows.cancelAgent(cancelledReplay.snapshot.runId, 0, "cancel replay handoff");
+    availability.release();
+    const cancelledReplayFinal = await cancelledReplay.completion;
+    assert.equal((cancelledReplayFinal.result as { ok: boolean }).ok, false);
+    assert.equal(f.claude.requests.length, 1, "selected-agent cancellation never reruns the primary");
+    assert.equal(f.backend.requests.length, 0, "selected-agent cancellation wins before replacement dispatch");
 
     const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: cancelled.runId }));
     await f.backend.waitForStart();
@@ -2854,6 +3002,9 @@ test("converge keeps pending findings and later rounds on a progressed replaceme
     assert.match(handoff, /F1/);
     assert.match(handoff, /guard the null case/);
     assert.match(handoff, /partial fix|tracked\.txt/);
+    assert.match(handoff, /Pending convergence state:/);
+    assert.match(handoff, /Checkout checkpoint: sha256:/);
+    assert.match(handoff, /Continue from the files and tool effects that are already present/);
     f.claude.complete(replacementJobId, "implementation v2");
 
     await f.claude.waitForSend();
@@ -2902,6 +3053,55 @@ test("converge keeps pending findings and later rounds on a progressed replaceme
     assert.equal(replayedImplementer.logicalJobId, failedLineage);
     assert.equal(replayedImplementer.jobId, replacementJobId);
     assert.equal(replayedImplementer.continuation?.state, "completed");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("converge preserves its review schema and later review rounds on a fresh continuation", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const script = `export default async () => converge({
+      name: "continued reviewer",
+      maxRounds: 2,
+      implement: { prompt: "implement", options: { name: "implementer", harness: "codex" } },
+      review: {
+        prompt: "review",
+        options: { name: "reviewer", harness: "claude", continuationFallback: { harness: "codex" } }
+      }
+    });`;
+    const started = await f.workflows.start(f.request(script));
+    await f.backend.waitForStart();
+    const implementer = f.backend.starts[0]!;
+    f.backend.complete(implementer, "implementation v1");
+
+    await f.claude.waitForStart();
+    const failedReviewer = f.claude.starts[0]!;
+    f.claude.emit(failedReviewer, { type: "message", text: "reviewed part of the checkout" });
+    f.claude.fail(failedReviewer, "quota", progressedQuota("claude"));
+
+    await f.backend.waitForStart(2);
+    const replacementReviewer = f.backend.starts[1]!;
+    assert.match(f.backend.requests[1]!.task, /Return ONLY valid JSON matching this JSON Schema/);
+    assert.match(f.backend.requests[1]!.task, /"verdict"/);
+    f.backend.complete(replacementReviewer, CONVERGE_REQUEST_CHANGES);
+
+    await f.backend.waitForSend();
+    assert.equal(f.backend.sends[0]?.id, implementer);
+    f.backend.complete(implementer, "implementation v2");
+
+    await f.backend.waitForSend(2);
+    assert.equal(f.backend.sends[1]?.id, replacementReviewer, "later review rounds stay on the replacement reviewer session");
+    assert.match(f.backend.sends[1]!.message, /Return ONLY valid JSON matching this JSON Schema/);
+    f.backend.complete(replacementReviewer, CONVERGE_APPROVE);
+
+    const final = await started.completion;
+    assert.equal(final.convergence?.state, "approved");
+    const reviewer = final.agents.find((agent) => agent.name === "reviewer")!;
+    assert.equal(reviewer.continuation?.state, "completed");
+    assert.equal(reviewer.jobId, replacementReviewer);
+    assert.equal(reviewer.structuredTransport, "portable");
   } finally {
     await f.cleanup();
   }

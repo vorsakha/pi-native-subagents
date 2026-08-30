@@ -64,7 +64,7 @@ Both attempts share one ordinal and cumulative usage; budget preflight runs agai
 
 `continuationFallback` is the separate opt-in for one opposite-provider handoff after authoritative unavailability and observed progress. It never combines with fallback or waiting. Failed-turn, replacement, and later follow-up usage is cumulative on one logical lineage; each archived attempt stores only its delta. Every original budget remains fixed and is checked before replacement.
 
-A durable handoff checkpoints the current Git checkout before target dispatch. Exact completed replay spends nothing. Interrupted replay revalidates the proof and runs only the replacement; a progressed primary without a safe checkpoint, or a diverged checkout, fails without redispatch. Cancellation covers settlement, handoff, validation, replacement, and retained calls. `/workflows` distinguishes continued, fallback, and waiting routes.
+A pre-settlement progressed record first forbids primary replay; it cannot authorize replacement. The later durable handoff proves the full index/worktree checkout before target dispatch. Completed replay spends nothing. Interrupted handoff replay runs only the replacement; missing or diverged proof fails closed. Cancellation covers both records, validation, replacement, and retained calls. `/workflows` separates continued, fallback, and waiting routes.
 
 ## Recovery
 

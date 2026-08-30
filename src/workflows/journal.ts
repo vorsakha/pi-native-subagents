@@ -75,6 +75,7 @@ export function workflowDefinitionFingerprint(input: {
  * discarding later parallel calls whose own journal pairs remain valid. */
 export function replayableJournalCalls(records: WorkflowJournalRecord[]): WorkflowReplayCall[] {
   const started = new Map<number, WorkflowJournalRecord>();
+  const progressed = new Map<number, WorkflowJournalRecord>();
   const handoffs = new Map<number, WorkflowJournalRecord>();
   const completed = new Map<number, WorkflowJournalRecord>();
   const invalid = new Set<number>();
@@ -90,6 +91,13 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
       else started.set(record.callIndex, record);
       continue;
     }
+    if (record.state === "progressed") {
+      if (!priorStart || priorStart.fingerprint !== record.fingerprint || progressed.has(record.callIndex)
+          || handoffs.has(record.callIndex) || completed.has(record.callIndex) || !record.continuationProgress) {
+        invalid.add(record.callIndex);
+      } else progressed.set(record.callIndex, record);
+      continue;
+    }
     if (record.state === "handoff") {
       if (!priorStart || priorStart.fingerprint !== record.fingerprint || handoffs.has(record.callIndex)
           || completed.has(record.callIndex) || !record.continuation) invalid.add(record.callIndex);
@@ -102,11 +110,43 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
     }
     if (record.state === "completed" && record.result?.ok === true) completed.set(record.callIndex, record);
     else if (record.state === "failed" && record.result?.ok === false
-        && (handoffs.has(record.callIndex) || record.result.progressed === true)) completed.set(record.callIndex, record);
+        && (progressed.has(record.callIndex) || handoffs.has(record.callIndex) || record.result.progressed === true)) completed.set(record.callIndex, record);
     else invalid.add(record.callIndex);
   }
 
-  return [...completed.entries()]
+  const replayable = new Map(completed);
+  for (const [callIndex, record] of progressed) {
+    if (invalid.has(callIndex) || handoffs.has(callIndex) || completed.has(callIndex)) continue;
+    const progress = record.continuationProgress!;
+    const route = record.route ? structuredClone(record.route) : undefined;
+    if (route && !route.attempts?.length) {
+      route.attempts = [{
+        index: 0,
+        jobId: progress.failedJobId,
+        harness: progress.trigger.provider,
+        requestedHarness: progress.trigger.provider,
+        model: route.model,
+        error: route.error,
+        usage: { ...progress.attemptUsage },
+        disposition: "continuation",
+        trigger: { ...progress.trigger },
+      }];
+    }
+    replayable.set(callIndex, {
+      ...record,
+      state: "failed",
+      route,
+      result: {
+        ok: false,
+        output: "",
+        error: "Progressed primary stopped before a safe continuation handoff; the original prompt was not replayed",
+        progressed: true,
+        usage: { ...progress.usage },
+      },
+    });
+  }
+
+  return [...replayable.entries()]
     .filter(([callIndex, record]) => !invalid.has(callIndex) && !!record.result)
     .sort(([left], [right]) => left - right)
     .map(([callIndex, record]) => ({
@@ -126,6 +166,7 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
  */
 export function replayableJournalHandoffs(records: WorkflowJournalRecord[]): WorkflowReplayHandoff[] {
   const started = new Map<number, WorkflowJournalRecord>();
+  const progressed = new Set<number>();
   const handoffs = new Map<number, WorkflowJournalRecord>();
   const terminal = new Set<number>();
   const invalid = new Set<number>();
@@ -140,6 +181,11 @@ export function replayableJournalHandoffs(records: WorkflowJournalRecord[]): Wor
     const start = started.get(record.callIndex);
     if (!start || start.fingerprint !== record.fingerprint) {
       invalid.add(record.callIndex);
+      continue;
+    }
+    if (record.state === "progressed") {
+      if (progressed.has(record.callIndex) || handoffs.has(record.callIndex) || !record.continuationProgress) invalid.add(record.callIndex);
+      else progressed.add(record.callIndex);
       continue;
     }
     if (record.state === "handoff") {
