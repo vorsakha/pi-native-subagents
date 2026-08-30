@@ -5,6 +5,7 @@ import { formatWorkflowBudget, workflowBudgetHealth } from "../../src/workflows/
 import { formatDurationLabel, type DashboardSummary } from "../dashboard-style.ts";
 import type {
   WorkflowAgentRecord,
+  WorkflowAdvisorRecord,
   WorkflowConvergence,
   WorkflowInteractionSummary,
   WorkflowPhase,
@@ -470,7 +471,8 @@ function phaseRow(phase: WorkflowPhase, isCurrent: boolean, theme: Theme, now: n
   // stays undemoted too — only failure/warning states and the current row keep full color.
   const shown = isCurrent ? status : demoteUnlessAttention(status);
   const marker = isCurrent ? theme.fg("accent", "›") : " ";
-  return `${GROUP_INDENT}${marker} ${theme.fg(shown.color, shown.glyph)} ${theme.fg("toolTitle", sanitizeInline(phase.name))} ${theme.fg("dim", `· ${phase.status} · ${countLabel(phase.agents.length, "agent")}`)}`;
+  const advisorCalls = phase.advisorConsultations?.length ?? 0;
+  return `${GROUP_INDENT}${marker} ${theme.fg(shown.color, shown.glyph)} ${theme.fg("toolTitle", sanitizeInline(phase.name))} ${theme.fg("dim", `· ${phase.status} · ${countLabel(phase.agents.length, "agent")}${advisorCalls ? ` · ${countLabel(advisorCalls, "advisor call")}` : ""}`)}`;
 }
 
 /** Bounded roster of individual phase rows, windowed around the current phase. */
@@ -558,6 +560,16 @@ function agentRow(agent: WorkflowAgentRecord, theme: Theme, now: number): string
   return `${GROUP_INDENT}${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", `${agent.access}${profile}${independent} · ${agent.state}${route} · effort ${agent.effort ?? "adaptive"}${speed}${isolation}${warning}`)}`;
 }
 
+function advisorRow(advisor: WorkflowAdvisorRecord, theme: Theme, now: number): string {
+  const status = demoteUnlessAttention(traceStatusMeta(advisor.state, now));
+  const replay = advisor.outputProvenance === "replay" ? " · replay" : "";
+  const wait = advisor.queuedMs ? ` · advisor queue ${formatDurationLabel(advisor.queuedMs)}` : "";
+  const usage = formatUsage(advisor.usage);
+  const spend = usage ? ` · ${usage}` : "";
+  const warning = advisor.instructionShaped ? " · ⚠ instruction-like output" : "";
+  return `${GROUP_INDENT}${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", `advisor · ${sanitizeInline(advisor.advisorName)}`)} ${theme.fg("dim", `· ${advisor.state} · lineage ${advisor.lineage}/${advisor.generation ?? "?"} · ${advisor.harness ?? "?"}/${advisor.model ?? "default"}${spend}${wait}${replay}${warning}`)}`;
+}
+
 function clampContent(theme: Theme, lines: string[], budget: number): string[] {
   if (lines.length <= budget) return lines;
   const kept = lines.slice(0, Math.max(0, budget - 1));
@@ -622,6 +634,14 @@ export function buildWorkflowCardLines(
     const hiddenBefore = snapshot.agents.length - roster.length;
     if (hiddenBefore > 0) lines.push(`${GROUP_INDENT}${theme.fg("muted", `⋯ ${hiddenBefore} earlier agent${hiddenBefore === 1 ? "" : "s"}`)}`);
     for (const agent of roster) lines.push(agentRow(agent, theme, options.now));
+  }
+
+  const advisorCalls = snapshot.advisorConsultations ?? [];
+  if (advisorCalls.length) {
+    const active = advisorCalls.filter((advisor) => advisor.state === "queued" || advisor.state === "running").length;
+    const failed = advisorCalls.filter((advisor) => advisor.state === "failed" || advisor.state === "cancelled" || advisor.state === "aborted").length;
+    lines.push(group(theme, "Advisors", `${advisorCalls.length} call${advisorCalls.length === 1 ? "" : "s"}${active ? ` · ${active} active` : ""}${failed ? ` · ${failed} failed` : ""}`));
+    if (options.expanded) for (const advisor of advisorCalls.slice(-MAX_AGENTS_EXPANDED)) lines.push(advisorRow(advisor, theme, options.now));
   }
 
   if (options.expanded && snapshot.logs?.length) {

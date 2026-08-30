@@ -1,6 +1,7 @@
 import type { DashboardSummary } from "../dashboard-style.ts";
 import type {
   WorkflowAgentRecord,
+  WorkflowAdvisorRecord,
   WorkflowAgentState,
   WorkflowPhase,
   WorkflowSnapshot,
@@ -12,7 +13,8 @@ export type WorkflowDashboardFocus = "runs" | "outline" | "agent-detail";
 export type WorkflowAgentFilter = "all" | "active" | "failed" | "completed";
 export type WorkflowOutlinePhaseKey = `phase:${number}`;
 export type WorkflowOutlineAgentKey = `agent:${number}`;
-export type WorkflowOutlineNodeKey = WorkflowOutlinePhaseKey | WorkflowOutlineAgentKey;
+export type WorkflowOutlineAdvisorKey = `advisor:${number}`;
+export type WorkflowOutlineNodeKey = WorkflowOutlinePhaseKey | WorkflowOutlineAgentKey | WorkflowOutlineAdvisorKey;
 
 interface WorkflowOutlineNodeBase {
   key: WorkflowOutlineNodeKey;
@@ -47,11 +49,22 @@ export interface WorkflowOutlineAgentNode extends WorkflowOutlineNodeBase {
   agent: WorkflowAgentRecord;
 }
 
-export type WorkflowOutlineNode = WorkflowOutlinePhaseNode | WorkflowOutlineAgentNode;
+export interface WorkflowOutlineAdvisorNode extends WorkflowOutlineNodeBase {
+  kind: "advisor";
+  key: WorkflowOutlineAdvisorKey;
+  advisorIndex: number;
+  name: string;
+  state: WorkflowAgentState;
+  summary: DashboardSummary;
+  advisor: WorkflowAdvisorRecord;
+}
+
+export type WorkflowOutlineNode = WorkflowOutlinePhaseNode | WorkflowOutlineAgentNode | WorkflowOutlineAdvisorNode;
 
 export type WorkflowOutlineSelection =
   | { kind: "phase"; key: WorkflowOutlinePhaseKey; phaseKey: WorkflowOutlinePhaseKey }
-  | { kind: "agent"; key: WorkflowOutlineAgentKey; phaseKey: WorkflowOutlinePhaseKey };
+  | { kind: "agent"; key: WorkflowOutlineAgentKey; phaseKey: WorkflowOutlinePhaseKey }
+  | { kind: "advisor"; key: WorkflowOutlineAdvisorKey; phaseKey: WorkflowOutlinePhaseKey };
 
 export interface WorkflowOutlineModel {
   nodes: readonly WorkflowOutlineNode[];
@@ -70,6 +83,7 @@ export type WorkflowOutlineRow =
     omitted: number;
     omittedPhases: number;
     omittedAgents: number;
+    omittedAdvisors: number;
   };
 
 export function workflowPhaseNodeKey(phaseIndex: number): WorkflowOutlinePhaseKey {
@@ -78,6 +92,10 @@ export function workflowPhaseNodeKey(phaseIndex: number): WorkflowOutlinePhaseKe
 
 export function workflowAgentNodeKey(agentIndex: number): WorkflowOutlineAgentKey {
   return `agent:${agentIndex}`;
+}
+
+export function workflowAdvisorNodeKey(advisorIndex: number): WorkflowOutlineAdvisorKey {
+  return `advisor:${advisorIndex}`;
 }
 
 export function buildWorkflowOutline(
@@ -89,10 +107,13 @@ export function buildWorkflowOutline(
   const phaseProgress = workflowPhaseProgress(run);
   const phaseRecords = plannedAndRecordedPhases(run);
   const phaseAgents = new Map<WorkflowOutlinePhaseKey, readonly WorkflowAgentRecord[]>();
+  const phaseAdvisors = new Map<WorkflowOutlinePhaseKey, readonly WorkflowAdvisorRecord[]>();
   const phases = phaseRecords.map(({ phase, phaseIndex, position }): WorkflowOutlinePhaseNode => {
     const key = workflowPhaseNodeKey(phaseIndex);
     const agents = agentsForPhase(run, phaseIndex, phase);
     phaseAgents.set(key, agents);
+    const advisors = advisorsForPhase(run, phaseIndex, phase);
+    phaseAdvisors.set(key, advisors);
     const visibleAgents = agents.filter((agent) => workflowAgentMatchesFilter(agent, filter));
     const status = phase?.status ?? "pending";
     const current = run.currentPhase === phaseIndex;
@@ -108,9 +129,9 @@ export function buildWorkflowOutline(
       status,
       current,
       recorded: !!phase,
-      completedAgents: agents.filter((agent) => agent.state === "completed").length,
-      agentCount: agents.length,
-      hiddenAgentCount: agents.length - visibleAgents.length,
+      completedAgents: agents.filter((agent) => agent.state === "completed").length + advisors.filter((advisor) => advisor.state === "completed").length,
+      agentCount: agents.length + advisors.length,
+      hiddenAgentCount: agents.length - visibleAgents.length + advisors.filter((advisor) => !workflowStateMatchesFilter(advisor.state, filter)).length,
       attention: current || phaseNeedsAttention(status),
       phase,
     };
@@ -120,12 +141,16 @@ export function buildWorkflowOutline(
   const requestedAgent = requested?.kind === "agent"
     ? run.agents.find((agent) => workflowAgentNodeKey(agent.index) === requested.key)
     : undefined;
+  const requestedAdvisor = requested?.kind === "advisor"
+    ? (run.advisorConsultations ?? []).find((advisor) => workflowAdvisorNodeKey(advisor.index) === requested.key)
+    : undefined;
   const requestedAgentPhase = requestedAgent
     ? phaseForAgent(phases, phaseAgents, requestedAgent)
     : undefined;
   const requestedPhase = requested?.kind === "phase"
     ? phaseByKey.get(requested.phaseKey)
-    : requestedAgentPhase ?? (requested ? phaseByKey.get(requested.phaseKey) : undefined);
+    : requestedAgentPhase ?? (requestedAdvisor ? phases.find((phase) => phase.phaseIndex === requestedAdvisor.phase) : undefined)
+      ?? (requested ? phaseByKey.get(requested.phaseKey) : undefined);
   const currentPhase = phases.find((phase) => phase.current);
   const expandedPhase = requestedPhase ?? currentPhase ?? phases[0];
   const visibleAgents = expandedPhase
@@ -145,15 +170,43 @@ export function buildWorkflowOutline(
       agent,
     }))
     : [];
+  const advisorNodes = expandedPhase
+    ? (phaseAdvisors.get(expandedPhase.key) ?? [])
+      .filter((advisor) => workflowStateMatchesFilter(advisor.state, filter))
+      .map((advisor): WorkflowOutlineAdvisorNode => ({
+        kind: "advisor",
+        key: workflowAdvisorNodeKey(advisor.index),
+        phaseKey: expandedPhase.key,
+        phaseIndex: expandedPhase.phaseIndex,
+        advisorIndex: advisor.index,
+        name: `advisor · ${advisor.advisorName}`,
+        state: advisor.state,
+        summary: advisor.error
+          ? { kind: "failure", text: advisor.error }
+          : advisor.state === "queued" || advisor.state === "running"
+            ? { kind: "wait", text: advisor.state === "queued" ? "waiting on advisor queue" : "consulting advisor" }
+            : { kind: "result", text: advisor.output ?? advisor.state },
+        attention: advisor.state === "queued" || advisor.state === "running" || advisor.state === "failed" || advisor.state === "cancelled" || advisor.state === "aborted",
+        advisor,
+      }))
+    : [];
 
   const nodes: WorkflowOutlineNode[] = [];
   for (const phase of phases) {
     nodes.push(phase);
-    if (phase.key === expandedPhase?.key) nodes.push(...agentNodes);
+    if (phase.key === expandedPhase?.key) {
+      nodes.push(...[...agentNodes, ...advisorNodes].sort((left, right) => {
+        const leftCall = left.kind === "agent" ? left.agent.callIndex ?? left.agent.index : left.advisor.callIndex;
+        const rightCall = right.kind === "agent" ? right.agent.callIndex ?? right.agent.index : right.advisor.callIndex;
+        return leftCall - rightCall;
+      }));
+    }
   }
 
   const sameNode = requested?.kind === "agent"
     ? agentNodes.find((node) => node.key === requested.key)
+    : requested?.kind === "advisor"
+      ? advisorNodes.find((node) => node.key === requested.key)
     : requested?.kind === "phase"
       ? phaseByKey.get(requested.key)
       : undefined;
@@ -210,6 +263,7 @@ export function boundWorkflowOutline(model: WorkflowOutlineModel, rows: number):
     omitted: omittedNodes.length,
     omittedPhases: omittedNodes.filter((node) => node.kind === "phase").length,
     omittedAgents: omittedNodes.filter((node) => node.kind === "agent").length,
+    omittedAdvisors: omittedNodes.filter((node) => node.kind === "advisor").length,
   };
   const firstOmitted = model.nodes.findIndex((_, index) => !selectedIndexes.has(index));
   const insertion = selected.findIndex(({ index }) => index > firstOmitted);
@@ -221,14 +275,20 @@ export function boundWorkflowOutline(model: WorkflowOutlineModel, rows: number):
 export function selectionForNode(node: WorkflowOutlineNode): WorkflowOutlineSelection {
   return node.kind === "phase"
     ? { kind: "phase", key: node.key, phaseKey: node.phaseKey }
-    : { kind: "agent", key: node.key, phaseKey: node.phaseKey };
+    : node.kind === "agent"
+      ? { kind: "agent", key: node.key, phaseKey: node.phaseKey }
+      : { kind: "advisor", key: node.key, phaseKey: node.phaseKey };
 }
 
 export function workflowAgentMatchesFilter(agent: WorkflowAgentRecord, filter: WorkflowAgentFilter): boolean {
+  return workflowStateMatchesFilter(agent.state, filter);
+}
+
+function workflowStateMatchesFilter(state: WorkflowAgentState, filter: WorkflowAgentFilter): boolean {
   if (filter === "all") return true;
-  if (filter === "active") return agent.state === "queued" || agent.state === "running" || agent.state === "waiting";
-  if (filter === "failed") return agent.state === "failed" || agent.state === "cancelled" || agent.state === "aborted";
-  return agent.state === "completed";
+  if (filter === "active") return state === "queued" || state === "running" || state === "waiting";
+  if (filter === "failed") return state === "failed" || state === "cancelled" || state === "aborted";
+  return state === "completed";
 }
 
 function plannedAndRecordedPhases(run: WorkflowSnapshot): Array<{
@@ -254,6 +314,11 @@ function agentsForPhase(
 ): readonly WorkflowAgentRecord[] {
   const referenced = new Set(phase?.agents ?? []);
   return run.agents.filter((agent) => agent.phase === phaseIndex || referenced.has(agent.index));
+}
+
+function advisorsForPhase(run: WorkflowSnapshot, phaseIndex: number, phase: WorkflowPhase | undefined): readonly WorkflowAdvisorRecord[] {
+  const referenced = new Set(phase?.advisorConsultations ?? []);
+  return (run.advisorConsultations ?? []).filter((advisor) => advisor.phase === phaseIndex || referenced.has(advisor.index));
 }
 
 function phaseForAgent(

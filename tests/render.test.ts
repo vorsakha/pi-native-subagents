@@ -302,6 +302,7 @@ test("every direct tool registers width-safe, sanitized trace renderers", () => 
   registerNativeSubagents(pi.api, { registry: {}, legacyRoot: false, backends });
 
   const expected = [
+    "advisor_close", "advisor_consult", "advisor_list", "advisor_open", "advisor_reset",
     "session_peer_fork", "session_peer_list",
     "subagent", "subagent_answer", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait",
   ];
@@ -318,6 +319,11 @@ test("every direct tool registers width-safe, sanitized trace renderers", () => 
     session_peer_list: { query: "\u001b[31mbug\u001b[0m", limit: 5 },
     session_peer_fork: { sessionId: "peer-1", message: "\u001b[31mclarify\u001b[0m", name: "peer" },
     subagent_answer: { requestId: "req-1", answer: "\u001b[31mkeep the legacy flag\u001b[0m" },
+    advisor_open: { name: "security", description: "Review security boundaries" },
+    advisor_consult: { advisorId: "adv_123", question: "\u001b[31mreview this\u001b[0m" },
+    advisor_list: {},
+    advisor_close: { advisorId: "adv_123" },
+    advisor_reset: { advisorId: "adv_123" },
   };
   for (const name of expected) {
     const toolDef = pi.tools.get(name);

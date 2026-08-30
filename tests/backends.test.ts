@@ -40,7 +40,7 @@ process.stdin.on("data", chunk => {
     if (process.env.MODE === "hang") continue;
     if (value.id) {
       let data;
-      if (value.type === "get_state") data = { model: { provider: "fixture", id: "fixture-model" } };
+      if (value.type === "get_state") data = { model: { provider: "fixture", id: "fixture-model" }, sessionFile: "/sessions/pi-fixture.jsonl", sessionId: "pi-fixture" };
       if (value.type === "get_available_models") data = { models: process.env.MODE === "unauthenticated" ? [] : [{ provider: "fixture", id: "fixture-model" }] };
       if (value.type === "get_commands") data = { commands: [{ name: "review", source: "skill" }] };
       process.stdout.write(JSON.stringify({ type: "response", id: value.id, command: value.type, success: true, data }) + "\\n");
@@ -124,6 +124,10 @@ process.stdin.on("data", chunk => {
     else if (value.method === "thread/start") {
       if (process.env.THREAD_PARAM_FILE) fs.writeFileSync(process.env.THREAD_PARAM_FILE, JSON.stringify(value.params));
       reply(value.id, { modelProvider: "openai", ...(process.env.THREAD_MODEL ? { model: process.env.THREAD_MODEL } : {}), ...(process.env.THREAD_SERVICE_TIER ? { serviceTier: process.env.THREAD_SERVICE_TIER } : {}), thread: { id: "thread-1", modelProvider: process.env.THREAD_PROVIDER || "openai" } });
+    }
+    else if (value.method === "thread/resume") {
+      if (process.env.THREAD_PARAM_FILE) fs.writeFileSync(process.env.THREAD_PARAM_FILE, JSON.stringify(value.params));
+      reply(value.id, { thread: { id: value.params.threadId } });
     }
     else if (value.method === "turn/start") {
       if (process.env.PARAM_FILE) fs.appendFileSync(process.env.PARAM_FILE, JSON.stringify(value.params) + "\\n");
@@ -532,6 +536,9 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
     const run = await backend.start(piRequest, (event) => events.push(event));
     await run.completed;
     assert.deepEqual(terminal(events), { type: "completed", output: "PI_OK" });
+    assert.ok(events.some((event) => event.type === "started"
+      && event.backendSessionId === "pi-fixture"
+      && event.sessionFile === "/sessions/pi-fixture.jsonl"), "fresh Pi runs expose their native continuation without a model turn");
     await run.send("SECOND", "followUp");
     const deadline = Date.now() + 1_000;
     while (events.filter((event) => event.type === "completed").length < 2 && Date.now() < deadline) {
@@ -603,7 +610,7 @@ test("Pi RPC resumes a forked session and sends a peer question verbatim", async
   const events: BackendEvent[] = [];
   try {
     const peerRequest = request("pi", fake.dir, { ...process.env, MODE: "complete", ARG_FILE: argFile });
-    peerRequest.resumeSessionFile = "/sessions/forked-peer.jsonl";
+    peerRequest.continuation = { harness: "pi", sessionFile: "/sessions/forked-peer.jsonl" };
     peerRequest.rawInitialMessage = true;
     peerRequest.task = "What decision did this thread reach?";
     peerRequest.policy.piTools = [];
@@ -612,7 +619,7 @@ test("Pi RPC resumes a forked session and sends a peer question verbatim", async
     await run.completed;
     assert.deepEqual(terminal(events), { type: "completed", output: peerRequest.task });
     const args = JSON.parse(await readFile(argFile, "utf8")) as string[];
-    assert.deepEqual(args.slice(args.indexOf("--session"), args.indexOf("--session") + 2), ["--session", peerRequest.resumeSessionFile]);
+    assert.deepEqual(args.slice(args.indexOf("--session"), args.indexOf("--session") + 2), ["--session", peerRequest.continuation.sessionFile]);
     assert.ok(args.includes("--no-tools"), "clarification peers start without child tools");
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
@@ -755,6 +762,29 @@ test("Claude emits live events and reopens a completed subscription session", as
   assert.ok(events.some((event) => event.type === "tool_end" && event.id === "denied-write" && event.error));
   assert.ok(Buffer.byteLength(final.output ?? "") <= MAX_OUTPUT_BYTES);
   assert.equal(events.filter((event) => event.type === "completed").length, 2);
+  await run.close();
+});
+
+test("Claude resumes only the explicitly typed native session identity", async () => {
+  let options: Record<string, unknown> | undefined;
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-retained", tools: [] };
+    yield { type: "result", subtype: "success", result: "resumed", usage: {}, total_cost_usd: 0, num_turns: 1 };
+  }
+  const backend = new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: ((input: { options?: Record<string, unknown> }) => {
+      options = input.options;
+      return Object.assign(messages(), { close() {} });
+    }) as never,
+  });
+  const resumed = request("claude", process.cwd(), process.env);
+  resumed.continuation = { harness: "claude", sessionId: "claude-retained" };
+  const events: BackendEvent[] = [];
+  const run = await backend.start(resumed, (event) => events.push(event));
+  await run.completed;
+  assert.equal(options?.resume, "claude-retained");
+  assert.ok(events.some((event) => event.type === "started" && event.backendSessionId === "claude-retained"));
   await run.close();
 });
 
@@ -1538,6 +1568,36 @@ test("Codex surfaces a native priority-policy rejection without retrying or down
     assert.equal(contextEvents(events).at(-1)?.context.effectiveSpeed, undefined, "requested Fast is never invented as accepted telemetry");
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex resumes an exact native thread without silently starting a replacement", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  const threadParamFile = join(fake.dir, "resume-thread-params.json");
+  let run: BackendRun | undefined;
+  try {
+    const resumed = request("codex", fake.dir, { ...process.env, MODE: "normal", THREAD_PARAM_FILE: threadParamFile });
+    resumed.continuation = { harness: "codex", threadId: "thread-1" };
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 5_000 })
+      .start(resumed, (event) => events.push(event));
+    await run.completed;
+    const resumeParams = JSON.parse(await readFile(threadParamFile, "utf8"));
+    assert.deepEqual({ ...resumeParams, developerInstructions: undefined }, {
+      threadId: "thread-1",
+      cwd: fake.dir,
+      model: "fixture-model",
+      modelProvider: "openai",
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      config: { mcp_servers: {}, hooks: {} },
+      developerInstructions: undefined,
+    });
+    assert.match(resumeParams.developerInstructions, /remain read-only/);
+    assert.ok(events.some((event) => event.type === "started" && event.backendSessionId === "thread-1"));
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
 });
 
 test("Codex exposes parent_thread_context as a client-hosted dynamic tool", async () => {

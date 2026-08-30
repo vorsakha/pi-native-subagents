@@ -67,8 +67,8 @@ function failure(message) {
 
 function formatWorkflowError(error) {
   const message = errorMessage(error);
-  if (/Cannot destructure property ['"](?:phase|log|agent|followUp|parallel|converge)['"]/.test(message)) {
-    return `${message}. Workflow helpers are globals: use phase(), log(), agent(), followUp(), parallel(), and converge().`;
+  if (/Cannot destructure property ['"](?:phase|log|agent|followUp|consult|parallel|converge)['"]/.test(message)) {
+    return `${message}. Workflow helpers are globals: use phase(), log(), agent(), followUp(), consult(), parallel(), and converge().`;
   }
   return message;
 }
@@ -148,7 +148,7 @@ function bridge(operation, payloadJson, resolve) {
     if (!send({ type: "convergence", progress: payload })) return "Unable to emit workflow convergence progress";
     return undefined;
   }
-  if ((operation !== "agent" && operation !== "followUp") || typeof resolve !== "function") return;
+  if ((operation !== "agent" && operation !== "followUp" && operation !== "advisor") || typeof resolve !== "function") return;
   if (agentCalls >= MAX_AGENT_CALLS) {
     resolve(failure(`Agent call limit exceeded (${MAX_AGENT_CALLS})`));
     return;
@@ -168,11 +168,17 @@ function bridge(operation, payloadJson, resolve) {
     resolve(failure("followUp requires a job ID, a string prompt, and an options object"));
     return;
   }
+  if (operation === "advisor" && (typeof payload.advisorId !== "string" || !payload.advisorId.trim())) {
+    resolve(failure("consult requires an advisor ID, a string question, and an options object"));
+    return;
+  }
   const id = nextAgentId++;
   agentCalls++;
   const request = operation === "followUp"
     ? { type: "followUp", id, jobId: payload.jobId, prompt: payload.prompt, options: payload.options }
-    : { type: "agent", id, prompt: payload.prompt, options: payload.options };
+    : operation === "advisor"
+      ? { type: "advisor", id, advisorId: payload.advisorId, prompt: payload.prompt, options: payload.options }
+      : { type: "agent", id, prompt: payload.prompt, options: payload.options };
   if (frameSize({ token, ...request }) > MAX_IPC_BYTES || !send(request)) {
     resolve(failure("Agent request exceeds the 512 KiB IPC limit"));
     return;
@@ -255,6 +261,23 @@ function installApi(context, argsJson) {
           if (payload === undefined) return asFailure(new TypeError("Follow-up request is not JSON-serializable"));
           return await new Promise((resolve) => {
             callHost("followUp", payload, (responseJson) => {
+              try { resolve(JSON.parse(responseJson)); }
+              catch (error) { resolve(asFailure(error)); }
+            });
+          });
+        } catch (error) {
+          return asFailure(error);
+        }
+      };
+      const consultApi = async (advisorId, question, options = {}) => {
+        try {
+          if (typeof advisorId !== "string" || !advisorId.trim() || typeof question !== "string" || options === null || typeof options !== "object" || Array.isArray(options)) {
+            return asFailure(new TypeError("consult requires an advisor ID, a string question, and an options object"));
+          }
+          const payload = JSON.stringify({ advisorId, prompt: question, options });
+          if (payload === undefined) return asFailure(new TypeError("Advisor consultation is not JSON-serializable"));
+          return await new Promise((resolve) => {
+            callHost("advisor", payload, (responseJson) => {
               try { resolve(JSON.parse(responseJson)); }
               catch (error) { resolve(asFailure(error)); }
             });
@@ -679,6 +702,7 @@ function installApi(context, argsJson) {
         log: { value: logApi, writable: false, configurable: false },
         agent: { value: agentApi, writable: false, configurable: false },
         followUp: { value: followUpApi, writable: false, configurable: false },
+        consult: { value: consultApi, writable: false, configurable: false },
         parallel: { value: parallelApi, writable: false, configurable: false },
         pipeline: { value: pipelineApi, writable: false, configurable: false },
         converge: { value: convergeApi, writable: false, configurable: false },

@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
-import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, GatedWorkflowCheckout, GatedWorkflowJournalAppender, ScriptedHarnessAvailability, tempDir, theme, tick, waitFor, withTimeout } from "./helpers.ts";
+import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledAdvisorGateway, ControlledBackend, delay, GatedHarnessAvailability, GatedWorkflowCheckout, GatedWorkflowJournalAppender, ScriptedHarnessAvailability, tempDir, theme, tick, waitFor, withTimeout } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import { replayableJournalInteractions, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint, workflowInteractionFingerprint } from "../src/workflows/journal.ts";
 import {
@@ -86,6 +86,7 @@ async function fixture(
   availability?: ScriptedHarnessAvailability,
   checkout?: ConstructorParameters<typeof WorkflowManager>[0]["checkout"],
   journalAppender?: ConstructorParameters<typeof WorkflowManager>[0]["journalAppender"],
+  advisors?: ControlledAdvisorGateway,
 ) {
   const parent = await tempDir("workflow-manager");
   const cwd = join(parent, "cwd");
@@ -110,6 +111,7 @@ async function fixture(
     checkout,
     journalAppender,
     resolveProfile: (name) => profiles.get(name),
+    advisors,
   });
   return {
     parent,
@@ -273,6 +275,132 @@ test("rejects mismatched workflow agent schemas without spawning jobs", async ()
   } finally {
     await f.cleanup();
   }
+});
+
+test("workflow consult() requires an explicit stable-ID allowlist and records bounded advisor provenance and spend", async () => {
+  const advisors = new ControlledAdvisorGateway();
+  const advisorId = "adv_11111111111111111111111111111111";
+  advisors.add(advisorId, { lineage: 4, harness: "claude", model: "advisor-model" });
+  advisors.results.push({
+    ok: true,
+    advisorId,
+    advisorName: "Security advisor",
+    lineage: 4,
+    generation: 7,
+    output: "Keep the boundary read-only.",
+    usage: { input: 11, output: 3, cacheRead: 2, cacheWrite: 0, cost: 0.02, turns: 1 },
+    route: { harness: "claude", model: "advisor-model" },
+    queuedMs: 12,
+  });
+  const f = await fixture(4, undefined, undefined, undefined, undefined, advisors);
+  try {
+    const script = `export default async () => consult(${JSON.stringify(advisorId)}, "Review containment", { phase: "Security", context: "bounded facts" });`;
+    const started = await f.workflows.start(f.request(script, { advisors: [advisorId] }));
+    const final = await started.completion;
+    assert.equal(final.status, "completed");
+    assert.deepEqual(final.advisors, [advisorId]);
+    assert.equal(advisors.requests.length, 1);
+    assert.deepEqual(advisors.requests[0]?.workflow, { runId: final.runId, phase: "Security", callIndex: 0 });
+    assert.equal(advisors.requests[0]?.threadId, "session-1");
+    const record = final.advisorConsultations?.[0];
+    assert.equal(record?.advisorId, advisorId);
+    assert.equal(record?.lineage, 4);
+    assert.equal(record?.generation, 7);
+    assert.equal(record?.outputProvenance, "advisor");
+    assert.equal(record?.queuedMs, 12);
+    assert.deepEqual(final.phases[0]?.advisorConsultations, [0]);
+    assert.deepEqual(aggregateWorkflowUsage(final), {
+      input: 11, output: 3, cacheRead: 2, cacheWrite: 0, cost: 0.02, turns: 1,
+    });
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    assert.equal(journal.find((entry) => entry.kind === "advisor" && entry.state === "completed")?.result?.advisorLineage, 4);
+    const persisted = (await loadWorkflowSummaries(f.artifactRoot, { sessionId: "session-1" }))
+      .find((snapshot) => snapshot.runId === final.runId);
+    assert.equal(persisted?.advisorConsultations?.[0]?.advisorId, advisorId);
+    assert.equal(persisted?.advisorConsultations?.[0]?.generation, 7);
+    assert.doesNotMatch(JSON.stringify(persisted), /sessionFile|continuation/, "durable workflow state contains provenance, never native continuation references");
+    assert.match(await readFile(join(f.artifactRoot, final.runId, "report.md"), "utf8"), /Advisor consultations: 1/);
+
+    const denied = await f.workflows.start(f.request(script));
+    const deniedFinal = await denied.completion;
+    assert.match((deniedFinal.result as { error?: string }).error ?? "", /not allowlisted/i);
+    assert.equal(advisors.requests.length, 1, "authorization fails before reaching the thread advisor registry");
+  } finally { await f.cleanup(); }
+});
+
+test("workflow advisor calls share the hard call budget and cumulative spend preflight", async () => {
+  const advisors = new ControlledAdvisorGateway();
+  const advisorId = "adv_22222222222222222222222222222222";
+  advisors.add(advisorId);
+  advisors.results.push({
+    ok: true,
+    advisorId,
+    advisorName: "Security advisor",
+    lineage: 0,
+    generation: 1,
+    output: "expensive answer",
+    usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+    route: { harness: "claude" },
+    queuedMs: 0,
+  });
+  const f = await fixture(4, undefined, undefined, undefined, undefined, advisors);
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => {
+        const first = await consult(${JSON.stringify(advisorId)}, "first");
+        const second = await consult(${JSON.stringify(advisorId)}, "second");
+        return { first, second };
+      }
+    `, { advisors: [advisorId], budget: { maxAgents: 2, maxTokens: 10 } }));
+    const final = await started.completion;
+    const result = final.result as { first: { ok: boolean }; second: { ok: boolean; limit?: string; error?: string } };
+    assert.equal(result.first.ok, true);
+    assert.equal(result.second.ok, false);
+    assert.equal(result.second.limit, "budget");
+    assert.match(result.second.error ?? "", /token/i);
+    assert.equal(advisors.requests.length, 1, "reached spend blocks the later consultation before dispatch");
+    assert.equal(final.advisorConsultations?.length, 1);
+    assert.equal(final.advisorConsultations?.length, 1, "advisor consultation is a charged workflow call");
+  } finally { await f.cleanup(); }
+});
+
+test("workflow replay reuses journaled advisor answers and cancellation reaches an in-flight consultation", async () => {
+  const advisors = new ControlledAdvisorGateway();
+  const advisorId = "adv_33333333333333333333333333333333";
+  advisors.add(advisorId, { lineage: 2 });
+  const f = await fixture(4, undefined, undefined, undefined, undefined, advisors);
+  const script = `export default async () => consult(${JSON.stringify(advisorId)}, "stable replay question");`;
+  try {
+    const first = await f.workflows.start(f.request(script, { advisors: [advisorId] }));
+    const firstFinal = await first.completion;
+    assert.equal(advisors.requests.length, 1);
+    const replay = await f.workflows.start(f.request(script, { advisors: [advisorId], resumeFromRunId: firstFinal.runId }));
+    const replayFinal = await replay.completion;
+    assert.equal(advisors.requests.length, 1, "exact replay never re-consults the retained specialist");
+    assert.equal(replayFinal.advisorConsultations?.[0]?.outputProvenance, "replay");
+    assert.equal(replayFinal.advisorConsultations?.[0]?.lineage, 2);
+
+    advisors.consultHandler = (request) => new Promise((resolveConsult) => {
+      request.signal.addEventListener("abort", () => resolveConsult({
+        ok: false,
+        advisorId,
+        advisorName: "Security advisor",
+        lineage: 2,
+        output: "",
+        error: "cancelled",
+        route: { harness: "claude" },
+        queuedMs: 0,
+      }), { once: true });
+    });
+    const active = await f.workflows.start(f.request(
+      `export default async () => consult(${JSON.stringify(advisorId)}, "cancel me");`,
+      { advisors: [advisorId] },
+    ));
+    await waitFor(() => advisors.requests.length === 2, "advisor consultation dispatch");
+    const cancelled = await f.workflows.cancel(active.snapshot.runId, "stop advisor consultation");
+    assert.equal(cancelled.status, "aborted");
+    assert.equal(cancelled.advisorConsultations?.[0]?.state, "cancelled");
+  } finally { await f.cleanup(); }
 });
 
 test("runs sequential and parallel agents through one JobManager and its global cap", async () => {

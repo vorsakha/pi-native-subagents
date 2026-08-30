@@ -16,6 +16,12 @@ export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
 export type AgentSpeed = "standard" | "fast";
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
+/** Private native lineage handle. It is persisted only by the advisor store. */
+export type NativeContinuation =
+  | { harness: "pi"; sessionFile: string }
+  | { harness: "claude"; sessionId: string }
+  | { harness: "codex"; threadId: string; sessionFile?: string };
+
 export interface Usage {
   /** Fresh, non-cached input tokens. */
   input: number;
@@ -132,8 +138,8 @@ export interface BackendRequest {
   env: NodeJS.ProcessEnv;
   /** Aborts harness initialization before a usable run has been returned. */
   signal: AbortSignal;
-  /** Existing Pi session file to resume instead of starting fresh. Pi-only; other backends ignore it. */
-  resumeSessionFile?: string;
+  /** Existing native lineage to resume. The harness must match `policy.harness`. */
+  continuation?: NativeContinuation;
   /** When true, the initial message is sent verbatim instead of prefixed with the generic "Task:" wrapper. */
   rawInitialMessage?: boolean;
   /** Read-only spawn-time snapshot available only to human /subagent jobs through parent_thread_context. */
@@ -241,6 +247,12 @@ export interface WorkflowJobReference {
   phase?: string;
 }
 
+/** Internal ownership marker for a read-only advisor lineage. */
+export interface AdvisorJobReference {
+  advisorId: string;
+  threadId: string;
+}
+
 /** Provenance for a job forked from a saved Pi session (a "session peer"). */
 export interface PeerSessionReference {
   sourceSessionId: string;
@@ -305,6 +317,14 @@ export interface SpawnRequest {
   peer?: PeerSessionReference & { sessionFile: string };
   /** Internal workflow-runtime request for a provider-native structured-result channel; never a model-facing tool field. */
   structuredOutput?: StructuredOutputPolicy;
+  /** Internal advisor ownership. Presence forces read-only access and disables routed questions. */
+  advisor?: AdvisorJobReference;
+  /** Private native lineage restored by an advisor. */
+  continuation?: NativeContinuation;
+  /** Cumulative usage restored with an advisor lineage. */
+  initialUsage?: Usage;
+  /** Last completed advisor generation restored with a native lineage. */
+  initialGeneration?: number;
   /** Internal authorization for host-routed questions; absent means the child never sees an ask tool. */
   interaction?: JobInteractionPolicy;
   /**
@@ -384,6 +404,8 @@ export interface JobSnapshot {
   backendSessionId?: string;
   sessionFile?: string;
   workflow?: WorkflowJobReference;
+  /** Advisor ownership is safe to display; native continuation data is not. */
+  advisor?: AdvisorJobReference;
   /** Present when this job is a read-only session peer forked from a saved Pi session. */
   peer?: PeerSessionReference;
   /** Capability IDs required by the caller. */

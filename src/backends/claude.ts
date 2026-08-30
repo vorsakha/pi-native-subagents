@@ -385,6 +385,9 @@ export class ClaudeBackend implements Backend {
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     request.signal.throwIfAborted();
+    if (request.continuation && request.continuation.harness !== "claude") {
+      throw new Error(`Claude cannot resume a ${request.continuation.harness} continuation`);
+    }
     const env = sanitizeSubscriptionEnv(request.env, "claude");
     await this.#verifyAuth(this.#command, request.cwd, env, request.signal);
     request.signal.throwIfAborted();
@@ -505,6 +508,7 @@ export class ClaudeBackend implements Backend {
         env: { ...env, CLAUDE_AGENT_SDK_CLIENT_APP: "pi-native-subagents/0.1.0" },
         pathToClaudeCodeExecutable: this.#command,
         ...(request.policy.model ? { model: request.policy.model } : {}),
+        ...(request.continuation?.harness === "claude" ? { resume: request.continuation.sessionId } : {}),
         ...(request.policy.effort ? { effort: request.policy.effort } : {}),
         thinking: request.policy.thinking === "off" ? { type: "disabled" } : { type: "adaptive" },
         systemPrompt: { type: "preset", preset: "claude_code", append: request.systemPrompt },

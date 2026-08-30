@@ -916,3 +916,35 @@ test("convergence state reads without color: distinct glyphs, round position, ve
   const withoutConvergence = buildWorkflowCardLines(workflow(), theme, { expanded: false, now: 6_000 });
   assert.ok(!withoutConvergence.some((line) => line.startsWith("Rounds")), "one-shot workflows gain no convergence line");
 });
+
+test("workflow cards render advisor calls as distinct lineage and replay provenance", () => {
+  const snapshot = workflow({
+    advisorConsultations: [{
+      index: 0,
+      callIndex: 1,
+      callFingerprint: "fingerprint",
+      advisorId: "adv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      advisorName: "Security advisor",
+      lineage: 3,
+      generation: 8,
+      phase: 1,
+      state: "completed",
+      timestamps: { createdAt: 1_000, updatedAt: 2_000, startedAt: 1_100, endedAt: 2_000 },
+      prompt: "Review containment",
+      output: "Keep it read-only",
+      harness: "claude",
+      model: "advisor-model",
+      usage: { input: 12, output: 3, cacheRead: 0, cacheWrite: 0, cost: 0.01, turns: 1 },
+      queuedMs: 1_500,
+      outputProvenance: "replay",
+    }],
+  });
+  snapshot.phases[1]!.advisorConsultations = [0];
+  const expanded = buildWorkflowCardLines(snapshot, theme, { expanded: true, now: 6_000 }).join("\n");
+  assert.match(expanded, /Advisors.*1 call/);
+  assert.match(expanded, /advisor · Security advisor/);
+  assert.match(expanded, /lineage 3\/8/);
+  assert.match(expanded, /advisor queue 1s/);
+  assert.match(expanded, /replay/);
+  assert.match(expanded, /advisor · Security advisor.*1t ↑12 ↓3/);
+});

@@ -41,6 +41,7 @@ test("capabilityDenial enforces the orchestration/interactivity ceiling by name 
   assert.equal(capabilityDenial("tool", "task_list")?.effect, "delegation", "a word-boundary-delimited task name is denied");
   assert.equal(capabilityDenial("tool", "sub_agent")?.reason, "nested agent orchestration is denied");
   assert.equal(capabilityDenial("command", "workflow-start")?.reason, "nested workflow orchestration is denied");
+  assert.equal(capabilityDenial("tool", "advisor_consult")?.reason, "nested advisor consultation is denied");
   assert.equal(capabilityDenial("tool", "session-peer-fork")?.reason, "session-peer forking is denied");
   assert.equal(capabilityDenial("tool", "delegate-to-worker")?.reason, "nested delegation is denied");
   assert.equal(capabilityDenial("command", "plugin-install")?.effect, "external-write");

@@ -314,6 +314,7 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
       description: phase.description ? truncateUtf8(phase.description, 2_000) : undefined,
       error: phase.error ? truncateUtf8(phase.error, 2_000) : undefined,
       agents: phase.agents.slice(0, 32),
+      advisorConsultations: phase.advisorConsultations?.slice(0, 32),
       result: serializeWorkflowValue(phase.result, { maxNodes: 256, maxStringBytes: 4 * 1024, maxTotalBytes: 8 * 1024 }),
     })),
     interactions: snapshot.interactions?.slice(-16).map((interaction) => ({
@@ -379,6 +380,15 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
         structured: serializeWorkflowValue(generation.structured, { maxNodes: 512, maxStringBytes: 8 * 1024, maxTotalBytes: 16 * 1024 }),
         error: generation.error ? truncateUtf8(generation.error, 2_000) : undefined,
       })),
+    })),
+    advisors: snapshot.advisors?.slice(0, 16),
+    advisorConsultations: snapshot.advisorConsultations?.slice(0, 32).map((advisor) => ({
+      ...advisor,
+      advisorName: truncateUtf8(advisor.advisorName, 1_000),
+      prompt: truncateUtf8(advisor.prompt, 2 * 1024),
+      context: advisor.context ? truncateUtf8(advisor.context, 2 * 1024) : undefined,
+      output: advisor.output ? truncateUtf8(advisor.output, 16 * 1024) : undefined,
+      error: advisor.error ? truncateUtf8(advisor.error, 2_000) : undefined,
     })),
   }, {
     maxDepth: 16,
@@ -551,7 +561,7 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || typeof record.fingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(record.fingerprint)
       || !["started", "progressed", "handoff", "completed", "accepted", "failed"].includes(record.state ?? "")
       || typeof record.at !== "number" || !Number.isFinite(record.at)) return false;
-  if (record.kind !== undefined && !["agent", "followUp", "peerQuestion"].includes(record.kind)) return false;
+  if (record.kind !== undefined && !["agent", "followUp", "advisor", "peerQuestion"].includes(record.kind)) return false;
   if (record.replayProof !== undefined && (record.replayProof !== true || record.kind === "peerQuestion")) return false;
   if (record.replayUsageClaim !== undefined && (record.replayUsageClaim !== true
       || record.kind === "peerQuestion" || record.replayProof === true)) return false;
@@ -634,7 +644,12 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || record.result.jobId !== undefined && (typeof record.result.jobId !== "string" || !record.result.jobId || record.result.jobId.length > 200)
       || record.result.error !== undefined && typeof record.result.error !== "string"
       || record.result.progressed !== undefined && record.result.progressed !== true
-      || record.result.transport !== undefined && record.result.transport !== "native" && record.result.transport !== "portable") return false;
+      || record.result.transport !== undefined && record.result.transport !== "native" && record.result.transport !== "portable"
+      || record.result.advisorId !== undefined && (typeof record.result.advisorId !== "string" || !/^adv_[a-f0-9]{32}$/.test(record.result.advisorId))
+      || record.result.advisorName !== undefined && typeof record.result.advisorName !== "string"
+      || record.result.advisorLineage !== undefined && (!Number.isSafeInteger(record.result.advisorLineage) || record.result.advisorLineage < 0)
+      || record.result.advisorGeneration !== undefined && (!Number.isSafeInteger(record.result.advisorGeneration) || record.result.advisorGeneration < 0)
+      || record.result.queuedMs !== undefined && (typeof record.result.queuedMs !== "number" || !Number.isFinite(record.result.queuedMs) || record.result.queuedMs < 0)) return false;
   return record.state === "completed" ? record.result.ok : !record.result.ok;
 }
 
@@ -758,7 +773,7 @@ export async function writeWorkflowResult(
 
 export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapshot): Promise<void> {
   const directory = await requireRunDirectory(root, snapshot.runId);
-  const usage = snapshot.agents.reduce((total, agent) => ({
+  const agentUsage = snapshot.agents.reduce((total, agent) => ({
     input: total.input + agent.usage.input,
     output: total.output + agent.usage.output,
     cacheRead: total.cacheRead + agent.usage.cacheRead,
@@ -766,6 +781,14 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
     cost: total.cost + agent.usage.cost,
     turns: total.turns + agent.usage.turns,
   }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+  const usage = (snapshot.advisorConsultations ?? []).reduce((total, advisor) => ({
+    input: total.input + advisor.usage.input,
+    output: total.output + advisor.usage.output,
+    cacheRead: total.cacheRead + advisor.usage.cacheRead,
+    cacheWrite: total.cacheWrite + advisor.usage.cacheWrite,
+    cost: total.cost + advisor.usage.cost,
+    turns: total.turns + advisor.usage.turns,
+  }), agentUsage);
   const budget = formatWorkflowBudget(snapshot, usage);
   const lines = [
     `# ${snapshot.name}`,
@@ -776,11 +799,12 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
     `- Status: **${snapshot.status}**`,
     ...(snapshot.status === "completed" ? [`- Task outcome: **${snapshot.taskOutcome ?? workflowTaskOutcome(snapshot.result)}**`] : []),
     `- Agents: ${snapshot.agents.length}`,
+    `- Advisor consultations: ${snapshot.advisorConsultations?.length ?? 0}`,
     `- Usage: ${usage.input} fresh input / ${usage.output} output / ${usage.cacheRead} cache-read / ${usage.cacheWrite} cache-write tokens · ${usage.turns} turns · $${usage.cost.toFixed(4)}`,
     ...(budget ? [`- Budget: ${budget}`] : []),
     "",
     "## Phases",
-    ...snapshot.phases.map((phase) => `- ${phase.name}: ${phase.status} (${phase.agents.length} agents)`),
+    ...snapshot.phases.map((phase) => `- ${phase.name}: ${phase.status} (${phase.agents.length} agents, ${phase.advisorConsultations?.length ?? 0} advisor calls)`),
     "",
     ...(snapshot.convergence ? [
       "## Convergence",
@@ -799,6 +823,7 @@ export async function writeWorkflowReport(root: string, snapshot: WorkflowSnapsh
     ] : []),
     "## Agents",
     ...snapshot.agents.map((agent) => `### ${agent.name}\n\n- Access: ${agent.access}\n- Profile: ${agent.profile ?? "none"}\n- Independent: ${agent.independent ? "yes" : "no"}\n- Status: ${agent.state}\n- Route: ${agent.harness ?? "?"}/${agent.model ?? "?"}\n- Effort: ${agent.effort ?? "adaptive"}\n\n${truncateUtf8(String(agent.output ?? agent.preview ?? agent.error ?? "(no output)"), 8 * 1024)}\n`),
+    ...(snapshot.advisorConsultations?.map((advisor) => `### Advisor · ${advisor.advisorName}\n\n- ID: ${advisor.advisorId}\n- Lineage/generation: ${advisor.lineage}/${advisor.generation ?? "?"}\n- Status: ${advisor.state}\n- Route: ${advisor.harness ?? "?"}/${advisor.model ?? "?"}\n- Replay: ${advisor.outputProvenance === "replay" ? "yes" : "no"}\n\n${truncateUtf8(String(advisor.output ?? advisor.error ?? "(no output)"), 8 * 1024)}\n`) ?? []),
     "## Result",
     "",
     "```json",
@@ -924,7 +949,17 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
       && (agent.access === "readOnly" || agent.access === "full")
       && (agent.speed === undefined || agent.speed === "standard" || agent.speed === "fast")
       && (agent.effectiveSpeed === undefined || agent.effectiveSpeed === "standard" || agent.effectiveSpeed === "fast")
-      && typeof agent.independent === "boolean");
+      && typeof agent.independent === "boolean")
+    && (candidate.advisors === undefined || Array.isArray(candidate.advisors)
+      && candidate.advisors.length <= 16
+      && candidate.advisors.every((advisorId) => typeof advisorId === "string" && /^adv_[a-f0-9]{32}$/.test(advisorId)))
+    && (candidate.advisorConsultations === undefined || Array.isArray(candidate.advisorConsultations)
+      && candidate.advisorConsultations.length <= 32
+      && candidate.advisorConsultations.every((advisor) => !!advisor && typeof advisor === "object"
+        && typeof advisor.advisorId === "string"
+        && typeof advisor.advisorName === "string"
+        && typeof advisor.prompt === "string"
+        && isWorkflowUsage(advisor.usage)));
 }
 
 function withDefaultAgentSpeeds(snapshot: WorkflowSnapshot): WorkflowSnapshot {
@@ -983,6 +1018,15 @@ function abortStaleWorkflow(snapshot: WorkflowSnapshot, now: number, staleAfterM
         timestamps: { ...agent.timestamps, updatedAt: now, endedAt: now },
       } : cleared;
     }),
+    advisorConsultations: snapshot.advisorConsultations?.map((advisor) =>
+      advisor.state === "running" || advisor.state === "queued" || advisor.state === "waiting"
+        ? {
+            ...advisor,
+            state: "aborted",
+            error: advisor.error ?? error,
+            timestamps: { ...advisor.timestamps, updatedAt: now, endedAt: now },
+          }
+        : advisor),
   };
 }
 

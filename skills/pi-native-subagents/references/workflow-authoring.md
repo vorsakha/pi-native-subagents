@@ -25,6 +25,7 @@ A workflow script must export a default async function. The helpers are globals,
 - `log(message)` — report bounded progress text;
 - `agent(prompt, options)` — request one generic child and return a result object;
 - `followUp(jobId, prompt, options)` — continue a completed `agent()` call's own retained native session and return the same result shape;
+- `consult(advisorId, question, options)` — consult one stable, explicitly allowlisted thread advisor;
 - `parallel(tasks, { concurrency })` — run deferred tasks with a bounded worker pool;
 - `pipeline(items, ...stages)` — process independent items through ordered stages;
 - `converge(options)` — run a bounded implement/review/fix loop over two retained sessions;
@@ -53,7 +54,7 @@ const processed = await pipeline(files, (file) => agent(`Summarize ${file}.`, { 
 const failed = files.filter((_, index) => processed[index] === null);
 ```
 
-Always await every `agent()`/`followUp()` call before returning from the default function. A forgotten promise fails the workflow rather than silently losing the child result.
+Always await every `agent()`, `followUp()`, and `consult()` call before returning from the default function. A forgotten promise fails the workflow rather than silently losing the child result.
 
 `agent("task", { harness: "codex", speed: "fast" })` explicitly opts one Codex lineage into Fast mode. Omit `speed` for standard policy. A selected profile never supplies this opt-in. Fast is unsupported by Pi and Claude, does not choose a route for `harness: "auto"`, and cannot combine with provider or continuation fallback.
 
@@ -93,7 +94,7 @@ A fresh explicit Claude/Codex `agent()` may set one opposite native route. `prov
 - The sandbox exposes only orchestration: no imports, I/O, environment, processes, credentials, or nested delegation.
 - Workflows are deterministic: `Date.now()`, zero-argument `new Date()`, and `Math.random()` all throw.
 - Workflow data is bounded and JSON-serializable; one agent request is capped at 512 KiB.
-- A run may make at most 32 agent calls (`agent()` and `followUp()` share the budget) and use at most four concurrent workers. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
+- A run may make at most 32 calls (`agent()`, `followUp()`, and `consult()` share the budget) and use at most four concurrent workers. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
 - Mutating agents sharing one checkout are serialized; read-only and worktree-isolated calls are not.
 
 ## Lifecycle versus task outcome

@@ -66,7 +66,7 @@ export function piChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 
 interface PendingCommand {
   command: string;
-  resolve(): void;
+  resolve(data: Record<string, unknown>): void;
   reject(error: Error): void;
   timer: NodeJS.Timeout;
 }
@@ -327,7 +327,10 @@ export class PiRpcBackend implements Backend {
       await cleanupParentThread();
       throw error;
     }
-    if (request.resumeSessionFile) args.push("--session", request.resumeSessionFile);
+    if (request.continuation) {
+      if (request.continuation.harness !== "pi") throw new Error(`Pi cannot resume a ${request.continuation.harness} continuation`);
+      args.push("--session", request.continuation.sessionFile);
+    }
     if (request.policy.model) args.push("--model", request.policy.model);
     args.push(
       "--thinking", request.policy.thinking,
@@ -382,10 +385,14 @@ export class PiRpcBackend implements Backend {
       if (closed || managed.child.stdin.destroyed || !managed.child.stdin.writable) throw new Error("Pi RPC process is closed");
       managed.child.stdin.write(`${JSON.stringify(value)}\n`);
     };
-    const command = (type: string, fields: Record<string, unknown> = {}, timeoutMs = this.#requestTimeoutMs): Promise<void> => {
+    const command = (
+      type: string,
+      fields: Record<string, unknown> = {},
+      timeoutMs = this.#requestTimeoutMs,
+    ): Promise<Record<string, unknown>> => {
       if (closed) return Promise.reject(new Error("Pi RPC process is closed"));
       const id = `${request.jobId}:${++commandSequence}`;
-      return new Promise<void>((resolve, reject) => {
+      return new Promise<Record<string, unknown>>((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
           reject(new Error(`Pi RPC command timed out: ${type}`));
@@ -414,7 +421,7 @@ export class PiRpcBackend implements Backend {
           pending.delete(event.id);
           clearTimeout(item.timer);
           if (event.success === false) item.reject(new Error(String(event.error ?? `Pi rejected ${item.command}`)));
-          else item.resolve();
+          else item.resolve(asObject(event.data));
         }
         return;
       }
@@ -545,10 +552,17 @@ export class PiRpcBackend implements Backend {
 
     const initialMessage = request.rawInitialMessage ? request.task : `Task: ${request.task}`;
     emit({ type: "user_message", text: initialMessage });
-    void command("prompt", { message: initialMessage })
+    void command("get_state")
+      .then((state) => {
+        const sessionFile = typeof state.sessionFile === "string" && state.sessionFile
+          ? state.sessionFile
+          : request.continuation?.harness === "pi" ? request.continuation.sessionFile : undefined;
+        const sessionId = typeof state.sessionId === "string" && state.sessionId ? state.sessionId : undefined;
+        emit({ type: "started", backendSessionId: sessionId, sessionFile });
+        return command("prompt", { message: initialMessage });
+      })
       .then(() => {
         if (!settled) watchdog.arm();
-        emit({ type: "started" });
       })
       .catch((error) => {
         if (!request.signal.aborted) finish({ type: "failed", error: error instanceof Error ? error.message : String(error) });
