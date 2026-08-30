@@ -12,6 +12,7 @@ export interface AdvisorsDashboardManager {
     advisorId: string;
     question: string;
     sender: "human";
+    trusted: boolean;
   }): Promise<AdvisorConsultResult>;
   close(threadId: string, advisorId: string): Promise<AdvisorSnapshot>;
   reset(threadId: string, advisorId: string): Promise<AdvisorSnapshot>;
@@ -19,12 +20,41 @@ export interface AdvisorsDashboardManager {
 
 type Mode = "list" | "ask" | "confirm-close" | "confirm-reset";
 
+export function advisorViewport(
+  roster: string[],
+  inspector: string[],
+  actions: string[],
+  selectedIndex: number,
+  rows: number,
+): string[] {
+  const budget = Math.max(0, rows);
+  if (!budget) return [];
+  if (!inspector.length || selectedIndex < 0) return [...roster, ...actions].slice(0, budget);
+
+  const rosterBudget = Math.min(roster.length, Math.max(1, Math.floor(budget / 2)));
+  const start = Math.min(
+    Math.max(0, selectedIndex - Math.floor(rosterBudget / 2)),
+    Math.max(0, roster.length - rosterBudget),
+  );
+  const visibleRoster = roster.slice(start, start + rosterBudget);
+  const inspectorBudget = budget - visibleRoster.length;
+  if (inspectorBudget <= 0) return visibleRoster;
+
+  const visibleActions = actions.slice(-inspectorBudget);
+  const detailBudget = inspectorBudget - visibleActions.length;
+  const details = detailBudget === 1 && inspector[0] === "─"
+    ? inspector.slice(1, 2)
+    : inspector.slice(0, detailBudget);
+  return [...visibleRoster, ...details, ...visibleActions];
+}
+
 export class AdvisorsDashboard implements Focusable {
   readonly #tui: TUI;
   readonly #theme: Theme;
   readonly #keybindings: KeybindingsManager;
   readonly #manager: AdvisorsDashboardManager;
   readonly #threadId: string;
+  readonly #isTrusted: () => boolean;
   readonly #done: () => void;
   readonly #unsubscribe: () => void;
   #selectedId?: string;
@@ -33,12 +63,13 @@ export class AdvisorsDashboard implements Focusable {
   #message?: string;
   #focused = false;
 
-  constructor(tui: TUI, theme: Theme, keybindings: KeybindingsManager, manager: AdvisorsDashboardManager, threadId: string, done: () => void) {
+  constructor(tui: TUI, theme: Theme, keybindings: KeybindingsManager, manager: AdvisorsDashboardManager, threadId: string, isTrusted: () => boolean, done: () => void) {
     this.#tui = tui;
     this.#theme = theme;
     this.#keybindings = keybindings;
     this.#manager = manager;
     this.#threadId = threadId;
+    this.#isTrusted = isTrusted;
     this.#done = done;
     this.#selectedId = manager.list()[0]?.id;
     this.#unsubscribe = manager.subscribe(() => {
@@ -97,30 +128,32 @@ export class AdvisorsDashboard implements Focusable {
     const roster = this.#manager.list();
     const selected = this.#selected();
     const title = `Thread advisors · ${roster.length}/${16}`;
-    const content: string[] = [];
-    if (!roster.length) content.push(this.#theme.fg("dim", "No advisors. Use /advisor open <name> <description>."));
+    const rosterLines: string[] = [];
+    if (!roster.length) rosterLines.push(this.#theme.fg("dim", "No advisors. Use /advisor open <name> <description>."));
     for (const advisor of roster) {
       const marker = advisor.id === this.#selectedId ? "❯" : " ";
       const state = advisor.state === "unavailable" ? "!" : advisor.state === "consulting" ? "↻" : advisor.state === "idle" ? "●" : "○";
-      content.push(`${marker} ${state} ${sanitizeInline(advisor.name)} · ${advisor.state} · ${advisor.policy.harness} · q${advisor.queued}`);
+      rosterLines.push(`${marker} ${state} ${sanitizeInline(advisor.name)} · ${advisor.state} · ${advisor.policy.harness} · q${advisor.queued}`);
     }
+    const inspector: string[] = [];
     if (selected) {
-      content.push("─");
-      content.push(`${selected.name} · ${shortId(selected.id)} · owner ${shortId(selected.threadId)}`);
-      content.push(`Route · ${selected.policy.harness}/${selected.policy.model ?? "default"} · read-only · profile ${selected.policy.profile ?? "none"}`);
-      content.push(`Lineage · ${selected.lineage} · generation ${selected.generation} · ${formatUsage(selected.usage)}`);
-      content.push(`Budget · ${selected.policy.budget ? JSON.stringify(selected.policy.budget) : "open"} · queued ${selected.queued}`);
-      if (selected.lastConsultedAt) content.push(`Last consultation · ${new Date(selected.lastConsultedAt).toISOString()}`);
-      if (selected.error) content.push(this.#theme.fg("error", `Unavailable · ${sanitizeInline(selected.error)}`));
+      inspector.push("─");
+      inspector.push(`${selected.name} · ${shortId(selected.id)} · owner ${shortId(selected.threadId)}`);
+      inspector.push(`Route · ${selected.policy.harness}/${selected.policy.model ?? "default"} · read-only · profile ${selected.policy.profile ?? "none"}`);
+      inspector.push(`Lineage · ${selected.lineage} · generation ${selected.generation} · ${formatUsage(selected.usage)}`);
+      inspector.push(`Budget · ${selected.policy.budget ? JSON.stringify(selected.policy.budget) : "open"} · queued ${selected.queued}`);
+      if (selected.lastConsultedAt) inspector.push(`Last consultation · ${new Date(selected.lastConsultedAt).toISOString()}`);
+      if (selected.error) inspector.push(this.#theme.fg("error", `Unavailable · ${sanitizeInline(selected.error)}`));
       const latest = selected.ledger.at(-1);
-      if (latest) content.push(`Latest · ${latest.sender} · ${latest.state} · generation ${latest.generation} · ${sanitizeInline(latest.output ?? latest.error ?? latest.question)}`);
+      if (latest) inspector.push(`Latest · ${latest.sender} · ${latest.state} · generation ${latest.generation} · ${sanitizeInline(latest.output ?? latest.error ?? latest.question)}`);
     }
-    if (this.#mode === "ask") content.push(`Ask › ${this.#input.getValue()}`);
-    if (this.#mode === "confirm-close") content.push(this.#theme.fg("warning", "Close this advisor and delete its private continuation? Enter confirms · Esc cancels"));
-    if (this.#mode === "confirm-reset") content.push(this.#theme.fg("warning", "Reset this lineage explicitly? Stable ID and cumulative spend remain. Enter confirms · Esc cancels"));
-    if (this.#message) content.push(this.#message);
+    const actions: string[] = [];
+    if (this.#mode === "ask") actions.push(`Ask › ${this.#input.getValue()}`);
+    if (this.#mode === "confirm-close") actions.push(this.#theme.fg("warning", "Close this advisor and delete its private continuation? Enter confirms · Esc cancels"));
+    if (this.#mode === "confirm-reset") actions.push(this.#theme.fg("warning", "Reset this lineage explicitly? Stable ID and cumulative spend remain. Enter confirms · Esc cancels"));
+    if (this.#message) actions.push(this.#message);
 
-    const visible = content.slice(0, layout.contentRows);
+    const visible = advisorViewport(rosterLines, inspector, actions, roster.findIndex((advisor) => advisor.id === this.#selectedId), layout.contentRows);
     const lines = [frame.header(title, "read-only retained specialists"), frame.top("roster / inspector")];
     for (let index = 0; index < layout.contentRows; index++) lines.push(frame.row(truncateToWidth(visible[index] ?? "", frame.innerWidth, "…")));
     lines.push(frame.bottom());
@@ -144,7 +177,7 @@ export class AdvisorsDashboard implements Focusable {
     this.#message = "Consulting…";
     this.#tui.requestRender();
     try {
-      const result = await this.#manager.consult({ threadId: this.#threadId, advisorId: advisor.id, question, sender: "human" });
+      const result = await this.#manager.consult({ threadId: this.#threadId, advisorId: advisor.id, question, sender: "human", trusted: this.#isTrusted() });
       this.#message = result.ok ? `Answer · ${sanitizeInline(result.output)}` : this.#theme.fg("error", `Error · ${sanitizeInline(result.error ?? "consultation failed")}`);
     } catch (error) {
       this.#message = this.#theme.fg("error", `Error · ${sanitizeInline(error instanceof Error ? error.message : String(error))}`);
@@ -183,6 +216,7 @@ export async function openAdvisorsDashboard(ctx: ExtensionCommandContext, manage
     keybindings,
     manager,
     ctx.sessionManager.getSessionId(),
+    () => ctx.isProjectTrusted(),
     () => done(null),
   ), {
     overlay: true,

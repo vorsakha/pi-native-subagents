@@ -110,6 +110,7 @@ export interface WorkflowAdvisorGateway {
     advisorId: string;
     question: string;
     context?: string;
+    trusted: boolean;
     signal: AbortSignal;
     requiredLineage?: number;
     workflow: { runId: string; phase?: string; callIndex: number };
@@ -1956,6 +1957,7 @@ export class WorkflowManager {
           advisorId,
           question,
           context: typeof options.context === "string" ? options.context : undefined,
+          trusted: request.trusted,
           signal,
           requiredLineage,
           workflow: {

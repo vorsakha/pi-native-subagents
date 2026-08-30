@@ -7,8 +7,13 @@ import { advisorSnapshotFixture, theme, tick } from "./helpers.ts";
 const ENTER = "\r";
 const ESCAPE = "\u001b";
 
-function harness() {
-  const roster = [advisorSnapshotFixture()];
+function harness(options: { advisors?: number; rows?: number } = {}) {
+  const count = options.advisors ?? 1;
+  const roster = Array.from({ length: count }, (_, index) => advisorSnapshotFixture(count === 1 ? {} : {
+    id: `adv_${index.toString(16).padStart(32, "0")}`,
+    name: `Advisor ${index.toString().padStart(2, "0")}`,
+    aliases: [`advisor-${index}`],
+  }));
   const calls: string[] = [];
   const listeners = new Set<(advisor: ReturnType<typeof advisorSnapshotFixture>) => void>();
   let renders = 0;
@@ -44,14 +49,14 @@ function harness() {
     },
   };
   const tui = {
-    terminal: { rows: 24 },
+    terminal: { rows: options.rows ?? 24 },
     requestRender: () => { renders++; },
   } as unknown as TUI;
   const keybindings = {
     matches: () => false,
     getKeys: () => [],
   } as unknown as KeybindingsManager;
-  const dashboard = new AdvisorsDashboard(tui, theme, keybindings, manager, "thread-advisors", () => { closed++; });
+  const dashboard = new AdvisorsDashboard(tui, theme, keybindings, manager, "thread-advisors", () => true, () => { closed++; });
   dashboard.focused = true;
   return { dashboard, roster, calls, get renders() { return renders; }, get closed() { return closed; } };
 }
@@ -97,4 +102,15 @@ test("advisor dashboard keeps ask, explicit reset, close confirmation, and Escap
 
   state.dashboard.handleInput(ESCAPE);
   assert.equal(state.closed, 1);
+});
+
+test("advisor dashboard keeps the selected roster row and inspector visible in a short viewport", () => {
+  const state = harness({ advisors: 16, rows: 12 });
+  for (let index = 1; index < 16; index++) state.dashboard.handleInput("j");
+  const text = state.dashboard.render(64).join("\n");
+  assert.match(text, /❯.*Advisor 15/);
+  assert.match(text, /Advisor 15.*owner/);
+  assert.match(text, /Route.*read-only/);
+  assert.doesNotMatch(text, /❯.*Advisor 00/);
+  state.dashboard.dispose();
 });

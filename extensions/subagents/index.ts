@@ -389,8 +389,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const advisorStore = new FileAdvisorStore(options.advisorRoot ?? resolve(getAgentDir(), "native-subagents/advisors"));
   const advisorRouter: AdvisorRouteResolver = {
     async resolve(request: AdvisorOpenRequest, expectedHarness: HarnessName | undefined) {
-      const profile = request.profile ? profileCatalog.profiles.get(request.profile.trim()) : undefined;
-      if (request.profile && !profile) throw new Error(`Unknown subagent profile: ${request.profile}`);
+      const profile = expectedHarness === undefined && request.profile
+        ? profileCatalog.profiles.get(request.profile.trim())
+        : undefined;
+      if (expectedHarness === undefined && request.profile && !profile) throw new Error(`Unknown subagent profile: ${request.profile}`);
       const routed = await routeCapabilities(capabilities, {
         request: {
           name: request.name,
@@ -402,7 +404,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
           model: request.model,
           effort: request.effort,
           access: "readOnly",
-          profile: request.profile,
+          profile: expectedHarness === undefined ? request.profile : undefined,
           defaultHarness: activeHarness,
         },
         profile,
@@ -415,7 +417,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       if (expectedHarness && harness !== expectedHarness) {
         throw new Error(`Advisor route ${expectedHarness} is unavailable; silent migration to ${harness} is forbidden`);
       }
-      return { harness, requires: routed.requires ?? [], capabilityRoute: routed.capabilityRoute };
+      return {
+        harness,
+        requires: routed.requires ?? [],
+        capabilityRoute: routed.capabilityRoute,
+        effort: request.effort ?? profile?.effort,
+        profileBinding: profile ? { name: profile.name, systemPrompt: profile.systemPrompt } : undefined,
+      };
     },
   };
   const getAdvisors = () => {
@@ -1255,6 +1263,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
             question: rest.join(" "),
             context: contextPacket,
             sender: "human",
+            trusted: ctx.isProjectTrusted(),
           });
           ctx.ui.notify(result.ok ? result.output || "Advisor returned no text." : result.error ?? "Advisor consultation failed", result.ok ? "info" : "error");
           return;
@@ -1353,6 +1362,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         decisions: params.decisions,
         retryUnavailable: params.retryUnavailable,
         sender: "orchestrator",
+        trusted: ctx.isProjectTrusted(),
         signal,
       });
       return { content: [{ type: "text" as const, text: result.ok ? result.output : result.error ?? "Advisor consultation failed" }], details: { advisorConsultation: result } };

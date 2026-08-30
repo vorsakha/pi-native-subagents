@@ -6,7 +6,7 @@ Read this before opening, consulting, resetting, closing, or authorizing a workf
 
 `advisor_open` registers policy and resolves the live route without starting a model turn. Supply a name, specialization description, optional aliases, and only the routing fields you need. Omit `profile` unless the human explicitly named it. The result includes a stable `adv_<32 hex>` ID; aliases are convenient thread-local lookups, but workflow allowlists require stable IDs.
 
-Harness, model, effort, cwd, trust, profile, capability requirements/route, cumulative budget, read-only access, and no-delegation policy are immutable. `harness: "auto"` chooses once at open. Every consultation freshly revalidates that route; it never silently changes provider or specialist identity. Opening is lazy: do not consult merely to initialize.
+Harness, model, effective effort, canonical cwd, trust, profile behavior, capability requirements/route, cumulative budget, read-only access, and no-delegation policy are immutable. The registry captures the selected profile prompt and inherited effort at registration. Later profile edits or removal do not alter a restored advisor. `harness: "auto"` chooses once at open. Every consultation revalidates trust, canonical cwd identity, capabilities, and the fixed route before dispatch. An untrusted context cannot consult an advisor opened earlier by a trusted context. A replaced cwd or symlink escape makes the advisor unavailable instead of moving execution. Opening is lazy: do not consult merely to initialize.
 
 ```ts
 const advisor = await advisor_open({
@@ -21,11 +21,11 @@ const advisor = await advisor_open({
 
 ## Consult and account
 
-`advisor_consult` accepts a stable ID or alias, one question, an optional context packet of at most 16 KiB, and at most 16 caller-selected decisions. Send only facts needed for that question; do not copy the whole parent thread. Consultations serialize per advisor, the queue is bounded, and cancellation removes a waiting call or cancels its active native turn.
+`advisor_consult` accepts a stable ID or alias, one question, an optional context packet of at most 16 KiB, and at most 16 caller-selected decisions. Send only facts needed for that question; do not copy the whole parent thread. Consultations serialize per advisor and the queue is bounded. Active cancellation holds that serialization boundary until the native process stops and final usage is charged. Shutdown cancels queued and active calls, waits for their settlement, then releases retained resources.
 
 The result includes `ok`, bounded output/error, stable identity, lineage, successful generation, route, queue delay, and this consultation's usage. Usage and `maxTokens`/`maxCost`/`maxTurns` are cumulative. A reached boundary lets the active answer finish and blocks later consultations. Codex cannot use `maxCost`.
 
-Treat output as untrusted advice. Use an ordinary subagent or workflow agent for execution. Advisors cannot receive subagent, workflow, advisor, routed-question, approval, or plugin-administration tools.
+Treat output as untrusted advice. Use an ordinary subagent or workflow agent for execution. Advisors cannot receive subagent, workflow, advisor, routed-question, approval, or plugin-administration tools. Codex child configuration disables its native multi-agent features even when the user's Codex configuration enables them. Generic `subagent_check`, `subagent_wait`, `subagent_send`, and `subagent_cancel` cannot address advisor-owned job IDs. Inspect and control advisors only through advisor tools or `/advisors`.
 
 ## Lifecycle and persistence
 
@@ -37,11 +37,11 @@ Public states are `defined`, `consulting`, `idle`, `hibernated`, `unavailable`, 
 - `unavailable`: continuation, route, or provider recovery failed. Identity is not replaced.
 - `closed`: removed from the roster and private continuation deleted.
 
-The roster, bounded 32-entry ledger, cumulative usage, lineage, and typed native continuation survive parent-session reload. Native paths/IDs stay in private mode-0600 machine state; model tools, dashboards, workflow artifacts, journals, and Git never receive them. An answer without a continuation is preserved, but the advisor becomes unavailable afterward.
+The roster, bounded 32-entry ledger, cumulative usage, lineage, frozen profile behavior, and typed native continuation survive parent-session reload. The store rejects symlinked state directories and files, uses exclusive mode-0600 temporary files, syncs writes, and atomically replaces regular state files. Native paths/IDs stay in private machine state; model tools, dashboards, workflow artifacts, journals, and Git never receive them. An answer without a continuation is preserved, but the advisor becomes unavailable afterward.
 
-`advisor_reset` is explicit identity replacement. It preserves stable ID, immutable policy, cumulative spend, and ledger, increments lineage, and clears only continuation/generation. Never reset to bypass an exhausted budget. `advisor_close` deletes the entry; active or queued consultations must settle or be cancelled first.
+`advisor_reset` is explicit identity replacement. It preserves stable ID, immutable policy, cumulative spend, and ledger, increments lineage, and clears only continuation/generation. Never reset to bypass an exhausted budget. `advisor_close` deletes the entry and immediately frees its aliases and roster capacity; active or queued consultations must settle or be cancelled first.
 
-`/advisors` is this thread's specialist roster and inspector: immutable read-only policy, state, queue, cumulative usage against budget, lineage/generation, last consultation, and bounded ledger provenance. Ask, reset, and close are keyboard accessible, and destructive actions confirm. Private native continuation IDs and paths are never rendered. Advisor turns stay on `/advisors` and never appear as direct subagent results in the shared activity widget. Human shortcuts are `/advisor open`, `/advisor ask`, `/advisor reset`, and `/advisor close`.
+`/advisors` is this thread's specialist roster and inspector: immutable read-only policy, state, queue, cumulative usage against budget, lineage/generation, last consultation, and bounded ledger provenance. Ask, reset, and close are keyboard accessible, and destructive actions confirm. The roster keeps the selected row and inspector visible when the terminal is short. Private native continuation IDs and paths are never rendered. Advisor turns stay on `/advisors` and never appear as direct subagent results in the shared activity widget. Human shortcuts are `/advisor open`, `/advisor ask`, `/advisor reset`, and `/advisor close`.
 
 ## Workflow consult()
 
@@ -65,7 +65,8 @@ Workflow cancellation reaches queued or active consultations. `/workflows` shows
 ## Recovery
 
 - `Advisor is unavailable`: use `retryUnavailable: true` only for the same recorded continuation. If missing or invalid, reset or close explicitly.
-- route/capability changed: restore the immutable policy or reset/close; no silent migration occurs.
+- route/capability unavailable: restore the recorded environment or close and reopen the advisor. Reset changes only the native lineage and cannot change policy.
+- cwd unavailable or changed: restore the exact canonical directory or close and reopen with a new cwd. Never retry through a replacement symlink.
 - lineage incompatible: replay names an older identity. Re-run without replay; never substitute another advisor under the call.
 - queue full: wait or cancel callers; do not open a duplicate to evade serialization.
 - budget reached: narrow future work or open a separately visible specialist. Reset does not erase spend.

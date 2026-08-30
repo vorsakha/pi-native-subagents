@@ -793,6 +793,7 @@ export class ControlledBackend implements Backend {
   readonly #cancellationGates = new Map<string, ControlledCancellationGate>();
   readonly #closeGates = new Map<string, ControlledCancellationGate>();
   readonly #closeFailures = new Map<string, Error>();
+  cancelBarrier?: Promise<void>;
   active = 0;
   maxActive = 0;
 
@@ -870,6 +871,7 @@ export class ControlledBackend implements Backend {
           this.#cancellationGates.delete(request.jobId);
           if (gate.usage) emit({ type: "usage", usage: gate.usage });
         }
+        await this.cancelBarrier;
         emit({ type: "cancelled", reason });
         run.settle();
       },

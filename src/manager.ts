@@ -18,7 +18,7 @@ import {
   type InteractionTargetKind,
   type PendingInteraction,
 } from "./interactions.ts";
-import type { Backend, BackendEvent, BackendRun, HarnessName, JobSnapshot, NativeContinuation, ProfileDefinition, ProviderFamily, SendBehavior, SpawnRequest, Usage } from "./types.ts";
+import type { Backend, BackendEvent, BackendRun, BoundAdvisorProfile, HarnessName, JobSnapshot, NativeContinuation, ProfileDefinition, ProviderFamily, SendBehavior, SpawnRequest, Usage } from "./types.ts";
 
 const GENERIC_SYSTEM_PROMPT = `You are an isolated, task-driven subagent. Work only on the supplied task and return a concise, evidence-based result. You do not have access to parent conversation context beyond the task. Before recommending structural changes, inspect applicable repository instructions, scripts, CI, and nearby conventions. Distinguish acceptance failures, convention violations, verification gaps, and optional improvements; do not prescribe an implementation mechanism that the acceptance wording does not require. Treat absent tests as a defect only when repository convention or concrete regression risk justifies it. Do not spawn subagents or workflows.`;
 
@@ -56,6 +56,8 @@ interface InternalJob {
   publishedSnapshot?: JobSnapshot;
   /** The single active-turn lease this job's in-flight generation owns. */
   lease?: ActiveTurnLease;
+  /** Full generation lifecycle, including native teardown and scheduler release. */
+  launch?: Promise<void>;
   /** The one outstanding question this generation is parked on. */
   interaction?: InternalInteraction;
   /** Set while this job's retained session is producing a peer answer. */
@@ -323,7 +325,13 @@ export class JobManager {
     if (request.independentOf !== undefined && (!independentOf || independentOf.length > 200)) {
       throw new Error("independentOf must be a job ID containing 1–200 characters");
     }
-    const profile = profileName ? this.#profiles.get(profileName) : undefined;
+    if (request.advisorProfile && !request.advisor) throw new Error("Bound advisor profiles require advisor ownership");
+    if (request.advisorProfile && request.advisorProfile.name !== profileName) {
+      throw new Error("Bound advisor profile does not match the requested profile name");
+    }
+    const profile = request.advisorProfile
+      ? frozenAdvisorProfile(request.advisorProfile)
+      : profileName ? this.#profiles.get(profileName) : undefined;
     if (profileName && !profile) throw new Error(`Unknown subagent profile: ${profileName}`);
     const independentOfProvider = this.#independenceProvider(request, independentOf);
     const compiled = compilePolicy(request, profile, independentOfProvider);
@@ -416,11 +424,15 @@ export class JobManager {
   check(id: string): JobSnapshot {
     const job = this.#jobs.get(id);
     if (!job) throw new Error(`Unknown job: ${id}`);
+    if (job.snapshot.advisor) throw new Error(`Cannot inspect ${id}: advisor-owned jobs are controlled by their advisor registry`);
     return clone(job.snapshot);
   }
 
   list(): JobSnapshot[] {
-    return [...this.#jobs.values()].map((job) => clone(job.snapshot)).sort((a, b) => a.createdAt - b.createdAt);
+    return [...this.#jobs.values()]
+      .filter((job) => !job.snapshot.advisor)
+      .map((job) => clone(job.snapshot))
+      .sort((a, b) => a.createdAt - b.createdAt);
   }
 
   subscribe(listener: (job: JobSnapshot, event: BackendEvent) => void): () => void {
@@ -432,6 +444,9 @@ export class JobManager {
     if (!message.trim()) throw new Error("Subagent message must not be empty");
     const job = this.#jobs.get(id);
     if (!job) throw new Error(`Unknown job: ${id}`);
+    if (job.snapshot.advisor) {
+      throw new Error(`Cannot send to ${id}: advisor-owned jobs are controlled by their advisor registry`);
+    }
     if (job.snapshot.workflow) {
       throw new Error(`Cannot send to ${id}: workflow-owned agents are controlled by their workflow; inspect or cancel them instead`);
     }
@@ -487,17 +502,32 @@ export class JobManager {
   /** Continue only a retained advisor lineage; ordinary direct/workflow jobs are rejected. */
   async continueAdvisorJob(id: string, advisorId: string, message: string): Promise<JobSnapshot> {
     if (!message.trim()) throw new Error("Advisor question must not be empty");
-    const job = this.#jobs.get(id);
-    if (!job) throw new Error(`Unknown job: ${id}`);
-    if (job.snapshot.advisor?.advisorId !== advisorId) throw new Error(`Cannot continue ${id}: job does not belong to advisor ${advisorId}`);
+    const job = this.#advisorJob(id, advisorId);
     if (job.snapshot.status !== "completed") throw new Error(`Cannot continue ${id}: job is ${job.snapshot.status}`);
     return this.#queueFollowUp(job, message);
   }
 
+  checkAdvisorJob(id: string, advisorId: string): JobSnapshot {
+    return clone(this.#advisorJob(id, advisorId).snapshot);
+  }
+
+  async waitAdvisorJob(id: string, advisorId: string): Promise<JobSnapshot> {
+    const job = this.#advisorJob(id, advisorId);
+    await this.#waitJob(job);
+    await job.launch;
+    return clone(job.snapshot);
+  }
+
+  async cancelAdvisorJob(id: string, advisorId: string, reason = "Advisor consultation cancelled"): Promise<JobSnapshot> {
+    const job = this.#advisorJob(id, advisorId);
+    await this.#cancelJob(job, reason);
+    await job.launch;
+    return clone(job.snapshot);
+  }
+
   /** Private host-only projection of the native continuation for an advisor job. */
-  continuation(id: string): NativeContinuation | undefined {
-    const job = this.#jobs.get(id);
-    if (!job?.snapshot.advisor) return undefined;
+  continuation(id: string, advisorId: string): NativeContinuation | undefined {
+    const job = this.#advisorJob(id, advisorId);
     switch (job.snapshot.harness) {
       case "pi":
         return job.snapshot.sessionFile ? { harness: "pi", sessionFile: job.snapshot.sessionFile } : undefined;
@@ -517,11 +547,22 @@ export class JobManager {
    */
   async releaseRun(id: string): Promise<void> {
     const job = this.#jobs.get(id);
-    if (!job || !job.run) return;
+    if (!job) return;
+    if (job.snapshot.advisor) throw new Error(`Cannot release ${id}: advisor-owned jobs are controlled by their advisor registry`);
+    if (!job.run) return;
     // Strict workflow settlement already surfaced this cleanup failure. Do
     // not queue ordinary release behind the same stuck operation and prevent
     // the containing workflow from reaching its fail-closed terminal state.
     if (job.cleanupError) return;
+    await this.#releaseJobRun(job);
+  }
+
+  async releaseAdvisorRun(id: string, advisorId: string): Promise<void> {
+    await this.#releaseJobRun(this.#advisorJob(id, advisorId));
+  }
+
+  async #releaseJobRun(job: InternalJob): Promise<void> {
+    if (!job.run) return;
     const run = job.run;
     await this.#serialize(job, async () => {
       if (job.run !== run) return;
@@ -619,12 +660,17 @@ export class JobManager {
   async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<JobSnapshot> {
     const job = this.#jobs.get(id);
     if (!job) throw new Error(`Unknown job: ${id}`);
+    if (job.snapshot.advisor) throw new Error(`Cannot wait for ${id}: advisor-owned jobs are controlled by their advisor registry`);
+    return this.#waitJob(job, options);
+  }
+
+  async #waitJob(job: InternalJob, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<JobSnapshot> {
     if (isTerminal(job.snapshot.status) && !job.deferredStartupTerminal) return clone(job.snapshot);
     return new Promise<JobSnapshot>((resolve, reject) => {
       let timer: NodeJS.Timeout | undefined;
       const finish = () => {
         cleanup();
-        resolve(this.check(id));
+        resolve(clone(job.snapshot));
       };
       const abort = () => {
         cleanup();
@@ -633,12 +679,12 @@ export class JobManager {
       const cleanup = () => {
         if (timer) clearTimeout(timer);
         options.signal?.removeEventListener("abort", abort);
-        this.#waiters.get(id)?.delete(finish);
+        this.#waiters.get(job.snapshot.id)?.delete(finish);
       };
-      const set = this.#waiters.get(id) ?? new Set<() => void>();
+      const set = this.#waiters.get(job.snapshot.id) ?? new Set<() => void>();
       set.add(finish);
-      this.#waiters.set(id, set);
-      if (options.timeoutMs !== undefined) timer = setTimeout(() => { cleanup(); resolve(this.check(id)); }, options.timeoutMs);
+      this.#waiters.set(job.snapshot.id, set);
+      if (options.timeoutMs !== undefined) timer = setTimeout(() => { cleanup(); resolve(clone(job.snapshot)); }, options.timeoutMs);
       if (options.signal?.aborted) abort();
       else options.signal?.addEventListener("abort", abort, { once: true });
     });
@@ -647,6 +693,12 @@ export class JobManager {
   async cancel(id: string, reason = "Cancelled by parent"): Promise<JobSnapshot> {
     const job = this.#jobs.get(id);
     if (!job) throw new Error(`Unknown job: ${id}`);
+    if (job.snapshot.advisor) throw new Error(`Cannot cancel ${id}: advisor-owned jobs are controlled by their advisor registry`);
+    return this.#cancelJob(job, reason);
+  }
+
+  async #cancelJob(job: InternalJob, reason: string): Promise<JobSnapshot> {
+    const id = job.snapshot.id;
     // A completed target can already be marked as answering while its retained
     // follow-up is crossing the queue boundary. Cancel the interaction before
     // the ordinary terminal no-op so that race cannot orphan peer-answer work.
@@ -694,7 +746,7 @@ export class JobManager {
     const operations: Promise<unknown>[] = [];
     for (const job of this.#jobs.values()) {
       operations.push((async () => {
-        if (!isTerminal(job.snapshot.status)) await this.cancel(job.snapshot.id, "Session shutdown");
+        if (!isTerminal(job.snapshot.status)) await this.#cancelJob(job, "Session shutdown");
         const run = job.run;
         if (run) await this.#serialize(job, () => run.close());
       })());
@@ -812,8 +864,12 @@ export class JobManager {
       job.inFlight = true;
       job.lease = this.#createLease(job);
       const launch = job.run && job.pendingRestart ? this.#restart(job) : this.#launch(job);
+      job.launch = launch;
       this.#launches.add(launch);
-      void launch.finally(() => this.#launches.delete(launch));
+      void launch.finally(() => {
+        if (job.launch === launch) job.launch = undefined;
+        this.#launches.delete(launch);
+      });
     }
   }
 
@@ -1401,6 +1457,15 @@ export class JobManager {
     return retainedProvider ?? providerHint;
   }
 
+  #advisorJob(id: string, advisorId: string): InternalJob {
+    const job = this.#jobs.get(id);
+    if (!job) throw new Error(`Unknown job: ${id}`);
+    if (job.snapshot.advisor?.advisorId !== advisorId) {
+      throw new Error(`Cannot access ${id}: job does not belong to advisor ${advisorId}`);
+    }
+    return job;
+  }
+
   async #cancelRun(job: InternalJob, run: BackendRun, reason: string): Promise<void> {
     await this.#serialize(job, async () => {
       if (isTerminal(job.snapshot.status) || job.run !== run) return;
@@ -1449,6 +1514,7 @@ export class JobManager {
   }
 
   #publish(job: InternalJob, event: BackendEvent): void {
+    if (job.snapshot.advisor) return;
     const source = job.snapshot;
     const snapshot = clone(source, job.publishedSource && job.publishedSnapshot
       ? { source: job.publishedSource, value: job.publishedSnapshot }
@@ -1468,4 +1534,14 @@ export class JobManager {
 
 export function isTerminal(status: JobSnapshot["status"]): boolean {
   return status === "completed" || status === "failed" || status === "cancelled";
+}
+
+function frozenAdvisorProfile(profile: BoundAdvisorProfile): ProfileDefinition {
+  return {
+    name: profile.name,
+    description: "Immutable advisor profile captured at registration",
+    systemPrompt: profile.systemPrompt,
+    filePath: "[advisor-private-state]",
+    origin: "project",
+  };
 }

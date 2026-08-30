@@ -253,6 +253,12 @@ export interface AdvisorJobReference {
   threadId: string;
 }
 
+/** Private profile behavior captured when an advisor is opened. */
+export interface BoundAdvisorProfile {
+  name: string;
+  systemPrompt: string;
+}
+
 /** Provenance for a job forked from a saved Pi session (a "session peer"). */
 export interface PeerSessionReference {
   sourceSessionId: string;
@@ -319,6 +325,8 @@ export interface SpawnRequest {
   structuredOutput?: StructuredOutputPolicy;
   /** Internal advisor ownership. Presence forces read-only access and disables routed questions. */
   advisor?: AdvisorJobReference;
+  /** Immutable profile behavior for an advisor job. Never copied into JobSnapshot. */
+  advisorProfile?: BoundAdvisorProfile;
   /** Private native lineage restored by an advisor. */
   continuation?: NativeContinuation;
   /** Cumulative usage restored with an advisor lineage. */

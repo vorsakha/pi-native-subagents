@@ -302,6 +302,7 @@ test("workflow consult() requires an explicit stable-ID allowlist and records bo
     assert.equal(advisors.requests.length, 1);
     assert.deepEqual(advisors.requests[0]?.workflow, { runId: final.runId, phase: "Security", callIndex: 0 });
     assert.equal(advisors.requests[0]?.threadId, "session-1");
+    assert.equal(advisors.requests[0]?.trusted, true, "workflow consultation forwards the current trusted execution context");
     const record = final.advisorConsultations?.[0];
     assert.equal(record?.advisorId, advisorId);
     assert.equal(record?.lineage, 4);

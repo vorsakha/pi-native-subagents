@@ -5,7 +5,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ClaudeBackend, CLAUDE_SUBAGENT_ASK_TOOL, forbiddenInitTools } from "../src/backends/claude.ts";
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
-import { CodexAppServerBackend, classifyCodexUnavailability, codexExitDiagnostic } from "../src/backends/codex.ts";
+import { CodexAppServerBackend, classifyCodexUnavailability, codexExitDiagnostic, codexThreadConfig } from "../src/backends/codex.ts";
 import { MAX_OUTPUT_BYTES } from "../src/reducer.ts";
 import type { BackendEvent, BackendRun, HarnessName, BackendRequest } from "../src/types.ts";
 import {
@@ -1589,7 +1589,7 @@ test("Codex resumes an exact native thread without silently starting a replaceme
       modelProvider: "openai",
       approvalPolicy: "never",
       sandbox: "read-only",
-      config: { mcp_servers: {}, hooks: {} },
+      config: { mcp_servers: {}, hooks: {}, features: { multi_agent: false, multi_agent_v2: false } },
       developerInstructions: undefined,
     });
     assert.match(resumeParams.developerInstructions, /remain read-only/);
@@ -1598,6 +1598,17 @@ test("Codex resumes an exact native thread without silently starting a replaceme
     await run?.close();
     await rm(fake.dir, { recursive: true, force: true });
   }
+});
+
+test("Codex child threads disable native multi-agent delegation for every access mode", () => {
+  assert.deepEqual(codexThreadConfig({ customization: "native", access: "full" }), {
+    features: { multi_agent: false, multi_agent_v2: false },
+  });
+  assert.deepEqual(codexThreadConfig({ customization: "native", access: "readOnly" }), {
+    mcp_servers: {},
+    hooks: {},
+    features: { multi_agent: false, multi_agent_v2: false },
+  });
 });
 
 test("Codex exposes parent_thread_context as a client-hosted dynamic tool", async () => {

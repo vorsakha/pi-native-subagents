@@ -195,8 +195,9 @@ export function codexExitDiagnostic(context: CodexExitContext): string {
  * that could mutate outside the sandbox.
  */
 export function codexThreadConfig(policy: Pick<BackendPolicy, "customization" | "access">): Record<string, unknown> | undefined {
-  if (policy.customization === "native" && policy.access === "full") return undefined;
-  return { mcp_servers: {}, hooks: {} };
+  const features = { multi_agent: false, multi_agent_v2: false };
+  if (policy.customization === "native" && policy.access === "full") return { features };
+  return { mcp_servers: {}, hooks: {}, features };
 }
 
 export class CodexAppServerBackend implements Backend {

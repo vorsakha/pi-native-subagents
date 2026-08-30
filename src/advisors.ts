@@ -1,6 +1,7 @@
-import { createHash, randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import { join, relative, resolve } from "node:path";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { constants as fsConstants, realpathSync } from "node:fs";
+import { chmod, lstat, mkdir, open, realpath, rename, rm } from "node:fs/promises";
+import { basename, dirname, join, relative, resolve } from "node:path";
 import { firstReachedSpendWarning, validateSpendBudget, type SpendBudget } from "./budget.ts";
 import type { JobManager } from "./manager.ts";
 import { emptyUsage } from "./reducer.ts";
@@ -16,6 +17,7 @@ export const MAX_ADVISORS_PER_THREAD = 16;
 export const MAX_ADVISOR_QUEUE = 8;
 export const MAX_ADVISOR_LEDGER = 32;
 export const MAX_ADVISOR_CONTEXT_BYTES = 16 * 1024;
+export const MAX_ADVISOR_PROFILE_PROMPT_BYTES = 64 * 1024;
 export const DEFAULT_ADVISOR_IDLE_MS = 10 * 60_000;
 
 export type AdvisorState = "defined" | "consulting" | "idle" | "hibernated" | "unavailable" | "closed";
@@ -89,6 +91,7 @@ export interface AdvisorConsultRequest {
   advisorId: string;
   question: string;
   sender: AdvisorSender;
+  trusted: boolean;
   context?: string;
   decisions?: string[];
   signal?: AbortSignal;
@@ -114,6 +117,13 @@ export interface AdvisorRouteResolution {
   harness: HarnessName;
   requires: string[];
   capabilityRoute?: JobCapabilityRoute;
+  effort?: EffortLevel;
+  profileBinding?: AdvisorProfileBinding;
+}
+
+export interface AdvisorProfileBinding {
+  name: string;
+  systemPrompt: string;
 }
 
 export interface AdvisorRouteResolver {
@@ -122,6 +132,7 @@ export interface AdvisorRouteResolver {
 
 interface StoredAdvisor extends Omit<AdvisorSnapshot, "queued"> {
   continuation?: NativeContinuation;
+  profileBinding?: AdvisorProfileBinding;
 }
 
 interface AdvisorStorePayload {
@@ -144,29 +155,31 @@ export class FileAdvisorStore implements AdvisorStore {
   }
 
   async load(threadId: string): Promise<StoredAdvisor[]> {
+    let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      const parsed = JSON.parse(await readFile(this.#path(threadId), "utf8")) as AdvisorStorePayload;
+      await requirePrivateDirectory(this.#root);
+      handle = await open(this.#path(threadId), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const info = await handle.stat();
+      if (!info.isFile()) throw new Error("Advisor state path is not a regular file");
+      const parsed = JSON.parse(await handle.readFile("utf8")) as AdvisorStorePayload;
       if (parsed.version !== 1 || parsed.threadId !== threadId || !Array.isArray(parsed.advisors)) return [];
       return parsed.advisors.slice(0, MAX_ADVISORS_PER_THREAD).filter(validStoredAdvisor).map(cloneStored);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
       throw error;
+    } finally {
+      await handle?.close().catch(() => undefined);
     }
   }
 
   async save(threadId: string, advisors: StoredAdvisor[]): Promise<void> {
-    await mkdir(this.#root, { recursive: true, mode: 0o700 });
-    await chmod(this.#root, 0o700);
-    const path = this.#path(threadId);
-    const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+    await ensurePrivateDirectory(this.#root);
     const payload: AdvisorStorePayload = {
       version: 1,
       threadId,
       advisors: advisors.slice(0, MAX_ADVISORS_PER_THREAD).map(cloneStored),
     };
-    await writeFile(temporary, JSON.stringify(payload), { encoding: "utf8", mode: 0o600 });
-    await rename(temporary, path);
-    await chmod(path, 0o600);
+    await atomicPrivateWrite(this.#path(threadId), JSON.stringify(payload));
   }
 
   #path(threadId: string): string {
@@ -191,6 +204,7 @@ export class AdvisorRegistry {
   readonly #idleMs: number;
   readonly #records = new Map<string, InternalAdvisor>();
   readonly #listeners = new Set<(snapshot: AdvisorSnapshot) => void>();
+  readonly #shutdownController = new AbortController();
   #persistChain: Promise<void> = Promise.resolve();
   #initializing?: Promise<void>;
   #initialized = false;
@@ -206,7 +220,7 @@ export class AdvisorRegistry {
   }) {
     this.#jobs = options.jobs;
     this.#threadId = requireText(options.threadId, "Thread ID", 200);
-    this.#projectRoot = resolve(options.projectRoot);
+    this.#projectRoot = realpathSync(options.projectRoot);
     this.#store = options.store;
     this.#router = options.router;
     this.#idleMs = Math.max(1, options.idleMs ?? DEFAULT_ADVISOR_IDLE_MS);
@@ -223,10 +237,16 @@ export class AdvisorRegistry {
     for (const value of stored) {
       if (value.threadId !== this.#threadId) continue;
       const record: InternalAdvisor = { ...cloneStored(value), queued: 0, tail: Promise.resolve() };
-      try { record.policy.cwd = containedCwd(this.#projectRoot, record.policy.cwd); }
-      catch { continue; }
       if (record.state === "closed") continue;
-      if (record.generation > 0 && !record.continuation) {
+      try {
+        record.policy.cwd = await containedCwd(this.#projectRoot, record.policy.cwd, true);
+      } catch (error) {
+        record.state = "unavailable";
+        record.error = `Stored advisor cwd is unavailable or changed: ${error instanceof Error ? error.message : String(error)}`;
+      }
+      if (record.state === "unavailable" && record.error?.startsWith("Stored advisor cwd")) {
+        // Keep the roster entry visible, but never dispatch it from a changed path.
+      } else if (record.generation > 0 && !record.continuation) {
         record.state = "unavailable";
         record.error = "Native continuation is missing; explicitly reset or close this advisor.";
       } else if (record.continuation) {
@@ -271,7 +291,7 @@ export class AdvisorRegistry {
         throw new Error(`Advisor alias is already in use in this thread: ${alias}`);
       }
     }
-    const cwd = containedCwd(this.#projectRoot, request.cwd);
+    const cwd = await containedCwd(this.#projectRoot, request.cwd);
     const budget = validateSpendBudget(request.budget, "Advisor budget");
     const resolution = await this.#router.resolve({ ...request, cwd }, undefined);
     const policy: AdvisorPolicy = {
@@ -285,7 +305,15 @@ export class AdvisorRegistry {
       capabilityRoute: resolution.capabilityRoute ? cloneCapabilityRoute(resolution.capabilityRoute) : undefined,
       budget,
     };
-    this.#jobs.assertSpendBudgetSupported(spawnRequestForPolicy(policy, "advisor policy validation"), budget);
+    policy.effort = resolution.effort ?? policy.effort;
+    if (request.profile && !validProfileBinding(resolution.profileBinding, request.profile.trim())) {
+      throw new Error(`Advisor profile binding was not resolved for ${request.profile}`);
+    }
+    if (!request.profile && resolution.profileBinding) throw new Error("Advisor route returned an unexpected profile binding");
+    this.#jobs.assertSpendBudgetSupported({
+      ...spawnRequestForPolicy(policy, "advisor policy validation"),
+      profile: undefined,
+    }, budget);
     const now = Date.now();
     const id = `adv_${randomUUID().replaceAll("-", "")}`;
     const record: InternalAdvisor = {
@@ -303,6 +331,7 @@ export class AdvisorRegistry {
       updatedAt: now,
       queued: 0,
       ledger: [],
+      profileBinding: resolution.profileBinding ? cloneProfileBinding(resolution.profileBinding) : undefined,
       tail: Promise.resolve(),
     };
     this.#records.set(id, record);
@@ -313,6 +342,8 @@ export class AdvisorRegistry {
 
   async consult(request: AdvisorConsultRequest): Promise<AdvisorConsultResult> {
     await this.initialize();
+    if (this.#closed) throw new Error("Advisor registry is closed");
+    if (!request.trusted) throw new Error("Advisor consultation is disabled for untrusted projects");
     const record = this.#resolve(request.threadId, request.advisorId);
     const question = requireText(request.question, "Advisor question", 100_000);
     const context = boundedOptional(request.context, MAX_ADVISOR_CONTEXT_BYTES, "Advisor context");
@@ -337,11 +368,14 @@ export class AdvisorRegistry {
     let settle!: () => void;
     record.tail = new Promise<void>((resolveTail) => { settle = resolveTail; });
     let dequeued = false;
+    const signal = request.signal
+      ? AbortSignal.any([request.signal, this.#shutdownController.signal])
+      : this.#shutdownController.signal;
     try {
-      await abortable(previous, request.signal, "Advisor consultation cancelled while queued");
+      await abortable(previous, signal, "Advisor consultation cancelled while queued");
       record.queued--;
       dequeued = true;
-      return await this.#runConsult(record, { ...request, question, context, decisions }, queuedAt);
+      return await this.#runConsult(record, { ...request, question, context, decisions, signal }, queuedAt);
     } finally {
       if (!dequeued) record.queued--;
       settle();
@@ -353,7 +387,7 @@ export class AdvisorRegistry {
     await this.initialize();
     const record = this.#resolve(threadId, idOrAlias);
     if (record.state === "consulting" || record.queued) throw new Error("Cannot reset an advisor with an active or queued consultation");
-    if (record.jobId) await this.#jobs.releaseRun(record.jobId);
+    if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
     const now = Date.now();
     record.jobId = undefined;
     record.continuation = undefined;
@@ -386,9 +420,9 @@ export class AdvisorRegistry {
     }
     if (record.jobId) {
       try {
-        const job = this.#jobs.check(record.jobId);
-        if (job.status === "queued" || job.status === "running") await this.#jobs.cancel(record.jobId, "Advisor closed");
-        await this.#jobs.releaseRun(record.jobId);
+        const job = this.#jobs.checkAdvisorJob(record.jobId, record.id);
+        if (job.status === "queued" || job.status === "running") await this.#jobs.cancelAdvisorJob(record.jobId, record.id, "Advisor closed");
+        await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
       } catch { /* the job may already be evicted */ }
     }
     if (record.idleTimer) clearTimeout(record.idleTimer);
@@ -398,6 +432,7 @@ export class AdvisorRegistry {
     record.state = "closed";
     record.updatedAt = Date.now();
     await this.#persist();
+    this.#records.delete(record.id);
     this.#publish(record);
     return publicSnapshot(record);
   }
@@ -405,7 +440,7 @@ export class AdvisorRegistry {
   async hibernate(threadId: string, idOrAlias: string): Promise<AdvisorSnapshot> {
     const record = this.#resolve(threadId, idOrAlias);
     if (record.state === "consulting" || record.queued) throw new Error("Cannot hibernate an active advisor");
-    if (record.jobId) await this.#jobs.releaseRun(record.jobId);
+    if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
     record.jobId = undefined;
     record.state = record.continuation ? "hibernated" : record.generation ? "unavailable" : "defined";
     if (record.state === "unavailable") record.error = "Native continuation is missing; explicitly reset or close this advisor.";
@@ -418,9 +453,11 @@ export class AdvisorRegistry {
   async shutdown(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
+    this.#shutdownController.abort(new Error("Advisor registry shutdown"));
+    await Promise.allSettled([...this.#records.values()].map((record) => record.tail));
     for (const record of this.#records.values()) {
       if (record.idleTimer) clearTimeout(record.idleTimer);
-      if (record.jobId) await this.#jobs.releaseRun(record.jobId);
+      if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
       record.jobId = undefined;
       if (record.state !== "closed") {
         record.state = record.continuation ? "hibernated" : record.generation ? "unavailable" : "defined";
@@ -437,6 +474,17 @@ export class AdvisorRegistry {
     queuedAt: number,
   ): Promise<AdvisorConsultResult> {
     request.signal?.throwIfAborted();
+    try {
+      record.policy.cwd = await containedCwd(this.#projectRoot, record.policy.cwd, true);
+    } catch (error) {
+      return this.#unavailable(record, `Advisor cwd is unavailable or changed: ${error instanceof Error ? error.message : String(error)}`, queuedAt);
+    }
+    if (record.state === "unavailable") {
+      if (!request.retryUnavailable) return this.#unavailable(record, record.error ?? "Advisor is unavailable", queuedAt);
+      if (!record.continuation) return this.#unavailable(record, "Advisor continuation is missing; retry cannot reconstruct it. Reset or close the advisor explicitly.", queuedAt);
+      record.state = "hibernated";
+      record.error = undefined;
+    }
     const budgetError = firstReachedSpendWarning(record.policy.budget, record.usage, record.policy.harness, "Advisor budget");
     if (budgetError) throw new Error(budgetError);
     if (record.generation > 0 && !record.jobId && !record.continuation) {
@@ -477,9 +525,10 @@ export class AdvisorRegistry {
       }
       if (jobId) {
         try {
-          const current = this.#jobs.check(jobId);
+          const current = this.#jobs.checkAdvisorJob(jobId, record.id);
           if (current.status !== "completed") throw new Error(`Advisor retained job is ${current.status}`);
-        } catch {
+        } catch (error) {
+          if (!(error instanceof Error) || !error.message.startsWith("Unknown job:")) throw error;
           jobId = undefined;
           record.jobId = undefined;
         }
@@ -488,7 +537,7 @@ export class AdvisorRegistry {
         await this.#jobs.continueAdvisorJob(jobId, record.id, prompt);
       } else {
         const spawned = this.#jobs.spawn({
-          ...spawnRequestForPolicy(record.policy, prompt, record.name),
+          ...spawnRequestForPolicy(record.policy, prompt, record.name, record.profileBinding),
           capabilityRoute: liveRoute.capabilityRoute,
           requires: liveRoute.requires,
           continuation: record.continuation,
@@ -499,11 +548,21 @@ export class AdvisorRegistry {
         jobId = spawned.id;
         record.jobId = jobId;
       }
-      const abort = () => { if (jobId) void this.#jobs.cancel(jobId, "Advisor consultation cancelled").catch(() => undefined); };
+      let cancellation: Promise<void> | undefined;
+      let cancellationError: unknown;
+      const abort = () => {
+        if (!jobId || cancellation) return;
+        cancellation = this.#jobs.cancelAdvisorJob(jobId, record.id, "Advisor consultation cancelled")
+          .then(() => undefined, (error) => { cancellationError = error; });
+      };
       if (request.signal?.aborted) abort();
       else request.signal?.addEventListener("abort", abort, { once: true });
       let final;
-      try { final = await this.#jobs.wait(jobId, { signal: request.signal }); }
+      try {
+        final = await this.#jobs.waitAdvisorJob(jobId, record.id);
+        await cancellation;
+        if (cancellationError) throw cancellationError;
+      }
       finally { request.signal?.removeEventListener("abort", abort); }
       record.usage = { ...final.usage };
       const usage = subtractUsage(record.usage, beforeUsage);
@@ -513,11 +572,11 @@ export class AdvisorRegistry {
         record.jobId = undefined;
         record.state = "unavailable";
         record.error = final.error ?? `Advisor consultation ${final.status}`;
-        this.#appendLedger(record, request, "failed", startedAt, endedAt, usage, final.output, record.error);
+        this.#appendLedger(record, request, request.signal?.aborted ? "cancelled" : "failed", startedAt, endedAt, usage, final.output, record.error);
         await this.#persist();
         return resultFor(record, false, final.output, record.error, usage, Date.now() - queuedAt);
       }
-      record.continuation = this.#jobs.continuation(jobId) ?? record.continuation;
+      record.continuation = this.#jobs.continuation(jobId, record.id) ?? record.continuation;
       record.generation++;
       record.lastConsultedAt = endedAt;
       record.updatedAt = endedAt;
@@ -534,7 +593,7 @@ export class AdvisorRegistry {
       const endedAt = Date.now();
       const message = error instanceof Error ? error.message : String(error);
       if (jobId) {
-        try { record.usage = { ...this.#jobs.check(jobId).usage }; }
+        try { record.usage = { ...this.#jobs.checkAdvisorJob(jobId, record.id).usage }; }
         catch { /* a released/evicted job leaves the last persisted cumulative usage */ }
       }
       record.continuation = previousContinuation;
@@ -625,7 +684,12 @@ export class AdvisorRegistry {
   }
 }
 
-function spawnRequestForPolicy(policy: AdvisorPolicy, task: string, name = "advisor") {
+function spawnRequestForPolicy(
+  policy: AdvisorPolicy,
+  task: string,
+  name = "advisor",
+  profileBinding?: AdvisorProfileBinding,
+) {
   return {
     name,
     task,
@@ -637,6 +701,7 @@ function spawnRequestForPolicy(policy: AdvisorPolicy, task: string, name = "advi
     model: policy.model,
     effort: policy.effort,
     profile: policy.profile,
+    advisorProfile: profileBinding ? cloneProfileBinding(profileBinding) : undefined,
     access: "readOnly" as const,
     budget: policy.budget,
   };
@@ -695,6 +760,7 @@ function storedSnapshot(record: InternalAdvisor): StoredAdvisor {
   return {
     ...snapshot,
     continuation: record.continuation ? { ...record.continuation } : undefined,
+    profileBinding: record.profileBinding ? cloneProfileBinding(record.profileBinding) : undefined,
   };
 }
 
@@ -706,7 +772,12 @@ function cloneStored(record: StoredAdvisor): StoredAdvisor {
     usage: { ...record.usage },
     ledger: record.ledger.map(cloneLedger),
     continuation: record.continuation ? { ...record.continuation } : undefined,
+    profileBinding: record.profileBinding ? cloneProfileBinding(record.profileBinding) : undefined,
   };
+}
+
+function cloneProfileBinding(binding: AdvisorProfileBinding): AdvisorProfileBinding {
+  return { name: binding.name, systemPrompt: binding.systemPrompt };
 }
 
 function clonePolicy(policy: AdvisorPolicy): AdvisorPolicy {
@@ -740,7 +811,18 @@ function validStoredAdvisor(value: unknown): value is StoredAdvisor {
     && Number.isSafeInteger(record.lineage) && record.lineage! >= 0
     && Number.isSafeInteger(record.generation) && record.generation! >= 0
     && Array.isArray(record.ledger) && record.ledger.length <= MAX_ADVISOR_LEDGER
+    && (record.policy!.profile === undefined
+      ? record.profileBinding === undefined
+      : validProfileBinding(record.profileBinding, record.policy!.profile))
     && (record.continuation === undefined || validContinuation(record.continuation, record.policy!.harness));
+}
+
+function validProfileBinding(value: unknown, profileName: string): value is AdvisorProfileBinding {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const binding = value as Partial<AdvisorProfileBinding>;
+  return binding.name === profileName
+    && typeof binding.systemPrompt === "string"
+    && Buffer.byteLength(binding.systemPrompt) <= MAX_ADVISOR_PROFILE_PROMPT_BYTES;
 }
 
 function validPolicy(value: unknown): value is AdvisorPolicy {
@@ -749,6 +831,7 @@ function validPolicy(value: unknown): value is AdvisorPolicy {
   return typeof policy.cwd === "string" && policy.trusted === true
     && ["pi", "claude", "codex"].includes(policy.harness ?? "")
     && (policy.model === undefined || typeof policy.model === "string")
+    && (policy.effort === undefined || ["low", "medium", "high", "xhigh", "max"].includes(policy.effort))
     && (policy.profile === undefined || typeof policy.profile === "string")
     && Array.isArray(policy.requires) && policy.requires.every((requirement) => typeof requirement === "string")
     && validCapabilityRoute(policy.capabilityRoute)
@@ -800,13 +883,56 @@ function normalizeAliases(name: string, values: string[] | undefined): string[] 
   return aliases;
 }
 
-function containedCwd(root: string, value: string): string {
-  const cwd = resolve(value);
+async function containedCwd(root: string, value: string, requireStableIdentity = false): Promise<string> {
+  const requested = resolve(value);
+  const cwd = await realpath(requested);
   const relation = relative(root, cwd);
   if (relation === ".." || relation.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
     throw new Error("Advisor cwd must stay within the trusted project directory");
   }
+  if (requireStableIdentity && cwd !== requested) {
+    throw new Error("Advisor cwd identity changed after registration");
+  }
   return cwd;
+}
+
+async function requirePrivateDirectory(path: string): Promise<void> {
+  const info = await lstat(path);
+  if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`Advisor state path is not a private directory: ${path}`);
+}
+
+async function ensurePrivateDirectory(path: string): Promise<void> {
+  await mkdir(path, { recursive: true, mode: 0o700 });
+  await requirePrivateDirectory(path);
+  await chmod(path, 0o700);
+}
+
+async function atomicPrivateWrite(path: string, contents: string): Promise<void> {
+  try {
+    const current = await lstat(path);
+    if (current.isSymbolicLink() || !current.isFile()) throw new Error(`Advisor state path is not a regular file: ${path}`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  const temporary = join(dirname(path), `.${basename(path)}.${randomBytes(8).toString("hex")}.tmp`);
+  let handle: Awaited<ReturnType<typeof open>> | undefined;
+  try {
+    handle = await open(temporary, "wx", 0o600);
+    await handle.writeFile(contents, "utf8");
+    await handle.sync();
+    await handle.close();
+    handle = undefined;
+    await rename(temporary, path);
+    const directoryHandle = await open(dirname(path), "r").catch(() => undefined);
+    if (directoryHandle) {
+      await directoryHandle.sync().catch(() => undefined);
+      await directoryHandle.close();
+    }
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    await rm(temporary, { force: true }).catch(() => undefined);
+    throw error;
+  }
 }
 
 function requireText(value: unknown, label: string, max: number): string {

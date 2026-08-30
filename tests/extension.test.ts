@@ -207,6 +207,19 @@ test("the subagent extension surface", async (t) => {
       }, undefined, undefined, context({ trusted: false, sessionId: "extension-session" }).ctx),
       /untrusted/i,
     );
+    const startsBeforeUntrustedConsult = backends.reduce((total, backend) => total + backend.starts.length, 0);
+    await assert.rejects(
+      pi.tools.get("advisor_consult").execute("untrusted-consult", {
+        advisorId: opened.details.advisor.id,
+        question: "Reuse the trusted stored policy",
+      }, undefined, undefined, context({ trusted: false, sessionId: "extension-session" }).ctx),
+      /untrusted/i,
+    );
+    assert.equal(
+      backends.reduce((total, backend) => total + backend.starts.length, 0),
+      startsBeforeUntrustedConsult,
+      "an untrusted context cannot dispatch a restored trusted advisor",
+    );
     await pi.tools.get("advisor_close").execute("advisor-close", { advisorId: opened.details.advisor.id }, undefined, undefined, ctx);
     const afterClose = await pi.tools.get("advisor_list").execute("advisor-list-closed", {}, undefined, undefined, ctx);
     assert.deepEqual(afterClose.details.advisors, []);
