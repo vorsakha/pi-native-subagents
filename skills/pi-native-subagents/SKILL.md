@@ -179,7 +179,7 @@ These are enforced by the runtime. Do not design around them.
 - **Deny-by-construction read-only.** A read-only child is sandboxed by the native runtime, not asked to behave.
 - **Deterministic sandbox.** Workflow code has no imports, filesystem, network, environment variables, subprocesses, credentials, `require`, or `process`. `Date.now()`, zero-argument `new Date()`, and `Math.random()` all throw. Results, metadata, requests, logs, phases, source, and arguments are bounded and must be JSON-serializable.
 - **Bounded run shape.** At most 32 agent calls per run (`agent()` and `followUp()` share the budget), at most four concurrent workers, and at most four concurrent jobs globally. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
-- **One outstanding routed question per generation.** A turn may have exactly one question open at a time; a second ask is refused until the first settles.
+- **Routed questions fail closed.** One may be open per generation; a second is refused. Peer replay requires durable answer acceptance.
 - **Provider independence is provider diversity.** `independent`/`independentOf` select a different native provider, never a bigger model on the same one.
 - **Worktree isolation is one-shot and can destroy work.** A finalized worktree can never be continued by `followUp()`, answer a peer question, or be used inside `converge()`. Read `references/worktrees-and-retention.md` before reclaiming or `--force`-discarding any worktree: it may hold the only copy of a child's changed work.
 - **Retained sessions are policy-fixed.** Harness, model, effort, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original call; a follow-up may only change `phase` and `schema`.

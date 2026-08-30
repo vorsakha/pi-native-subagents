@@ -365,15 +365,33 @@ test("peer-question journals require lineage provenance from started through set
       agentIndex: 1,
       result: { ok: true, output: "keep the legacy flag", usage },
       interaction: { ...detail, targetGeneration: 1, route: "peer" },
+      interactionPending: true,
+    });
+    await appendWorkflowJournal(f.root, f.created.runId, {
+      version: 1, sequence: 2, callIndex: 0, fingerprint: question, kind: "peerQuestion", state: "accepted", at: 3,
+      agentIndex: 1,
+      interaction: { ...detail, targetGeneration: 1, route: "peer" },
     });
     // A second interaction has only a started record and must never replay.
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 2, callIndex: 1, fingerprint: workflowInteractionFingerprint({ question: "unfinished" }), kind: "peerQuestion", state: "started", at: 3,
+      version: 1, sequence: 3, callIndex: 1, fingerprint: workflowInteractionFingerprint({ question: "unfinished" }), kind: "peerQuestion", state: "started", at: 4,
       agentIndex: 1,
       interaction: detail,
     });
 
     const records = await loadWorkflowJournal(f.root, f.created.runId);
+    assert.deepEqual(
+      replayableJournalInteractions(records.slice(0, 2)),
+      [],
+      "a provisional answer is not replayable without its accepted record",
+    );
+    const mismatchedAcceptance = structuredClone(records.slice(0, 3));
+    mismatchedAcceptance[2]!.interaction!.targetGeneration = 2;
+    assert.deepEqual(
+      replayableJournalInteractions(mismatchedAcceptance),
+      [],
+      "acceptance must bind the exact provisional answer provenance",
+    );
     assert.deepEqual(replayableJournalInteractions(records), [{
       ordinal: 0,
       questionFingerprint: question,
@@ -381,6 +399,9 @@ test("peer-question journals require lineage provenance from started through set
       answer: "keep the legacy flag",
       usage,
     }]);
+    const legacyCompletion = structuredClone(records.slice(0, 2));
+    legacyCompletion[1]!.interactionPending = undefined;
+    assert.equal(replayableJournalInteractions(legacyCompletion)[0]?.answer, "keep the legacy flag");
     assert.deepEqual(replayableJournalCalls(records), [], "interaction ordinals never enter the sandbox call replay stream");
   } finally {
     await f.cleanup();

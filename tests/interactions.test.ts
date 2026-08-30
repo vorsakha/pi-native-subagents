@@ -274,6 +274,42 @@ test("a peer-answer turn cannot ask another agent or the orchestrator", async ()
   await manager.shutdown();
 });
 
+test("final peer-answer acceptance serializes dismissal behind its durable write", async () => {
+  const backend = new ControlledBackend();
+  const manager = new JobManager({ backends: [backend], concurrency: 2 });
+  const workflow = (agentIndex: number, label: string) => ({ runId: "wf_accept", agentIndex, label });
+  const target = manager.spawn({ ...base, task: "planner", workflow: workflow(0, "planner") });
+  const caller = manager.spawn({ ...base, task: "implementer", workflow: workflow(1, "implementer"), interaction: { peers: true } });
+  await tick();
+  backend.complete(target.id, "plan");
+  await tick();
+
+  let reached!: () => void;
+  let release!: () => void;
+  const acceptanceReached = new Promise<void>((resolve) => { reached = resolve; });
+  const acceptanceRelease = new Promise<void>((resolve) => { release = resolve; });
+  manager.setPeerInteractionRouter(async (request) => {
+    await request.commitAcceptance(async () => {
+      reached();
+      await acceptanceRelease;
+    });
+    return { answer: "durably accepted answer" };
+  });
+
+  const asked = backend.ask(caller.id, { question: "which plan?", target: { type: "agent", jobId: target.id } });
+  await acceptanceReached;
+  const requestId = manager.pendingInteractions()[0]!.requestId;
+  assert.throws(
+    () => manager.dismissInteraction(requestId, "too late"),
+    /committed its durable peer answer/,
+    "dismissal cannot invalidate a final acceptance write already in progress",
+  );
+  release();
+  assert.match((await asked).answer, /durably accepted answer/);
+  backend.complete(caller.id);
+  await manager.shutdown();
+});
+
 test("cancelling a completed target during peer routing cancels the correlated question", async () => {
   const backend = new ControlledBackend();
   const manager = new JobManager({ backends: [backend], concurrency: 2 });

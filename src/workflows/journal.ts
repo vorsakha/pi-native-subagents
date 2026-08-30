@@ -507,14 +507,15 @@ export function replayableJournalHandoffs(records: WorkflowJournalRecord[]): Wor
 }
 
 /**
- * Return every completed peer answer that may be replayed. A peer answer is
- * only reusable as an exact triple: the same interaction ordinal, the same
- * asking lineage identity, and the same question against the same target call
- * fingerprint. Anything incomplete, duplicated, or failed is dropped so the
- * question reruns live (or fails with an actionable error) instead.
+ * Return every accepted peer answer that may be replayed. New journals require
+ * a provisional completion followed by matching acceptance; legacy completed
+ * records remain readable. A peer answer is reusable only for the same ordinal,
+ * asking lineage, question, and target call fingerprint. Anything incomplete,
+ * duplicated, or failed is dropped so the question reruns or fails safely.
  */
 export function replayableJournalInteractions(records: WorkflowJournalRecord[]): WorkflowReplayInteraction[] {
   const started = new Map<number, WorkflowJournalRecord>();
+  const provisional = new Map<number, WorkflowJournalRecord>();
   const completed = new Map<number, WorkflowJournalRecord>();
   const invalid = new Set<number>();
 
@@ -523,7 +524,7 @@ export function replayableJournalInteractions(records: WorkflowJournalRecord[]):
     const ordinal = record.callIndex;
     const priorStart = started.get(ordinal);
     if (record.state === "started") {
-      if (priorStart || completed.has(ordinal)) invalid.add(ordinal);
+      if (priorStart || provisional.has(ordinal) || completed.has(ordinal)) invalid.add(ordinal);
       else started.set(ordinal, record);
       continue;
     }
@@ -531,8 +532,18 @@ export function replayableJournalInteractions(records: WorkflowJournalRecord[]):
       invalid.add(ordinal);
       continue;
     }
-    if (record.state === "completed" && record.result?.ok === true && record.interaction) completed.set(ordinal, record);
-    else invalid.add(ordinal);
+    if (record.state === "completed" && record.result?.ok === true && record.interaction) {
+      if (provisional.has(ordinal)) invalid.add(ordinal);
+      else if (record.interactionPending === true) provisional.set(ordinal, record);
+      else completed.set(ordinal, record); // Backward-compatible journals predate two-phase acceptance.
+      continue;
+    }
+    const answer = provisional.get(ordinal);
+    if (record.state === "accepted" && answer?.interaction && record.interaction
+        && answer.agentIndex === record.agentIndex
+        && canonicalJson(answer.interaction) === canonicalJson(record.interaction)) {
+      completed.set(ordinal, answer);
+    } else invalid.add(ordinal);
   }
 
   return [...completed.entries()]

@@ -68,6 +68,9 @@ interface InternalInteraction {
   cancelDeadline?: () => void;
   controller: AbortController;
   settled: boolean;
+  /** Serializes the final durable peer-answer acceptance against dismissal. */
+  committingAcceptance?: boolean;
+  acceptanceCommitted?: boolean;
 }
 
 /** Injectable interaction deadline clock. Tests advance it without sleeping. */
@@ -195,6 +198,12 @@ export interface PeerInteractionRequest {
   context?: string;
   /** Aborted when the caller is cancelled, the deadline passes, or the session shuts down. */
   signal: AbortSignal;
+  /**
+   * Runs the final durable acceptance write as the interaction's linearization
+   * point. Dismissal may win before this begins; once it begins, successful
+   * persistence wins and the answer is no longer dismissible.
+   */
+  commitAcceptance(persist: () => Promise<void>): Promise<void>;
 }
 
 export interface PeerInteractionResult {
@@ -988,6 +997,9 @@ export class JobManager {
     const pending = job?.interaction;
     if (!job || !pending) throw new InteractionError(`Unknown or already-resolved question: ${requestId}`);
     if (pending.settled) throw new InteractionError(`Question ${requestId} is ${pending.record.state} and can no longer be dismissed`);
+    if (pending.committingAcceptance || pending.acceptanceCommitted) {
+      throw new InteractionError(`Question ${requestId} has committed its durable peer answer and can no longer be dismissed`);
+    }
     pending.settle({ error: new InteractionError(reason), state: "dismissed" });
     return cloneInteraction(pending.record);
   }
@@ -1049,6 +1061,7 @@ export class JobManager {
     const answered = new Promise<PendingInteraction>((resolve, reject) => {
       settle = (outcome) => {
         if (pending.settled) return;
+        if ("error" in outcome && (pending.committingAcceptance || pending.acceptanceCommitted)) return;
         pending.settled = true;
         pending.cancelDeadline?.();
         pending.cancelDeadline = undefined;
@@ -1178,6 +1191,23 @@ export class JobManager {
       question: record.question,
       context: record.context,
       signal: pending.controller.signal,
+      commitAcceptance: async (persist) => {
+        if (pending.settled || pending.controller.signal.aborted) {
+          throw pending.controller.signal.reason instanceof Error
+            ? pending.controller.signal.reason
+            : new InteractionError(`Question ${record.requestId} can no longer accept an answer`);
+        }
+        if (pending.committingAcceptance || pending.acceptanceCommitted) {
+          throw new InteractionError(`Question ${record.requestId} already committed its durable peer answer`);
+        }
+        pending.committingAcceptance = true;
+        try {
+          await persist();
+          pending.acceptanceCommitted = true;
+        } finally {
+          pending.committingAcceptance = false;
+        }
+      },
     }).then(
       (result) => pending.settle({ answer: normalizeAnswer(result.answer), route: result.route ?? "peer", targetGeneration: result.targetGeneration, label: result.targetLabel ?? answering?.snapshot.name }),
       (error: unknown) => pending.settle({ error: error instanceof Error ? error : new Error(String(error)), state: "dismissed" }),

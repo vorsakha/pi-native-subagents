@@ -4836,7 +4836,7 @@ test("a workflow child asks a completed peer, and the answer becomes a charged g
 
     const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
     const peerRecords = journal.filter((record) => record.kind === "peerQuestion");
-    assert.deepEqual(peerRecords.map((record) => record.state), ["started", "completed"]);
+    assert.deepEqual(peerRecords.map((record) => record.state), ["started", "completed", "accepted"]);
     assert.equal(peerRecords[0]!.callIndex, 0, "interactions use their own ordinal, not a sandbox call index");
     assert.equal(peerRecords[1]!.interaction?.sourceAgentIndex, 1);
     assert.equal(peerRecords[1]!.interaction?.targetAgentIndex, 0);
@@ -5337,6 +5337,121 @@ test("a replayed peer answer dismissed during completed-journal persistence is i
       ["started", "completed", "failed"],
     );
     assert.deepEqual(replayableJournalInteractions(journal), [], "dismissed replay persistence cannot become new replay evidence");
+  } finally {
+    gate.release();
+    await f.cleanup();
+  }
+});
+
+test("a live peer dismissal stays non-replayable when its invalidation append fails", async () => {
+  const gate = new GatedWorkflowJournalAppender();
+  gate.arm();
+  gate.failNextInvalidation();
+  const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, gate.append);
+  try {
+    const started = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "ORIGINAL PLAN");
+    await waitFor(() => f.backend.requests.length === 2, "implementer dispatch");
+    const implementerJobId = f.backend.requests[1]!.jobId;
+
+    const asked = f.backend.ask(implementerJobId, {
+      question: "which plan?",
+      target: { type: "agent", jobId: plannerJobId },
+    });
+    const rejected = assert.rejects(asked, /dismiss before failed invalidation/);
+    await waitFor(() => f.backend.sends.length === 1, "live peer answer dispatch");
+    f.backend.complete(plannerJobId, "PROVISIONAL LIVE ANSWER");
+    await gate.waitUntilReached();
+
+    const requestId = f.jobs.pendingInteractions()[0]?.requestId;
+    assert.ok(requestId);
+    f.jobs.dismissInteraction(requestId, "dismiss before failed invalidation");
+    gate.release();
+    await rejected;
+
+    const failed = await started.completion;
+    assert.equal(failed.status, "aborted");
+    assert.match(failed.error ?? "", /journal persistence failed/i);
+    const journal = await loadWorkflowJournal(f.artifactRoot, failed.runId);
+    const peerRecords = journal.filter((record) => record.kind === "peerQuestion");
+    assert.deepEqual(peerRecords.map((record) => record.state), ["started", "completed"]);
+    assert.equal(peerRecords[1]?.interactionPending, true);
+    assert.deepEqual(replayableJournalInteractions(journal), [], "the durable prefix cannot replay its provisional answer");
+
+    const sendsBeforeReplay = f.backend.sends.length;
+    const replay = await f.workflows.start(f.request(PEER_SCRIPT, { resumeFromRunId: failed.runId }));
+    await waitFor(() => f.backend.requests.length === 3, "implementer replay after invalidation failure");
+    const replayedImplementer = f.backend.requests[2]!.jobId;
+    await assert.rejects(
+      f.backend.ask(replayedImplementer, { question: "which plan?", target: { type: "agent", jobId: plannerJobId } }),
+      /retains no native session, and no recorded answer matches/,
+    );
+    assert.equal(f.backend.sends.length, sendsBeforeReplay, "replay never dispatches or returns the provisional answer");
+    f.backend.complete(replayedImplementer, "IMPLEMENTED WITHOUT DISMISSED ANSWER");
+    await replay.completion;
+  } finally {
+    gate.release();
+    await f.cleanup();
+  }
+});
+
+test("a replayed peer dismissal stays non-replayable when its invalidation append fails", async () => {
+  const gate = new GatedWorkflowJournalAppender();
+  const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, gate.append);
+  try {
+    const sourceRun = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "source planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "ORIGINAL PLAN");
+    await waitFor(() => f.backend.requests.length === 2, "source implementer dispatch");
+    const sourceImplementer = f.backend.requests[1]!.jobId;
+    const question = "which plan?";
+    const sourceAnswer = f.backend.ask(sourceImplementer, {
+      question,
+      target: { type: "agent", jobId: plannerJobId },
+    });
+    await waitFor(() => f.backend.sends.length === 1, "source peer answer dispatch");
+    f.backend.complete(plannerJobId, "RECORDED ANSWER");
+    await sourceAnswer;
+    f.backend.fail(sourceImplementer, "rerun the asker");
+    const source = await sourceRun.completion;
+
+    gate.arm();
+    gate.failNextInvalidation();
+    const replayRun = await f.workflows.start(f.request(PEER_SCRIPT, { resumeFromRunId: source.runId }));
+    await waitFor(() => f.backend.requests.length === 3, "replayed implementer dispatch");
+    const replayedImplementer = f.backend.requests[2]!.jobId;
+    const asked = f.backend.ask(replayedImplementer, { question, target: { type: "agent", jobId: plannerJobId } });
+    const rejected = assert.rejects(asked, /dismiss replay before failed invalidation/);
+    await gate.waitUntilReached();
+
+    const requestId = f.jobs.pendingInteractions()[0]?.requestId;
+    assert.ok(requestId);
+    f.jobs.dismissInteraction(requestId, "dismiss replay before failed invalidation");
+    gate.release();
+    await rejected;
+
+    const failedReplay = await replayRun.completion;
+    assert.equal(failedReplay.status, "aborted");
+    const journal = await loadWorkflowJournal(f.artifactRoot, failedReplay.runId);
+    const peerRecords = journal.filter((record) => record.kind === "peerQuestion");
+    assert.deepEqual(peerRecords.map((record) => record.state), ["started", "completed"]);
+    assert.equal(peerRecords[1]?.interactionPending, true);
+    assert.deepEqual(replayableJournalInteractions(journal), [], "a provisional replay copy grants no answer authority");
+
+    const sendsBeforeReplay = f.backend.sends.length;
+    const replayAgain = await f.workflows.start(f.request(PEER_SCRIPT, { resumeFromRunId: failedReplay.runId }));
+    await waitFor(() => f.backend.requests.length === 4, "implementer after replay invalidation failure");
+    const finalImplementer = f.backend.requests[3]!.jobId;
+    await assert.rejects(
+      f.backend.ask(finalImplementer, { question, target: { type: "agent", jobId: plannerJobId } }),
+      /retains no native session, and no recorded answer matches/,
+    );
+    assert.equal(f.backend.sends.length, sendsBeforeReplay, "replay cannot reuse the dismissed replay copy");
+    f.backend.complete(finalImplementer, "IMPLEMENTED WITHOUT DISMISSED REPLAY");
+    await replayAgain.completion;
   } finally {
     gate.release();
     await f.cleanup();

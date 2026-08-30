@@ -545,7 +545,7 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
   if (record.version !== 1 || !Number.isSafeInteger(record.sequence) || record.sequence! < 0 || record.sequence! >= MAX_JOURNAL_RECORDS
       || !Number.isSafeInteger(record.callIndex) || record.callIndex! < 0 || record.callIndex! >= 32
       || typeof record.fingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(record.fingerprint)
-      || !["started", "progressed", "handoff", "completed", "failed"].includes(record.state ?? "")
+      || !["started", "progressed", "handoff", "completed", "accepted", "failed"].includes(record.state ?? "")
       || typeof record.at !== "number" || !Number.isFinite(record.at)) return false;
   if (record.kind !== undefined && !["agent", "followUp", "peerQuestion"].includes(record.kind)) return false;
   if (record.replayProof !== undefined && (record.replayProof !== true || record.kind === "peerQuestion")) return false;
@@ -555,6 +555,8 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
   // Without it, a `started` record cannot prove what was in flight when a
   // crash occurred. Other record kinds must never acquire that authority.
   if ((record.interaction !== undefined) !== (record.kind === "peerQuestion")) return false;
+  if (record.interactionPending !== undefined && (record.interactionPending !== true
+      || record.kind !== "peerQuestion" || record.state !== "completed")) return false;
   if (record.interaction !== undefined) {
     const detail = record.interaction;
     if (!detail || typeof detail !== "object"
@@ -603,7 +605,7 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || typeof record.replacementOf.reason !== "string" || !record.replacementOf.reason || record.replacementOf.reason.length > 200)) return false;
   if (record.state === "started") return record.result === undefined && record.route === undefined && record.replayedFrom === undefined
     && record.replacementOf === undefined && record.replayProof === undefined && record.replayUsageClaim === undefined
-    && record.continuation === undefined && record.continuationProgress === undefined;
+    && record.interactionPending === undefined && record.continuation === undefined && record.continuationProgress === undefined;
   if (record.state === "progressed") {
     return record.result === undefined && record.replayedFrom === undefined && record.replacementOf === undefined
       && record.continuation === undefined && isContinuationProgress(record.continuationProgress) && record.route !== undefined;
@@ -611,6 +613,13 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
   if (record.state === "handoff") {
     return record.result === undefined && record.replayedFrom === undefined && record.replacementOf === undefined
       && record.continuationProgress === undefined && isContinuationHandoff(record.continuation) && record.route !== undefined;
+  }
+  if (record.state === "accepted") {
+    return record.kind === "peerQuestion" && record.result === undefined && record.route === undefined
+      && record.replayedFrom === undefined && record.replacementOf === undefined
+      && record.replayProof === undefined && record.replayUsageClaim === undefined
+      && record.interactionPending === undefined && record.continuation === undefined
+      && record.continuationProgress === undefined;
   }
   if (record.replayProof !== undefined || record.replayUsageClaim !== undefined) return false;
   if (record.continuation !== undefined || record.continuationProgress !== undefined) return false;

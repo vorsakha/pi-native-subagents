@@ -417,13 +417,15 @@ export interface WorkflowJournalRecord {
   callIndex: number;
   /** Call fingerprint, or the question fingerprint for `peerQuestion` records. */
   fingerprint: string;
-  state: "started" | "progressed" | "handoff" | "completed" | "failed";
+  state: "started" | "progressed" | "handoff" | "completed" | "accepted" | "failed";
   at: number;
   /** Absent means "agent" for journals written before followUp() existed. */
   kind?: "agent" | "followUp" | "peerQuestion";
   agentIndex?: number;
   /** Present only on `peerQuestion` records. */
   interaction?: WorkflowInteractionJournalDetail;
+  /** A persisted peer answer that requires a later accepted record before replay. */
+  interactionPending?: true;
   result?: WorkflowJournalResult;
   route?: WorkflowJournalRoute;
   replayedFrom?: WorkflowReplayReference;

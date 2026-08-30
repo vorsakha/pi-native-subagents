@@ -2970,17 +2970,13 @@ export class WorkflowManager {
     try {
       const replayed = this.#matchReplayedInteraction(entry, questionFingerprint, detail);
       if (replayed) {
-        await this.#appendJournal(entry, {
-          callIndex: ordinal,
-          fingerprint: questionFingerprint,
-          kind: "peerQuestion",
-          state: "completed",
-          at: Date.now(),
-          agentIndex: owner.agentIndex,
+        await this.#persistPeerAnswer(entry, request, {
+          ordinal,
+          questionFingerprint,
+          sourceAgentIndex: owner.agentIndex,
           result: { ok: true, output: replayed.answer, usage: replayed.usage },
           interaction: { ...detail, targetGeneration: replayed.detail.targetGeneration, route: "replay" },
         });
-        if (request.signal.aborted) throw abortError(request.signal.reason);
         return { answer: replayed.answer, targetGeneration: replayed.detail.targetGeneration, targetLabel: target.name, route: "replay" };
       }
       if (!request.target) {
@@ -3002,18 +2998,14 @@ export class WorkflowManager {
           signal: request.signal,
         });
       });
-      await this.#appendJournal(entry, {
-        callIndex: ordinal,
-        fingerprint: questionFingerprint,
-        kind: "peerQuestion",
-        state: "completed",
-        at: Date.now(),
-        agentIndex: owner.agentIndex,
+      await this.#persistPeerAnswer(entry, request, {
+        ordinal,
+        questionFingerprint,
+        sourceAgentIndex: owner.agentIndex,
         result: { ok: true, output: dispatched.answer, jobId: target.jobId, usage: dispatched.usage },
         route: journalRoute(target),
         interaction: { ...detail, targetGeneration: dispatched.targetGeneration, route: "peer" },
       });
-      if (request.signal.aborted) throw abortError(request.signal.reason);
       return { answer: dispatched.answer, targetGeneration: dispatched.targetGeneration, targetLabel: target.name, route: "peer" };
     } catch (error) {
       await this.#appendJournal(entry, {
@@ -3029,6 +3021,48 @@ export class WorkflowManager {
       }).catch(() => undefined);
       throw error;
     }
+  }
+
+  /**
+   * Persists an answer provisionally, lets a concurrent dismissal win, then
+   * commits a separate replay-acceptance record while JobManager serializes
+   * that final write against later dismissal. A failed invalidation append can
+   * therefore expose only a non-replayable provisional answer.
+   */
+  async #persistPeerAnswer(
+    entry: RunEntry,
+    request: PeerInteractionRequest,
+    input: {
+      ordinal: number;
+      questionFingerprint: string;
+      sourceAgentIndex: number;
+      result: WorkflowJournalResult;
+      route?: WorkflowJournalRoute;
+      interaction: WorkflowInteractionJournalDetail;
+    },
+  ): Promise<void> {
+    await this.#appendJournal(entry, {
+      callIndex: input.ordinal,
+      fingerprint: input.questionFingerprint,
+      kind: "peerQuestion",
+      state: "completed",
+      at: Date.now(),
+      agentIndex: input.sourceAgentIndex,
+      result: clone(input.result),
+      route: input.route ? clone(input.route) : undefined,
+      interaction: { ...input.interaction },
+      interactionPending: true,
+    });
+    if (request.signal.aborted) throw abortError(request.signal.reason);
+    await request.commitAcceptance(() => this.#appendJournal(entry, {
+      callIndex: input.ordinal,
+      fingerprint: input.questionFingerprint,
+      kind: "peerQuestion",
+      state: "accepted",
+      at: Date.now(),
+      agentIndex: input.sourceAgentIndex,
+      interaction: { ...input.interaction },
+    }));
   }
 
   /**

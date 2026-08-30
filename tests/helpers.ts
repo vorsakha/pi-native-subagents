@@ -71,17 +71,22 @@ export class GatedManagedProcess implements ManagedProcess {
   }
 }
 
-/** Persists one completed peer answer, then holds its append promise so tests
+/** Persists one provisional peer answer, then holds its append promise so tests
  * can dismiss the source interaction in the exact post-write race window. */
 export class GatedWorkflowJournalAppender {
   #armed = false;
   #reached = false;
+  #failInvalidation = false;
   #resolveReached!: () => void;
   #resolveRelease!: () => void;
   readonly #reachedPromise = new Promise<void>((resolve) => { this.#resolveReached = resolve; });
   readonly #releasePromise = new Promise<void>((resolve) => { this.#resolveRelease = resolve; });
 
   readonly append = async (root: string, runId: string, record: WorkflowJournalRecord): Promise<void> => {
+    if (this.#failInvalidation && record.kind === "peerQuestion" && record.state === "failed") {
+      this.#failInvalidation = false;
+      throw new Error("controlled peer-answer invalidation persistence failure");
+    }
     await appendWorkflowJournal(root, runId, record);
     if (!this.#armed || this.#reached || record.kind !== "peerQuestion" || record.state !== "completed") return;
     this.#reached = true;
@@ -91,6 +96,10 @@ export class GatedWorkflowJournalAppender {
 
   arm(): void {
     this.#armed = true;
+  }
+
+  failNextInvalidation(): void {
+    this.#failInvalidation = true;
   }
 
   waitUntilReached(): Promise<void> {
