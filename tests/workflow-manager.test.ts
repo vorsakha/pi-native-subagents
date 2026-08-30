@@ -1957,11 +1957,25 @@ test("ordinary progressed failure persists dashboard and restart refusal proof",
     const final = await started.completion;
     assert.equal(final.agents[0]?.progressedCheckpoint, true, "runtime snapshot carries the same proof as the journal");
     const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
-    assert.equal([...journal].reverse().find((record) => record.kind !== "peerQuestion")?.result?.progressed, true);
+    const terminal = [...journal].reverse().find((record) => record.kind !== "peerQuestion")!;
+    assert.equal(terminal.result?.progressed, true);
     await assert.rejects(
       f.workflows.restartAgent(final.runId, final.agents[0]!.index),
       /progressed continuation checkpoint/i,
     );
+
+    await appendWorkflowJournal(f.artifactRoot, final.runId, {
+      ...structuredClone(terminal),
+      sequence: journal.length,
+      at: terminal.at + 1,
+    });
+    const dispatches = f.backend.requests.length;
+    const resumed = await f.workflows.start(f.request(`export default async () => agent("progress then fail");`, {
+      resumeFromRunId: final.runId,
+    }));
+    const replayed = await resumed.completion;
+    assert.equal(f.backend.requests.length, dispatches, "a duplicate after durable terminal progress never reruns the primary");
+    assert.match((replayed.result as { error?: string }).error ?? "", /inconsistent after durable progress/);
   } finally {
     await f.cleanup();
   }
@@ -2508,6 +2522,10 @@ test("cancellation at a durable handoff prevents replacement, and replay resumes
     const resumedFinal = await resumed.completion;
     assert.equal((resumedFinal.result as { ok: boolean }).ok, true);
     assert.equal((resumedFinal.result as { jobId: string }).jobId, primary, "handoff replay preserves the original logical ID");
+    const resumedJournal = await loadWorkflowJournal(f.artifactRoot, resumedFinal.runId);
+    const resumedCheckpoints = resumedJournal.filter((record) => record.state === "progressed" || record.state === "handoff");
+    assert.ok(resumedCheckpoints.length >= 2);
+    assert.ok(resumedCheckpoints.every((record) => record.replayUsageClaim === true), "resumed checkpoints claim their carried usage durably");
 
     await writeFile(join(f.cwd, "tracked.txt"), "diverged after checkpoint\n");
     const targetDispatches = f.backend.requests.length;
@@ -2660,11 +2678,11 @@ test("interrupted continuation handoffs keep every original workflow budget ceil
   }
 });
 
-test("handoff replay charges completed sibling usage before replacement admission", async () => {
+test("handoff replay combines replay-carried, checkpointed, and journal-only usage before replacement admission", async () => {
   const scenarios = [
-    { name: "tokens", budget: { maxTokens: 10 }, sibling: { input: 6 }, primary: { input: 4 }, error: /token budget exhausted/i },
-    { name: "cost", budget: { maxCost: 2 }, sibling: { cost: 1 }, primary: { cost: 1 }, error: /cost budget exhausted/i },
-    { name: "turns", budget: { maxTurns: 2 }, sibling: { turns: 1 }, primary: { turns: 1 }, error: /turn budget exhausted/i },
+    { name: "tokens", budget: { maxTokens: 13 }, carried: { input: 6 }, sibling: { input: 3 }, primary: { input: 4 }, error: /token budget exhausted/i },
+    { name: "cost", budget: { maxCost: 3 }, carried: { cost: 1 }, sibling: { cost: 1 }, primary: { cost: 1 }, error: /cost budget exhausted/i },
+    { name: "turns", budget: { maxTurns: 3 }, carried: { turns: 1 }, sibling: { turns: 1 }, primary: { turns: 1 }, error: /turn budget exhausted/i },
   ] as const;
   for (const scenario of scenarios) {
     const availability = new GatedHarnessAvailability("codex", {
@@ -2706,10 +2724,15 @@ test("handoff replay charges completed sibling usage before replacement admissio
 
       const summaryPath = join(source.artifactDir, "workflow.json");
       const staleSummary = JSON.parse(await readFile(summaryPath, "utf8")) as WorkflowSnapshot;
+      const zeroUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
       for (const agent of staleSummary.agents) {
-        agent.usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
+        agent.usage = agent.callIndex === 1 ? { ...zeroUsage, ...scenario.primary } : { ...zeroUsage };
       }
-      if (staleSummary.replay) delete staleSummary.replay.carriedUsage;
+      staleSummary.replay = {
+        sourceRunId: `wf_${"a".repeat(24)}`,
+        matchedCalls: 0,
+        carriedUsage: { ...zeroUsage, ...scenario.carried },
+      };
       await writeFile(summaryPath, `${JSON.stringify(staleSummary)}\n`);
 
       const replacementDispatches = f.backend.requests.length;
@@ -2725,8 +2748,8 @@ test("handoff replay charges completed sibling usage before replacement admissio
         assert.equal((final.result as { ok: boolean }).ok, false);
         assert.match((final.result as { error?: string }).error ?? "", scenario.error);
         assert.equal(f.claude.requests.length, 2, "replay never reruns the progressed primary");
-        assert.equal(f.backend.requests.length, replacementDispatches, "journaled sibling usage blocks replacement startup");
-        assert.ok(final.replay?.carriedUsage, "journal-derived source usage remains durable on the replay snapshot");
+        assert.equal(f.backend.requests.length, replacementDispatches, "all three durable ledgers block replacement startup");
+        assert.ok(final.replay?.carriedUsage, "combined source usage remains durable on the replay snapshot");
       } finally {
         await diskWorkflows.shutdown(200).catch(() => undefined);
       }

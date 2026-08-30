@@ -233,14 +233,26 @@ function maxWorkflowUsage(left: WorkflowUsage, right: WorkflowUsage): WorkflowUs
   };
 }
 
+function workflowUsageContains(total: WorkflowUsage, part: WorkflowUsage): boolean {
+  return total.input >= part.input
+    && total.output >= part.output
+    && total.cacheRead >= part.cacheRead
+    && total.cacheWrite >= part.cacheWrite
+    && total.cost >= part.cost
+    && total.turns >= part.turns;
+}
+
 /**
  * Recovers cumulative source spend from the journal without double-charging a
  * logical agent across follow-ups or peer answers. The snapshot remains a
  * conservative fallback for older journals and replay-carried accounting.
  */
 function durableReplaySourceUsage(snapshot: WorkflowSnapshot, records: WorkflowJournalRecord[]): WorkflowUsage {
-  const byLineage = new Map<string, WorkflowUsage>();
-  for (const agent of snapshot.agents) byLineage.set(`agent:${agent.index}`, workflowUsage(agent.usage));
+  const snapshotLineages = new Map<string, WorkflowUsage>();
+  const journalLineages = new Map<string, WorkflowUsage>();
+  const replayClaims = new Map<string, WorkflowUsage>();
+  const hasCarriedLedger = snapshot.replay?.carriedUsage !== undefined;
+  for (const agent of snapshot.agents) snapshotLineages.set(`agent:${agent.index}`, workflowUsage(agent.usage));
 
   for (const record of records) {
     const usage = record.result?.usage ?? record.continuation?.usage ?? record.continuationProgress?.usage;
@@ -249,12 +261,28 @@ function durableReplaySourceUsage(snapshot: WorkflowSnapshot, records: WorkflowJ
       ? record.interaction?.targetAgentIndex
       : record.agentIndex;
     const key = agentIndex === undefined ? `call:${record.callIndex}` : `agent:${agentIndex}`;
-    byLineage.set(key, maxWorkflowUsage(byLineage.get(key) ?? workflowUsage(), workflowUsage(usage)));
+    const normalized = workflowUsage(usage);
+    if (record.replayUsageClaim === true) {
+      replayClaims.set(key, maxWorkflowUsage(replayClaims.get(key) ?? workflowUsage(), normalized));
+      continue;
+    }
+    if (record.replayProof === true || record.replayedFrom !== undefined
+        || record.kind === "peerQuestion" && record.interaction?.route === "replay") continue;
+    journalLineages.set(key, maxWorkflowUsage(journalLineages.get(key) ?? workflowUsage(), normalized));
   }
 
-  const journalAndSnapshot = [...byLineage.values()].reduce(addWorkflowUsage, workflowUsage());
-  const checkpointLedger = addWorkflowUsage(snapshot.replay?.carriedUsage, aggregateWorkflowUsage(snapshot));
-  return maxWorkflowUsage(journalAndSnapshot, checkpointLedger);
+  const currentLineages = new Map(snapshotLineages);
+  for (const [key, journalUsage] of journalLineages) {
+    const snapshotUsage = snapshotLineages.get(key) ?? workflowUsage();
+    const claim = hasCarriedLedger ? replayClaims.get(key) : undefined;
+    const currentJournalUsage = claim && !workflowUsageContains(snapshotUsage, claim)
+      ? subtractWorkflowUsageFloor(journalUsage, claim)
+      : journalUsage;
+    currentLineages.set(key, maxWorkflowUsage(snapshotUsage, currentJournalUsage));
+  }
+
+  const currentUsage = [...currentLineages.values()].reduce(addWorkflowUsage, workflowUsage());
+  return addWorkflowUsage(snapshot.replay?.carriedUsage, currentUsage);
 }
 
 /** Isolates one attempt's own usage out of a cumulative total, for bounded per-attempt provenance. */
@@ -2568,6 +2596,7 @@ export class WorkflowManager {
       state: "progressed",
       at: Date.now(),
       agentIndex: record.index,
+      replayUsageClaim: true,
       route: progressRoute,
       continuationProgress: {
         agentIndex: record.index,
@@ -2600,6 +2629,7 @@ export class WorkflowManager {
         state: "handoff",
         at: Date.now(),
         agentIndex: record.index,
+        replayUsageClaim: true,
         route: journalRoute(record),
         continuation: clone(checkpoint),
       });

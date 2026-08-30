@@ -101,7 +101,8 @@ function continuationCheckpointsMatch(
   const progressRoute = progressRecord.route;
   const handoffRoute = handoffRecord.route;
   if (!progress || !handoff || !progressRoute || !handoffRoute
-      || progressRecord.replayProof !== handoffRecord.replayProof) return false;
+      || progressRecord.replayProof !== handoffRecord.replayProof
+      || progressRecord.replayUsageClaim !== handoffRecord.replayUsageClaim) return false;
   if (callKind(progressRecord) !== callKind(handoffRecord)
       || progressRecord.agentIndex !== progress.agentIndex
       || handoffRecord.agentIndex !== handoff.agentIndex
@@ -269,6 +270,7 @@ export function replayableJournalCalls(
   const completed = new Map<number, WorkflowJournalRecord>();
   const continuationProofs = new Map<number, NonNullable<WorkflowReplayCall["continuationProof"]>>();
   const acceptedLineageProofs: Array<NonNullable<WorkflowReplayCall["continuationProof"]>> = [];
+  const durableProgressEvidence = new Map<number, WorkflowJournalRecord>();
   const invalid = new Set<number>();
   const failClosedProgress = new Set<number>();
 
@@ -288,7 +290,10 @@ export function replayableJournalCalls(
           || callKind(priorStart) !== callKind(record) || handoffs.has(record.callIndex)
           || completed.has(record.callIndex) || !record.continuationProgress) {
         invalid.add(record.callIndex);
-      } else progressed.set(record.callIndex, record);
+      } else {
+        progressed.set(record.callIndex, record);
+        durableProgressEvidence.set(record.callIndex, record);
+      }
       continue;
     }
     if (record.state === "handoff") {
@@ -327,18 +332,26 @@ export function replayableJournalCalls(
       if ((carriesContinuation && !localProof && !replayProof && !lineageProof) || (progress && !localProof)) {
         rejectedTerminals.add(record.callIndex);
         rejectedContinuationTerminals.set(record.callIndex, record);
+        durableProgressEvidence.set(record.callIndex, record);
         handoffs.delete(record.callIndex);
       } else {
         completed.set(record.callIndex, record);
         const proof = localProof ?? replayProof ?? lineageProof;
+        if (record.result.progressed === true) durableProgressEvidence.set(record.callIndex, record);
         if (proof) {
           continuationProofs.set(record.callIndex, proof);
           acceptedLineageProofs.push(proof);
+          durableProgressEvidence.set(record.callIndex, record);
         }
       }
     }
     else if (record.state === "failed" && record.result?.ok === false
-        && (progressed.has(record.callIndex) || handoffs.has(record.callIndex) || record.result.progressed === true)) completed.set(record.callIndex, record);
+        && (progressed.has(record.callIndex) || handoffs.has(record.callIndex) || record.result.progressed === true)) {
+      completed.set(record.callIndex, record);
+      if (record.result.progressed === true || progressed.has(record.callIndex) || handoffs.has(record.callIndex)) {
+        durableProgressEvidence.set(record.callIndex, record);
+      }
+    }
     else invalid.add(record.callIndex);
   }
 
@@ -375,6 +388,23 @@ export function replayableJournalCalls(
         error,
         progressed: true,
         usage: { ...progress.usage },
+      },
+    });
+    failClosedProgress.add(callIndex);
+  }
+  for (const [callIndex, record] of durableProgressEvidence) {
+    if (!invalid.has(callIndex) || failClosedProgress.has(callIndex)) continue;
+    const usage = progressed.get(callIndex)?.continuationProgress?.usage ?? record.result?.usage;
+    replayable.set(callIndex, {
+      ...record,
+      state: "failed",
+      route: undefined,
+      result: {
+        ok: false,
+        output: "",
+        error: "Workflow journal became inconsistent after durable progress; the original prompt was not replayed",
+        progressed: true,
+        ...(usage ? { usage: { ...usage } } : {}),
       },
     });
     failClosedProgress.add(callIndex);

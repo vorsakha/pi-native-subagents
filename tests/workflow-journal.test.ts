@@ -277,6 +277,19 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
   assert.equal(inconsistentAfterCompletion[0]?.result.progressed, true);
   assert.deepEqual(replayableJournalHandoffs([started, progressed, handoff, completed, duplicateTerminal]), []);
 
+  const progressedFailure: WorkflowJournalRecord = {
+    version: 1, sequence: 1, callIndex: 0, fingerprint, kind: "agent", state: "failed", at: 2,
+    agentIndex: 0,
+    result: { ok: false, output: "partial work", error: "failed after progress", progressed: true, usage: cumulativeUsage },
+  };
+  const duplicateFailure = { ...structuredClone(progressedFailure), sequence: 2 };
+  const inconsistentProgressedFailure = replayableJournalCalls([started, progressedFailure, duplicateFailure]);
+  assert.equal(inconsistentProgressedFailure.length, 1);
+  assert.equal(inconsistentProgressedFailure[0]?.result.ok, false);
+  assert.equal(inconsistentProgressedFailure[0]?.result.progressed, true);
+  assert.match(inconsistentProgressedFailure[0]?.result.error ?? "", /inconsistent after durable progress/);
+  assert.deepEqual(inconsistentProgressedFailure[0]?.result.usage, cumulativeUsage);
+
   const replayedTerminal = structuredClone(completed);
   replayedTerminal.replayedFrom = { runId: "source-run", callIndex: 0 };
   const terminalOnly = [started, replayedTerminal];
@@ -287,6 +300,16 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
 
   const validated = new Map([[workflowReplayReferenceKey(replayedTerminal.replayedFrom), accepted]]);
   assert.equal(replayableJournalCalls(terminalOnly, validated)[0]?.result.ok, true);
+
+  const duplicateReplayedTerminal = { ...structuredClone(replayedTerminal), sequence: 2 };
+  const inconsistentValidatedTerminal = replayableJournalCalls(
+    [started, replayedTerminal, duplicateReplayedTerminal],
+    validated,
+  );
+  assert.equal(inconsistentValidatedTerminal.length, 1);
+  assert.equal(inconsistentValidatedTerminal[0]?.result.ok, false);
+  assert.equal(inconsistentValidatedTerminal[0]?.result.progressed, true);
+  assert.match(inconsistentValidatedTerminal[0]?.result.error ?? "", /inconsistent after durable progress/);
 
   const mismatchedReplay = structuredClone(replayedTerminal);
   mismatchedReplay.result!.output = "different replay output";

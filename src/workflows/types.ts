@@ -430,6 +430,8 @@ export interface WorkflowJournalRecord {
   replacementOf?: WorkflowReplacementReference;
   /** Copied checkpoint evidence for replay validation; never replacement-dispatch authority. */
   replayProof?: true;
+  /** A resumed handoff moved this lineage's checkpoint usage out of replay-carried usage. */
+  replayUsageClaim?: true;
   /** Present only on a progressed continuation handoff checkpoint. */
   continuation?: WorkflowContinuationHandoff;
   /** Present only on the pre-settlement progressed-primary checkpoint. */
