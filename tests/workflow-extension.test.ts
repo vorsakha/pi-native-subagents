@@ -385,9 +385,10 @@ test("concurrent workflows share one session widget and open the existing workfl
   assert.match(rendered, /Second workflow/);
   assert.equal((rendered.match(/[├└]─/g) ?? []).length, 2, "one row is rendered per workflow run");
 
-  assert.equal(pi.shortcuts.has("ctrl+shift+w"), false, "the default no longer collides with pi-web-access");
+  assert.equal(pi.shortcuts.has("ctrl+shift+w"), false, "the default does not collide with pi-web-access");
+  assert.equal(pi.shortcuts.has("ctrl+shift+f"), false, "the default does not collide with Pi transcript search");
   const rawWidget = widgetFactory(undefined, theme).render(200).join("\n");
-  assert.match(rawWidget, /Ctrl\+Shift\+F/, "the widget hint follows the effective shortcut");
+  assert.match(rawWidget, /Ctrl\+Alt\+W/, "the widget hint follows the effective shortcut");
   await pi.shortcuts.get(DEFAULT_WORKFLOWS_SHORTCUT)?.handler(session.ctx);
   assert.match(session.notifications.at(-1)?.message ?? "", /First workflow/);
   assert.match(session.notifications.at(-1)?.message ?? "", /Second workflow/);

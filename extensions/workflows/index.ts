@@ -27,12 +27,11 @@ const MAX_RESULT_TEXT_BYTES = 48 * 1024;
 
 /**
  * Keyboard shortcut that opens the `/workflows` supervision surface. The default
- * deliberately avoids `ctrl+shift+w`, which `pi-web-access` registers for its web
- * activity widget, so both packages can be enabled without a shortcut conflict.
- * Override with `PI_NATIVE_SUBAGENTS_WORKFLOWS_SHORTCUT` (e.g. to restore the old
- * `ctrl+shift+w`).
+ * avoids both `ctrl+shift+w`, which `pi-web-access` uses for its activity widget,
+ * and Pi's built-in `ctrl+shift+f` transcript search shortcut.
+ * Override with `PI_NATIVE_SUBAGENTS_WORKFLOWS_SHORTCUT` if needed.
  */
-export const DEFAULT_WORKFLOWS_SHORTCUT: KeyId = "ctrl+shift+f";
+export const DEFAULT_WORKFLOWS_SHORTCUT: KeyId = "ctrl+alt+w";
 export const WORKFLOWS_SHORTCUT_ENV = "PI_NATIVE_SUBAGENTS_WORKFLOWS_SHORTCUT";
 
 const SHORTCUT_MODIFIER_ORDER = ["ctrl", "alt", "shift", "super"] as const;
@@ -56,7 +55,7 @@ export function configuredWorkflowsShortcut(env: NodeJS.ProcessEnv = process.env
   return normalizeWorkflowsShortcut(env[WORKFLOWS_SHORTCUT_ENV]) ?? DEFAULT_WORKFLOWS_SHORTCUT;
 }
 
-/** Title-cases a shortcut chord for display hints, e.g. `ctrl+shift+f` -> `Ctrl+Shift+F`. */
+/** Title-cases a shortcut chord for display hints, e.g. `ctrl+alt+w` -> `Ctrl+Alt+W`. */
 export function formatWorkflowsShortcutHint(shortcut: string): string {
   return shortcut
     .split("+")
@@ -71,7 +70,7 @@ export interface WorkflowRegistration {
   check(runId: string): WorkflowSnapshot | undefined;
   /** Effective keyboard shortcut registered for the `/workflows` surface. */
   readonly shortcut: KeyId;
-  /** Display hint for the effective shortcut, e.g. `Ctrl+Shift+F`. */
+  /** Display hint for the effective shortcut, e.g. `Ctrl+Alt+W`. */
   readonly shortcutHint: string;
 }
 
