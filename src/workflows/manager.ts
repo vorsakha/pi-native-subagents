@@ -1889,7 +1889,6 @@ export class WorkflowManager {
         const admittedRequires = routing.requires ?? [];
         spawnRequest.dispatchAdmission = async (admissionSignal) => {
           try {
-            await retry.beforeStart!(admissionSignal);
             const admitted = await resolveRouting(admissionSignal);
             const liveHarness = admitted.harness ?? this.#jobs.resolveHarness(spawnRequest);
             if (liveHarness !== admittedHarness) {
@@ -1898,6 +1897,10 @@ export class WorkflowManager {
             if (canonicalJson(admitted.requires ?? []) !== canonicalJson(admittedRequires)) {
               throw new Error("Continuation admission changed the required capability policy");
             }
+            // Routing may perform asynchronous readiness and capability probes.
+            // Prove the checkout only after those finish so backend startup can
+            // never consume workspace state that changed during admission.
+            await retry.beforeStart!(admissionSignal);
             applyRoutingEvidence(admitted);
             this.#touch(entry);
             const budgetError = this.#budgetPreflight(entry);
@@ -2090,16 +2093,34 @@ export class WorkflowManager {
     const record = entry.snapshot.agents[owner.agentIndex];
     if (!record) return { ok: false, output: "", error: `followUp() target ${jobId} is unknown` };
     if (record.isolation) {
-      return { ok: false, output: "", error: `followUp() target ${jobId} used an isolated worktree that already finalized (${record.isolation.state}) and cannot continue` };
+      return {
+        ok: false,
+        output: "",
+        error: `followUp() target ${jobId} used an isolated worktree that already finalized (${record.isolation.state}) and cannot continue`,
+        usage: clone(record.usage),
+      };
     }
     if (callIndex >= (entry.snapshot.budget?.maxAgents ?? 32)) {
-      return { ok: false, output: "", error: `Workflow agent budget exceeded (${entry.snapshot.budget?.maxAgents} calls)`, limit: "budget" };
+      return {
+        ok: false,
+        output: "",
+        error: `Workflow agent budget exceeded (${entry.snapshot.budget?.maxAgents} calls)`,
+        usage: clone(record.usage),
+        limit: "budget",
+      };
     }
     const preflightError = this.#budgetPreflight(entry);
-    if (preflightError) return { ok: false, output: "", error: preflightError, limit: "budget" };
+    if (preflightError) {
+      return { ok: false, output: "", error: preflightError, usage: clone(record.usage), limit: "budget" };
+    }
     const schema = options.schema === undefined ? undefined : workflowSchema(options.schema);
     if (options.schema !== undefined && !schema) {
-      return { ok: false, output: "", error: "followUp schema must be a bounded JSON Schema object" };
+      return {
+        ok: false,
+        output: "",
+        error: "followUp schema must be a bounded JSON Schema object",
+        usage: clone(record.usage),
+      };
     }
     // A retained native session is schema-bound at agent() time (the SDK
     // exposes no way to change outputFormat mid-session): followUp() may
@@ -2107,7 +2128,12 @@ export class WorkflowManager {
     // but cannot request a different one.
     const nativeLineage = record.structuredTransport === "native" && record.nativeStructuredSchema;
     if (nativeLineage && schema && canonicalJson(schema) !== canonicalJson(record.nativeStructuredSchema)) {
-      return { ok: false, output: "", error: "followUp() cannot change the schema of a native structured lineage; the retained session is bound to its agent() schema" };
+      return {
+        ok: false,
+        output: "",
+        error: "followUp() cannot change the schema of a native structured lineage; the retained session is bound to its agent() schema",
+        usage: clone(record.usage),
+      };
     }
     const effectiveSchema = nativeLineage ? workflowSchema(record.nativeStructuredSchema) : schema;
     // Snapshot generation 0 from the record's pre-follow-up fields before any
@@ -2160,7 +2186,7 @@ export class WorkflowManager {
         generation.timestamps = { ...generation.timestamps, updatedAt: record.timestamps.updatedAt, endedAt: record.timestamps.endedAt };
       }
       this.#touch(entry);
-      return { ok: false, output: "", error: failure };
+      return { ok: false, output: "", error: failure, usage: clone(record.usage) };
     }
     this.#updateAgentFromJob(queued);
 
@@ -2909,7 +2935,11 @@ export class WorkflowManager {
       if (generation) generation.outputProvenance = "peerAnswer";
       target.outputProvenance = "peerAnswer";
       this.#touch(entry);
-      return { answer: final.output, targetGeneration: generationIndex, usage: final.usage };
+      return {
+        answer: final.output,
+        targetGeneration: generationIndex,
+        usage: addWorkflowUsage(target.retryUsage, workflowUsage(final.usage)),
+      };
     } catch (error) {
       failGeneration(boundedText(error));
       throw error;

@@ -1688,6 +1688,117 @@ test("continuation scheduler admission rechecks workflow usage after its asynchr
   }
 });
 
+test("continuation scheduler admission rechecks checkout after a blocked routing probe", async () => {
+  const availability = new GatedHarnessAvailability("codex", {
+    claude: availabilityFixture("claude"),
+    codex: availabilityFixture("codex"),
+  });
+  const f = await fixture(1, undefined, undefined, undefined, availability);
+  try {
+    await initializeGitCheckout(f.cwd);
+    const started = await f.workflows.start(f.request(`export default async () => agent("queued routing race", {
+      harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+    });`));
+    await f.claude.waitForStart();
+    const primary = f.claude.starts[0]!;
+    const direct = f.jobs.spawn({ name: "direct blocker", task: "hold admission", cwd: f.cwd, trusted: true, harness: "codex" });
+    f.claude.emit(primary, { type: "message", text: "progress" });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+
+    await availability.waitUntilReached();
+    availability.release();
+    await f.backend.waitForStart();
+    assert.equal(f.backend.starts[0], direct.id);
+    await waitFor(() => f.jobs.list().some((job) =>
+      job.workflow?.runId === started.snapshot.runId && job.id !== primary && job.status === "queued"), "queued continuation replacement");
+
+    availability.gateNext();
+    f.backend.complete(direct.id, "release admission");
+    await availability.waitUntilReached();
+    await writeFile(join(f.cwd, "tracked.txt"), "changed while routing was blocked\n");
+    availability.release();
+
+    const final = await started.completion;
+    assert.equal((final.result as { ok: boolean }).ok, false);
+    assert.match((final.result as { error?: string }).error ?? "", /checkout is missing or diverged/);
+    assert.equal(f.backend.requests.length, 1, "divergence after routing prevents replacement backend startup");
+    assert.equal(final.agents[0]?.continuation?.state, "failed");
+  } finally {
+    availability.release();
+    await f.cleanup();
+  }
+});
+
+test("continued follow-up budget refusal preserves cumulative lineage usage in its result and journal", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const script = `export default async () => {
+      const continued = await agent("continued budget target", {
+        harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+      });
+      return followUp(continued.jobId, "refused by exhausted budget");
+    };`;
+    const started = await f.workflows.start(f.request(script, { budget: { maxTokens: 5 } }));
+    await f.claude.waitForStart();
+    const primary = f.claude.starts[0]!;
+    f.claude.emit(primary, { type: "message", text: "progress" });
+    f.claude.emit(primary, { type: "usage", usage: { input: 2, output: 1, turns: 1 } });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+    await f.backend.waitForStart();
+    f.backend.complete(f.backend.starts[0]!, "continued", { input: 1, output: 1, turns: 1 });
+
+    const final = await started.completion;
+    const result = final.result as { ok: boolean; error?: string; usage?: Record<string, number> };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /Workflow token budget exhausted \(5\/5\)/);
+    assert.deepEqual(result.usage, { input: 3, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2 });
+    assert.equal(f.backend.sends.length, 0, "budget refusal occurs before retained-session dispatch");
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const followUp = [...journal].reverse().find((record) => record.kind === "followUp" && record.state === "failed");
+    assert.deepEqual(followUp?.result?.usage, result.usage);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("continued follow-up retained-session rejection preserves cumulative lineage usage in its result and journal", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const script = `export default async () => {
+      const continued = await agent("continued retained target", {
+        harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+      });
+      await agent("hold before follow-up", { harness: "claude", access: "readOnly" });
+      return followUp(continued.jobId, "retained session was closed");
+    };`;
+    const started = await f.workflows.start(f.request(script));
+    await f.claude.waitForStart();
+    const primary = f.claude.starts[0]!;
+    f.claude.emit(primary, { type: "message", text: "progress" });
+    f.claude.emit(primary, { type: "usage", usage: { input: 2, output: 1, turns: 1 } });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+    await f.backend.waitForStart();
+    const replacement = f.backend.starts[0]!;
+    f.backend.complete(replacement, "continued", { input: 3, output: 4, turns: 1 });
+    await f.claude.waitForStart(2);
+    await f.jobs.releaseRun(replacement);
+    f.claude.complete(f.claude.starts[1]!, "gate complete");
+
+    const final = await started.completion;
+    const result = final.result as { ok: boolean; error?: string; usage?: Record<string, number> };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /native session is no longer available/);
+    assert.deepEqual(result.usage, { input: 5, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2 });
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const followUp = [...journal].reverse().find((record) => record.kind === "followUp" && record.state === "failed");
+    assert.deepEqual(followUp?.result?.usage, result.usage);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("ordinary progressed failure persists dashboard and restart refusal proof", async () => {
   const f = await fixture();
   try {
@@ -4381,11 +4492,12 @@ test("a peer can address a continued lineage by its stable logical job ID", asyn
     await f.claude.waitForStart();
     const logicalJobId = f.claude.starts[0]!;
     f.claude.emit(logicalJobId, { type: "message", text: "partial target answer" });
+    f.claude.emit(logicalJobId, { type: "usage", usage: { input: 2, output: 1, turns: 1 } });
     f.claude.fail(logicalJobId, "quota", progressedQuota("claude"));
 
     await f.backend.waitForStart();
     const replacementJobId = f.backend.starts[0]!;
-    f.backend.complete(replacementJobId, "continued target ready");
+    f.backend.complete(replacementJobId, "continued target ready", { input: 3, output: 4, turns: 1 });
     await f.claude.waitForStart(2);
     const askerJobId = f.claude.starts[1]!;
     assert.match(f.claude.requests[1]!.task, new RegExp(logicalJobId));
@@ -4396,7 +4508,7 @@ test("a peer can address a continued lineage by its stable logical job ID", asyn
     });
     await f.backend.waitForSend();
     assert.equal(f.backend.sends[0]?.id, replacementJobId, "logical target resolves to the retained replacement session");
-    f.backend.complete(replacementJobId, "Use the continued state.");
+    f.backend.complete(replacementJobId, "Use the continued state.", { input: 5, output: 6, turns: 1 });
     const answer = await asked;
     assert.equal(answer.route, "peer");
     assert.match(answer.answer, /Use the continued state\./);
@@ -4407,7 +4519,11 @@ test("a peer can address a continued lineage by its stable logical job ID", asyn
     assert.equal(target.logicalJobId, logicalJobId);
     assert.equal(target.jobId, replacementJobId);
     assert.equal(target.generations?.at(-1)?.outputProvenance, "peerAnswer");
+    assert.deepEqual(target.usage, { input: 10, output: 11, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 3 });
     assert.equal(final.interactions?.at(-1)?.targetAgentIndex, target.index);
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const peer = [...journal].reverse().find((record) => record.kind === "peerQuestion" && record.state === "completed");
+    assert.deepEqual(peer?.result?.usage, target.usage, "peer journal usage covers the continued logical lineage");
   } finally {
     await f.cleanup();
   }
