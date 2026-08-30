@@ -11,6 +11,8 @@ import {
   renderWorkflowCall,
   renderWorkflowCard,
   workflowConvergenceMeta,
+  workflowAgentDashboardSummary,
+  workflowDashboardSummary,
   workflowPhaseProgress,
 } from "../extensions/workflows/render.ts";
 import { shortId } from "../extensions/subagents/render.ts";
@@ -66,6 +68,92 @@ function agent(overrides: Partial<WorkflowAgentRecord>): WorkflowAgentRecord {
     ...overrides,
   };
 }
+
+test("workflow run and agent summaries preserve semantic priority and wait distinctions", () => {
+  const question = {
+    ordinal: 0,
+    requestId: "req-1",
+    target: "orchestrator" as const,
+    sourceAgentIndex: 1,
+    sourceName: "tests",
+    question: "Ship with the compatibility flag?",
+    state: "pending" as const,
+    createdAt: 4_000,
+  };
+  const conflictedAgent = agent({
+    state: "failed",
+    error: "test agent failed",
+    liveThinking: "stale activity",
+    preview: "stale preview",
+    waitingOn: question,
+  });
+  assert.equal(workflowAgentDashboardSummary(conflictedAgent, 6_000).kind, "input");
+  assert.deepEqual(workflowAgentDashboardSummary({ ...conflictedAgent, waitingOn: undefined }, 6_000), {
+    kind: "failure",
+    text: "test agent failed",
+  });
+  assert.deepEqual(workflowAgentDashboardSummary(agent({
+    state: "running",
+    liveThinking: "checking the release gate",
+    preview: "older preview",
+    tools: [{ id: "bash", name: "bash", summary: "npm test", status: "running" }],
+  }), 6_000), {
+    kind: "activity",
+    text: "checking the release gate",
+  });
+  assert.equal(workflowAgentDashboardSummary(agent({
+    state: "waiting",
+    preview: "stale preview",
+    providerWait: { provider: "codex", kind: "quota", detail: "limit", retryAt: 66_000, attempt: 2, maxAttempts: 3 },
+  }), 6_000).text, "waiting for codex quota · retry in 1m · attempt 2/3");
+
+  const conflictedRun = workflow({
+    status: "failed",
+    error: "workflow failed",
+    agents: [conflictedAgent],
+  });
+  assert.equal(workflowDashboardSummary(conflictedRun, 6_000).kind, "input");
+  assert.deepEqual(workflowDashboardSummary({
+    ...conflictedRun,
+    agents: [{ ...conflictedAgent, waitingOn: undefined }],
+  }, 6_000), {
+    kind: "failure",
+    text: "workflow failed",
+  });
+
+  const activeFailure = workflow();
+  activeFailure.agents[0] = agent({ state: "failed", error: "review failed" });
+  activeFailure.agents[1]!.liveThinking = "newer live activity";
+  assert.deepEqual(workflowDashboardSummary(activeFailure, 6_000), {
+    kind: "failure",
+    text: "review failed",
+  });
+
+  const paused = workflow({ status: "paused" });
+  paused.agents[1]!.liveThinking = "stale running activity";
+  assert.deepEqual(workflowDashboardSummary(paused, 6_000), {
+    kind: "wait",
+    text: "paused by operator",
+  });
+
+  const providerWait = workflow({ logs: [{ index: 0, message: "stale log", at: 3_000 }] });
+  providerWait.agents[1] = agent({
+    index: 1,
+    name: "tests",
+    state: "waiting",
+    providerWait: { provider: "codex", kind: "quota", detail: "limit", retryAt: 66_000, attempt: 1, maxAttempts: 3 },
+  });
+  assert.equal(workflowDashboardSummary(providerWait, 6_000).text, "tests: waiting for codex quota · retry in 1m · attempt 1/3");
+
+  assert.deepEqual(workflowDashboardSummary(workflow({
+    status: "completed",
+    taskOutcome: "unsuccessful",
+    result: "Release rejected",
+  }), 6_000), {
+    kind: "result",
+    text: "task unsuccessful: Release rejected",
+  });
+});
 
 test("workflow cards enforce one budget, sanitization, and dashboard-pointer contract", () => {
   const huge = workflow({

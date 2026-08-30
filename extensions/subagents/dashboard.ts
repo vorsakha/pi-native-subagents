@@ -10,24 +10,37 @@ import {
   type TUI,
 } from "@earendil-works/pi-tui";
 import {
-  alignDashboardRow,
+  alignDashboardSummaryRow,
   clampDashboard,
   createDashboardFrame,
   DASHBOARD_COMPACT_ROWS,
   dashboardCancelKeyLabel,
   dashboardConfirmKeyLabel,
+  dashboardFoldRow,
   dashboardLayout,
-  dashboardListViewport,
+  dashboardInfoRule,
   dashboardScrollRule,
+  dashboardSectionRow,
   dashboardSelectionMarker,
   dashboardSubmitKeyLabel,
+  dashboardSummaryColor,
+  dashboardViewportLabel,
   fitDashboardRows,
+  formatDurationLabel,
   isFullscreenTui,
   dashboardOverlayRows,
   renderDashboardConfirmHint,
   renderDashboardHelp,
 } from "../dashboard-style.ts";
 import type { DashboardFrame, DashboardKeyGroup, DashboardLayout } from "../dashboard-style.ts";
+import {
+  dashboardCollectionViewport,
+  groupDashboardCollection,
+  type DashboardCollection,
+  type DashboardCollectionGroupDefinition,
+  type DashboardCollectionRow,
+  type DashboardCollectionViewport,
+} from "../dashboard-collection.ts";
 export {
   DASHBOARD_CHROME_ROWS,
   DASHBOARD_COMPACT_ROWS,
@@ -45,6 +58,7 @@ import {
   formatElapsed,
   formatUsage,
   interactionWaitLabel,
+  jobDashboardSummary,
   pendingInteraction,
   sanitizeInline,
   sanitizeText,
@@ -66,10 +80,9 @@ import {
 } from "../../src/harness-availability.ts";
 
 /*
- * `/subagents` is one panel with three modes. Browse mode selects a job and reads
- * its normalized transcript; takeover mode keeps the same selection and scroll
- * position and adds a composer for steering or queuing a follow-up; answer mode
- * reuses that composer to resolve one routed question a job is parked on. The panel
+ * `/subagents` is one panel with three explicit focus layers. Job-list focus moves
+ * among jobs, job-detail focus reads and scrolls the normalized transcript, and
+ * composer focus answers, steers, or queues a follow-up. The panel
  * takes the whole screen when Pi runs its fullscreen TUI and keeps Pi's 80%
  * overlay otherwise, so overlay geometry stays percentage-based and survives
  * resize. Layout adapts to the terminal it is given — see `dashboardLayout`.
@@ -87,6 +100,96 @@ export interface SubagentsDashboardManager {
   readonly concurrency?: number;
 }
 
+/** State story for the selected direct job. Routine route and usage rows follow it. */
+function directJobStatePreview(
+  job: JobSnapshot,
+  now: number,
+  theme: Theme,
+  width: number,
+  canAnswerInline: boolean,
+): string[] {
+  const line = (color: Parameters<Theme["fg"]>[0], value: string) =>
+    truncate(theme.fg(color, value), width);
+  const interaction = pendingInteraction(job);
+
+  if (interaction) {
+    const elapsed = formatDurationLabel(now - interaction.createdAt);
+    const target = interaction.target.kind === "agent"
+      ? `peer ${sanitizeInline(interaction.target.label ?? shortId(interaction.target.jobId ?? "peer"))}`
+      : interaction.humanVisible ? "you" : "parent orchestrator";
+    const owner = interaction.workflow
+      ? ` · workflow ${sanitizeInline(interaction.workflow.label)} ${shortId(sanitizeText(interaction.workflow.runId))}`
+      : "";
+    let next: string;
+    if (interaction.workflow) {
+      next = `Next · /workflows: supervise ${sanitizeInline(interaction.workflow.label)}; no answer or steer here`;
+    } else if (interaction.target.kind === "agent") {
+      next = `Next · no human action required; waiting for ${target}`;
+    } else if (interaction.humanVisible) {
+      next = canAnswerInline
+        ? "Next · press a to answer inline"
+        : "Next · inline answering is unavailable in this session";
+    } else {
+      next = "Next · parent thread: subagent_answer; do not steer";
+      if (visibleWidth(next) > width) next = "Next · parent: subagent_answer; do not steer";
+    }
+    const rows = [
+      line("warning", `Question · ${sanitizeInline(interaction.question)}`),
+      line("muted", `Route · ${sanitizeInline(interaction.sourceName)} → ${target} · waiting ${elapsed}${owner}`),
+    ];
+    rows.push(line("text", next));
+    if (interaction.context) rows.push(line("dim", `Context · ${sanitizeInline(interaction.context)}`));
+    return rows;
+  }
+
+  const summary = jobDashboardSummary(job);
+  const workflowDestination = job.workflow
+    ? `supervise ${sanitizeInline(job.workflow.label)} in /workflows`
+    : undefined;
+  if (summary.kind === "failure") {
+    const recovery = workflowDestination
+      ?? (!takeoverPolicy(job).reusable
+        ? "no recovery action is available in this pane"
+        : isTerminal(job.status) ? "press f to follow up" : "press s to steer");
+    return [
+      line("error", `Error · ${summary.text}`),
+      line("text", `Recovery · ${recovery}`),
+    ];
+  }
+  if (job.status === "queued") {
+    return [
+      line("warning", `Waiting · ${summary.text}`),
+      line("muted", `Next · ${workflowDestination ?? "automatic dispatch; no human action required"}`),
+    ];
+  }
+  if (job.status === "running") {
+    if (!workflowDestination && width >= 40) {
+      const prefix = "Latest · ";
+      const suffix = " · Next · s steer";
+      const previewWidth = Math.max(1, width - visibleWidth(prefix) - visibleWidth(suffix));
+      const preview = truncateToWidth(summary.text, previewWidth, "…");
+      return [line("accent", `${prefix}${preview}${suffix}`)];
+    }
+    return [
+      line("accent", `Latest · ${summary.text}`),
+      line("muted", `Next · ${workflowDestination ?? "monitor here or press s to steer"}`),
+    ];
+  }
+  if (job.status === "completed") {
+    return [
+      line("success", `Result · ${summary.text}`),
+      line("muted", `Next · ${workflowDestination ?? "press f to follow up if more work is needed"}`),
+    ];
+  }
+
+  const recovery = workflowDestination
+    ?? (takeoverPolicy(job).reusable ? "continue in this inspector" : "no recovery action is available in this pane");
+  return [
+    line("muted", `State · ${summary.text}`),
+    line("muted", `Next · ${recovery}`),
+  ];
+}
+
 export interface DashboardOverlayOptions {
   now?: () => number;
   setInterval?: typeof setInterval;
@@ -96,7 +199,7 @@ export interface DashboardOverlayOptions {
   renderMarkdown?: (text: string, width: number) => string[];
   /** Job selected when the panel opens; falls back to the most useful active or recent job. */
   focusJobId?: string;
-  /** Panel mode on open. `takeover` is used by {@link openSubagentTakeover}. */
+  /** Compatibility entry point used by {@link openSubagentTakeover}. */
   mode?: DashboardMode;
   /** Forces the fullscreen height policy; defaults to Pi's renderer mode. */
   fullscreen?: boolean;
@@ -105,7 +208,27 @@ export interface DashboardOverlayOptions {
 }
 
 export type DashboardMode = "browse" | "takeover" | "answer";
+type DraftOwner = { jobId: string; composer: "answer" | "steer" | "follow-up"; requestId?: string };
+type TakeoverComposer = Exclude<DraftOwner["composer"], "answer">;
+export type SubagentsDashboardFocus =
+  | { kind: "job-list" }
+  | { kind: "job-detail" }
+  | { kind: "composer"; composer: "answer" | "steer" | "follow-up" };
 export type { DashboardLayout, DashboardLayoutKind } from "../dashboard-style.ts";
+
+type JobDashboardGroup = "input" | "working" | "waiting" | "failed" | "finished";
+
+function takeoverComposer(behavior: SendBehavior): TakeoverComposer {
+  return behavior === "followUp" ? "follow-up" : "steer";
+}
+
+const JOB_DASHBOARD_GROUPS = [
+  { key: "input", label: "Needs input" },
+  { key: "working", label: "Working" },
+  { key: "waiting", label: "Queued or waiting" },
+  { key: "failed", label: "Failed" },
+  { key: "finished", label: "Finished", foldLabel: "finished" },
+] as const satisfies readonly DashboardCollectionGroupDefinition<JobDashboardGroup>[];
 
 export function createDashboardOverlay(
   tui: Pick<TUI, "requestRender" | "terminal">,
@@ -121,11 +244,9 @@ export function createDashboardOverlay(
 class DashboardOverlay implements Focusable {
   #focused = false;
   #finished = false;
-  #mode: DashboardMode;
+  #focus: SubagentsDashboardFocus;
   /** Selection is held by job id so list growth, eviction, and reordering cannot move it. */
   #selectedId: string | undefined;
-  /** Single-pane drill-down state; only consulted by the `narrow` layout. */
-  #pane: "list" | "detail" = "list";
   /** Scroll offset in lines from the top of the selected job's transcript. */
   #scroll = 0;
   #scrollJobId: string | undefined;
@@ -139,11 +260,15 @@ class DashboardOverlay implements Focusable {
   #confirmCancelId: string | undefined;
   /** `?` cheatsheet toggle; browse-only, never intercepts takeover composer input. */
   #showHelp = false;
+  /** Routine telemetry is opt-in; state and recovery remain visible without it. */
+  #showInfo = false;
   #notice = "";
   #behavior: SendBehavior | undefined;
+  /** Identity that owns the preserved draft; a draft never crosses jobs or composer kinds. */
+  #draftOwner: DraftOwner | undefined;
   #pendingSend: { jobId: string; draft: string; inputRevision: number } | undefined;
-  /** Request ID the answer composer is bound to, so a changed question cannot be answered by a stale draft. */
-  #answerRequestId: string | undefined;
+  /** Exact job/request identity the answer composer may resolve. */
+  #answerIdentity: { jobId: string; requestId: string } | undefined;
   #inputRevision = 0;
   #input = new Input();
   #jobs: JobSnapshot[] | undefined;
@@ -191,12 +316,16 @@ class DashboardOverlay implements Focusable {
     this.#forceFullscreen = options.fullscreen;
     this.#availability = options.availability;
     this.#selectedId = options.focusJobId;
-    this.#mode = options.mode ?? "browse";
-    if (this.#mode === "takeover") this.#pane = "detail";
-    this.#unsubscribe = manager.subscribe(() => {
+    this.#focus = options.mode === "takeover"
+      ? { kind: "composer", composer: "steer" }
+      : options.mode === "answer"
+        ? { kind: "composer", composer: "answer" }
+        : { kind: "job-list" };
+    this.#unsubscribe = manager.subscribe((job) => {
       // Manager snapshots are immutable projections, but bounded fields can
       // change without changing their length. Drop the rendered transcript
       // cache on every lifecycle/output event before coalescing the repaint.
+      this.revalidateTakeoverComposer(job);
       this.invalidate();
       this.invalidateSoon();
     });
@@ -219,7 +348,15 @@ class DashboardOverlay implements Focusable {
     this.#renderedConfirmationId = undefined;
     const jobs = this.manager.list();
     this.#jobs = jobs;
-    const chosen = this.syncSelection(jobs);
+    const collection = jobDashboardCollection(jobs);
+    const chosen = this.syncSelection(collection.items);
+    if (chosen && this.#focus.kind === "composer" && this.#focus.composer !== "answer" && !this.#draftOwner) {
+      const policy = takeoverPolicy(chosen);
+      const composer = takeoverComposer(policy.behavior);
+      this.#focus = { kind: "composer", composer };
+      this.#behavior = policy.behavior;
+      this.bindDraft({ jobId: chosen.id, composer });
+    }
     this.syncTicker(jobs);
 
     const rows = dashboardOverlayRows(this.tui.terminal?.rows ?? 0, this.fullscreen());
@@ -235,15 +372,15 @@ class DashboardOverlay implements Focusable {
     const frame = createDashboardFrame(this.theme, width, this.#focused);
     if (rows < DASHBOARD_COMPACT_ROWS) {
       this.resetCompactHierarchy();
-      return this.renderCompact(rows, jobs.length, frame, width);
+      return this.renderCompact(rows, jobs, frame, width);
     }
 
     const layout = dashboardLayout(width, rows);
     this.#layout = layout;
     if (this.#showHelp) return this.renderHelp(frame, layout, jobs);
-    if (layout.kind === "wide") return this.renderWide(frame, layout, jobs, chosen);
-    if (layout.kind === "medium") return this.renderMedium(frame, layout, jobs, chosen);
-    return this.renderNarrow(frame, layout, jobs, chosen);
+    if (layout.kind === "wide") return this.renderWide(frame, layout, jobs, collection, chosen);
+    if (layout.kind === "medium") return this.renderMedium(frame, layout, jobs, collection, chosen);
+    return this.renderNarrow(frame, layout, jobs, collection, chosen);
   }
 
   invalidate(): void {
@@ -260,13 +397,14 @@ class DashboardOverlay implements Focusable {
     if (this.#finished) return;
     const jobs = this.manager.list();
     this.#jobs = jobs;
-    this.syncSelection(jobs);
+    const orderedJobs = jobDashboardCollection(jobs).items;
+    this.syncSelection(orderedJobs);
     // Both the cancel arm and the notice are answers to the previous keystroke.
     const compact = this.isCompactGeometry();
     const armed = compact ? undefined : this.#confirmCancelId;
     this.#confirmCancelId = undefined;
     this.#notice = "";
-    const job = this.currentJob(jobs);
+    const job = this.currentJob(orderedJobs);
     const cancel = matchesKey(data, Key.escape) || this.keybindings.matches(data, "tui.select.cancel");
 
     if (compact) {
@@ -307,7 +445,7 @@ class DashboardOverlay implements Focusable {
       return;
     }
 
-    const takeover = this.composing();
+    const composing = this.composing();
 
     // The cheatsheet is a browse-only modal: `?` never reaches the takeover
     // composer, and while shown, `?` or cancel dismiss it without touching
@@ -319,24 +457,31 @@ class DashboardOverlay implements Focusable {
     }
 
     if (cancel) {
-      if (this.composing()) this.leaveTakeover();
-      else if (this.#layout?.kind === "narrow" && this.#pane === "detail") {
-        this.#pane = "list";
-        this.resetScroll();
+      if (this.composing()) this.leaveComposer();
+      else if (this.#focus.kind === "job-detail") {
+        this.#focus = { kind: "job-list" };
       }
       else return this.finish();
       this.tui.requestRender();
       return;
     }
 
-    if (!takeover && data === "?") {
+    if (!composing && data === "?") {
       this.#showHelp = true;
       this.tui.requestRender();
       return;
     }
 
-    const narrowList = this.#layout?.kind === "narrow" && this.#pane === "list";
-    if (takeover) {
+    if (!composing && data === "i") {
+      this.#showInfo = !this.#showInfo;
+      this.tui.requestRender();
+      return;
+    }
+
+    const confirm = this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter);
+    const forward = confirm || matchesKey(data, Key.right) || matchesKey(data, "l");
+    const back = matchesKey(data, Key.left) || matchesKey(data, "h");
+    if (composing) {
       // Route the host's configured input-submit binding explicitly; the
       // bundled Input component otherwise consults its own TUI keybinding
       // singleton. Printable navigation keys, including `?`, must remain
@@ -350,33 +495,33 @@ class DashboardOverlay implements Focusable {
         this.#input.handleInput(data);
       }
     }
-    else if (narrowList) {
-      if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectJob(-1, jobs);
-      else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(1, jobs);
-      else if (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter)) {
+    else if (this.#focus.kind === "job-list") {
+      if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectJob(-1, orderedJobs);
+      else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(1, orderedJobs);
+      else if (forward) {
         if (job) {
-          this.#pane = "detail";
-          this.resetScroll();
+          this.#focus = { kind: "job-detail" };
         }
       }
+      else if (matchesKey(data, "s") && this.steerControlVisible(job)) this.enterComposer(job, "steer");
+      else if (matchesKey(data, "f") && this.followUpControlVisible(job)) this.enterComposer(job, "followUp");
+      else if (matchesKey(data, "a") && job && pendingInteraction(job)) this.enterAnswer(job);
       else if (matchesKey(data, "x") && this.cancelControlVisible(job)) this.requestCancel(job, undefined);
       else if (matchesKey(data, "t") || matchesKey(data, Key.ctrl("t"))) this.toggleToolDisplay();
     }
-    else if (matchesKey(data, Key.shift(Key.up))) this.scroll(-1);
-    else if (matchesKey(data, Key.shift(Key.down))) this.scroll(1);
-    else if (!this.composing() && this.#layout?.kind !== "narrow" && matchesKey(data, Key.pageUp)) this.scroll(-this.pageStep());
-    else if (!this.composing() && this.#layout?.kind !== "narrow" && matchesKey(data, Key.pageDown)) this.scroll(this.pageStep());
+    else if (matchesKey(data, Key.up) || matchesKey(data, "k") || matchesKey(data, Key.shift(Key.up))) this.scroll(-1);
+    else if (matchesKey(data, Key.down) || matchesKey(data, "j") || matchesKey(data, Key.shift(Key.down))) this.scroll(1);
+    else if (matchesKey(data, Key.pageUp)) this.scroll(-this.pageStep());
+    else if (matchesKey(data, Key.pageDown)) this.scroll(this.pageStep());
     else if (matchesKey(data, Key.ctrl("u"))) this.scroll(-this.halfPageStep());
     else if (matchesKey(data, Key.ctrl("d"))) this.scroll(this.halfPageStep());
     else if (matchesKey(data, "g")) this.scrollTo(0);
     else if (matchesKey(data, Key.shift("g"))) this.scrollTo(Number.MAX_SAFE_INTEGER);
-    else if (matchesKey(data, Key.up) || matchesKey(data, "k")) this.selectJob(-1, jobs);
-    else if (matchesKey(data, Key.down) || matchesKey(data, "j")) this.selectJob(1, jobs);
-    else if (this.keybindings.matches(data, "tui.select.confirm") || matchesKey(data, Key.enter)) {
-      if (this.takeoverControlVisible(job)) this.enterTakeover(job);
+    else if (back) {
+      this.#focus = { kind: "job-list" };
     }
-    else if (matchesKey(data, "s") && this.steerControlVisible(job)) this.enterTakeover(job, "steer");
-    else if (matchesKey(data, "f") && this.followUpControlVisible(job)) this.enterTakeover(job, "followUp");
+    else if (matchesKey(data, "s") && this.steerControlVisible(job)) this.enterComposer(job, "steer");
+    else if (matchesKey(data, "f") && this.followUpControlVisible(job)) this.enterComposer(job, "followUp");
     // `a` reaches the composer only for a human-owned question; on a
     // model-owned one it explains who owes the answer instead of doing nothing.
     else if (matchesKey(data, "a") && !this.composing() && job && pendingInteraction(job)) this.enterAnswer(job);
@@ -444,10 +589,9 @@ class DashboardOverlay implements Focusable {
   }
 
   private resetCompactHierarchy(): void {
-    this.#mode = "browse";
-    this.#pane = "list";
+    this.#focus = { kind: "job-list" };
     this.#behavior = undefined;
-    this.#answerRequestId = undefined;
+    this.#answerIdentity = undefined;
     this.#confirmCancelId = undefined;
     this.#renderedCancelId = undefined;
     this.#renderedConfirmationId = undefined;
@@ -461,27 +605,27 @@ class DashboardOverlay implements Focusable {
 
   /* ── selection and actions ─────────────────────────────────────────────── */
 
-  private syncSelection(jobs: JobSnapshot[]): JobSnapshot | undefined {
+  private syncSelection(jobs: readonly JobSnapshot[]): JobSnapshot | undefined {
     if (!jobs.length) {
       this.#selectedId = undefined;
-      if (this.composing()) this.leaveTakeover();
+      if (this.composing()) this.leaveComposer();
       return undefined;
     }
     const chosen = jobs.find((job) => job.id === this.#selectedId) ?? defaultJob(jobs);
     if (chosen.id !== this.#selectedId) {
       // The previous selection was evicted (or this is the first render): start clean.
       this.#selectedId = chosen.id;
-      if (this.composing()) this.leaveTakeover();
+      if (this.composing()) this.leaveComposer();
       this.resetScroll();
     }
     return chosen;
   }
 
-  private currentJob(jobs: JobSnapshot[]): JobSnapshot | undefined {
+  private currentJob(jobs: readonly JobSnapshot[]): JobSnapshot | undefined {
     return jobs.find((job) => job.id === this.#selectedId);
   }
 
-  private selectJob(delta: number, jobs: JobSnapshot[]): void {
+  private selectJob(delta: number, jobs: readonly JobSnapshot[]): void {
     if (!jobs.length) return;
     const index = jobs.findIndex((job) => job.id === this.#selectedId);
     const next = jobs[clampDashboard(index + delta, 0, jobs.length - 1)];
@@ -495,29 +639,30 @@ class DashboardOverlay implements Focusable {
     this.invalidate();
   }
 
-  private enterTakeover(job: JobSnapshot | undefined, behavior?: SendBehavior): void {
+  private enterComposer(job: JobSnapshot | undefined, behavior: SendBehavior): void {
     if (!job) return;
     const policy = takeoverPolicy(job);
     if (!policy.reusable) {
       this.#notice = policy.restriction ?? "This native session is read-only.";
       return;
     }
-    this.#mode = "takeover";
-    this.#pane = "detail";
+    const composer = takeoverComposer(behavior);
+    this.bindDraft({ jobId: job.id, composer });
+    this.#focus = { kind: "composer", composer };
     this.#behavior = behavior;
     this.#input.focused = this.#focused;
   }
 
-  private leaveTakeover(): void {
-    this.#mode = "browse";
+  private leaveComposer(): void {
+    this.#focus = { kind: "job-detail" };
     this.#behavior = undefined;
-    this.#answerRequestId = undefined;
+    this.#answerIdentity = undefined;
     this.#input.focused = false;
   }
 
   /** True while a composer owns keyboard input, for either steering or answering. */
   private composing(): boolean {
-    return this.#mode !== "browse";
+    return this.#focus.kind === "composer";
   }
 
   /**
@@ -536,18 +681,44 @@ class DashboardOverlay implements Focusable {
       this.#notice = "This session cannot answer routed questions.";
       return;
     }
-    this.#mode = "answer";
-    this.#pane = "detail";
+    this.bindDraft({ jobId: job.id, composer: "answer", requestId: interaction.requestId });
+    this.#focus = { kind: "composer", composer: "answer" };
     this.#behavior = undefined;
-    this.#answerRequestId = interaction.requestId;
+    this.#answerIdentity = { jobId: job.id, requestId: interaction.requestId };
     this.#input.focused = this.#focused;
+  }
+
+  private bindDraft(owner: DraftOwner): void {
+    const current = this.#draftOwner;
+    if (!current
+      || current.jobId !== owner.jobId
+      || current.composer !== owner.composer
+      || current.requestId !== owner.requestId) {
+      this.#inputRevision++;
+      this.#input.setValue("");
+    }
+    this.#draftOwner = owner;
+  }
+
+  private takeoverComposerMatches(job: JobSnapshot): boolean {
+    if (this.#focus.kind !== "composer" || this.#focus.composer === "answer") return false;
+    const policy = takeoverPolicy(job);
+    return policy.reusable
+      && this.#draftOwner?.jobId === job.id
+      && this.#draftOwner.composer === this.#focus.composer
+      && this.#focus.composer === takeoverComposer(policy.behavior);
+  }
+
+  private revalidateTakeoverComposer(job: JobSnapshot): void {
+    if (job.id !== this.#selectedId || this.#focus.kind !== "composer" || this.#focus.composer === "answer") return;
+    if (!this.takeoverComposerMatches(job)) this.#behavior = undefined;
   }
 
   private submit(raw: string): void {
     if (!this.composing()) return;
     const message = raw.trim();
     if (!message) return;
-    if (this.#mode === "answer") return this.submitAnswer(message, raw);
+    if (this.#focus.kind === "composer" && this.#focus.composer === "answer") return this.submitAnswer(message, raw);
     if (this.#pendingSend) {
       this.#notice = "Previous message is still being sent; keep editing and try again when it settles.";
       this.tui.requestRender();
@@ -555,9 +726,20 @@ class DashboardOverlay implements Focusable {
     }
     const job = this.currentJob(this.#jobs ?? this.manager.list());
     if (!job) return;
+    if (pendingInteraction(job)) {
+      this.#notice = "This job is waiting on a routed question. Your draft is unchanged; answer through the displayed route.";
+      this.tui.requestRender();
+      return;
+    }
     const policy = takeoverPolicy(job);
     if (!policy.reusable) {
       this.#notice = policy.restriction ?? "This native session is read-only.";
+      this.tui.requestRender();
+      return;
+    }
+    if (!this.takeoverComposerMatches(job)) {
+      const composer = this.#draftOwner?.composer ?? "takeover";
+      this.#notice = `This ${composer} draft belongs to the job's previous state. It is preserved but cannot be sent.`;
       this.tui.requestRender();
       return;
     }
@@ -565,7 +747,7 @@ class DashboardOverlay implements Focusable {
     this.#input.setValue("");
     this.#followTail = true;
     this.#pendingSend = { jobId: job.id, draft, inputRevision: this.#inputRevision };
-    void this.manager.send(job.id, message, this.#behavior ?? policy.behavior)
+    void this.manager.send(job.id, message, policy.behavior)
       .then(() => {
         this.#pendingSend = undefined;
       })
@@ -591,14 +773,28 @@ class DashboardOverlay implements Focusable {
    * message and keeps the draft instead of silently dropping the answer.
    */
   private submitAnswer(answer: string, raw: string): void {
-    const requestId = this.#answerRequestId;
+    const identity = this.#answerIdentity;
     const answerInteraction = this.manager.answerInteraction;
-    if (!requestId || !answerInteraction) return;
+    if (!identity || !answerInteraction) return;
+    const job = this.currentJob(this.manager.list());
+    const interaction = job && pendingInteraction(job);
+    if (
+      !job
+      || job.id !== identity.jobId
+      || !interaction
+      || interaction.requestId !== identity.requestId
+      || !interaction.humanVisible
+      || interaction.target.kind !== "orchestrator"
+    ) {
+      this.#notice = "This routed question changed or closed. Your draft is unchanged; go back before answering the current question.";
+      this.tui.requestRender();
+      return;
+    }
     try {
-      answerInteraction.call(this.manager, requestId, answer, "human");
+      answerInteraction.call(this.manager, identity.requestId, answer, "human");
       this.#input.setValue("");
       this.#notice = "Answer delivered; the subagent resumed.";
-      this.leaveTakeover();
+      this.leaveComposer();
     } catch (error) {
       this.#notice = error instanceof Error ? error.message : String(error);
       this.#input.setValue(raw);
@@ -668,10 +864,11 @@ class DashboardOverlay implements Focusable {
     frame: DashboardFrame,
     layout: DashboardLayout,
     jobs: JobSnapshot[],
+    collection: DashboardCollection<JobSnapshot, JobDashboardGroup>,
     chosen: JobSnapshot | undefined,
   ): string[] {
     const { left, right } = frame.columns(layout.railWidth);
-    const view = dashboardListViewport(jobs, this.selectedIndex(jobs), layout.contentRows);
+    const view = dashboardCollectionViewport(collection, this.#selectedId, layout.contentRows, (job) => job.id);
     const rail = this.renderRail(jobs, view, chosen, layout.contentRows, Math.max(1, left - 1));
     const detail = this.renderInspector(chosen, layout.contentRows, Math.max(1, right - 1));
     const lines = [
@@ -689,9 +886,10 @@ class DashboardOverlay implements Focusable {
     frame: DashboardFrame,
     layout: DashboardLayout,
     jobs: JobSnapshot[],
+    collection: DashboardCollection<JobSnapshot, JobDashboardGroup>,
     chosen: JobSnapshot | undefined,
   ): string[] {
-    const view = dashboardListViewport(jobs, this.selectedIndex(jobs), layout.listRows);
+    const view = dashboardCollectionViewport(collection, this.#selectedId, layout.listRows, (job) => job.id);
     const lines = [this.renderHeader(frame, jobs), frame.top(this.listTitle(jobs, view))];
     for (const row of this.renderList(jobs, view, chosen, layout.listRows, frame.innerWidth)) {
       lines.push(frame.row(row));
@@ -708,27 +906,27 @@ class DashboardOverlay implements Focusable {
     frame: DashboardFrame,
     layout: DashboardLayout,
     jobs: JobSnapshot[],
+    collection: DashboardCollection<JobSnapshot, JobDashboardGroup>,
     chosen: JobSnapshot | undefined,
   ): string[] {
-    const detail = this.#pane === "detail" && chosen;
-    const view = dashboardListViewport(jobs, this.selectedIndex(jobs), layout.contentRows);
-    const lines = [
-      this.renderHeader(frame, jobs),
-      frame.top(detail ? this.detailTitle(chosen) : this.listTitle(jobs, view)),
-    ];
+    const detail = this.#focus.kind !== "job-list" && chosen;
+    const view = dashboardCollectionViewport(collection, this.#selectedId, layout.contentRows, (job) => job.id);
+    // At the eight-row floor, question supervision needs five inspector rows.
+    // Keep the panel and footer geometry; the session summary yields its row.
+    const expandQuestionDetail = detail && layout.contentRows === 4 && pendingInteraction(chosen);
+    const bodyRows = layout.contentRows + (expandQuestionDetail ? 1 : 0);
+    const lines = expandQuestionDetail ? [] : [this.renderHeader(frame, jobs)];
+    lines.push(frame.top(detail ? this.detailTitle(chosen) : this.listTitle(jobs, view)));
     const body = detail
-      ? this.renderInspector(chosen, layout.contentRows, Math.max(1, frame.innerWidth - 1)).map((row) => ` ${row}`)
-      : this.renderList(jobs, view, chosen, layout.contentRows, frame.innerWidth);
+      ? this.renderInspector(chosen, bodyRows, Math.max(1, frame.innerWidth - 1)).map((row) => ` ${row}`)
+      : this.renderList(jobs, view, chosen, bodyRows, frame.innerWidth);
     for (const row of body) lines.push(frame.row(row));
     lines.push(frame.bottom(), this.renderHint(frame, chosen));
     return lines;
   }
 
-  private renderCompact(rows: number, count: number, frame: DashboardFrame, width: number): string[] {
-    const header = frame.header(
-      this.theme.fg("accent", this.theme.bold("Native subagents")),
-      this.theme.fg("muted", `${count} job${count === 1 ? "" : "s"}`),
-    );
+  private renderCompact(rows: number, jobs: JobSnapshot[], frame: DashboardFrame, width: number): string[] {
+    const header = this.renderHeader(frame, jobs);
     if (rows <= 1) return [truncate("Esc close", width)];
     if (rows === 2) return [header, frame.hint("Esc close")];
     if (rows === 3) return [header, frame.row(this.theme.fg("dim", "  Screen too short — resize to supervise jobs.")), frame.hint("Esc close")];
@@ -744,32 +942,38 @@ class DashboardOverlay implements Focusable {
 
   /** `?` cheatsheet: a grouped legend for whichever pane is currently active. */
   private renderHelp(frame: DashboardFrame, layout: DashboardLayout, jobs: JobSnapshot[]): string[] {
-    const narrowList = layout.kind === "narrow" && this.#pane === "list";
+    const listFocused = this.#focus.kind === "job-list";
     return [
       this.renderHeader(frame, jobs),
-      ...renderDashboardHelp(this.theme, frame, "help", this.helpGroups(narrowList), layout.contentRows),
+      ...renderDashboardHelp(this.theme, frame, "help", this.helpGroups(listFocused), layout.contentRows),
       frame.hint(`? or ${dashboardCancelKeyLabel(this.keybindings)} close help`),
     ];
   }
 
-  private helpGroups(narrowList: boolean): DashboardKeyGroup[] {
+  private helpGroups(listFocused: boolean): DashboardKeyGroup[] {
     const confirm = dashboardConfirmKeyLabel(this.keybindings);
     const cancel = dashboardCancelKeyLabel(this.keybindings);
-    if (narrowList) {
+    if (listFocused) {
       return [
-        { title: "Navigate", entries: [["↑↓ / j k", "select job"], [confirm, "open detail"]] },
-        { title: "Actions", entries: [["x", "cancel a live job (press twice)"]] },
+        { title: "Navigate", entries: [["↑↓ / j k", "select job"], [`${confirm} / →`, "inspect job"]] },
+        { title: "Actions", entries: [
+          ["s", "steer a running job"],
+          ["f", "queue a follow-up on a finished job"],
+          ["a", "answer a question your own /subagent job asked"],
+          ["x", "cancel a live job (press twice)"],
+        ] },
         { title: "Panel", entries: [[cancel, "close"], ["?", "close this help"]] },
       ];
     }
     return [
-      { title: "Navigate", entries: [["↑↓ / j k", "select job"], [confirm, "open takeover"]] },
+      { title: "Navigate", entries: [["↑↓ / j k", "scroll detail"], ["←", "back to jobs"]] },
       { title: "Actions", entries: [
         ["s", "steer a running job"],
         ["f", "queue a follow-up on a finished job"],
         ["a", "answer a question your own /subagent job asked"],
         ["x", "cancel a live job (press twice)"],
         ["t / Ctrl+T", "toggle compact/full tool display"],
+        ["i", "show / hide routine info"],
       ] },
       { title: "Scroll", entries: [
         ["Shift+↑↓", "scroll transcript"],
@@ -782,28 +986,50 @@ class DashboardOverlay implements Focusable {
   }
 
   private renderHeader(frame: DashboardFrame, jobs: JobSnapshot[]): string {
-    const running = jobs.filter((job) => job.status === "running").length;
+    const active = jobs.filter((job) => job.status === "running").length;
     const queued = jobs.filter((job) => job.status === "queued").length;
     const capacity = this.manager.concurrency ?? 4;
     const needInput = jobs.filter((job) => pendingInteraction(job)).length;
-    const summary = [
-      `${running}/${capacity} running`,
-      queued ? `${queued} queued` : "",
+    const failed = jobs.filter((job) => job.status === "failed").length;
+    const attention = [
       needInput ? `${needInput} need input` : "",
+      active ? `${active} active` : "",
+      failed ? `${failed} failed` : "",
+    ].filter(Boolean);
+    const routine = [
       `${jobs.length} retained`,
-    ].filter(Boolean).join(" · ");
+      `${active}/${capacity} slots`,
+      queued ? `${queued} queued` : "",
+    ].filter(Boolean);
     const availability = formatDashboardAvailability(this.#availability);
+    const routeFallback = dashboardAvailabilityFallback(this.#availability);
+    const candidates = [
+      ["Native subagents", ...attention, ...routine, availability],
+      ["Native subagents", ...attention, ...routine, routeFallback],
+      ["Native subagents", ...attention, routeFallback],
+      ["Subagents", ...attention, routeFallback],
+      [...attention, routeFallback],
+      ["Subagents", ...attention],
+      attention,
+      ...attention.slice(0, -1).map((_, index) => attention.slice(0, attention.length - index - 1)),
+      ...attention.slice(0, -1).map((_, index) => ["Subagents", ...attention.slice(0, attention.length - index - 1)]),
+      ["Subagents", `${jobs.length} jobs`],
+    ].map((parts) => parts.filter(Boolean).join(" · "));
+    const availableWidth = Math.max(0, frame.innerWidth - 2);
+    const text = candidates.find((candidate) => visibleWidth(candidate) <= availableWidth)
+      ?? candidates.at(-1)
+      ?? "Subagents";
     return frame.header(
-      this.theme.fg("accent", this.theme.bold(`Native subagents${availability ? ` · ${availability}` : ""}`)),
-      this.theme.fg("muted", summary),
+      this.theme.fg("accent", this.theme.bold(text)),
+      "",
     );
   }
 
-  private listTitle(jobs: JobSnapshot[], view: ListViewport): string {
+  private listTitle(jobs: JobSnapshot[], view: JobListViewport): string {
     const running = jobs.filter((job) => job.status === "running").length;
     const capacity = this.manager.concurrency ?? 4;
-    const clipped = `${view.start > 0 ? "↑" : ""}${view.end < jobs.length ? "↓" : ""}`;
-    const focus = this.#mode === "browse" ? "▸ " : "";
+    const clipped = `${view.clippedBefore ? "↑" : ""}${view.clippedAfter ? "↓" : ""}`;
+    const focus = this.#focus.kind === "job-list" ? "▸ " : "";
     return `${focus}jobs · ${Math.min(running, capacity)}/${capacity} slots${clipped ? ` ${clipped}` : ""}`;
   }
 
@@ -811,45 +1037,74 @@ class DashboardOverlay implements Focusable {
     // The tool-display mode also lives in the terse footer hint, but that hint
     // truncates first under width pressure; the title survives longer.
     if (!job) return "detail";
-    if (this.#mode === "answer") return `▸ answer · ${shortId(sanitizeText(job.id))} · ${this.#toolDisplay}`;
-    if (this.#mode !== "takeover") {
+    if (this.#focus.kind === "composer" && this.#focus.composer === "answer") return `▸ answer · ${shortId(sanitizeText(job.id))} · ${this.#toolDisplay}`;
+    if (this.#focus.kind !== "composer") {
       const interaction = pendingInteraction(job);
-      return `detail · ${shortId(sanitizeText(job.id))} · ${interaction ? interactionWaitLabel(interaction) : job.status} · ${this.#toolDisplay}`;
+      const marker = this.#focus.kind === "job-detail" ? "▸ " : "";
+      return `${marker}detail · ${shortId(sanitizeText(job.id))} · ${interaction ? interactionWaitLabel(interaction) : job.status} · ${this.#toolDisplay}`;
     }
-    const policy = takeoverPolicy(job);
-    const behavior = this.#behavior ?? policy.behavior;
-    return `▸ takeover · ${behavior === "followUp" ? "follow-up" : "steer"} · ${shortId(sanitizeText(job.id))} · ${this.#toolDisplay}`;
+    return `▸ composer · ${this.#focus.composer} · ${shortId(sanitizeText(job.id))} · ${this.#toolDisplay}`;
   }
 
   private renderRail(
     jobs: JobSnapshot[],
-    view: ListViewport,
+    view: JobListViewport,
     chosen: JobSnapshot | undefined,
     rows: number,
     width: number,
   ): string[] {
-    if (!jobs.length) return fitDashboardRows([this.theme.fg("muted", "No jobs in this session.")], rows);
-    const lines = view.items.map((job) => {
+    if (!jobs.length) return this.renderEmptyJobs(rows, false);
+    const lines = view.rows.map((row) => {
+      if (row.kind !== "item") return this.renderCollectionRow(row, width);
+      const job = row.item;
       const status = pendingInteraction(job) ? { glyph: "?", color: "warning" as const } : statusMeta(job.status, this.#now());
       const selected = job.id === chosen?.id;
       const marker = dashboardSelectionMarker(this.theme, selected);
       const name = sanitizeInline(job.name);
-      const left = `${marker} ${this.theme.fg(status.color, status.glyph)} ${this.theme.fg(selected ? "accent" : "text", name)}`;
-      const right = this.theme.fg("muted", formatElapsed(job, this.#now()));
-      return alignDashboardRow(left, right, width);
+      const identity = `${marker} ${this.theme.fg(status.color, status.glyph)} ${this.theme.fg(selected ? "accent" : "text", name)}`;
+      const summary = jobDashboardSummary(job);
+      const decoration = this.theme.fg(dashboardSummaryColor(summary), summary.text)
+        + this.theme.fg("muted", ` · ${formatElapsed(job, this.#now())}`);
+      const owner = job.workflow ? `${this.theme.fg("muted", "workflow · ")}` : "";
+      const right = `${owner}${this.theme.fg(status.color, job.status)}`;
+      return alignDashboardSummaryRow(
+        identity,
+        decoration,
+        right,
+        width,
+      );
     });
     return fitDashboardRows(lines, rows);
   }
 
   private renderList(
     jobs: JobSnapshot[],
-    view: ListViewport,
+    view: JobListViewport,
     chosen: JobSnapshot | undefined,
     rows: number,
     width: number,
   ): string[] {
-    if (!jobs.length) return fitDashboardRows([this.theme.fg("muted", "  No jobs in this session.")], rows);
-    return fitDashboardRows(view.items.map((job) => this.renderJob(job, job.id === chosen?.id, width)), rows);
+    if (!jobs.length) return this.renderEmptyJobs(rows, true);
+    return fitDashboardRows(view.rows.map((row) => row.kind === "item"
+      ? this.renderJob(row.item, row.item.id === chosen?.id, width)
+      : this.renderCollectionRow(row, width)), rows);
+  }
+
+  private renderCollectionRow(
+    row: Exclude<DashboardCollectionRow<JobSnapshot, JobDashboardGroup>, { kind: "item" }>,
+    width: number,
+  ): string {
+    return row.kind === "section"
+      ? dashboardSectionRow(this.theme, row.label, row.count, width)
+      : dashboardFoldRow(this.theme, row.label, row.hidden, width);
+  }
+
+  private renderEmptyJobs(rows: number, indented: boolean): string[] {
+    const prefix = indented ? "  " : "";
+    return fitDashboardRows([
+      this.theme.fg("muted", `${prefix}No jobs in this session.`),
+      this.theme.fg("dim", `${prefix}/subagent <task> starts one.`),
+    ], rows);
   }
 
   private renderJob(job: JobSnapshot, selected: boolean, width: number): string {
@@ -857,16 +1112,23 @@ class DashboardOverlay implements Focusable {
     const status = interaction ? { glyph: "?", color: "warning" as const } : statusMeta(job.status, this.#now());
     const marker = dashboardSelectionMarker(this.theme, selected);
     const name = this.theme.fg(selected ? "accent" : "text", sanitizeInline(job.name));
-    const left = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name} ${this.theme.fg("dim", shortId(sanitizeText(job.id)))}`;
-    const owner = job.workflow ? " · workflow" : "";
-    // Stable policy metadata belongs in the inspector. Keep the row's right
-    // side compact so the job name survives narrow terminals.
-    const right =
-      this.theme.fg(
+    const identity = ` ${marker} ${this.theme.fg(status.color, status.glyph)} ${name}`;
+    const summary = jobDashboardSummary(job);
+    // Stable policy metadata belongs in the inspector. Ownership and lifecycle
+    // wording own the right edge; route and elapsed yield with the summary.
+    const decoration = this.theme.fg(dashboardSummaryColor(summary), summary.text)
+      + this.theme.fg(
         "muted",
-        `${sanitizeInline(job.harness)}${owner} · ${formatElapsed(job, this.#now())}`,
-      ) + ` · ${this.theme.fg(status.color, interaction ? interactionWaitLabel(interaction) : job.status)} `;
-    return alignDashboardRow(left, right, width);
+        ` · ${sanitizeInline(job.harness)} · ${formatElapsed(job, this.#now())}`,
+      );
+    const owner = job.workflow ? `${this.theme.fg("muted", "workflow · ")}` : "";
+    const right = `${owner}${this.theme.fg(status.color, job.status)} `;
+    return alignDashboardSummaryRow(
+      identity,
+      decoration,
+      right,
+      width,
+    );
   }
 
   /** Job detail plus, in takeover mode, the composer. Always exactly `rows` lines. */
@@ -875,19 +1137,22 @@ class DashboardOverlay implements Focusable {
       return fitDashboardRows([this.theme.fg("dim", "Select a job to inspect its route, usage, and transcript.")], rows);
     }
     const composer = this.composing() ? this.renderComposer(job, width) : [];
-    const bodyRows = Math.max(1, rows - composer.length);
+    const bodyRows = Math.max(0, rows - composer.length);
     return [...fitDashboardRows(this.renderDetail(job, bodyRows, width), bodyRows), ...composer].slice(0, rows);
   }
 
   private renderComposer(job: JobSnapshot, width: number): string[] {
-    if (this.#mode === "answer") {
+    if (this.#focus.kind === "composer" && this.#focus.composer === "answer") {
       const rule = dashboardScrollRule(this.theme, `answer · ${dashboardSubmitKeyLabel(this.keybindings)} sends`, width);
       return [rule, this.#input.render(Math.max(1, width))[0] ?? ""];
     }
     const policy = takeoverPolicy(job);
-    const behavior = this.#behavior ?? policy.behavior;
-    const label = policy.reusable
+    const current = this.takeoverComposerMatches(job);
+    const behavior = current ? policy.behavior : undefined;
+    const label = policy.reusable && current
       ? `${behavior === "followUp" ? "follow-up" : "steer"} · ${dashboardSubmitKeyLabel(this.keybindings)} sends`
+      : policy.reusable
+        ? `${this.#focus.kind === "composer" ? this.#focus.composer : "takeover"} draft preserved · no longer sendable`
       : "read-only session";
     const rule = dashboardScrollRule(this.theme, label, width);
     if (!policy.reusable) {
@@ -904,36 +1169,28 @@ class DashboardOverlay implements Focusable {
   private renderDetail(job: JobSnapshot, rows: number, width: number): string[] {
     const now = this.#now();
     const status = statusMeta(job.status, now);
-    const pinned = [this.renderTitle(job, width)];
-    const queueNote = job.status === "queued" ? this.queueNote(job) : "";
+    const identity = [this.renderTitle(job, width)];
     const generation = job.generation ? ` · turn ${job.generation + 1}` : "";
-    pinned.push(truncate(
-      `${this.theme.fg(status.color, `${status.glyph} ${job.status}`)}${this.theme.fg("dim", ` · ${formatElapsed(job, now)}${generation}${queueNote}`)}`,
+    const statusLine = truncate(
+      `${this.theme.fg(status.color, `${status.glyph} ${job.status}`)}${this.theme.fg("dim", ` · ${formatElapsed(job, now)}${generation}`)}`,
       width,
-    ));
-    if (job.error) {
-      for (const line of sanitizeText(job.error).split("\n").map(sanitizeInline).filter(Boolean).slice(0, 3)) {
-        pinned.push(truncate(this.theme.fg("error", `× ${line}`), width));
-      }
-    }
-    // A pending question is pinned with the failure rows: it is the only thing
-    // that unblocks this job, and it must never be dropped for metadata.
-    const interaction = pendingInteraction(job);
-    if (interaction) {
-      pinned.push(truncate(this.theme.fg("warning", `? ${interactionWaitLabel(interaction)}`), width));
-      pinned.push(truncate(this.theme.fg("text", `  ${sanitizeInline(interaction.question)}`), width));
-      if (interaction.context) pinned.push(truncate(this.theme.fg("dim", `  ${sanitizeInline(interaction.context)}`), width));
-      pinned.push(truncate(this.theme.fg("dim", interaction.humanVisible
-        ? "  press a to answer inline"
-        : "  the orchestrator answers this from the parent thread"), width));
-    }
+    );
+    const statePreview = directJobStatePreview(
+      job,
+      now,
+      this.theme,
+      width,
+      !!this.manager.answerInteraction,
+    );
+    identity.push(statusLine);
+    const pinned = [...statePreview];
     if (job.answeringInteraction) {
       pinned.push(truncate(this.theme.fg("muted", `↩ answering ${sanitizeInline(job.answeringInteraction.sourceName)}`), width));
     }
 
-    const optional: string[] = [];
+    const info: string[] = [];
     const task = sanitizeInline(job.task);
-    optional.push(truncate(this.theme.fg("dim", `task  ${task || "(no task description)"}`), width));
+    info.push(truncate(this.theme.fg("dim", `Task · ${task || "(no task description)"}`), width));
     const route = [
       job.access,
       job.profile ? `profile ${sanitizeInline(job.profile)}` : "",
@@ -942,29 +1199,47 @@ class DashboardOverlay implements Focusable {
       `${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}`,
       job.capabilities?.auto ? "auto-routed" : "",
     ].filter(Boolean).join(" · ");
-    optional.push(truncate(this.theme.fg("muted", `route ${route}`), width));
+    info.push(truncate(this.theme.fg("muted", `Route · ${route}`), width));
     const meter = [formatUsage(job.usage), `budget ${formatSpendBudget(job.budget, job.usage, job.harness)}`, formatContext(job.context), job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""]
       .filter(Boolean).join(" · ");
-    if (meter) optional.push(truncate(this.theme.fg("dim", `usage ${meter}`), width));
+    if (meter) info.push(truncate(this.theme.fg("dim", `Usage · ${meter}`), width));
+    if (job.capabilities || job.requires?.length) {
+      const capability = [
+        job.capabilities?.auto ? "auto-routed" : "explicit route",
+        job.requires?.length ? `required ${job.requires.map(sanitizeInline).join(", ")}` : "",
+        job.capabilities?.matched.length ? `matched ${job.capabilities.matched.map(sanitizeInline).join(", ")}` : "",
+        job.capabilities?.revision ? `revision ${shortId(job.capabilities.revision)}` : "",
+      ].filter(Boolean).join(" · ");
+      info.push(truncate(this.theme.fg("dim", `Capabilities · ${capability}`), width));
+    }
+    if (job.peer) info.push(truncate(this.theme.fg("muted", `Provenance · session peer of ${shortId(sanitizeText(job.peer.sourceSessionId))}`), width));
+    if (job.independentOf) info.push(truncate(this.theme.fg("muted", `Provenance · independent of ${shortId(sanitizeText(job.independentOf))}`), width));
     if (job.workflow) {
       const phase = job.workflow.phase ? ` · ${sanitizeInline(job.workflow.phase)}` : "";
-      optional.push(truncate(this.theme.fg("muted", `flow  ${shortId(sanitizeText(job.workflow.runId))} · ${sanitizeInline(job.workflow.label)}${phase}`), width));
+      info.push(truncate(this.theme.fg("muted", `Ownership · workflow ${shortId(sanitizeText(job.workflow.runId))} · ${sanitizeInline(job.workflow.label)}${phase} · supervise in /workflows`), width));
     }
+    if (job.status === "queued") info.push(truncate(this.theme.fg("dim", `Queue · ${this.queueNote()}`), width));
     for (const warning of (job.warnings ?? []).slice(-2)) {
-      optional.push(truncate(this.theme.fg("warning", `!  ${sanitizeInline(warning)}`), width));
+      pinned.push(truncate(this.theme.fg("warning", `!  ${sanitizeInline(warning)}`), width));
     }
-    if (job.truncated) optional.push(truncate(this.theme.fg("warning", "!  bounded output truncated — earliest lines dropped"), width));
+    if (job.truncated) pinned.push(truncate(this.theme.fg("warning", "!  bounded output truncated — earliest lines dropped"), width));
 
     // Tool activity lives in the transcript's Pi-style execution shells. Keeping
     // a second recent-tools list here duplicates the same calls and steals rows
     // from the more legible call/result presentation below.
 
-    // Reserve the transcript label plus one transcript row before spending rows on metadata.
-    const budget = Math.max(0, rows - pinned.length - 2);
-    const head = [...pinned, ...optional.slice(0, budget)];
-    if (rows <= head.length + 1) return head.slice(0, rows);
+    // Full Pi tool shells can need a call row plus a result row. Let routine
+    // metadata yield that second transcript row when full detail is selected.
+    const minimumTranscriptRows = this.#toolDisplay === "full" ? 2 : 1;
+    const disclosed = [dashboardInfoRule(this.theme, this.#showInfo, width)];
+    const headBudget = Math.max(0, rows - 1 - minimumTranscriptRows);
+    const visiblePinned = pinned.slice(0, headBudget);
+    const remainingHeadRows = headBudget - visiblePinned.length;
+    const visibleIdentity = identity.slice(0, Math.max(0, remainingHeadRows - disclosed.length));
+    const visibleDisclosure = disclosed.slice(0, Math.max(0, remainingHeadRows - visibleIdentity.length));
+    const head = [...visiblePinned, ...visibleIdentity, ...visibleDisclosure];
 
-    const transcript = this.transcript(job, width);
+    const transcript = this.#showInfo ? [...info, ...this.transcript(job, width)] : this.transcript(job, width);
     const transcriptRows = Math.max(0, rows - head.length - 1);
     if (this.#scrollJobId !== job.id) this.resetScroll();
     this.#transcriptRows = transcriptRows;
@@ -973,8 +1248,14 @@ class DashboardOverlay implements Focusable {
     this.#scroll = this.#followTail ? max : clampDashboard(this.#scroll, 0, max);
     const start = this.#scroll;
     const end = Math.min(transcript.length, start + transcriptRows);
-    const range = transcriptRows ? `${start + 1}–${end}` : "0";
-    const label = `transcript ${range}/${transcript.length}${this.#followTail ? " · live" : ""}`;
+    const label = dashboardViewportLabel(
+      this.#showInfo ? "detail" : "transcript",
+      start,
+      end,
+      transcript.length,
+      this.#followTail,
+      !isTerminal(job.status),
+    );
     head.push(dashboardScrollRule(this.theme, label, width));
     for (const line of transcript.slice(start, end)) head.push(truncate(line, width, ""));
     return head;
@@ -991,10 +1272,10 @@ class DashboardOverlay implements Focusable {
       : rendered;
   }
 
-  private queueNote(_job: JobSnapshot): string {
+  private queueNote(): string {
     const queued = (this.#jobs ?? []).filter((item) => item.status === "queued").length;
     const capacity = this.manager.concurrency ?? 4;
-    return ` · waiting for slot · ${queued} queued · ${capacity} slots`;
+    return `${queued} queued · ${capacity} slots`;
   }
 
   /** Wrapping and Markdown are the expensive part; they only rerun when the job or width moves. */
@@ -1007,7 +1288,7 @@ class DashboardOverlay implements Focusable {
   }
 
   private renderHint(frame: DashboardFrame, job: JobSnapshot | undefined): string {
-    const back = this.composing() || (this.#layout?.kind === "narrow" && this.#pane === "detail");
+    const back = this.#focus.kind !== "job-list";
     const right = `· ${dashboardCancelKeyLabel(this.keybindings)} ${back ? "back" : "close"}`;
     if (this.#confirmCancelId) {
       const name = sanitizeInline(this.#jobs?.find((item) => item.id === this.#confirmCancelId)?.name ?? "job");
@@ -1031,11 +1312,14 @@ class DashboardOverlay implements Focusable {
   private controls(frame: DashboardFrame, job: JobSnapshot | undefined): string {
     const scroll = "Shift+↑↓ scroll";
     const toolToggle = `t ${this.#toolDisplay === "compact" ? "full" : "compact"}`;
-    if (this.#mode === "answer") {
+    const infoToggle = `i ${this.#showInfo ? "hide info" : "info"}`;
+    if (this.#focus.kind === "composer" && this.#focus.composer === "answer") {
       return `${dashboardSubmitKeyLabel(this.keybindings)} answer · ${dashboardCancelKeyLabel(this.keybindings)} back · ${scroll}`;
     }
-    if (this.#mode === "takeover") {
-      const behavior = job ? (this.#behavior ?? takeoverPolicy(job).behavior) : "steer";
+    if (this.#focus.kind === "composer") {
+      const current = job && this.takeoverComposerMatches(job);
+      if (!current) return `${dashboardCancelKeyLabel(this.keybindings)} back · stale draft preserved · ${scroll}`;
+      const behavior = takeoverPolicy(job).behavior;
       const submit = dashboardSubmitKeyLabel(this.keybindings);
       return `${submit} ${behavior === "followUp" ? "queue follow-up" : "steer"} · Ctrl+T ${this.#toolDisplay === "compact" ? "full" : "compact"} · ${scroll}`;
     }
@@ -1044,18 +1328,28 @@ class DashboardOverlay implements Focusable {
     // The hint mirrors the same predicate the keys use, so a parked caller
     // never advertises a takeover its own handler refuses.
     const sendable = this.takeoverControlVisible(job);
-    if (this.#layout?.kind === "narrow" && this.#pane === "list") {
+    if (this.#focus.kind === "job-list") {
       const navigation = frame.innerWidth < 60 ? "↑↓/jk" : "↑↓/jk select";
-      return [live ? "x cancel" : "", navigation, `${confirm} open`, "? help"].filter(Boolean).join(" · ");
+      return [
+        live ? "x cancel" : "",
+        navigation,
+        `${confirm}/→ inspect`,
+        this.answerControlVisible(job) ? "a answer" : "",
+        sendable && live ? "s steer" : "",
+        sendable && !live ? "f follow-up" : "",
+        toolToggle,
+        infoToggle,
+        "? help",
+      ].filter(Boolean).join(" · ");
     }
     return [
       live ? "x cancel" : "",
-      "↑↓/jk select",
+      "↑↓/jk scroll",
       this.answerControlVisible(job) ? "a answer" : "",
-      sendable ? `${confirm} takeover` : "",
       sendable && live ? "s steer" : "",
       sendable && !live ? "f follow-up" : "",
       toolToggle,
+      infoToggle,
       `${scroll} · Ctrl+U/D · g/G`,
       "? help",
     ].filter(Boolean).join(" · ");
@@ -1063,7 +1357,7 @@ class DashboardOverlay implements Focusable {
 
   private takeoverControlVisible(job: JobSnapshot | undefined): boolean {
     return !this.composing()
-      && !(this.#layout?.kind === "narrow" && this.#pane === "list")
+      && this.#focus.kind !== "composer"
       && !!job
       // A parked caller is waiting on a provider tool result: a steer or
       // follow-up would start a competing user turn, so those controls are
@@ -1073,8 +1367,7 @@ class DashboardOverlay implements Focusable {
   }
 
   private answerControlVisible(job: JobSnapshot | undefined): boolean {
-    if (this.composing() || !job || !this.manager.answerInteraction) return false;
-    if (this.#layout?.kind === "narrow" && this.#pane === "list") return false;
+    if (this.#focus.kind === "composer" || !job || !this.manager.answerInteraction) return false;
     const interaction = pendingInteraction(job);
     return !!interaction && !!interaction.humanVisible && interaction.target.kind === "orchestrator";
   }
@@ -1099,16 +1392,22 @@ class DashboardOverlay implements Focusable {
       && !isTerminal(job.status);
   }
 
-  private selectedIndex(jobs: JobSnapshot[]): number {
-    const index = jobs.findIndex((job) => job.id === this.#selectedId);
-    return index < 0 ? 0 : index;
-  }
 }
 
-type ListViewport = ReturnType<typeof dashboardListViewport<JobSnapshot>>;
+type JobListViewport = DashboardCollectionViewport<JobSnapshot, JobDashboardGroup>;
+
+function jobDashboardCollection(jobs: readonly JobSnapshot[]): DashboardCollection<JobSnapshot, JobDashboardGroup> {
+  return groupDashboardCollection(jobs, JOB_DASHBOARD_GROUPS, (job) => {
+    if (pendingInteraction(job)) return "input";
+    if (job.status === "running") return "working";
+    if (job.status === "queued") return "waiting";
+    if (job.status === "failed") return "failed";
+    return "finished";
+  });
+}
 
 /** Opening on a finished job while others are live buries the useful state; prefer live work. */
-function defaultJob(jobs: JobSnapshot[]): JobSnapshot {
+function defaultJob(jobs: readonly JobSnapshot[]): JobSnapshot {
   const running = jobs.find((job) => job.status === "running");
   if (running) return running;
   const queued = jobs.find((job) => job.status === "queued");
@@ -1154,6 +1453,16 @@ export function formatDashboardAvailability(activations: HarnessActivation[] | u
     const state = activation.enabled ? availabilityLabel(activation.availability.status) : "disabled by user";
     return `${activation.harness} ${state}`;
   }).join(" · ");
+}
+
+function dashboardAvailabilityFallback(activations: HarnessActivation[] | undefined): string {
+  if (!activations?.length) return "routes status unknown";
+  if (activations.some((activation) =>
+    !activation.enabled || !["ready", "unknown"].includes(activation.availability.status)
+  )) return "routes abnormal";
+  return activations.some((activation) => activation.availability.status === "unknown")
+    ? "routes status unknown"
+    : "";
 }
 
 export function renderMarkdown(text: string, width: number): string[] {

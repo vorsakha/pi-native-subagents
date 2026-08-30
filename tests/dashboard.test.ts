@@ -7,8 +7,10 @@ import type { KeybindingsManager } from "@earendil-works/pi-tui";
 import {
   createDashboardOverlay,
   truncateDashboardLine,
+  type DashboardMode,
 } from "../extensions/subagents/dashboard.ts";
 import { alignDashboardRow, createDashboardFrame, dashboardLayout } from "../extensions/dashboard-style.ts";
+import { dashboardCollectionViewport, groupDashboardCollection } from "../extensions/dashboard-collection.ts";
 import { TakeoverView, buildTranscript } from "../extensions/subagents/takeover.ts";
 import { renderAssistantMarkdown } from "../extensions/subagents/transcript.ts";
 import type { JobSnapshot } from "../src/types.ts";
@@ -21,6 +23,8 @@ const ESCAPE = "\u001b";
 const PAGE_UP = "\u001b[5~";
 const CTRL_T = String.fromCharCode(20);
 const PAGE_DOWN = "\u001b[6~";
+const RIGHT = "\u001b[C";
+const LEFT = "\u001b[D";
 
 test("dashboard truncation respects terminal display width for Unicode and ANSI", () => {
   for (const value of [
@@ -61,7 +65,173 @@ test("dashboard layout adapts to fullscreen terminal geometry", () => {
   assert.equal(dashboardLayout(120, 8).kind, "narrow");
 });
 
-test("browse detail keeps Page Up and Page Down aliases in wide and medium layouts", (t) => {
+test("grouped collection rows keep headers presentational and selected entities visible at one row", () => {
+  const definitions = [
+    { key: "active", label: "Active" },
+    { key: "finished", label: "Finished", foldLabel: "finished" },
+  ] as const;
+  const collection = groupDashboardCollection(
+    [
+      { id: "done-1", group: "finished" as const },
+      { id: "live", group: "active" as const },
+      { id: "done-2", group: "finished" as const },
+    ],
+    definitions,
+    (item) => item.group,
+  );
+
+  assert.deepEqual(collection.items.map((item) => item.id), ["live", "done-1", "done-2"]);
+  const view = dashboardCollectionViewport(collection, "done-2", 1, (item) => item.id);
+  assert.equal(view.rows.length, 1);
+  assert.equal(view.rows[0]?.kind, "item", "a section header never consumes the selected entity's only row");
+  assert.equal(view.rows[0]?.kind === "item" ? view.rows[0].item.id : undefined, "done-2");
+
+  const pressured = groupDashboardCollection(
+    [
+      { id: "live-1", group: "active" as const },
+      { id: "live-2", group: "active" as const },
+      { id: "live-3", group: "active" as const },
+      { id: "done", group: "finished" as const },
+    ],
+    definitions,
+    (item) => item.group,
+  );
+  const pressuredView = dashboardCollectionViewport(pressured, "live-1", 3, (item) => item.id);
+  assert.ok(pressuredView.rows.some((row) => row.kind === "item" && row.item.id === "live-1"));
+  assert.ok(pressuredView.rows.some((row) => row.kind === "section" && row.label === "Active"), "the visible group keeps its textual heading");
+  assert.ok(
+    pressuredView.rows.every((row) => row.kind !== "fold" || row.hidden === 1),
+    "a finished fold never counts a displaced active entity",
+  );
+});
+
+test("direct jobs render attention groups with counts and navigate only entity rows", (t) => {
+  const blocked = {
+    ...job("blocked"),
+    name: "input-row",
+    interaction: interactionSnapshot({ sourceJobId: "blocked", sourceName: "blocked" }),
+  };
+  const working = { ...job("working"), name: "work-row" };
+  const queued = { ...job("queued", "queued"), name: "queue-row" };
+  const failed = { ...job("failed", "failed"), name: "error-row" };
+  const completed = { ...job("completed", "completed"), name: "done-row" };
+  const cancelled = { ...job("cancelled", "cancelled"), name: "cancel-row" };
+  const state = dashboard(
+    [completed, failed, cancelled, queued, working, blocked],
+    30,
+    () => {},
+    undefined,
+    { focusJobId: blocked.id, fullscreen: true },
+  );
+  t.after(() => state.overlay.dispose());
+
+  const lines = state.overlay.render(160);
+  const text = lines.join("\n");
+  for (const heading of [
+    "Needs input · 1",
+    "Working · 1",
+    "Queued or waiting · 1",
+    "Failed · 1",
+    "Finished · 2",
+  ]) assert.match(text, new RegExp(heading));
+
+  const positions = ["input-row", "work-row", "queue-row", "error-row", "done-row"]
+    .map((name) => lines.findIndex((line) => line.includes(name)));
+  assert.ok(positions.every((position) => position >= 0));
+  assert.deepEqual([...positions].sort((left, right) => left - right), positions, "rows follow attention order");
+  assert.match(lines.find((line) => line.includes("input-row") && line.includes("❯")) ?? "", /running/, "a routed question does not erase the lifecycle status");
+  assert.match(lines.find((line) => line.includes("cancel-row")) ?? "", /cancelled/);
+
+  state.overlay.handleInput("j");
+  const selected = state.overlay.render(160).find((line) => line.includes("work-row") && line.includes("❯"));
+  assert.ok(selected, "one navigation step skips the section header and selects the next entity");
+  state.overlay.handleInput("x");
+  state.overlay.render(160);
+  state.overlay.handleInput("x");
+  assert.deepEqual(state.manager.cancelCalls, ["working"], "the destructive action targets the selected entity, never a header");
+});
+
+test("direct job folding yields to live work and reveals the selected finished identity", (t) => {
+  const live = { ...job("live"), name: "live" };
+  const finished = Array.from({ length: 8 }, (_, index) => ({
+    ...job(`done-${index + 1}`, "completed"),
+    name: `done-${index + 1}`,
+  }));
+  const jobs = [live, ...finished];
+  const state = dashboard(jobs, 7, () => {}, undefined, { focusJobId: live.id, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  let lines = state.overlay.render(120);
+  assert.equal(lines.length, 7);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 120));
+  assert.ok(lines.some((line) => line.includes("live")));
+  assert.ok(lines.some((line) => line.includes("8 finished hidden")));
+
+  for (let index = 0; index < 6; index++) state.overlay.handleInput("j");
+  lines = state.overlay.render(120);
+  assert.ok(lines.some((line) => line.includes("done-6") && line.includes("❯")), "navigation reveals the selected folded job");
+  assert.ok(lines.some((line) => line.includes("7 finished hidden")));
+
+  finished[5]!.status = "running";
+  jobs.reverse();
+  lines = state.overlay.render(120);
+  assert.ok(lines.some((line) => line.includes("done-6") && line.includes("❯")), "the selected job ID survives reordering into Working");
+});
+
+test("grouped job folding stays within wide, medium, and narrow panel geometry", (t) => {
+  const jobs = [
+    { ...job("active"), name: "active" },
+    ...Array.from({ length: 30 }, (_, index) => ({
+      ...job(`history-${index}`, "completed"),
+      name: `history-${index}`,
+    })),
+  ];
+  for (const width of [120, 72, 52]) {
+    const state = dashboard(jobs, 30, () => {}, undefined, { focusJobId: "active", fullscreen: true });
+    t.after(() => state.overlay.dispose());
+    const lines = state.overlay.render(width);
+    assert.equal(lines.length, 30);
+    assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    assert.ok(lines.some((line) => line.includes("active")));
+    assert.ok(lines.some((line) => line.includes("finished hidden")), `${width}-column layout exposes the folded count`);
+  }
+});
+
+test("job summaries render in wide, medium, and narrow rows without displacing identity", (t) => {
+  for (const width of [120, 72, 52]) {
+    const current = jobSnapshot({
+      id: `summary-${width}`,
+      name: "worker",
+      liveThinking: "checking semantic summary",
+    });
+    const state = dashboard([current], 30, () => {}, undefined, { fullscreen: true });
+    t.after(() => state.overlay.dispose());
+    const lines = state.overlay.render(width);
+    assert.ok(lines.every((line) => visibleWidth(line) <= width));
+    assert.ok(lines.some((line) => line.includes("worker") && line.includes("check")), `${width}-column row shows the job summary`);
+  }
+
+  const constrained = dashboard([jobSnapshot({
+    id: "identity-priority",
+    name: "identity-survives",
+    liveThinking: "SUMMARY_MUST_YIELD",
+  })], 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => constrained.overlay.dispose());
+  const text = constrained.overlay.render(40).join("\n");
+  assert.match(text, /ide/);
+  assert.doesNotMatch(text, /SUMMARY_MUST_YIELD/, "summary yields before the job name at the constrained width");
+
+  const owned = dashboard([jobSnapshot({
+    id: "workflow-owned",
+    name: "owned",
+    workflow: { runId: "run-owned", agentIndex: 0, label: "build" },
+  })], 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => owned.overlay.dispose());
+  assert.ok(owned.overlay.render(120).some((line) => line.includes("owned") && line.includes("workflow")));
+  assert.ok(owned.overlay.render(40).some((line) => line.includes("owned") && line.includes("workflow")), "workflow ownership survives the minimum width");
+});
+
+test("detail focus keeps Page Up and Page Down aliases in wide and medium layouts", (t) => {
   const output = Array.from({ length: 80 }, (_, index) => `page ${index}`).join("\n");
   for (const width of [120, 72]) {
     const state = dashboard([{ ...job(`paging-${width}`, "completed"), output, transcript: [{ kind: "assistant", text: output }] }], 30, () => {}, (text) => text.split("\n"), { fullscreen: true });
@@ -69,6 +239,7 @@ test("browse detail keeps Page Up and Page Down aliases in wide and medium layou
 
     assert.equal(dashboardLayout(width, 30).kind, width === 120 ? "wide" : "medium");
     state.overlay.render(width);
+    state.overlay.handleInput(ENTER);
     state.overlay.handleInput("g");
     const top = state.overlay.render(width).join("\n");
     state.overlay.handleInput(PAGE_DOWN);
@@ -76,6 +247,248 @@ test("browse detail keeps Page Up and Page Down aliases in wide and medium layou
     state.overlay.handleInput(PAGE_UP);
     assert.equal(state.overlay.render(width).join("\n"), top, `Page Up returns to the ${width}-column detail top`);
   }
+});
+
+test("explicit job focus separates selection, detail scrolling, and composer drafts", (t) => {
+  const output = Array.from({ length: 80 }, (_, index) => `line ${index}`).join("\n");
+  const first = { ...job("focus-first"), name: "focus-first", output, transcript: [{ kind: "assistant" as const, text: output }] };
+  const second = { ...job("focus-second"), name: "focus-second" };
+  const state = dashboard([first, second], 30, () => {}, (text) => text.split("\n"), {
+    focusJobId: first.id,
+    fullscreen: true,
+  });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(120);
+  state.overlay.handleInput("j");
+  assert.match(state.overlay.render(120).find((line) => line.includes("focus-second") && line.includes("❯")) ?? "", /focus-second/);
+  state.overlay.handleInput("k");
+  state.overlay.handleInput(RIGHT);
+  assert.match(state.overlay.render(52).join("\n"), /▸ detail/, "Right drills into detail and survives a narrow resize");
+
+  state.overlay.handleInput("g");
+  const top = state.overlay.render(120).join("\n");
+  state.overlay.handleInput("j");
+  const scrolled = state.overlay.render(120);
+  assert.notEqual(scrolled.join("\n"), top, "j scrolls instead of changing jobs in detail focus");
+  assert.match(scrolled.find((line) => line.includes("focus-first") && line.includes("❯")) ?? "", /focus-first/);
+  const pausedRange = scrolled.find((line) => line.includes("transcript"));
+  assert.match(
+    pausedRange ?? "",
+    /transcript \d+–\d+\/\d+ · paused · G resumes live/,
+    "scrolling away from the tail labels the bounded viewport and its resume key",
+  );
+
+  const resizedPaused = state.overlay.render(72);
+  assert.ok(resizedPaused.every((line) => visibleWidth(line) <= 72));
+  assert.match(
+    resizedPaused.find((line) => line.includes("transcript")) ?? "",
+    /paused · G resumes live/,
+    "a width change preserves the paused viewport state",
+  );
+  first.output += "\nline 80";
+  first.transcript[0]!.text += "\nline 80";
+  for (const listener of state.manager.listeners) listener(first);
+  const updatedWhilePaused = state.overlay.render(72);
+  assert.doesNotMatch(updatedWhilePaused.join("\n"), /line 80/, "live output does not move a paused viewport");
+  assert.match(updatedWhilePaused.find((line) => line.includes("transcript")) ?? "", /paused · G resumes live/);
+
+  state.overlay.handleInput("s");
+  for (const character of "keep this draf") state.overlay.handleInput(character);
+  state.overlay.handleInput("x");
+  state.overlay.handleInput(LEFT);
+  state.overlay.handleInput("t");
+  assert.match(state.overlay.render(120).join("\n"), /keep this draft.*x/s, "Left moves the draft cursor instead of leaving the composer");
+  state.overlay.handleInput(ESCAPE);
+  assert.match(state.overlay.render(120).join("\n"), /▸ detail/, "Escape backs out of the composer by one layer");
+  state.overlay.handleInput("s");
+  assert.match(state.overlay.render(120).join("\n"), /keep this draft.*x/s, "the steer draft survives focus changes");
+  state.overlay.handleInput(ESCAPE);
+  state.overlay.handleInput(LEFT);
+  assert.match(state.overlay.render(120).join("\n"), /▸ jobs/, "Left backs out from detail to the job list");
+  state.overlay.handleInput(RIGHT);
+  assert.match(
+    state.overlay.render(120).find((line) => line.includes("transcript")) ?? "",
+    /transcript 2–22\/81 · paused · G resumes live/,
+    "detail focus changes preserve the paused range while the total tracks live output",
+  );
+  state.overlay.handleInput("G");
+  assert.match(
+    state.overlay.render(120).find((line) => line.includes("transcript")) ?? "",
+    /· live/,
+    "G resumes live tail-following",
+  );
+  assert.match(state.overlay.render(120).join("\n"), /line 80/, "resuming reaches output received while paused");
+});
+
+test("composer drafts stay bound to one job and composer identity", (t) => {
+  const first = job("draft-first");
+  const second: JobSnapshot = job("draft-second");
+  const state = dashboard([first, second], 30, () => {}, undefined, { focusJobId: first.id, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(52);
+  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput("s");
+  for (const character of "message for first") state.overlay.handleInput(character);
+  state.overlay.handleInput(ESCAPE);
+  state.overlay.handleInput(LEFT);
+  state.overlay.handleInput("j");
+  state.overlay.handleInput(RIGHT);
+  state.overlay.handleInput("s");
+  assert.doesNotMatch(state.overlay.render(52).join("\n"), /message for first/);
+
+  for (const character of "second draft") state.overlay.handleInput(character);
+  state.overlay.handleInput(ESCAPE);
+  second.interaction = interactionSnapshot({
+    requestId: "draft-second-question",
+    sourceJobId: second.id,
+    sourceName: second.name,
+    humanVisible: true,
+  });
+  for (const listener of state.manager.listeners) listener(second);
+  state.overlay.handleInput("a");
+  assert.doesNotMatch(state.overlay.render(52).join("\n"), /second draft/, "another composer kind cannot inherit a steer draft");
+});
+
+test("compatibility takeover mode preserves a running job's steer draft", (t) => {
+  const current = job("compatibility-takeover");
+  const state = dashboard([current], 30, () => {}, undefined, {
+    focusJobId: current.id,
+    mode: "takeover",
+    fullscreen: true,
+  });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(52);
+  for (const character of "keep compatibility draft") state.overlay.handleInput(character);
+  state.overlay.handleInput(ESCAPE);
+  state.overlay.handleInput("s");
+  assert.match(
+    state.overlay.render(52).join("\n"),
+    /keep compatibility draft/,
+    "reopening steer for the same job retains the mode-takeover draft",
+  );
+});
+
+test("compatibility takeover mode preserves a completed retained job's follow-up draft", (t) => {
+  const current = job("compatibility-follow-up", "completed");
+  const state = dashboard([current], 30, () => {}, undefined, {
+    focusJobId: current.id,
+    mode: "takeover",
+    fullscreen: true,
+  });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(52);
+  assert.match(state.overlay.render(52).join("\n"), /composer · follow-up/);
+  for (const character of "keep completed draft") state.overlay.handleInput(character);
+  state.overlay.handleInput(ESCAPE);
+  state.overlay.handleInput("f");
+  assert.match(
+    state.overlay.render(52).join("\n"),
+    /keep completed draft/,
+    "reopening follow-up for the same job retains the compatibility draft",
+  );
+});
+
+test("compatibility takeover drafts do not cross composer kinds", (t) => {
+  const current = job("compatibility-cross-kind");
+  const state = dashboard([current], 30, () => {}, undefined, {
+    focusJobId: current.id,
+    mode: "takeover",
+    fullscreen: true,
+  });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(52);
+  for (const character of "running steer draft") state.overlay.handleInput(character);
+  state.overlay.handleInput(ESCAPE);
+
+  current.status = "completed";
+  for (const listener of state.manager.listeners) listener(current);
+  state.overlay.render(52);
+  state.overlay.handleInput("f");
+  assert.doesNotMatch(
+    state.overlay.render(52).join("\n"),
+    /running steer draft/,
+    "a steer draft cannot cross into the completed job's follow-up composer",
+  );
+});
+
+test("completion leaves an open compatibility steer draft stale and follow-up starts with its own draft", (t) => {
+  const current = job("compatibility-open-transition");
+  const state = dashboard([current], 30, () => {}, undefined, {
+    focusJobId: current.id,
+    mode: "takeover",
+    fullscreen: true,
+  });
+  t.after(() => state.overlay.dispose());
+  state.overlay.focused = true;
+
+  state.overlay.render(52);
+  for (const character of "stale steer content") state.overlay.handleInput(character);
+
+  current.status = "completed";
+  for (const listener of state.manager.listeners) listener(current);
+
+  const stale = state.overlay.render(52).join("\n");
+  assert.match(stale, /stale steer content/, "the open steer draft remains intact after completion");
+  assert.match(stale, /steer draft preserved · no longer sendable/);
+  state.overlay.handleInput(ENTER);
+  assert.deepEqual(state.manager.sendCalls, [], "Enter cannot convert the stale steer into a follow-up");
+
+  state.overlay.handleInput(ESCAPE);
+  state.overlay.handleInput("f");
+  const followUp = state.overlay.render(52).join("\n");
+  assert.match(followUp, /composer · follow-up/);
+  assert.doesNotMatch(followUp, /stale steer content/, "the follow-up composer has its own empty draft identity");
+});
+
+test("six-row steer and answer composers keep their input visible", (t) => {
+  const steer = dashboard([job("six-row-steer")], 6, () => {}, undefined, { fullscreen: true });
+  t.after(() => steer.overlay.dispose());
+  steer.overlay.focused = true;
+  steer.overlay.render(52);
+  steer.overlay.handleInput(ENTER);
+  steer.overlay.handleInput("s");
+  steer.overlay.handleInput("v");
+  assert.match(steer.overlay.render(52).join("\n"), /> v/);
+
+  const answeringJob = {
+    ...job("six-row-answer"),
+    interaction: interactionSnapshot({
+      requestId: "six-row-request",
+      sourceJobId: "six-row-answer",
+      sourceName: "six-row-answer",
+      humanVisible: true,
+    }),
+  };
+  const answer = dashboard([answeringJob], 6, () => {}, undefined, { fullscreen: true });
+  t.after(() => answer.overlay.dispose());
+  answer.overlay.focused = true;
+  answer.overlay.render(52);
+  answer.overlay.handleInput(ENTER);
+  answer.overlay.handleInput("a");
+  answer.overlay.handleInput("y");
+  assert.match(answer.overlay.render(52).join("\n"), /> y/);
+});
+
+test("terminal job viewport labels use end instead of live", (t) => {
+  const completed = { ...job("terminal-label", "completed"), output: "done", transcript: [{ kind: "assistant" as const, text: "done" }] };
+  const state = dashboard([completed], 24, () => {}, undefined, { focusJobId: completed.id, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(72);
+  state.overlay.handleInput(RIGHT);
+  const label = state.overlay.render(72).find((line) => line.includes("transcript")) ?? "";
+  assert.match(label, /· end/);
+  assert.doesNotMatch(label, /· live/);
 });
 
 test("minimum-width live cancellation keeps its Unicode hint visible through confirmation", (t) => {
@@ -95,21 +508,21 @@ test("minimum-width live cancellation keeps its Unicode hint visible through con
   assert.deepEqual(state.manager.cancelCalls, ["cancel-你好👩🏽‍💻"]);
 });
 
-test("compact geometry resets hidden takeover state and accepts only its close control", (t) => {
+test("compact geometry resets hidden composer state and accepts only its close control", (t) => {
   const closed: unknown[] = [];
   const state = dashboard([job("compact")], 30, (value) => closed.push(value), undefined, { fullscreen: true });
   t.after(() => state.overlay.dispose());
 
   state.overlay.render(52);
   state.overlay.handleInput(ENTER);
-  state.overlay.handleInput(ENTER);
-  assert.match(state.overlay.render(52).join("\n"), /takeover/);
+  state.overlay.handleInput("s");
+  assert.match(state.overlay.render(52).join("\n"), /composer · steer/);
 
   state.setRows(5);
   const compact = state.overlay.render(52);
   assert.equal(compact.length, 5);
   assert.match(compact.join("\n"), /Esc close/);
-  assert.doesNotMatch(compact.join("\n"), /takeover|detail/);
+  assert.doesNotMatch(compact.join("\n"), /composer|detail/);
 
   for (const input of [ENTER, "p", "r", "s", "f", "x", PAGE_DOWN]) state.overlay.handleInput(input);
   assert.deepEqual(state.manager.cancelCalls, []);
@@ -118,25 +531,25 @@ test("compact geometry resets hidden takeover state and accepts only its close c
 
   state.setRows(30);
   const restored = state.overlay.render(52).join("\n");
-  assert.match(restored, /Enter open/);
-  assert.doesNotMatch(restored, /takeover|detail/);
+  assert.match(restored, /Enter\/→ inspe/);
+  assert.doesNotMatch(restored, /composer|detail/);
   state.overlay.handleInput(ESCAPE);
   assert.deepEqual(closed, [null]);
 });
 
-test("narrow list ignores hidden scrolling, navigation, takeover, and cancellation controls", (t) => {
+test("narrow list keeps selection keys out of the hidden detail viewport", (t) => {
   const state = dashboard([job("narrow-list", "completed")], 30, () => {}, undefined, { fullscreen: true });
   t.after(() => state.overlay.dispose());
 
   state.overlay.render(52);
   const list = state.overlay.render(52).join("\n");
-  assert.match(list, /Enter open/);
-  assert.doesNotMatch(list, /Enter takeover|x cancel|scroll/);
+  assert.match(list, /Enter\/→ inspect/);
+  assert.doesNotMatch(list, /scroll/);
 
-  for (const input of ["p", "h", "l", "f", "x", "X", "g", PAGE_DOWN, "r"]) state.overlay.handleInput(input);
+  for (const input of ["p", "h", "g", PAGE_DOWN, "r"]) state.overlay.handleInput(input);
   assert.deepEqual(state.manager.cancelCalls, []);
   assert.deepEqual(state.manager.sendCalls, []);
-  assert.match(state.overlay.render(52).join("\n"), /Enter open/);
+  assert.match(state.overlay.render(52).join("\n"), /Enter\/→ inspect/);
 
   state.overlay.handleInput(ENTER);
   assert.match(state.overlay.render(52).join("\n"), /detail/);
@@ -153,22 +566,22 @@ test("narrow detail ignores controls that are not exposed by a read-only inspect
   state.overlay.handleInput(ENTER);
   const detail = state.overlay.render(52).join("\n");
   assert.match(detail, /detail/);
-  assert.doesNotMatch(detail, /Enter takeover|s steer|f follow-up|x cancel/);
+  assert.doesNotMatch(detail, /s steer|f follow-up|x cancel/);
   state.overlay.handleInput("g");
   const top = state.overlay.render(52).join("\n");
   state.overlay.handleInput(PAGE_DOWN);
-  assert.equal(state.overlay.render(52).join("\n"), top, "hidden page scrolling does not move the narrow detail pane");
+  assert.notEqual(state.overlay.render(52).join("\n"), top, "Page Down scrolls the focused narrow detail pane");
 
-  for (const input of ["p", "h", "l", ENTER, "s", "f", "x", "X"]) state.overlay.handleInput(input);
+  for (const input of ["p", ENTER, "s", "f", "x", "X"]) state.overlay.handleInput(input);
   assert.deepEqual(state.manager.cancelCalls, []);
   assert.deepEqual(state.manager.sendCalls, []);
   assert.match(state.overlay.render(52).join("\n"), /detail/);
 
   state.overlay.handleInput(ESCAPE);
-  assert.match(state.overlay.render(52).join("\n"), /Enter open/);
+  assert.match(state.overlay.render(52).join("\n"), /Enter\/→ inspect/);
 });
 
-test("takeover accepts composer input without exposing browse cancellation or hidden paging", (t) => {
+test("composer accepts input without exposing detail cancellation or paging", (t) => {
   const current = {
     ...job("takeover-controls"),
     output: Array.from({ length: 80 }, (_, index) => `output ${index}`).join("\n"),
@@ -178,19 +591,19 @@ test("takeover accepts composer input without exposing browse cancellation or hi
 
   state.overlay.render(52);
   state.overlay.handleInput(ENTER);
-  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput("s");
   const takeover = state.overlay.render(52).join("\n");
-  assert.match(takeover, /▸ takeover ·/);
+  assert.match(takeover, /▸ composer · steer/);
   assert.match(takeover, /Enter steer/);
   assert.match(takeover, /Esc back/);
 
   for (const input of ["p", "r", "x", "f", PAGE_DOWN]) state.overlay.handleInput(input);
   assert.deepEqual(state.manager.cancelCalls, []);
   assert.deepEqual(state.manager.sendCalls, []);
-  assert.match(state.overlay.render(52).join("\n"), /▸ takeover ·/);
+  assert.match(state.overlay.render(52).join("\n"), /▸ composer · steer/);
 
   state.overlay.handleInput(ESCAPE);
-  assert.doesNotMatch(state.overlay.render(52).join("\n"), /▸ takeover ·/);
+  assert.doesNotMatch(state.overlay.render(52).join("\n"), /▸ composer/);
 });
 
 function job(id: string, status: JobSnapshot["status"] = "running"): JobSnapshot {
@@ -222,6 +635,7 @@ function dashboard(
   renderMarkdown: (text: string, width: number) => string[] = (text) => text.split("\n"),
   options: {
     focusJobId?: string;
+    mode?: DashboardMode;
     fullscreen?: boolean;
     sendError?: string;
     sendPromise?: Promise<JobSnapshot>;
@@ -295,6 +709,7 @@ function dashboard(
       now: () => 65_000,
       renderMarkdown,
       focusJobId: options.focusJobId,
+      mode: options.mode,
       fullscreen: options.fullscreen,
       availability: options.availability,
     },
@@ -334,6 +749,7 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
   assert.ok(wide.every((line) => visibleWidth(line) <= 120));
   assert.ok(wide.some((line) => line.includes("first-39")), "live detail follows the transcript tail");
 
+  overlay.handleInput(ENTER);
   overlay.handleInput("g");
   const top = overlay.render(120);
   assert.ok(top.some((line) => line.includes("first-0")), "g scrolls to the transcript top");
@@ -342,7 +758,8 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
   assert.ok(halfPage.some((line) => line.includes("first-")));
   assert.ok(halfPage.every((line) => visibleWidth(line) <= 120));
 
-  overlay.handleInput("j");
+  overlay.handleInput(ESCAPE);
+  overlay.handleInput("k");
   assert.ok(overlay.render(72).some((line) => line.includes("second")), "selection moves by job id");
   overlay.handleInput("x");
   assert.ok(overlay.render(72).some((line) => line.includes("Press x again")), "cancel is confirmed inline");
@@ -352,10 +769,11 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
   assert.ok(renders() >= 1);
 
   overlay.handleInput("k");
-  overlay.handleInput("\r");
-  assert.ok(overlay.render(72).some((line) => line.includes("takeover")), "takeover stays in the same panel");
+  overlay.handleInput("f");
+  assert.ok(overlay.render(72).some((line) => line.includes("follow-up")), "the composer stays in the same panel");
   overlay.handleInput("\x1b");
-  assert.ok(!overlay.render(72).some((line) => line.includes("▸ takeover ·")), "Escape returns from takeover without losing the panel");
+  assert.ok(!overlay.render(72).some((line) => line.includes("▸ composer")), "Escape returns from the composer without losing the panel");
+  overlay.handleInput("\x1b");
   overlay.handleInput("\x1b");
   assert.deepEqual(closed, [null]);
   assert.equal(manager.listeners.size, 0, "closing the dashboard unsubscribes from manager updates");
@@ -383,6 +801,62 @@ test("dashboard header exposes normalized harness states in text, not color alon
   assert.match(header, /codex disabled by user/);
 });
 
+test("responsive job header keeps attention counts and abnormal route text before routine detail", (t) => {
+  const blocked = {
+    ...job("blocked"),
+    interaction: interactionSnapshot({ sourceJobId: "blocked", sourceName: "blocked" }),
+  };
+  const failed = job("failed", "failed");
+  const availability = [
+    harnessActivation(availabilityFixture("pi"), true),
+    harnessActivation(availabilityFixture("claude", {
+      authenticated: false,
+      ready: false,
+      detail: "Claude Code is not logged in",
+    }), true),
+  ];
+  const state = dashboard([blocked, failed], 24, () => {}, undefined, { availability, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  const constrained = state.overlay.render(72)[0] ?? "";
+  assert.match(constrained, /1 need input/);
+  assert.match(constrained, /1 active/);
+  assert.match(constrained, /1 failed/);
+  assert.match(constrained, /routes abnormal/);
+  assert.doesNotMatch(constrained, /claude login required/, "the aggregate replaces labels that do not fit");
+  assert.ok(visibleWidth(constrained) <= 72);
+
+  const wide = state.overlay.render(180)[0] ?? "";
+  assert.match(wide, /claude login required/, "wide headers retain individual route states");
+});
+
+test("minimum-width job header keeps the largest fitting attention prefix", (t) => {
+  const jobs = [
+    ...Array.from({ length: 10 }, (_, index) => ({
+      ...job(`input-${index}`),
+      interaction: interactionSnapshot({ sourceJobId: `input-${index}`, sourceName: `input-${index}` }),
+    })),
+    ...Array.from({ length: 10 }, (_, index) => job(`active-${index}`)),
+    ...Array.from({ length: 10 }, (_, index) => job(`failed-${index}`, "failed")),
+  ];
+  const state = dashboard(jobs, 30, () => {}, undefined, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  const header = state.overlay.render(40)[0] ?? "";
+  assert.match(header, /10 need input/);
+  assert.match(header, /20 active/);
+  assert.doesNotMatch(header, /30 jobs/);
+});
+
+test("empty jobs name the next safe command within constrained geometry", (t) => {
+  const state = dashboard([], 10, () => {}, undefined, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+  const lines = state.overlay.render(40);
+  assert.equal(lines.length, 10);
+  assert.match(lines.join("\n"), /\/subagent <task>/);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 40));
+});
+
 test("dashboard pins errors and exposes queued empty states", (t) => {
   const failed = { ...job("failed", "failed"), output: "", error: "Harness exited before first response" };
   const queued = { ...job("queued", "queued"), output: "" };
@@ -390,7 +864,7 @@ test("dashboard pins errors and exposes queued empty states", (t) => {
   t.after(() => overlay.dispose());
   const failedLines = overlay.render(72);
   assert.ok(failedLines.some((line) => line.includes("Harness exited before first response")));
-  overlay.handleInput("j");
+  overlay.handleInput("k");
   const queuedLines = overlay.render(72);
   assert.ok(queuedLines.some((line) => line.includes("queued")));
   assert.ok(queuedLines.some((line) => line.includes("waiting for an agent slot")));
@@ -552,7 +1026,7 @@ test("t toggles tool display from the narrow list pane, and the detail title car
   assert.match(overlay.render(52).join("\n"), /detail · [\w-]+ · completed · compact/, "a second narrow-list t toggle reverts the mode");
 });
 
-test("? opens a width-safe grouped cheatsheet in browse, dismisses without losing state, and stays printable in takeover", (t) => {
+test("? opens a width-safe grouped cheatsheet, dismisses without losing state, and stays printable in the composer", (t) => {
   for (const width of [40, 72, 120]) {
     const state = dashboard([job("cheatsheet")], 30, () => {}, undefined, { fullscreen: true });
     t.after(() => state.overlay.dispose());
@@ -577,13 +1051,13 @@ test("? opens a width-safe grouped cheatsheet in browse, dismisses without losin
   }
 });
 
-test("the cheatsheet never intercepts ? inside the takeover composer", (t) => {
+test("the cheatsheet never intercepts ? inside the steer composer", (t) => {
   const state = dashboard([job("cheatsheet-takeover")], 30, () => {}, undefined, { fullscreen: true });
   t.after(() => state.overlay.dispose());
   state.overlay.focused = true;
   state.overlay.render(90);
-  state.overlay.handleInput("\r");
-  assert.match(state.overlay.render(90).join("\n"), /takeover/);
+  state.overlay.handleInput("s");
+  assert.match(state.overlay.render(90).join("\n"), /composer · steer/);
 
   state.overlay.handleInput("?");
   state.overlay.handleInput("!");
@@ -598,20 +1072,20 @@ test("configurable confirm/cancel/submit bindings render their configured key na
     getKeys: (binding) => binding === "tui.select.cancel" ? ["q"] : binding === "tui.select.confirm" ? ["space"] : [],
   });
   t.after(() => configured.overlay.dispose());
-  assert.match(configured.overlay.render(60).join("\n"), /Space open/i, "the narrow list hint reflects the configured confirm key");
+  assert.match(configured.overlay.render(60).join("\n"), /Space\/→ inspect/i, "the narrow list hint reflects the configured confirm key");
   const wide = configured.overlay.render(90).join("\n");
-  assert.match(wide, /Space takeover/i, "the browse hint reflects the configured confirm key");
+  assert.match(wide, /Space\/→ inspect/i, "the list hint reflects the configured confirm key");
   assert.match(wide, /Q close/i, "the browse hint reflects the configured cancel key");
   assert.doesNotMatch(wide, /Esc close/);
 
   const defaulted = dashboard([job("default-keys")], 30, () => {}, undefined, { fullscreen: true });
   t.after(() => defaulted.overlay.dispose());
   const defaultHint = defaulted.overlay.render(90).join("\n");
-  assert.match(defaultHint, /Enter takeover/);
+  assert.match(defaultHint, /Enter\/→ inspect/);
   assert.match(defaultHint, /Esc close/);
 });
 
-test("in-panel takeover toggles tool rendering with Ctrl+T and treats a bare t as composer input", (t) => {
+test("in-panel composer toggles tool rendering with Ctrl+T and treats a bare t as composer input", (t) => {
   const current = {
     ...job("takeover-toggle-tools"),
     output: "",
@@ -625,7 +1099,7 @@ test("in-panel takeover toggles tool rendering with Ctrl+T and treats a bare t a
   overlay.focused = true;
 
   overlay.render(90);
-  overlay.handleInput("\r"); // Enter takeover for a live, reusable job.
+  overlay.handleInput("s");
   const compact = overlay.render(90);
   assert.ok(compact.some((line) => line.includes("1 tool call")), "takeover compact mode is the default");
   assert.ok(compact.some((line) => line.includes("Ctrl+T full")), "takeover hint offers the toggle to full mode");
@@ -672,7 +1146,7 @@ test("takeover restores a rejected draft without overwriting newer input", async
   t.after(() => overlay.dispose());
   overlay.focused = true;
   overlay.render(72);
-  overlay.handleInput("\r");
+  overlay.handleInput("s");
   for (const character of "g/G draft message") overlay.handleInput(character);
   overlay.handleInput("\u0011");
   await tick();
@@ -689,7 +1163,7 @@ test("a newer draft survives rejection of an earlier in-flight send", async (t) 
   t.after(() => overlay.dispose());
   overlay.focused = true;
   overlay.render(72);
-  overlay.handleInput("\r");
+  overlay.handleInput("s");
   for (const character of "first") overlay.handleInput(character);
   overlay.handleInput("\r");
   for (const character of "second") overlay.handleInput(character);
@@ -790,7 +1264,7 @@ function parkedJob(id: string, overrides: Parameters<typeof interactionSnapshot>
 }
 
 test("a job parked on a question states the wait in words, withdraws steer/follow-up, and keeps cancel", (t) => {
-  const parked = { ...parkedJob("parked"), humanVisible: true, interaction: interactionSnapshot({ sourceJobId: "parked", humanVisible: true, question: "Which fixture is authoritative?", context: "the task and the tests disagree" }) };
+  const parked = { ...parkedJob("parked"), humanVisible: true, interaction: interactionSnapshot({ sourceJobId: "parked", sourceName: "parked", humanVisible: true, question: "Which fixture is authoritative?", context: "the task and the tests disagree" }) };
   const { overlay } = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id });
   t.after(() => overlay.dispose());
   overlay.focused = true;
@@ -800,6 +1274,7 @@ test("a job parked on a question states the wait in words, withdraws steer/follo
   assert.ok(text.includes("needs your answer"), "the wait is carried by words, not colour alone");
   assert.ok(text.includes("?"), "and by its own glyph");
   assert.ok(text.includes("Which fixture is authoritative?"), "the pending question is pinned in the inspector");
+  assert.ok(text.includes("Route · parked → you · waiting 1m 04s"), "the inspector names source, owner, and elapsed wait");
   assert.ok(text.includes("the task and the tests disagree"));
   assert.ok(text.includes("1 need input"), "the panel header aggregates blocked jobs");
   assert.ok(text.includes("a answer"), "the inline answer control is offered for a human-owned question");
@@ -812,6 +1287,67 @@ test("a job parked on a question states the wait in words, withdraws steer/follo
   overlay.handleInput("f");
   overlay.handleInput("\r");
   assert.ok(!overlay.render(120).some((line) => line.includes("▸ takeover ·")), "no key opens a competing user turn while a question is pending");
+});
+
+test("a composer opened before a routed question cannot submit and keeps its draft", (t) => {
+  const current = job("stale-composer");
+  const { overlay, manager } = dashboard([current], 24, () => {}, undefined, { focusJobId: current.id });
+  t.after(() => overlay.dispose());
+  overlay.focused = true;
+  overlay.render(120);
+  overlay.handleInput("s");
+  for (const character of "keep this draft") overlay.handleInput(character);
+
+  current.interaction = interactionSnapshot({
+    sourceJobId: current.id,
+    sourceName: current.name,
+    question: "Which route should answer?",
+  });
+  for (const listener of manager.listeners) listener(current);
+  overlay.handleInput(ENTER);
+
+  const text = overlay.render(120).join("\n");
+  assert.deepEqual(manager.sendCalls, []);
+  assert.match(text, /keep this draft/);
+  assert.match(text, /waiting on a routed question/);
+});
+
+test("an answer composer cannot submit after its routed request is replaced or cleared", (t) => {
+  for (const replacement of [
+    interactionSnapshot({ requestId: "req-b", sourceJobId: "answer-identity", humanVisible: true }),
+    undefined,
+  ]) {
+    const current: JobSnapshot = {
+      ...parkedJob("answer-identity"),
+      humanVisible: true,
+      interaction: interactionSnapshot({ requestId: "req-a", sourceJobId: "answer-identity", humanVisible: true }),
+    };
+    const { overlay, manager } = dashboard([current], 24, () => {}, undefined, {
+      focusJobId: current.id,
+      submitKey: "\u0011",
+    });
+    t.after(() => overlay.dispose());
+    overlay.focused = true;
+    overlay.render(120);
+    overlay.handleInput("a");
+    for (const character of "answer for req-a") overlay.handleInput(character);
+
+    current.interaction = replacement;
+    for (const listener of manager.listeners) listener(current);
+    overlay.handleInput("\u0011");
+
+    const stale = overlay.render(120).join("\n");
+    assert.deepEqual(manager.answerCalls, [], "the stale request is never answered");
+    assert.match(stale, /answer for req-a/, "the stale draft remains in its original composer");
+    assert.match(stale, /question changed or closed/);
+
+    overlay.handleInput(ESCAPE);
+    if (replacement) {
+      overlay.handleInput("a");
+      const next = overlay.render(120).join("\n");
+      assert.doesNotMatch(next, /answer for req-a/, "the old request draft cannot cross into the replacement request");
+    }
+  }
 });
 
 test("the inline answer composer resolves a human-owned question and surfaces a rejected answer", async (t) => {
@@ -851,7 +1387,8 @@ test("a model-owned question stays read-only in /subagents and Escape leaves the
   overlay.focused = true;
   const lines = overlay.render(120).join("\n");
   assert.ok(lines.includes("needs orchestrator"));
-  assert.ok(lines.includes("the orchestrator answers this from the parent thread"));
+  assert.ok(lines.includes("parent thread: subagent_answer"));
+  assert.ok(lines.includes("do not steer"));
   assert.ok(!lines.includes("a answer"), "no inline composer is offered for a question the parent thread owns");
 
   overlay.handleInput("a");
@@ -870,4 +1407,153 @@ test("a model-owned question stays read-only in /subagents and Escape leaves the
   composing.overlay.handleInput("\u0003");
   assert.ok(!composing.overlay.render(120).some((line) => line.includes("▸ answer ·")), "cancel layers back to browse without closing the panel");
   assert.deepEqual(composing.manager.answerCalls, []);
+});
+
+test("direct question previews route peer and workflow ownership to the accurate destination", (t) => {
+  const peer = parkedJob("peer-owned", {
+    sourceName: "implementer",
+    target: { kind: "agent", jobId: "planner-job", label: "planner" },
+  });
+  const peerState = dashboard([peer], 24, () => {}, undefined, { focusJobId: peer.id });
+  t.after(() => peerState.overlay.dispose());
+  peerState.overlay.focused = true;
+  const peerText = peerState.overlay.render(120).join("\n");
+  assert.match(peerText, /Route · implementer → peer planner · waiting 1m 04s/);
+  assert.match(peerText, /no human action required; waiting for peer planner/);
+  assert.doesNotMatch(peerText, /a answer|s steer|f follow-up|subagent_answer/);
+
+  const owned = jobSnapshot({
+    id: "workflow-question",
+    name: "workflow-worker",
+    workflow: { runId: "workflow-run-1234", agentIndex: 2, label: "release-flow", phase: "verify" },
+    interaction: interactionSnapshot({
+      sourceJobId: "workflow-question",
+      sourceName: "workflow-worker",
+      workflow: { runId: "workflow-run-1234", agentIndex: 2, label: "release-flow", phase: "verify" },
+    }),
+  });
+  const ownedState = dashboard([owned], 24, () => {}, undefined, { focusJobId: owned.id });
+  t.after(() => ownedState.overlay.dispose());
+  ownedState.overlay.focused = true;
+  const ownedText = ownedState.overlay.render(120).join("\n");
+  assert.match(ownedText, /\/workflows: supervise release-flow/);
+  assert.match(ownedText, /no answer or steer here/);
+  assert.doesNotMatch(ownedText, /a answer|takeover|s steer|f follow-up/);
+
+  const human = parkedJob("human-owned", { humanVisible: true });
+  const unavailable = dashboard([human], 24, () => {}, undefined, {
+    focusJobId: human.id,
+    answerable: false,
+  });
+  t.after(() => unavailable.overlay.dispose());
+  const unavailableText = unavailable.overlay.render(120).join("\n");
+  assert.match(unavailableText, /inline answering is unavailable in this session/);
+  assert.doesNotMatch(unavailableText, /press a|a answer/);
+});
+
+test("direct inspectors prioritize activity, results, failures, and queue recovery at constrained geometry", (t) => {
+  const cases = [
+    jobSnapshot({ id: "live-preview", name: "live-preview", liveThinking: "checking the bounded state preview" }),
+    jobSnapshot({ id: "done-preview", name: "done-preview", status: "completed", output: "final concise result", endedAt: 4_000 }),
+    jobSnapshot({ id: "failed-preview", name: "failed-preview", status: "failed", error: "bounded provider failure", endedAt: 4_000 }),
+    jobSnapshot({ id: "queued-preview", name: "queued-preview", status: "queued", startedAt: undefined }),
+  ];
+
+  for (const current of cases) {
+    const state = dashboard([current], 8, () => {}, undefined, { focusJobId: current.id, fullscreen: true });
+    t.after(() => state.overlay.dispose());
+    state.overlay.render(52);
+    state.overlay.handleInput(ENTER);
+    const lines = state.overlay.render(52);
+    const text = lines.join("\n");
+    assert.ok(lines.every((line) => visibleWidth(line) <= 52));
+    assert.match(text, current.status === "running"
+      ? /Latest · checking/
+      : current.status === "completed"
+        ? /Result · final concise result/
+        : current.status === "failed"
+          ? /Error · bounded provider failure/
+          : /Waiting · waiting for scheduler slot/);
+    const previewAt = lines.findIndex((line) => /Latest ·|Result ·|Error ·|Waiting ·/.test(line));
+    const routeAt = lines.findIndex((line) => line.includes("route "));
+    assert.ok(previewAt >= 0 && (routeAt < 0 || previewAt < routeAt), "state preview precedes route telemetry");
+  }
+
+  const failedState = dashboard([cases[2]!], 24, () => {}, undefined, { focusJobId: cases[2]!.id });
+  t.after(() => failedState.overlay.dispose());
+  const failedText = failedState.overlay.render(120).join("\n");
+  assert.match(failedText, /Recovery · no recovery action is available in this pane/);
+  assert.doesNotMatch(failedText, /f follow-up|restart|takeover/);
+
+  const liveFailure = jobSnapshot({
+    id: "live-failure",
+    name: "live-failure",
+    status: "running",
+    error: "transient tool failure",
+  });
+  const liveFailureState = dashboard([liveFailure], 24, () => {}, undefined, {
+    focusJobId: liveFailure.id,
+  });
+  t.after(() => liveFailureState.overlay.dispose());
+  const liveFailureText = liveFailureState.overlay.render(120).join("\n");
+  assert.match(liveFailureText, /Recovery · press s to steer/);
+  assert.doesNotMatch(liveFailureText, /press f to follow up/);
+});
+
+test("direct inspector hides routine info by default and keeps a transcript row at short height", (t) => {
+  const current = jobSnapshot({
+    id: "info-fold",
+    name: "info-fold",
+    access: "readOnly",
+    independent: true,
+    independentOf: "producer-job",
+    task: "inspect metadata",
+    context: { tokens: 32_000, window: 128_000, servingModel: "served-model" },
+    requires: ["tool:read"],
+    capabilities: { harness: "codex", matched: ["tool:read"], revision: "revision-1234", discoveredAt: 1, auto: true },
+    transcript: [{ kind: "assistant", text: "USEFUL_TRANSCRIPT_ROW" }],
+    output: "USEFUL_TRANSCRIPT_ROW",
+  });
+  const state = dashboard([current], 8, () => {}, undefined, { focusJobId: current.id, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(52);
+  state.overlay.handleInput(ENTER);
+  let lines = state.overlay.render(52);
+  assert.equal(lines.length, 8);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 52));
+  assert.match(lines.join("\n"), /USEFUL_TRANSCRIPT_ROW/);
+  assert.doesNotMatch(lines.join("\n"), /Capabilities ·|Provenance ·/);
+
+  state.overlay.handleInput("i");
+  state.overlay.handleInput("g");
+  lines = state.overlay.render(52);
+  assert.equal(lines.length, 8);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 52));
+  assert.match(lines.join("\n"), /Task · inspect metadata|Route · readOnly/);
+});
+
+test("short direct question inspectors pin the next action and retain transcript content", (t) => {
+  const current = {
+    ...parkedJob("short-question"),
+    interaction: interactionSnapshot({
+      sourceJobId: "short-question",
+      sourceName: "short-question",
+      humanVisible: true,
+      question: "Which fixture is authoritative?",
+      context: "the task and tests disagree",
+    }),
+    transcript: [{ kind: "assistant" as const, text: "TRANSCRIPT_RESERVE" }],
+  };
+  const state = dashboard([current], 8, () => {}, undefined, { focusJobId: current.id, fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  state.overlay.render(52);
+  state.overlay.handleInput(ENTER);
+  const lines = state.overlay.render(52);
+  assert.equal(lines.length, 8);
+  assert.ok(lines.every((line) => visibleWidth(line) <= 52));
+  assert.match(lines.find((line) => line.includes("transcript")) ?? "", /transcript/);
+  assert.match(lines.join("\n"), /Next · press a to answer inline/);
+  assert.match(lines.join("\n"), /last line/, "the reserved body row renders the transcript tail");
 });

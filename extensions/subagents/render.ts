@@ -1,7 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { truncateToWidth } from "@earendil-works/pi-tui";
-import { formatDurationLabel } from "../dashboard-style.ts";
+import { formatDurationLabel, type DashboardSummary } from "../dashboard-style.ts";
 import { isTerminal } from "../../src/manager.ts";
 import { formatSpendBudget } from "../../src/budget.ts";
 import type { PeerSessionSummary } from "../../src/session-peers.ts";
@@ -101,6 +101,13 @@ const ACTIVITY_PREVIEW_CHARS = 160;
 function activityPreview(value: string): string {
   const trimmed = value.length > ACTIVITY_PREVIEW_CHARS ? `…${value.slice(-ACTIVITY_PREVIEW_CHARS)}` : value;
   return sanitizeInline(trimmed);
+}
+
+function firstSummaryLine(value: string): string {
+  return sanitizeText(value.slice(0, ACTIVITY_PREVIEW_CHARS * 2))
+    .split("\n")
+    .map(sanitizeInline)
+    .find(Boolean) ?? "";
 }
 
 export function shortId(id: string): string {
@@ -365,6 +372,69 @@ export function interactionStatusLabel(job: Pick<JobSnapshot, "interaction" | "a
   const pending = pendingInteraction(job);
   if (pending) return interactionWaitLabel(pending);
   return job.answeringInteraction ? "answering peer" : undefined;
+}
+
+/** Operator-first semantic summary for a direct job dashboard row. */
+export function jobDashboardSummary(job: JobSnapshot): DashboardSummary {
+  const interaction = pendingInteraction(job);
+  if (interaction) {
+    return {
+      kind: "input",
+      text: `${interactionWaitLabel(interaction)}: ${sanitizeInline(interaction.question)}`,
+    };
+  }
+
+  if (job.error || job.status === "failed") {
+    return {
+      kind: "failure",
+      text: firstSummaryLine(job.error ?? "Subagent failed") || "Subagent failed",
+    };
+  }
+
+  if (job.answeringInteraction) {
+    return {
+      kind: "activity",
+      text: `answering peer question from ${sanitizeInline(job.answeringInteraction.sourceName)}`,
+    };
+  }
+
+  if (job.status === "running") {
+    const thinking = activityPreview(job.liveThinking);
+    if (thinking) return { kind: "activity", text: thinking };
+
+    const tool = [...job.tools].reverse().find((candidate) => candidate.status === "running");
+    if (tool) {
+      const detail = sanitizeInline(tool.summary ?? tool.name);
+      return { kind: "activity", text: `running ${detail || "tool"}` };
+    }
+
+    const latest = firstSummaryLine(job.output);
+    if (latest) return { kind: "activity", text: latest };
+  }
+
+  if (job.status === "queued") {
+    return { kind: "wait", text: "waiting for scheduler slot" };
+  }
+
+  if (job.status === "completed") {
+    const result = firstSummaryLine(job.output);
+    if (result) return { kind: "result", text: result };
+    if (job.structured !== undefined) {
+      let structured: string;
+      try {
+        structured = JSON.stringify(job.structured) ?? String(job.structured);
+      } catch {
+        structured = "structured result available";
+      }
+      return { kind: "result", text: firstSummaryLine(structured) || "structured result available" };
+    }
+    return { kind: "result", text: "completed without assistant text" };
+  }
+
+  if (job.status === "running") {
+    return { kind: "lifecycle", text: job.progressed ? "working" : "waiting for first response" };
+  }
+  return { kind: "lifecycle", text: job.status };
 }
 
 /**

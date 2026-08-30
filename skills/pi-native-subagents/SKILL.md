@@ -18,7 +18,7 @@ Paths are relative to this file. Read the reference **before** you write the cal
 | let a child use `subagent_ask`, or answer with `subagent_answer` | `references/routed-questions.md` |
 | set spend limits, send a limited retained follow-up, set a workflow `budget`, use `resumeFromRunId`, `providerFallback`, or `retry` | `references/budgets-replay-and-provider-waits.md` |
 | use `isolation: "worktree"`, or run `/workflows reclaim` | `references/worktrees-and-retention.md` |
-| inspect running jobs, workflow activity, providers, usage, or model numbers | `references/supervision-and-telemetry.md` |
+| run `/subagents providers` or `/subagents providers refresh`, supervise or recover a selected job/workflow/agent, report on running work, or interpret usage and model numbers | `references/supervision-and-telemetry.md` |
 
 ## Choose the smallest orchestration surface
 
@@ -186,6 +186,7 @@ These are enforced by the runtime. Do not design around them.
 - `Codex app-server exited (0) during an in-progress turn with no terminal result`: a clean mid-turn app-server exit is a Codex lifecycle/result-propagation failure, not proof a `requires` capability is unsupported — pre-dispatch revalidation only confirms the capability was discovered and healthy, not that the turn would exercise it successfully. Retry the job before dropping the requirement.
 - A harness rejected for login or readiness: the error names the normalized state (missing executable, login required, incompatible, temporarily unhealthy, or status unknown). Check `/subagents providers` for the active set and each harness's actionable reason, then switch routes or use `harness: "auto"` rather than guessing at the account state. The extension never logs in or installs a CLI for you.
 - A workflow or child fails: inspect the returned `ok`, `error`, route, and job ID; use `/workflows` for durable workflow state. Do not hide a failed route behind a success-only summary.
+- `/subagents` and `/workflows` use explicit focus layers. Use each contextual `?` legend, press `i` for routine inspector telemetry, and back out one layer at a time. Left edits composer drafts normally. Agent actions require an eligible selected entity that the current view visibly rendered.
 - A provider-quota, replay, worktree, or routed-question error: the matching reference above lists the exact message and its recovery.
 
 ## Safe routing defaults

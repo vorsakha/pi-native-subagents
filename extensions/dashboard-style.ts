@@ -39,6 +39,32 @@ export const DASHBOARD_CHROME_ROWS = 4;
 
 export type DashboardLayoutKind = "wide" | "medium" | "narrow";
 
+/** One deterministic semantic sentence for a dashboard list or rail row. */
+export type DashboardSummary =
+  | { kind: "input"; text: string }
+  | { kind: "failure"; text: string }
+  | { kind: "activity"; text: string }
+  | { kind: "wait"; text: string }
+  | { kind: "result"; text: string }
+  | { kind: "lifecycle"; text: string };
+
+export function dashboardSummaryColor(
+  summary: DashboardSummary,
+): "warning" | "error" | "muted" | "dim" {
+  switch (summary.kind) {
+    case "input":
+    case "wait":
+      return "warning";
+    case "failure":
+      return "error";
+    case "activity":
+      return "muted";
+    case "result":
+    case "lifecycle":
+      return "dim";
+  }
+}
+
 export interface DashboardLayout {
   kind: DashboardLayoutKind;
   /** Total lines the panel is allowed to render. */
@@ -51,6 +77,20 @@ export interface DashboardLayout {
   listRows: number;
   /** Rows given to the inspector. */
   detailRows: number;
+}
+
+/** Shared bounded-output label; paused viewports always advertise the one-key return to tail-following. */
+export function dashboardViewportLabel(
+  section: string,
+  start: number,
+  end: number,
+  total: number,
+  following: boolean,
+  canGrow = true,
+): string {
+  const range = end > start ? `${start + 1}–${end}` : "0";
+  const tail = canGrow ? "live" : "end";
+  return `${section} ${range}/${total} · ${following ? tail : `paused · G resumes ${tail}`}`;
 }
 
 export function dashboardLayout(width: number, rows: number): DashboardLayout {
@@ -225,6 +265,44 @@ export function alignDashboardRow(
   );
 }
 
+/**
+ * Adds a semantic summary only after the complete identity fits. Elapsed time
+ * and lifecycle metadata remain right-aligned, while the summary gives way
+ * before the job/run name at constrained widths.
+ */
+export function alignDashboardSummaryRow(
+  identity: string,
+  summary: string,
+  right: string,
+  width: number,
+): string {
+  const safeWidth = Math.max(0, width);
+  const gapWidth = safeWidth >= 2 ? 2 : 0;
+  const rightWidth = visibleWidth(right);
+  const minimumRight = Math.min(rightWidth, Math.min(25, Math.floor(safeWidth * 0.65)));
+  const identityMax = Math.max(0, safeWidth - minimumRight - gapWidth);
+  const fittedIdentity = truncateToWidth(identity, identityMax);
+  const fittedRight = truncateToWidth(
+    right,
+    Math.max(0, safeWidth - visibleWidth(fittedIdentity) - gapWidth),
+  );
+  const leftMax = Math.max(0, safeWidth - visibleWidth(fittedRight) - gapWidth);
+  let left = fittedIdentity;
+
+  if (
+    visibleWidth(fittedIdentity) === visibleWidth(identity)
+    && visibleWidth(fittedRight) === rightWidth
+  ) {
+    const separator = " · ";
+    const summaryWidth = leftMax - visibleWidth(identity) - visibleWidth(separator);
+    if (summaryWidth >= 2) {
+      left += separator + truncateToWidth(summary, summaryWidth);
+    }
+  }
+
+  return alignDashboardRow(left, fittedRight, safeWidth);
+}
+
 export type DashboardFrame = ReturnType<typeof createDashboardFrame>;
 
 /** A fixed-size, top-aligned viewport into a longer list, centered on `selected`. */
@@ -261,6 +339,22 @@ export function formatDurationLabel(elapsedMs: number): string {
 export function dashboardScrollRule(theme: Theme, label: string, width: number): string {
   const safeWidth = Math.max(0, width);
   return theme.fg("dim", truncateToWidth(`── ${label} ${"─".repeat(safeWidth)}`, safeWidth, ""));
+}
+
+/** Shared disclosure grammar for routine inspector telemetry. */
+export function dashboardInfoRule(theme: Theme, expanded: boolean, width: number): string {
+  return dashboardScrollRule(theme, expanded ? "info expanded · i hide" : "info · i show", width);
+}
+
+/** Textual, non-selectable list section header with its complete entity count. */
+export function dashboardSectionRow(theme: Theme, label: string, count: number, width: number): string {
+  return dashboardScrollRule(theme, `${label} · ${count}`, width);
+}
+
+/** Width-safe notice for automatically folded low-priority entities. */
+export function dashboardFoldRow(theme: Theme, label: string, hidden: number, width: number): string {
+  const safeWidth = Math.max(0, width);
+  return theme.fg("dim", truncateToWidth(`… ${hidden} ${label} hidden`, safeWidth, ""));
 }
 
 /** Primary (run/job-level) selection marker. */
