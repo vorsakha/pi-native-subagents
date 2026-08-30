@@ -1061,7 +1061,6 @@ export class JobManager {
     const answered = new Promise<PendingInteraction>((resolve, reject) => {
       settle = (outcome) => {
         if (pending.settled) return;
-        if ("error" in outcome && (pending.committingAcceptance || pending.acceptanceCommitted)) return;
         pending.settled = true;
         pending.cancelDeadline?.();
         pending.cancelDeadline = undefined;
@@ -1192,19 +1191,32 @@ export class JobManager {
       context: record.context,
       signal: pending.controller.signal,
       commitAcceptance: async (persist) => {
+        const abortReason = () => pending.controller.signal.reason instanceof Error
+          ? pending.controller.signal.reason
+          : new InteractionError(`Question ${record.requestId} can no longer accept an answer`);
         if (pending.settled || pending.controller.signal.aborted) {
-          throw pending.controller.signal.reason instanceof Error
-            ? pending.controller.signal.reason
-            : new InteractionError(`Question ${record.requestId} can no longer accept an answer`);
+          throw abortReason();
         }
         if (pending.committingAcceptance || pending.acceptanceCommitted) {
           throw new InteractionError(`Question ${record.requestId} already committed its durable peer answer`);
         }
         pending.committingAcceptance = true;
+        let removeAbortListener = () => {};
+        const aborted = new Promise<never>((_resolve, reject) => {
+          const abort = () => reject(abortReason());
+          if (pending.controller.signal.aborted) {
+            abort();
+            return;
+          }
+          pending.controller.signal.addEventListener("abort", abort, { once: true });
+          removeAbortListener = () => pending.controller.signal.removeEventListener("abort", abort);
+        });
         try {
-          await persist();
+          await Promise.race([persist(), aborted]);
+          if (pending.controller.signal.aborted) throw abortReason();
           pending.acceptanceCommitted = true;
         } finally {
+          removeAbortListener();
           pending.committingAcceptance = false;
         }
       },

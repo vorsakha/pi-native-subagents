@@ -5343,6 +5343,46 @@ test("a replayed peer answer dismissed during completed-journal persistence is i
   }
 });
 
+test("caller cancellation during peer acceptance invalidates the durable answer before replay", async () => {
+  const gate = new GatedWorkflowJournalAppender();
+  gate.arm("accepted");
+  const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, gate.append);
+  try {
+    const started = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "ORIGINAL PLAN");
+    await waitFor(() => f.backend.requests.length === 2, "implementer dispatch");
+    const implementerJobId = f.backend.requests[1]!.jobId;
+
+    const asked = f.backend.ask(implementerJobId, {
+      question: "which plan?",
+      target: { type: "agent", jobId: plannerJobId },
+    });
+    const rejected = assert.rejects(asked, /cancel during acceptance commit/);
+    await waitFor(() => f.backend.sends.length === 1, "peer follow-up dispatch");
+    f.backend.complete(plannerJobId, "ACCEPTED BUT NOT DELIVERED");
+    await gate.waitUntilReached();
+
+    const cancellation = f.jobs.cancel(implementerJobId, "cancel during acceptance commit");
+    await rejected;
+    assert.equal(f.jobs.pendingInteractions().length, 0, "the parked callback clears before the write is released");
+
+    gate.release();
+    await cancellation;
+    const final = await started.completion;
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    assert.deepEqual(
+      journal.filter((record) => record.kind === "peerQuestion").map((record) => record.state),
+      ["started", "completed", "accepted", "failed"],
+    );
+    assert.deepEqual(replayableJournalInteractions(journal), [], "the cancelled answer cannot become replay evidence");
+  } finally {
+    gate.release();
+    await f.cleanup();
+  }
+});
+
 test("a live peer dismissal stays non-replayable when its invalidation append fails", async () => {
   const gate = new GatedWorkflowJournalAppender();
   gate.arm();

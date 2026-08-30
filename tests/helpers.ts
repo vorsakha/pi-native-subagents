@@ -71,10 +71,10 @@ export class GatedManagedProcess implements ManagedProcess {
   }
 }
 
-/** Persists one provisional peer answer, then holds its append promise so tests
- * can dismiss the source interaction in the exact post-write race window. */
+/** Persists one selected peer-answer record, then holds its append promise. */
 export class GatedWorkflowJournalAppender {
   #armed = false;
+  #gateState: WorkflowJournalRecord["state"] = "completed";
   #reached = false;
   #failInvalidation = false;
   #resolveReached!: () => void;
@@ -88,19 +88,45 @@ export class GatedWorkflowJournalAppender {
       throw new Error("controlled peer-answer invalidation persistence failure");
     }
     await appendWorkflowJournal(root, runId, record);
-    if (!this.#armed || this.#reached || record.kind !== "peerQuestion" || record.state !== "completed") return;
+    if (!this.#armed || this.#reached || record.kind !== "peerQuestion" || record.state !== this.#gateState) return;
     this.#reached = true;
     this.#resolveReached();
     await this.#releasePromise;
   };
 
-  arm(): void {
+  arm(state: WorkflowJournalRecord["state"] = "completed"): void {
     this.#armed = true;
+    this.#gateState = state;
   }
 
   failNextInvalidation(): void {
     this.#failInvalidation = true;
   }
+
+  waitUntilReached(): Promise<void> {
+    return this.#reached ? Promise.resolve() : this.#reachedPromise;
+  }
+
+  release(): void {
+    this.#resolveRelease();
+  }
+}
+
+/** Controlled durable write for interaction acceptance lifecycle races. */
+export class GatedAcceptanceWrite {
+  #reached = false;
+  #resolveReached!: () => void;
+  #resolveRelease!: () => void;
+  readonly #reachedPromise = new Promise<void>((resolve) => { this.#resolveReached = resolve; });
+  readonly #releasePromise = new Promise<void>((resolve) => { this.#resolveRelease = resolve; });
+  calls = 0;
+
+  readonly persist = async (): Promise<void> => {
+    this.calls++;
+    this.#reached = true;
+    this.#resolveReached();
+    await this.#releasePromise;
+  };
 
   waitUntilReached(): Promise<void> {
     return this.#reached ? Promise.resolve() : this.#reachedPromise;
