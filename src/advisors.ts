@@ -100,6 +100,8 @@ export interface AdvisorConsultRequest {
   retryUnavailable?: boolean;
   requiredLineage?: number;
   workflow?: { runId: string; phase?: string; callIndex: number };
+  /** Internal launch-time budget gate used by workflow-owned consultations. */
+  dispatchGate?: () => string | undefined;
 }
 
 export interface AdvisorConsultResult {
@@ -134,6 +136,8 @@ export interface AdvisorRouteResolver {
 
 interface StoredAdvisor extends Omit<AdvisorSnapshot, "queued"> {
   continuation?: NativeContinuation;
+  /** Provider-reported cumulative usage for only the current native lineage. */
+  lineageUsage?: Usage;
   profileBinding?: AdvisorProfileBinding;
   /** Set only while normalizing a malformed private continuation from disk. */
   invalidContinuation?: true;
@@ -210,7 +214,6 @@ export class FileAdvisorStore implements AdvisorStore {
 
   async save(threadId: string, advisors: StoredAdvisor[]): Promise<void> {
     assertValidStoredRoster(advisors, threadId);
-    const directory = await openPrivateDirectory(this.#trustedRoot, this.#storageSegments(), true, this.#descriptorRoot);
     const payload: AdvisorStorePayload = {
       version: 1,
       threadId,
@@ -220,8 +223,13 @@ export class FileAdvisorStore implements AdvisorStore {
         return cloned;
       }),
     };
+    const contents = JSON.stringify(payload);
+    if (Buffer.byteLength(contents) > MAX_ADVISOR_STORE_BYTES) {
+      throw new Error(`Advisor state exceeds ${MAX_ADVISOR_STORE_BYTES} bytes`);
+    }
+    const directory = await openPrivateDirectory(this.#trustedRoot, this.#storageSegments(), true, this.#descriptorRoot);
     try {
-      await atomicPrivateWrite(directory, this.#filename(threadId), JSON.stringify(payload));
+      await atomicPrivateWrite(directory, this.#filename(threadId), contents);
     } finally {
       await directory.close();
     }
@@ -237,11 +245,13 @@ export class FileAdvisorStore implements AdvisorStore {
   }
 }
 
-interface InternalAdvisor extends StoredAdvisor {
+interface InternalAdvisor extends Omit<StoredAdvisor, "lineageUsage"> {
+  lineageUsage: Usage;
   queued: number;
   jobId?: string;
   tail: Promise<void>;
   idleTimer?: NodeJS.Timeout;
+  transition?: "reset" | "close" | "hibernate";
 }
 
 export class AdvisorRegistry {
@@ -255,6 +265,7 @@ export class AdvisorRegistry {
   readonly #listeners = new Set<(snapshot: AdvisorSnapshot) => void>();
   readonly #shutdownController = new AbortController();
   #persistChain: Promise<void> = Promise.resolve();
+  #openTail: Promise<void> = Promise.resolve();
   #initializing?: Promise<void>;
   #shutdownPromise?: Promise<void>;
   #initialized = false;
@@ -291,7 +302,14 @@ export class AdvisorRegistry {
         && !validContinuation(value.continuation, value.policy.harness);
       const normalized = cloneStored({ ...value, continuation: invalidContinuation ? undefined : value.continuation });
       if (invalidContinuation) normalized.invalidContinuation = true;
-      const record: InternalAdvisor = { ...normalized, queued: 0, tail: Promise.resolve() };
+      const record: InternalAdvisor = {
+        ...normalized,
+        lineageUsage: normalized.lineageUsage
+          ? { ...normalized.lineageUsage }
+          : legacyLineageUsage(normalized),
+        queued: 0,
+        tail: Promise.resolve(),
+      };
       if (record.state === "closed") continue;
       const storedUnavailable = record.state === "unavailable";
       try {
@@ -345,6 +363,19 @@ export class AdvisorRegistry {
     this.#assertTrusted(request.trusted);
     await this.initialize();
     this.#assertThread(request.threadId);
+    const previous = this.#openTail.catch(() => undefined);
+    let settle!: () => void;
+    const own = new Promise<void>((resolveTail) => { settle = resolveTail; });
+    this.#openTail = previous.then(() => own);
+    await previous;
+    try {
+      return await this.#open(request);
+    } finally {
+      settle();
+    }
+  }
+
+  async #open(request: AdvisorOpenRequest): Promise<AdvisorSnapshot> {
     if (this.#closed) throw new Error("Advisor registry is closed");
     if (this.#records.size >= MAX_ADVISORS_PER_THREAD) throw new Error(`Advisor limit reached (${MAX_ADVISORS_PER_THREAD} per thread)`);
     const name = requireText(request.name, "Advisor name", 160);
@@ -379,6 +410,7 @@ export class AdvisorRegistry {
       ...spawnRequestForPolicy(policy, "advisor policy validation"),
       profile: undefined,
     }, budget);
+    if (this.#closed) throw new Error("Advisor registry is closed");
     const now = Date.now();
     const id = `adv_${randomUUID().replaceAll("-", "")}`;
     const record: InternalAdvisor = {
@@ -392,6 +424,7 @@ export class AdvisorRegistry {
       lineage: 0,
       generation: 0,
       usage: emptyUsage(),
+      lineageUsage: emptyUsage(),
       createdAt: now,
       updatedAt: now,
       queued: 0,
@@ -400,7 +433,12 @@ export class AdvisorRegistry {
       tail: Promise.resolve(),
     };
     this.#records.set(id, record);
-    await this.#persist();
+    try {
+      await this.#persist();
+    } catch (error) {
+      this.#records.delete(id);
+      throw error;
+    }
     this.#publish(record);
     return publicSnapshot(record);
   }
@@ -424,6 +462,7 @@ export class AdvisorRegistry {
       throw new Error("Advisor continuation is missing; retry cannot reconstruct it. Reset or close the advisor explicitly.");
     }
     if (record.state === "closed") throw new Error("Advisor is closed");
+    if (record.transition) throw new Error(`Cannot consult an advisor while ${record.transition} is in progress`);
 
     const queuedAt = Date.now();
     record.queued++;
@@ -431,7 +470,8 @@ export class AdvisorRegistry {
     this.#publish(record);
     const previous = record.tail.catch(() => undefined);
     let settle!: () => void;
-    record.tail = new Promise<void>((resolveTail) => { settle = resolveTail; });
+    const own = new Promise<void>((resolveTail) => { settle = resolveTail; });
+    record.tail = previous.then(() => own);
     let dequeued = false;
     const signal = request.signal
       ? AbortSignal.any([request.signal, this.#shutdownController.signal])
@@ -452,75 +492,101 @@ export class AdvisorRegistry {
     this.#assertTrusted(trusted);
     await this.initialize();
     const record = this.#resolve(threadId, idOrAlias);
-    if (record.state === "consulting" || record.queued) throw new Error("Cannot reset an advisor with an active or queued consultation");
-    if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
-    const now = Date.now();
-    record.jobId = undefined;
-    record.continuation = undefined;
-    record.invalidContinuation = undefined;
-    record.lineage++;
-    record.generation = 0;
-    record.state = "defined";
-    record.error = undefined;
-    record.updatedAt = now;
-    record.ledger.push({
-      index: record.ledger.length ? record.ledger.at(-1)!.index + 1 : 0,
-      lineage: record.lineage,
-      generation: 0,
-      sender: "system",
-      question: "Explicit advisor lineage reset",
-      state: "reset",
-      startedAt: now,
-      endedAt: now,
+    return this.#withLifecycleTransition(record, "reset", async () => {
+      if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
+      const now = Date.now();
+      record.jobId = undefined;
+      record.continuation = undefined;
+      record.invalidContinuation = undefined;
+      record.lineage++;
+      record.generation = 0;
+      record.lineageUsage = emptyUsage();
+      record.state = "defined";
+      record.error = undefined;
+      record.updatedAt = now;
+      record.ledger.push({
+        index: record.ledger.length ? record.ledger.at(-1)!.index + 1 : 0,
+        lineage: record.lineage,
+        generation: 0,
+        sender: "system",
+        question: "Explicit advisor lineage reset",
+        state: "reset",
+        startedAt: now,
+        endedAt: now,
+      });
+      record.ledger = record.ledger.slice(-MAX_ADVISOR_LEDGER);
+      await this.#persist();
+      this.#publish(record);
+      return publicSnapshot(record);
     });
-    record.ledger = record.ledger.slice(-MAX_ADVISOR_LEDGER);
-    await this.#persist();
-    this.#publish(record);
-    return publicSnapshot(record);
   }
 
   async close(threadId: string, idOrAlias: string, trusted = false): Promise<AdvisorSnapshot> {
     this.#assertTrusted(trusted);
     await this.initialize();
     const record = this.#resolve(threadId, idOrAlias);
-    if (record.state === "consulting" || record.queued) {
-      throw new Error("Cannot close an advisor with an active or queued consultation; cancel the caller first");
-    }
-    if (record.jobId) {
-      try {
-        const job = this.#jobs.checkAdvisorJob(record.jobId, record.id);
-        if (job.status === "queued" || job.status === "running") await this.#jobs.cancelAdvisorJob(record.jobId, record.id, "Advisor closed");
-        await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
-      } catch { /* the job may already be evicted */ }
-    }
-    if (record.idleTimer) clearTimeout(record.idleTimer);
-    record.idleTimer = undefined;
-    record.jobId = undefined;
-    record.continuation = undefined;
-    record.state = "closed";
-    record.updatedAt = Date.now();
-    await this.#persist();
-    this.#records.delete(record.id);
-    this.#publish(record);
-    return publicSnapshot(record);
+    return this.#withLifecycleTransition(record, "close", async () => {
+      if (record.jobId) {
+        try {
+          const job = this.#jobs.checkAdvisorJob(record.jobId, record.id);
+          if (job.status === "queued" || job.status === "running") await this.#jobs.cancelAdvisorJob(record.jobId, record.id, "Advisor closed");
+          await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
+        } catch { /* the job may already be evicted */ }
+      }
+      record.jobId = undefined;
+      record.continuation = undefined;
+      record.state = "closed";
+      record.updatedAt = Date.now();
+      await this.#persist();
+      this.#records.delete(record.id);
+      this.#publish(record);
+      return publicSnapshot(record);
+    });
   }
 
   async hibernate(threadId: string, idOrAlias: string, trusted = false): Promise<AdvisorSnapshot> {
     this.#assertTrusted(trusted);
+    await this.initialize();
     const record = this.#resolve(threadId, idOrAlias);
     return this.#hibernate(record);
   }
 
   async #hibernate(record: InternalAdvisor): Promise<AdvisorSnapshot> {
-    if (record.state === "consulting" || record.queued) throw new Error("Cannot hibernate an active advisor");
-    if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
-    record.jobId = undefined;
-    record.state = record.continuation ? "hibernated" : record.generation ? "unavailable" : "defined";
-    if (record.state === "unavailable") record.error = "Native continuation is missing; explicitly reset or close this advisor.";
-    record.updatedAt = Date.now();
-    await this.#persist();
-    this.#publish(record);
-    return publicSnapshot(record);
+    return this.#withLifecycleTransition(record, "hibernate", async () => {
+      if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
+      record.jobId = undefined;
+      record.state = record.continuation ? "hibernated" : record.generation ? "unavailable" : "defined";
+      if (record.state === "unavailable") record.error = "Native continuation is missing; explicitly reset or close this advisor.";
+      record.updatedAt = Date.now();
+      await this.#persist();
+      this.#publish(record);
+      return publicSnapshot(record);
+    });
+  }
+
+  async #withLifecycleTransition<T>(
+    record: InternalAdvisor,
+    transition: NonNullable<InternalAdvisor["transition"]>,
+    operation: () => Promise<T>,
+  ): Promise<T> {
+    if (record.state === "consulting" || record.queued) {
+      throw new Error(`Cannot ${transition} an advisor with an active or queued consultation`);
+    }
+    if (record.transition) throw new Error(`Advisor ${record.transition} is already in progress`);
+    record.transition = transition;
+    if (record.idleTimer) clearTimeout(record.idleTimer);
+    record.idleTimer = undefined;
+    const previous = record.tail.catch(() => undefined);
+    let settle!: () => void;
+    const own = new Promise<void>((resolveTail) => { settle = resolveTail; });
+    record.tail = previous.then(() => own);
+    try {
+      await previous;
+      return await operation();
+    } finally {
+      record.transition = undefined;
+      settle();
+    }
   }
 
   async shutdown(): Promise<void> {
@@ -532,6 +598,7 @@ export class AdvisorRegistry {
     this.#closed = true;
     this.#shutdownController.abort(new Error("Advisor registry shutdown"));
     await this.initialize();
+    await this.#openTail.catch(() => undefined);
     await Promise.allSettled([...this.#records.values()].map((record) => record.tail));
     for (const record of this.#records.values()) {
       if (record.idleTimer) clearTimeout(record.idleTimer);
@@ -552,6 +619,8 @@ export class AdvisorRegistry {
     queuedAt: number,
   ): Promise<AdvisorConsultResult> {
     request.signal?.throwIfAborted();
+    const admissionState = record.state;
+    const admissionError = record.error;
     try {
       record.policy.cwd = await containedCwd(this.#projectRoot, record.policy.cwd, true);
     } catch (error) {
@@ -581,6 +650,7 @@ export class AdvisorRegistry {
     const prompt = consultationPrompt(record, request);
     const previousContinuation = record.continuation;
     let jobId = record.jobId;
+    let lineageUsageAccounted = false;
     try {
       const liveRoute = await this.#router.resolve({
         threadId: record.threadId,
@@ -619,6 +689,7 @@ export class AdvisorRegistry {
           record.id,
           prompt,
           request.workflow ? { runId: request.workflow.runId, callIndex: request.workflow.callIndex } : undefined,
+          request.dispatchGate,
         );
       } else {
         const spawned = this.#jobs.spawn({
@@ -627,7 +698,9 @@ export class AdvisorRegistry {
           requires: liveRoute.requires,
           continuation: record.continuation,
           initialUsage: record.usage,
+          providerUsageBaseline: record.continuation ? record.lineageUsage : undefined,
           initialGeneration: record.generation,
+          dispatchGate: request.dispatchGate,
           advisor: {
             advisorId: record.id,
             threadId: record.threadId,
@@ -660,14 +733,21 @@ export class AdvisorRegistry {
       const endedAt = Date.now();
       if (final.status !== "completed") {
         const privateReferences = this.#jobs.advisorNativeReferences(jobId, record.id);
+        const observedContinuation = this.#jobs.continuation(jobId, record.id);
+        if (previousContinuation && observedContinuation
+          && sameNativeIdentity(previousContinuation, observedContinuation)) {
+          record.lineageUsage = addUsage(record.lineageUsage, usage);
+        }
         await this.#jobs.releaseAdvisorRun(jobId, record.id).catch(() => undefined);
         record.continuation = previousContinuation;
         record.jobId = undefined;
-        record.state = "unavailable";
-        record.error = publicAdvisorError(final.error ?? `Advisor consultation ${final.status}`, previousContinuation, privateReferences);
-        this.#appendLedger(record, request, request.signal?.aborted ? "cancelled" : "failed", startedAt, endedAt, usage, final.output, record.error);
+        const didLaunch = final.startedAt !== undefined;
+        const failureMessage = publicAdvisorError(final.error ?? `Advisor consultation ${final.status}`, previousContinuation, privateReferences);
+        record.state = didLaunch ? "unavailable" : admissionState;
+        record.error = didLaunch ? failureMessage : admissionError;
+        this.#appendLedger(record, request, request.signal?.aborted ? "cancelled" : "failed", startedAt, endedAt, usage, final.output, failureMessage);
         await this.#persist();
-        return resultFor(record, false, final.output, record.error, usage, Date.now() - queuedAt);
+        return resultFor(record, false, final.output, failureMessage, usage, startedAt - queuedAt);
       }
       const observedContinuation = this.#jobs.continuation(jobId, record.id);
       if (previousContinuation) {
@@ -678,6 +758,8 @@ export class AdvisorRegistry {
       } else {
         record.continuation = observedContinuation;
       }
+      record.lineageUsage = addUsage(record.lineageUsage, usage);
+      lineageUsageAccounted = true;
       record.generation++;
       record.lastConsultedAt = endedAt;
       record.updatedAt = endedAt;
@@ -697,23 +779,30 @@ export class AdvisorRegistry {
     } catch (error) {
       const endedAt = Date.now();
       let privateReferences: string[] = [];
+      let observedContinuation: NativeContinuation | undefined;
       if (jobId) {
         try {
           record.usage = { ...this.#jobs.checkAdvisorJob(jobId, record.id).usage };
           privateReferences = this.#jobs.advisorNativeReferences(jobId, record.id);
+          observedContinuation = this.#jobs.continuation(jobId, record.id);
         }
         catch { /* a released/evicted job leaves the last persisted cumulative usage */ }
         await this.#jobs.releaseAdvisorRun(jobId, record.id).catch(() => undefined);
+      }
+      const failedUsage = subtractUsage(record.usage, beforeUsage);
+      if (!lineageUsageAccounted && previousContinuation && observedContinuation
+        && sameNativeIdentity(previousContinuation, observedContinuation)) {
+        record.lineageUsage = addUsage(record.lineageUsage, failedUsage);
       }
       const message = publicAdvisorError(error, previousContinuation, privateReferences);
       record.continuation = previousContinuation;
       record.jobId = undefined;
       record.state = "unavailable";
       record.error = message;
-      this.#appendLedger(record, request, request.signal?.aborted ? "cancelled" : "failed", startedAt, endedAt, subtractUsage(record.usage, beforeUsage), undefined, message);
+      this.#appendLedger(record, request, request.signal?.aborted ? "cancelled" : "failed", startedAt, endedAt, failedUsage, undefined, message);
       await this.#persist();
       this.#publish(record);
-      return resultFor(record, false, "", message, subtractUsage(record.usage, beforeUsage), startedAt - queuedAt);
+      return resultFor(record, false, "", message, failedUsage, startedAt - queuedAt);
     }
   }
 
@@ -758,6 +847,7 @@ export class AdvisorRegistry {
     record.idleTimer = setTimeout(() => {
       record.idleTimer = undefined;
       void this.#hibernate(record).catch((error) => {
+        if (record.transition || record.state === "consulting" || record.queued) return;
         record.state = "unavailable";
         record.error = boundedText(error instanceof Error ? error.message : String(error), 2_000);
         this.#publish(record);
@@ -874,6 +964,7 @@ function storedSnapshot(record: InternalAdvisor): StoredAdvisor {
   return {
     ...snapshot,
     continuation: record.continuation ? { ...record.continuation } : undefined,
+    lineageUsage: { ...record.lineageUsage },
     profileBinding: record.profileBinding ? cloneProfileBinding(record.profileBinding) : undefined,
   };
 }
@@ -884,6 +975,7 @@ function cloneStored(record: StoredAdvisor): StoredAdvisor {
     aliases: [...record.aliases],
     policy: clonePolicy(record.policy),
     usage: { ...record.usage },
+    lineageUsage: record.lineageUsage ? { ...record.lineageUsage } : undefined,
     ledger: record.ledger.map(cloneLedger),
     continuation: record.continuation ? { ...record.continuation } : undefined,
     profileBinding: record.profileBinding ? cloneProfileBinding(record.profileBinding) : undefined,
@@ -925,6 +1017,7 @@ function validStoredAdvisor(value: unknown): value is StoredAdvisor {
     && ["defined", "consulting", "idle", "hibernated", "unavailable", "closed"].includes(record.state ?? "")
     && validPolicy(record.policy)
     && validUsage(record.usage)
+    && (record.lineageUsage === undefined || validUsage(record.lineageUsage))
     && Number.isSafeInteger(record.lineage) && record.lineage! >= 0
     && Number.isSafeInteger(record.generation) && record.generation! >= 0
     && validTimestamp(record.createdAt)
@@ -1091,6 +1184,23 @@ function validUsage(value: unknown): value is Usage {
   const usage = value as Partial<Usage>;
   return [usage.input, usage.output, usage.cacheRead, usage.cacheWrite, usage.cost, usage.turns]
     .every((amount) => typeof amount === "number" && Number.isFinite(amount) && amount >= 0);
+}
+
+function legacyLineageUsage(record: StoredAdvisor): Usage {
+  const entries = record.ledger.filter((entry) => entry.lineage === record.lineage && entry.usage);
+  if (!entries.length) return record.lineage === 0 ? { ...record.usage } : emptyUsage();
+  return entries.reduce((total, entry) => addUsage(total, entry.usage!), emptyUsage());
+}
+
+function addUsage(left: Usage, right: Usage): Usage {
+  return {
+    input: left.input + right.input,
+    output: left.output + right.output,
+    cacheRead: left.cacheRead + right.cacheRead,
+    cacheWrite: left.cacheWrite + right.cacheWrite,
+    cost: left.cost + right.cost,
+    turns: left.turns + right.turns,
+  };
 }
 
 function validTextField(value: unknown, max: number): value is string {

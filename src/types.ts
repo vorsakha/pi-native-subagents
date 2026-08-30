@@ -140,8 +140,8 @@ export interface BackendRequest {
   signal: AbortSignal;
   /** Existing native lineage to resume. The harness must match `policy.harness`. */
   continuation?: NativeContinuation;
-  /** Previously accounted cumulative usage for that exact native lineage. */
-  initialUsage?: Usage;
+  /** Previously accounted provider counters for that exact native continuation. */
+  providerUsageBaseline?: Usage;
   /** When true, the initial message is sent verbatim instead of prefixed with the generic "Task:" wrapper. */
   rawInitialMessage?: boolean;
   /** Read-only spawn-time snapshot available only to human /subagent jobs through parent_thread_context. */
@@ -335,6 +335,8 @@ export interface SpawnRequest {
   continuation?: NativeContinuation;
   /** Cumulative usage restored with an advisor lineage. */
   initialUsage?: Usage;
+  /** Provider-counter baseline for the exact native continuation, excluding spend from older advisor lineages. */
+  providerUsageBaseline?: Usage;
   /** Last completed advisor generation restored with a native lineage. */
   initialGeneration?: number;
   /** Internal authorization for host-routed questions; absent means the child never sees an ask tool. */

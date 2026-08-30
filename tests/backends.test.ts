@@ -1667,7 +1667,7 @@ test("Codex resume subtracts already-accounted native thread usage", async () =>
   try {
     const resumed = request("codex", fake.dir, { ...process.env, MODE: "resume-usage" });
     resumed.continuation = { harness: "codex", threadId: "thread-1" };
-    resumed.initialUsage = { input: 500, output: 200, cacheRead: 300, cacheWrite: 50, cost: 0, turns: 4 };
+    resumed.providerUsageBaseline = { input: 500, output: 200, cacheRead: 300, cacheWrite: 50, cost: 0, turns: 4 };
     run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 5_000 })
       .start(resumed, (event) => events.push(event));
     await run.completed;

@@ -60,7 +60,7 @@ export default async function () {
 
 `consult()`, `agent()`, and `followUp()` share the hard 32-call ordinal and workflow `maxAgents` boundary. Advisor calls, active turns, per-call tokens, usage, and Codex cost support contribute to the same enforcement, reached warnings, and dashboard metrics as agents, as well as the advisor's own cumulative budget; a reached advisor per-call token limit blocks later dispatch. Dispatch uses the workflow lane of the global four-turn scheduler, preserving direct-work priority, and dispatch and lazy resume recheck both boundaries before a native turn. Calls are journaled with stable identity, lineage/generation, completed route, usage, queue delay, bounded result, and provenance. A completed advisor record missing any of those fields is corrupt and stops replay. Exact completed replay reuses the answer without spend. A live replay suffix requires a compatible lineage; reset-induced incompatibility fails explicitly.
 
-Workflow cancellation reaches queued or active consultations. `/workflows` shows advisor calls as distinct phase children and scrolls their bounded output with the normal detail keys. The sandbox exposes `consult()` only to workflow source; child agents never receive advisor tools.
+Workflow cancellation reaches queued or active consultations. `/workflows` shows advisor calls as distinct phase children and scrolls their bounded output with the normal detail keys. Advisor detail offers scrolling, back/help, and live run cancellation; agent restart/cancel, tool-display, and routine-info controls do not apply. The sandbox exposes `consult()` only to workflow source; child agents never receive advisor tools.
 
 ## Recovery
 

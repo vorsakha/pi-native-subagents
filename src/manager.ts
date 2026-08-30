@@ -530,6 +530,7 @@ export class JobManager {
     advisorId: string,
     message: string,
     workflow?: AdvisorJobReference["workflow"],
+    dispatchGate?: SpawnRequest["dispatchGate"],
   ): Promise<JobSnapshot> {
     if (!message.trim()) throw new Error("Advisor question must not be empty");
     const job = this.#advisorJob(id, advisorId);
@@ -539,6 +540,7 @@ export class JobManager {
       ...(workflow ? { workflow: { ...workflow } } : {}),
     };
     if (!workflow) delete job.snapshot.advisor.workflow;
+    job.request.dispatchGate = dispatchGate;
     return this.#queueFollowUp(job, message);
   }
 
@@ -956,7 +958,7 @@ export class JobManager {
           signal: startupController.signal,
           continuation: job.request.continuation
             ?? (job.request.peer ? { harness: "pi", sessionFile: job.request.peer.sessionFile } : undefined),
-          initialUsage: job.request.initialUsage,
+          providerUsageBaseline: job.request.providerUsageBaseline,
           rawInitialMessage: job.request.peer ? true : undefined,
           parentThread: job.request.parentThread,
           interactions: job.request.interaction ? this.#interactionHandler(job) : undefined,

@@ -794,6 +794,7 @@ export class ControlledBackend implements Backend {
   readonly #closeGates = new Map<string, ControlledCancellationGate>();
   readonly #closeFailures = new Map<string, Error>();
   cancelBarrier?: Promise<void>;
+  closeBarrier?: Promise<void>;
   active = 0;
   maxActive = 0;
 
@@ -886,6 +887,7 @@ export class ControlledBackend implements Backend {
         }
         const error = this.#closeFailures.get(request.jobId);
         if (error) throw error;
+        await this.closeBarrier;
       },
     };
   }
@@ -1021,6 +1023,7 @@ export class ControlledBackend implements Backend {
 export class MemoryAdvisorStore implements AdvisorStore {
   readonly records = new Map<string, Awaited<ReturnType<AdvisorStore["load"]>>>();
   loadBarrier?: Promise<void>;
+  saveError?: Error;
 
   async load(threadId: string): ReturnType<AdvisorStore["load"]> {
     await this.loadBarrier;
@@ -1028,6 +1031,7 @@ export class MemoryAdvisorStore implements AdvisorStore {
   }
 
   async save(threadId: string, advisors: Parameters<AdvisorStore["save"]>[1]): Promise<void> {
+    if (this.saveError) throw this.saveError;
     this.records.set(threadId, structuredClone(advisors));
   }
 }
@@ -1036,6 +1040,7 @@ export class ScriptedAdvisorRouter implements AdvisorRouteResolver {
   readonly calls: Array<{ request: AdvisorOpenRequest; expectedHarness?: HarnessName }> = [];
   resolution: AdvisorRouteResolution;
   error?: Error;
+  barrier?: Promise<void>;
 
   constructor(harness: HarnessName = "codex", requires: string[] = []) {
     this.resolution = { harness, requires };
@@ -1043,6 +1048,7 @@ export class ScriptedAdvisorRouter implements AdvisorRouteResolver {
 
   async resolve(request: AdvisorOpenRequest, expectedHarness: HarnessName | undefined): Promise<AdvisorRouteResolution> {
     this.calls.push({ request: structuredClone({ ...request, signal: undefined }), expectedHarness });
+    await this.barrier;
     if (this.error) throw this.error;
     return structuredClone(this.resolution);
   }

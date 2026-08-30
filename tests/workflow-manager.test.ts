@@ -365,6 +365,48 @@ test("workflow advisor calls share the hard call budget and cumulative spend pre
   } finally { await f.cleanup(); }
 });
 
+test("queued workflow advisor calls revalidate cumulative budgets before dispatch", async () => {
+  const advisors = new ControlledAdvisorGateway();
+  const advisorId = "adv_23232323232323232323232323232323";
+  advisors.add(advisorId);
+  const expensive = {
+    ok: true,
+    advisorId,
+    advisorName: "Security advisor",
+    lineage: 0,
+    generation: 1,
+    output: "exhausted budget",
+    usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+    route: { harness: "claude" },
+    queuedMs: 0,
+  } satisfies Awaited<ReturnType<ControlledAdvisorGateway["consult"]>>;
+  let releaseFirst!: (result: typeof expensive) => void;
+  advisors.pending = new Promise((resolve) => { releaseFirst = resolve; });
+  const f = await fixture(4, undefined, undefined, undefined, undefined, advisors);
+  try {
+    const started = await f.workflows.start(f.request(`
+      export default async () => parallel([
+        () => consult(${JSON.stringify(advisorId)}, "first"),
+        () => consult(${JSON.stringify(advisorId)}, "second")
+      ], 2);
+    `, { advisors: [advisorId], budget: { maxAgents: 2, maxConcurrency: 1, maxTokens: 10 } }));
+    await waitFor(
+      () => f.workflows.check(started.snapshot.runId).advisorConsultations?.length === 2,
+      "second advisor consultation queued behind workflow concurrency",
+    );
+    releaseFirst(expensive);
+    const final = await started.completion;
+    const result = final.result as Array<{ ok: boolean; limit?: string; error?: string }>;
+    assert.equal(result.filter((item) => item.ok).length, 1);
+    const blocked = result.find((item) => !item.ok);
+    assert.equal(blocked?.limit, "budget");
+    assert.match(blocked?.error ?? "", /token/i);
+    assert.equal(advisors.requests.length, 1, "the queued consultation is rejected after the prior call settles spend");
+    assert.equal(final.advisorConsultations?.filter((record) => record.state === "completed").length, 1);
+    assert.equal(final.advisorConsultations?.filter((record) => record.state === "failed").length, 1);
+  } finally { await f.cleanup(); }
+});
+
 test("an advisor call reaching maxTokensPerAgent blocks later dispatch and records the warning", async () => {
   const advisors = new ControlledAdvisorGateway();
   const advisorId = "adv_24242424242424242424242424242424";

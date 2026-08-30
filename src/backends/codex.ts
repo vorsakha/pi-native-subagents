@@ -399,12 +399,12 @@ export class CodexAppServerBackend implements Backend {
     let closing = false;
     let cancellingReason: string | undefined;
     let protocolFailure: string | undefined;
-    let previousTokenTotals: CodexTokenTotals | undefined = request.continuation?.harness === "codex" && request.initialUsage
+    let previousTokenTotals: CodexTokenTotals | undefined = request.continuation?.harness === "codex" && request.providerUsageBaseline
       ? {
-          input: request.initialUsage.input + request.initialUsage.cacheRead + request.initialUsage.cacheWrite,
-          output: request.initialUsage.output,
-          cacheRead: request.initialUsage.cacheRead,
-          cacheWrite: request.initialUsage.cacheWrite,
+          input: request.providerUsageBaseline.input + request.providerUsageBaseline.cacheRead + request.providerUsageBaseline.cacheWrite,
+          output: request.providerUsageBaseline.output,
+          cacheRead: request.providerUsageBaseline.cacheRead,
+          cacheWrite: request.providerUsageBaseline.cacheWrite,
         }
       : undefined;
     /** Model identity reported by the runtime; never seeded from configured policy. */

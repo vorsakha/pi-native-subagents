@@ -114,6 +114,7 @@ export interface WorkflowAdvisorGateway {
     signal: AbortSignal;
     requiredLineage?: number;
     workflow: { runId: string; phase?: string; callIndex: number };
+    dispatchGate?: () => string | undefined;
   }): Promise<{
     ok: boolean;
     advisorId: string;
@@ -1947,12 +1948,14 @@ export class WorkflowManager {
       (entry.snapshot.phases[phase]!.advisorConsultations ??= []).push(record.index);
       this.#touch(entry);
       const requiredLineage = expected?.kind === "advisor" ? expected.result.advisorLineage : undefined;
-      const execute = () => {
+      const execute = async () => {
+        const queuedPreflight = this.#budgetPreflight(entry);
+        if (queuedPreflight) throw new WorkflowAdvisorBudgetError(queuedPreflight);
         record!.state = "running";
         record!.timestamps.startedAt = Date.now();
         record!.timestamps.updatedAt = record!.timestamps.startedAt;
         this.#touch(entry);
-        return this.#advisors!.consult({
+        const consulted = await this.#advisors!.consult({
           threadId: request.sessionId,
           advisorId,
           question,
@@ -1965,26 +1968,32 @@ export class WorkflowManager {
             phase: entry.snapshot.phases[phase]?.name,
             callIndex,
           },
+          dispatchGate: () => this.#budgetPreflight(entry),
         });
+        const endedAt = Date.now();
+        record!.state = consulted.ok ? "completed" : signal.aborted ? "cancelled" : "failed";
+        record!.advisorName = consulted.advisorName;
+        record!.lineage = consulted.lineage;
+        record!.generation = consulted.generation;
+        record!.output = boundedText(consulted.output, 16 * 1024);
+        record!.error = consulted.error ? boundedText(consulted.error, 2_000) : undefined;
+        record!.harness = consulted.route.harness;
+        record!.model = consulted.route.model;
+        record!.usage = workflowUsage(consulted.usage);
+        record!.queuedMs = consulted.queuedMs;
+        record!.outputProvenance = "advisor";
+        record!.instructionShaped = looksInstructionShaped(consulted.output);
+        record!.timestamps.updatedAt = endedAt;
+        record!.timestamps.endedAt = endedAt;
+        this.#recordBudgetWarnings(entry);
+        this.#touch(entry);
+        return consulted;
       };
       const consulted = await this.#withDispatchSlot(entry, signal, execute);
-      const endedAt = Date.now();
-      record.state = consulted.ok ? "completed" : signal.aborted ? "cancelled" : "failed";
-      record.advisorName = consulted.advisorName;
-      record.lineage = consulted.lineage;
-      record.generation = consulted.generation;
-      record.output = boundedText(consulted.output, 16 * 1024);
-      record.error = consulted.error ? boundedText(consulted.error, 2_000) : undefined;
-      record.harness = consulted.route.harness;
-      record.model = consulted.route.model;
-      record.usage = workflowUsage(consulted.usage);
-      record.queuedMs = consulted.queuedMs;
-      record.outputProvenance = "advisor";
-      record.instructionShaped = looksInstructionShaped(consulted.output);
-      record.timestamps.updatedAt = endedAt;
-      record.timestamps.endedAt = endedAt;
-      this.#recordBudgetWarnings(entry);
-      this.#touch(entry);
+      const launchBudget = this.#budgetPreflight(entry);
+      if (!consulted.ok && launchBudget && consulted.error === launchBudget) {
+        throw new WorkflowAdvisorBudgetError(launchBudget);
+      }
       result = {
         ok: consulted.ok,
         output: consulted.output,

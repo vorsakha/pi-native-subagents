@@ -135,6 +135,52 @@ test("advisor dispatch rechecks trust and generic job controls cannot reach advi
   await jobs.shutdown();
 });
 
+test("advisor launch-time gates fail before provider dispatch without corrupting resting state", async () => {
+  const { backend, jobs, registry } = setup();
+  const opened = await openSecurity(registry);
+  const result = await registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "must be gated",
+    sender: "workflow",
+    trusted: true,
+    dispatchGate: () => "Workflow token budget reached before launch",
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? "", /budget reached before launch/i);
+  assert.equal(backend.starts.length, 0);
+  assert.equal(registry.get(threadId, opened.id, true).state, "defined");
+  await registry.shutdown();
+  await jobs.shutdown();
+});
+
+test("failed advisor results report queue delay without including provider runtime", async () => {
+  const originalNow = Date.now;
+  let now = 1_000;
+  Date.now = () => now;
+  const { backend, jobs, registry } = setup();
+  try {
+    const opened = await openSecurity(registry);
+    const consultation = registry.consult({
+      threadId,
+      advisorId: opened.id,
+      question: "fail after a long provider turn",
+      sender: "human",
+      trusted: true,
+    });
+    await backend.waitForStart();
+    now = 6_000;
+    backend.fail(backend.starts[0]!, "provider failed after runtime");
+    const result = await consultation;
+    assert.equal(result.ok, false);
+    assert.equal(result.queuedMs, 0);
+  } finally {
+    Date.now = originalNow;
+    await registry.shutdown();
+    await jobs.shutdown();
+  }
+});
+
 test("advisor consultations serialize, accumulate usage, enforce the cumulative budget, and reuse one native session", async () => {
   const { backend, jobs, registry } = setup();
   const opened = await openSecurity(registry);
@@ -160,6 +206,40 @@ test("advisor consultations serialize, accumulate usage, enforce the cumulative 
     /tokens limit reached/i,
   );
   assert.equal(backend.sends.length, 1);
+  await registry.shutdown();
+  await jobs.shutdown();
+});
+
+test("cancelling a middle queued consultation cannot release the preceding serialization barrier", async () => {
+  const { backend, jobs, registry } = setup();
+  const opened = await openSecurity(registry);
+  const first = registry.consult({ threadId, advisorId: opened.id, question: "first", sender: "human", trusted: true });
+  await backend.waitForStart();
+  const jobId = backend.starts[0]!;
+  const middleController = new AbortController();
+  const middle = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "cancel while queued",
+    sender: "human",
+    trusted: true,
+    signal: middleController.signal,
+  });
+  const last = registry.consult({ threadId, advisorId: opened.id, question: "last", sender: "human", trusted: true });
+  middleController.abort(new Error("cancel middle"));
+  await assert.rejects(middle, /cancel/i);
+  await delay(5);
+  assert.equal(backend.sends.length, 0);
+  assert.equal(backend.closes.includes(jobId), false, "later work cannot touch the still-active native run");
+  assert.equal(registry.get(threadId, opened.id, true).state, "consulting");
+
+  backend.emitContinuation(jobId, "serialized-cancel");
+  backend.complete(jobId, "first answer", { input: 5, output: 1, turns: 1 });
+  assert.equal((await first).ok, true);
+  await backend.waitForSend();
+  backend.complete(jobId, "last answer", { input: 3, output: 1, turns: 1 });
+  assert.equal((await last).ok, true);
+  assert.equal(backend.starts.length, 1);
   await registry.shutdown();
   await jobs.shutdown();
 });
@@ -200,11 +280,46 @@ test("idle advisors release provider resources and lazily resume only their reco
     threadId: "codex-hibernate",
     sessionFile: "/private/codex-hibernate.jsonl",
   });
-  assert.deepEqual(request.initialUsage, { input: 12, output: 3, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 });
+  assert.deepEqual(request.providerUsageBaseline, { input: 12, output: 3, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 });
   assert.equal(jobs.checkAdvisorJob(request.jobId, opened.id).generation, 1);
   backend.emitContinuation(request.jobId, "codex-hibernate");
   backend.complete(request.jobId, "remember this");
   assert.equal((await resumed).ok, true);
+  await registry.shutdown();
+  await jobs.shutdown();
+});
+
+test("reset starts a fresh provider usage lineage without erasing cumulative advisor spend", async () => {
+  const { backend, jobs, registry } = setup();
+  const opened = await openSecurity(registry);
+  const oldLineage = registry.consult({ threadId, advisorId: opened.id, question: "old lineage", sender: "human", trusted: true });
+  await backend.waitForStart();
+  backend.emitContinuation(backend.starts[0]!, "codex-old-lineage");
+  backend.complete(backend.starts[0]!, "old", { input: 30, output: 5, turns: 1 });
+  await oldLineage;
+  await registry.reset(threadId, opened.id, true);
+
+  const fresh = registry.consult({ threadId, advisorId: opened.id, question: "fresh lineage", sender: "human", trusted: true });
+  await backend.waitForStart(2);
+  const freshJob = backend.starts[1]!;
+  assert.equal(backend.requests[1]?.providerUsageBaseline, undefined, "a reset never seeds fresh provider counters with lifetime spend");
+  backend.emitContinuation(freshJob, "codex-fresh-lineage");
+  backend.complete(freshJob, "fresh", { input: 8, output: 2, turns: 1 });
+  await fresh;
+  await registry.hibernate(threadId, opened.id, true);
+
+  const resumed = registry.consult({ threadId, advisorId: opened.id, question: "resume fresh", sender: "human", trusted: true });
+  await backend.waitForStart(3);
+  const resumedRequest = backend.requests[2]!;
+  assert.deepEqual(resumedRequest.providerUsageBaseline, {
+    input: 8, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1,
+  });
+  assert.deepEqual(jobs.checkAdvisorJob(resumedRequest.jobId, opened.id).usage, {
+    input: 38, output: 7, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2,
+  }, "the JobManager still enforces cumulative advisor spend across reset");
+  backend.emitContinuation(resumedRequest.jobId, "codex-fresh-lineage");
+  backend.complete(resumedRequest.jobId, "resumed", { input: 1, output: 1, turns: 1 });
+  await resumed;
   await registry.shutdown();
   await jobs.shutdown();
 });
@@ -313,6 +428,54 @@ test("an unavailable retry cannot clear its recovery gate before cumulative budg
     sender: "human",
     trusted: true,
   }), /retryUnavailable/);
+  await registry.shutdown();
+  await jobs.shutdown();
+});
+
+test("a failed resumed Codex turn advances the same-lineage provider baseline exactly once", async () => {
+  const { backend, jobs, registry } = setup();
+  const opened = await openSecurity(registry);
+  const first = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "establish the native lineage",
+    sender: "human",
+    trusted: true,
+  });
+  await backend.waitForStart();
+  const firstJob = backend.starts[0]!;
+  backend.emitContinuation(firstJob, "codex-failed-turn-baseline");
+  backend.complete(firstJob, "established", { input: 10, output: 2, turns: 1 });
+  await first;
+
+  const failed = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "fail after provider usage",
+    sender: "human",
+    trusted: true,
+  });
+  await backend.waitForSend();
+  backend.emit(firstJob, { type: "usage", usage: { input: 5, output: 1, turns: 1 } });
+  backend.fail(firstJob, "provider failed after accounting usage");
+  assert.equal((await failed).ok, false);
+
+  const retried = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "retry the recorded lineage",
+    sender: "human",
+    trusted: true,
+    retryUnavailable: true,
+  });
+  await backend.waitForStart(2);
+  const retryRequest = backend.requests[1]!;
+  assert.deepEqual(retryRequest.providerUsageBaseline, {
+    input: 15, output: 3, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2,
+  });
+  backend.emitContinuation(retryRequest.jobId, "codex-failed-turn-baseline");
+  backend.complete(retryRequest.jobId, "recovered", { input: 2, output: 1, turns: 1 });
+  assert.equal((await retried).ok, true);
   await registry.shutdown();
   await jobs.shutdown();
 });
@@ -851,6 +1014,120 @@ test("advisor private persistence rejects symlinked roots and state files", asyn
   } finally {
     await rm(base, { recursive: true, force: true });
     await rm(redirected, { recursive: true, force: true });
+  }
+});
+
+test("advisor persistence rejects a valid roster whose UTF-8 encoding cannot be restored", async () => {
+  const base = await tempDir("advisor-store-size");
+  const memory = new MemoryAdvisorStore();
+  const runtime = setup({ store: memory });
+  try {
+    await openSecurity(runtime.registry);
+    const source = memory.records.get(threadId)?.[0];
+    assert.ok(source);
+    const records = Array.from({ length: 16 }, (_, advisorIndex) => ({
+      ...structuredClone(source),
+      id: `adv_${advisorIndex.toString(16).padStart(32, "0")}`,
+      name: `Advisor ${advisorIndex}`,
+      aliases: [`advisor ${advisorIndex}`],
+      ledger: Array.from({ length: 32 }, (_, entryIndex) => ({
+        index: entryIndex,
+        lineage: 0,
+        generation: entryIndex + 1,
+        sender: "human" as const,
+        question: "😀".repeat(1_000),
+        context: "😀".repeat(1_000),
+        state: "completed" as const,
+        output: "😀".repeat(2_000),
+        usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+        startedAt: source.createdAt + entryIndex,
+        endedAt: source.createdAt + entryIndex,
+      })),
+    }));
+    const fileStore = new FileAdvisorStore(join(base, "advisors"), base);
+    await assert.rejects(fileStore.save(threadId, records), /state exceeds 4194304 bytes/i);
+    assert.deepEqual(await readdir(base), [], "an oversized unrestorable roster is rejected before filesystem mutation");
+  } finally {
+    await runtime.registry.shutdown();
+    await runtime.jobs.shutdown();
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+test("concurrent advisor opens reserve aliases and capacity atomically and roll back failed persistence", async () => {
+  const duplicate = setup();
+  let releaseRoute!: () => void;
+  duplicate.router.barrier = new Promise<void>((resolve) => { releaseRoute = resolve; });
+  const first = openSecurity(duplicate.registry);
+  await waitFor(() => duplicate.router.calls.length === 1, "first advisor route");
+  const second = openSecurity(duplicate.registry);
+  releaseRoute();
+  const duplicateResults = await Promise.allSettled([first, second]);
+  assert.deepEqual(duplicateResults.map((result) => result.status).sort(), ["fulfilled", "rejected"]);
+  assert.equal(duplicate.registry.list(threadId, true).length, 1);
+  await duplicate.registry.shutdown();
+  await duplicate.jobs.shutdown();
+
+  const capacity = setup();
+  for (let index = 0; index < 15; index++) {
+    await capacity.registry.open({
+      threadId,
+      name: `Advisor ${index}`,
+      description: "capacity fixture",
+      cwd: process.cwd(),
+      trusted: true,
+      harness: "codex",
+    });
+  }
+  let releaseCapacity!: () => void;
+  capacity.router.barrier = new Promise<void>((resolve) => { releaseCapacity = resolve; });
+  const sixteenth = capacity.registry.open({
+    threadId, name: "Advisor 15", description: "capacity fixture", cwd: process.cwd(), trusted: true, harness: "codex",
+  });
+  await waitFor(() => capacity.router.calls.length === 16, "sixteenth advisor route");
+  const seventeenth = capacity.registry.open({
+    threadId, name: "Advisor 16", description: "capacity fixture", cwd: process.cwd(), trusted: true, harness: "codex",
+  });
+  releaseCapacity();
+  const capacityResults = await Promise.allSettled([sixteenth, seventeenth]);
+  assert.deepEqual(capacityResults.map((result) => result.status).sort(), ["fulfilled", "rejected"]);
+  assert.equal(capacity.registry.list(threadId, true).length, 16);
+  await capacity.registry.shutdown();
+  await capacity.jobs.shutdown();
+
+  const rollback = setup();
+  rollback.store.saveError = new Error("persistence failed");
+  await assert.rejects(openSecurity(rollback.registry), /persistence failed/);
+  assert.deepEqual(rollback.registry.list(threadId, true), []);
+  rollback.store.saveError = undefined;
+  assert.equal((await openSecurity(rollback.registry)).aliases.includes("sec"), true);
+  await rollback.registry.shutdown();
+  await rollback.jobs.shutdown();
+});
+
+test("advisor lifecycle transitions exclude new consultation admission while native release is pending", async () => {
+  for (const transition of ["reset", "hibernate", "close"] as const) {
+    const { backend, jobs, registry } = setup();
+    const opened = await openSecurity(registry);
+    const initial = registry.consult({ threadId, advisorId: opened.id, question: "retain", sender: "human", trusted: true });
+    await backend.waitForStart();
+    const jobId = backend.starts[0]!;
+    backend.emitContinuation(jobId, `codex-${transition}`);
+    backend.complete(jobId, "retained", { input: 2, output: 1, turns: 1 });
+    await initial;
+    let releaseClose!: () => void;
+    backend.closeBarrier = new Promise<void>((resolve) => { releaseClose = resolve; });
+    const lifecycle = registry[transition](threadId, opened.id, true);
+    await waitFor(() => backend.closes.includes(jobId), `${transition} native release`);
+    await assert.rejects(
+      registry.consult({ threadId, advisorId: opened.id, question: "race release", sender: "human", trusted: true }),
+      new RegExp(`${transition} is in progress`),
+    );
+    assert.equal(backend.starts.length, 1);
+    releaseClose();
+    await lifecycle;
+    await registry.shutdown();
+    await jobs.shutdown();
   }
 });
 

@@ -406,7 +406,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
       return;
     }
 
-    if (data === "i") {
+    const advisorDetail = this.#focus === "agent-detail" && !!this.selectedAdvisor(run);
+    if (data === "i" && !advisorDetail) {
       this.#showInfo = !this.#showInfo;
       this.tui.requestRender();
       return;
@@ -431,7 +432,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
       } else if (matchesKey(data, "r")) this.restartAgent(run);
       else if (matchesKey(data, "x")) this.requestAgentCancel(run);
       else if (data === "X" || matchesKey(data, Key.shift("x"))) this.requestRunCancel(run);
-      else if (matchesKey(data, "t") || matchesKey(data, Key.ctrl("t"))) this.toggleToolDisplay();
+      else if (!advisorDetail && (matchesKey(data, "t") || matchesKey(data, Key.ctrl("t")))) this.toggleToolDisplay();
     } else if (this.#focus === "outline") {
       if (matchesKey(data, Key.shift(Key.up))) this.scrollResult(-1);
       else if (matchesKey(data, Key.shift(Key.down))) this.scrollResult(1);
@@ -978,12 +979,12 @@ export class WorkflowsDashboardOverlay implements Focusable {
   private renderHelp(frame: DashboardFrame, layout: DashboardLayout, runs: WorkflowSnapshot[]): string[] {
     return [
       this.renderHeader(frame, runs),
-      ...renderDashboardHelp(this.theme, frame, "help", this.helpGroups(), layout.contentRows),
+      ...renderDashboardHelp(this.theme, frame, "help", this.helpGroups(runs.find((run) => run.runId === this.#selectedRunId)), layout.contentRows),
       frame.hint(`? or ${dashboardCancelKeyLabel(this.keybindings)} close help`),
     ];
   }
 
-  private helpGroups(): DashboardKeyGroup[] {
+  private helpGroups(run: WorkflowSnapshot | undefined): DashboardKeyGroup[] {
     const confirm = dashboardConfirmKeyLabel(this.keybindings);
     const cancel = dashboardCancelKeyLabel(this.keybindings);
     if (this.#focus === "runs") {
@@ -994,6 +995,21 @@ export class WorkflowsDashboardOverlay implements Focusable {
       ];
     }
     if (this.#focus === "agent-detail") {
+      if (this.selectedAdvisor(run)) {
+        const actions: DashboardKeyGroup[] = run && !workflowIsTerminal(run.status)
+          ? [{ title: "Actions", entries: [["X", "cancel the run (press twice)"]] }]
+          : [];
+        return [
+          { title: "Navigate", entries: [["Esc / ← / h", "back to outline"]] },
+          ...actions,
+          { title: "Scroll", entries: [
+            ["j k / ↑↓ / PgUp/PgDn", "scroll advisor output"],
+            ["Ctrl+U/D", "half-page scroll"],
+            ["g / G", "top / bottom"],
+          ] },
+          { title: "Panel", entries: [[cancel, "back / close"], ["?", "close this help"]] },
+        ];
+      }
       return [
         { title: "Navigate", entries: [["Esc / ← / h", "back to outline"]] },
         { title: "Actions", entries: [
@@ -1071,6 +1087,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
   private detailTitle(run: WorkflowSnapshot | undefined): string {
     if (!run) return "inspector";
     if (this.#focus === "agent-detail") {
+      const advisor = this.selectedAdvisor(run);
+      if (advisor) return `advisor · ${sanitizeInline(advisor.advisorName)} · ${advisor.state} · focus`;
       // The tool-display mode also lives in the terse footer hint, but that
       // hint truncates first under width pressure; the title survives longer.
       const agent = this.selectedAgent(run);
@@ -1771,7 +1789,15 @@ export class WorkflowsDashboardOverlay implements Focusable {
       if (live && rendered.includes(runCancelLabel)) this.#renderedRunCancelId = run?.runId;
       return rendered;
     }
-    const actions = this.#focus === "agent-detail"
+    const advisor = this.selectedAdvisor(run);
+    const actions = this.#focus === "agent-detail" && advisor
+      ? [
+        live ? runCancelLabel : "",
+        "Esc/← outline",
+        "jk/Pg scroll · Ctrl+U/D · g/G",
+        "? help",
+      ]
+      : this.#focus === "agent-detail"
       ? [
         agentActionable ? agentCancelLabel : "",
         live ? runCancelLabel : "",
