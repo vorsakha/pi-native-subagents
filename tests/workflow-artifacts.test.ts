@@ -151,6 +151,7 @@ test("completed advisor journal records require replay-safe identity, accounting
     ["lineage", (record) => { delete record.result!.advisorLineage; }],
     ["generation", (record) => { delete record.result!.advisorGeneration; }],
     ["usage", (record) => { delete record.result!.usage; }],
+    ["queue delay", (record) => { delete record.result!.queuedMs; }],
     ["route", (record) => { delete record.route; }],
   ];
   for (const [field, omit] of omissions) {
@@ -160,6 +161,16 @@ test("completed advisor journal records require replay-safe identity, accounting
       appendWorkflowJournal(root, created.runId, malformed),
       /Invalid workflow journal record/,
       `missing ${field} must stop replay provenance at the durable boundary`,
+    );
+  }
+  for (const status of [undefined, "failed"] as const) {
+    const malformed = structuredClone(complete);
+    if (status === undefined) delete malformed.route!.status;
+    else malformed.route!.status = status;
+    await assert.rejects(
+      appendWorkflowJournal(root, created.runId, malformed),
+      /Invalid workflow journal record/,
+      `completed advisor replay rejects ${status ?? "missing"} route status`,
     );
   }
   await appendWorkflowJournal(root, created.runId, complete);

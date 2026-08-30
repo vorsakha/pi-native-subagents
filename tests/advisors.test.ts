@@ -376,6 +376,7 @@ test("resume failures preserve exact lineage, redact private identities, and kee
   assert.equal(driftedResult.ok, false);
   assert.match(driftedResult.error ?? "", /different native advisor identity/);
   assert.doesNotMatch(JSON.stringify(registry.get(threadId, opened.id)), /codex-(?:recorded|replacement)-secret/);
+  assert.ok(backend.closes.includes(backend.starts[1]!), "a rejected provider lineage releases its retained native run");
 
   const recovered = registry.consult({
     threadId,
@@ -395,6 +396,29 @@ test("resume failures preserve exact lineage, redact private identities, and kee
   backend.emitContinuation(recoveryRequest.jobId, "codex-recorded-secret");
   backend.complete(recoveryRequest.jobId, "same lineage");
   assert.equal((await recovered).ok, true);
+  await registry.shutdown();
+  await jobs.shutdown();
+});
+
+test("first-generation provider failures redact every newly reported native reference", async () => {
+  const { backend, jobs, registry } = setup();
+  const opened = await openSecurity(registry);
+  const consultation = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "fail after reporting a private identity",
+    sender: "human",
+    trusted: true,
+  });
+  await backend.waitForStart();
+  const jobId = backend.starts[0]!;
+  backend.emitContinuation(jobId, "first-generation-private-id");
+  backend.fail(jobId, "provider failed first-generation-private-id at /private/first-generation-private-id.jsonl");
+  const result = await consultation;
+  const publicState = JSON.stringify({ result, snapshot: registry.get(threadId, opened.id) });
+  assert.equal(result.ok, false);
+  assert.doesNotMatch(publicState, /first-generation-private-id|\/private\/first-generation-private-id\.jsonl/);
+  assert.ok(backend.closes.includes(jobId), "failed native advisor runs are released before their job handle is dropped");
   await registry.shutdown();
   await jobs.shutdown();
 });
@@ -626,7 +650,7 @@ test("restoration preserves a changed cwd as unavailable and rejects symlink rep
   }
 });
 
-test("restored advisors use the profile behavior captured at registration", async () => {
+test("restored advisors use the canonical profile identity and behavior captured at registration", async () => {
   const store = new MemoryAdvisorStore();
   const first = setup({ store });
   first.router.resolution = {
@@ -642,8 +666,9 @@ test("restored advisors use the profile behavior captured at registration", asyn
     cwd: process.cwd(),
     trusted: true,
     harness: "codex",
-    profile: "audit",
+    profile: "  audit  ",
   });
+  assert.equal(opened.policy.profile, "audit");
   assert.equal(opened.policy.effort, "high");
   const initial = first.registry.consult({
     threadId,
@@ -693,7 +718,14 @@ test("advisor private persistence rejects symlinked roots and state files", asyn
   try {
     const linkedRoot = join(base, "linked-root");
     await symlink(redirected, linkedRoot, "dir");
-    await assert.rejects(new FileAdvisorStore(linkedRoot).save(threadId, []), /private directory/);
+    await assert.rejects(new FileAdvisorStore(linkedRoot).save(threadId, []), /private directory|symbolic link|ELOOP|ENOTDIR/i);
+
+    const privateBase = join(base, "agent-dir");
+    await mkdir(privateBase);
+    await symlink(redirected, join(privateBase, "native-subagents"), "dir");
+    const nested = new FileAdvisorStore(join(privateBase, "native-subagents", "advisors"), privateBase);
+    await assert.rejects(nested.save(threadId, []), /private directory|symbolic link|ELOOP|ENOTDIR/i);
+    assert.deepEqual(await readdir(redirected), [], "a symlinked private-root ancestor cannot receive advisor state");
 
     const root = join(base, "private");
     const store = new FileAdvisorStore(root);
@@ -712,6 +744,29 @@ test("advisor private persistence rejects symlinked roots and state files", asyn
     await rm(base, { recursive: true, force: true });
     await rm(redirected, { recursive: true, force: true });
   }
+});
+
+test("shutdown waits for restoration before persisting the durable roster", async () => {
+  const store = new MemoryAdvisorStore();
+  const first = setup({ store });
+  const opened = await openSecurity(first.registry);
+  await first.registry.shutdown();
+  await first.jobs.shutdown();
+
+  let releaseLoad!: () => void;
+  store.loadBarrier = new Promise<void>((resolve) => { releaseLoad = resolve; });
+  const restored = setup({ store });
+  const initializing = restored.registry.initialize();
+  let shutdownFinished = false;
+  const shutdown = restored.registry.shutdown().then(() => { shutdownFinished = true; });
+  await delay(5);
+  assert.equal(shutdownFinished, false);
+  assert.equal(store.records.get(threadId)?.length, 1, "shutdown cannot overwrite a pending restored roster with an empty snapshot");
+  releaseLoad();
+  await Promise.all([initializing, shutdown]);
+  assert.equal(restored.registry.get(threadId, opened.id).id, opened.id);
+  assert.equal(store.records.get(threadId)?.[0]?.id, opened.id);
+  await restored.jobs.shutdown();
 });
 
 test("advisor context and queue bounds fail before provider dispatch", async () => {

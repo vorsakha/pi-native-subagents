@@ -117,6 +117,18 @@ export function renderParentThreadContext(snapshot: ParentThreadSnapshot, rawInp
   return truncateUtf8(lines.join("\n").trimEnd(), MAX_TOOL_OUTPUT_BYTES, "\n\n[Tool output truncated; request a smaller page with offset/limit.]");
 }
 
+/** Preserve the safety label and most recent context within a UTF-8 byte budget. */
+export function boundRecentParentThreadContext(value: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  const label = value.split("\n", 1)[0] ?? "";
+  const marker = "\n\n[Earlier parent-thread context omitted.]\n";
+  const prefix = truncateUtf8(label, maxBytes, "");
+  const separator = truncateUtf8(marker, Math.max(0, maxBytes - Buffer.byteLength(prefix, "utf8")), "");
+  const remaining = Math.max(0, maxBytes - Buffer.byteLength(prefix + separator, "utf8"));
+  return prefix + separator + truncateUtf8Tail(value, remaining);
+}
+
 function toParentThreadMessage(value: unknown): ParentThreadMessage | undefined {
   const message = object(value);
   const role = String(message.role ?? "");
@@ -176,4 +188,23 @@ function truncateUtf8(value: string, maxBytes: number, suffix = "\n[message trun
     else high = middle - 1;
   }
   return value.slice(0, low) + suffix;
+}
+
+function truncateUtf8Tail(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    if (Buffer.byteLength(value.slice(middle), "utf8") <= maxBytes) high = middle;
+    else low = middle + 1;
+  }
+  const boundary = low > 0
+    && value.charCodeAt(low) >= 0xDC00
+    && value.charCodeAt(low) <= 0xDFFF
+    && value.charCodeAt(low - 1) >= 0xD800
+    && value.charCodeAt(low - 1) <= 0xDBFF
+    ? low + 1
+    : low;
+  return value.slice(boundary);
 }

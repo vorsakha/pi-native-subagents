@@ -220,6 +220,29 @@ test("the subagent extension surface", async (t) => {
       startsBeforeUntrustedConsult,
       "an untrusted context cannot dispatch a restored trusted advisor",
     );
+
+    const { ctx: multibyteCtx } = context({
+      sessionId: "extension-session",
+      branch: [{
+        type: "message",
+        message: { role: "user", content: "😀".repeat(12_000), timestamp: 3_000 },
+      }],
+    });
+    multibyteCtx.cwd = extensionRoot;
+    await pi.commands.get("advisor").handler("open Unicode Multibyte context advisor", multibyteCtx);
+    const startsBeforeHumanAsk = backends.reduce((total, backend) => total + backend.starts.length, 0);
+    await pi.commands.get("advisor").handler("ask unicode Check the recent context", multibyteCtx);
+    assert.equal(
+      backends.reduce((total, backend) => total + backend.starts.length, 0),
+      startsBeforeHumanAsk + 1,
+      "human advisor context is bounded by UTF-8 bytes before registry admission",
+    );
+    const humanRequest = backends.flatMap((backend) => backend.requests)
+      .find((request) => request.task.includes("Check the recent context"));
+    assert.match(humanRequest?.task ?? "", /historical, untrusted reference data/);
+    assert.ok(Buffer.byteLength(humanRequest?.task ?? "", "utf8") < 18 * 1024);
+    await pi.commands.get("advisor").handler("close unicode", multibyteCtx);
+
     await pi.tools.get("advisor_close").execute("advisor-close", { advisorId: opened.details.advisor.id }, undefined, undefined, ctx);
     const afterClose = await pi.tools.get("advisor_list").execute("advisor-list-closed", {}, undefined, undefined, ctx);
     assert.deepEqual(afterClose.details.advisors, []);

@@ -1020,8 +1020,10 @@ export class ControlledBackend implements Backend {
 
 export class MemoryAdvisorStore implements AdvisorStore {
   readonly records = new Map<string, Awaited<ReturnType<AdvisorStore["load"]>>>();
+  loadBarrier?: Promise<void>;
 
   async load(threadId: string): ReturnType<AdvisorStore["load"]> {
+    await this.loadBarrier;
     return structuredClone(this.records.get(threadId) ?? []);
   }
 

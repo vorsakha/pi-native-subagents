@@ -22,24 +22,28 @@ function metric(key: WorkflowBudgetMetric["key"], used: number, limit: number | 
 }
 
 export function workflowBudgetMetrics(
-  snapshot: Pick<WorkflowSnapshot, "budget" | "agents">,
+  snapshot: Pick<WorkflowSnapshot, "budget" | "agents" | "advisorConsultations">,
   usage: Pick<WorkflowUsage, "input" | "output" | "cost" | "turns">,
 ): WorkflowBudgetMetric[] {
   const budget = snapshot.budget;
   if (!budget) return [];
-  const activeAgents = snapshot.agents.filter((agent) => agent.state === "queued" || agent.state === "running").length;
+  const advisors = snapshot.advisorConsultations ?? [];
+  const activeAgents = snapshot.agents.filter((agent) => agent.state === "queued" || agent.state === "running").length
+    + advisors.filter((advisor) => advisor.state === "queued" || advisor.state === "running").length;
   const tokens = usage.input + usage.output;
   // Legacy or partially persisted agent records may omit usage or individual
   // usage fields; fold each missing field to 0 instead of collapsing the
   // whole agent's contribution to 0 when only one field is present.
-  const agentTokens = snapshot.agents.reduce((maximum, agent) => Math.max(maximum, (agent.usage?.input ?? 0) + (agent.usage?.output ?? 0)), 0);
+  const agentTokens = [...snapshot.agents, ...advisors]
+    .reduce((maximum, agent) => Math.max(maximum, (agent.usage?.input ?? 0) + (agent.usage?.output ?? 0)), 0);
+  const calls = snapshot.agents.reduce((total, agent) => total + Math.max(1, agent.generations?.length ?? 0), 0) + advisors.length;
   return [
-    metric("agents", snapshot.agents.length, budget.maxAgents),
+    metric("agents", calls, budget.maxAgents),
     metric("concurrency", activeAgents, budget.maxConcurrency),
     metric("tokens", tokens, budget.maxTokens),
     metric("agentTokens", agentTokens, budget.maxTokensPerAgent),
     metric("turns", usage.turns, budget.maxTurns),
-    metric("cost", usage.cost, budget.maxCost, !snapshot.agents.some((agent) => agent.harness === "codex")),
+    metric("cost", usage.cost, budget.maxCost, ![...snapshot.agents, ...advisors].some((agent) => agent.harness === "codex")),
   ].filter((value): value is WorkflowBudgetMetric => value !== undefined);
 }
 
@@ -57,7 +61,7 @@ function metricText(value: WorkflowBudgetMetric): string {
 }
 
 export function formatWorkflowBudget(
-  snapshot: Pick<WorkflowSnapshot, "budget" | "agents">,
+  snapshot: Pick<WorkflowSnapshot, "budget" | "agents" | "advisorConsultations">,
   usage: Pick<WorkflowUsage, "input" | "output" | "cost" | "turns">,
 ): string {
   const metrics = workflowBudgetMetrics(snapshot, usage);
@@ -83,7 +87,7 @@ const SATURATION_METRIC_KEYS: ReadonlySet<WorkflowBudgetMetric["key"]> = new Set
  * always named and marked abnormal rather than silently reported "ok".
  */
 export function workflowBudgetHealth(
-  snapshot: Pick<WorkflowSnapshot, "budget" | "agents">,
+  snapshot: Pick<WorkflowSnapshot, "budget" | "agents" | "advisorConsultations">,
   usage: Pick<WorkflowUsage, "input" | "output" | "cost" | "turns">,
 ): WorkflowBudgetHealth {
   const metrics = workflowBudgetMetrics(snapshot, usage);

@@ -566,6 +566,17 @@ export class JobManager {
     return job.reportedContinuation ? { ...job.reportedContinuation } : undefined;
   }
 
+  /** Every provider-reported native identity/path for boundary error redaction. */
+  advisorNativeReferences(id: string, advisorId: string): string[] {
+    const job = this.#advisorJob(id, advisorId);
+    const continuation = job.reportedContinuation;
+    const values = [job.snapshot.backendSessionId, job.snapshot.sessionFile];
+    if (continuation?.harness === "pi") values.push(continuation.sessionFile);
+    else if (continuation?.harness === "claude") values.push(continuation.sessionId);
+    else if (continuation?.harness === "codex") values.push(continuation.threadId, continuation.sessionFile);
+    return [...new Set(values.filter((value): value is string => !!value))];
+  }
+
   /**
    * Idempotently closes a retained native session. Used by the workflow
    * runtime to release a workflow-owned job's session once its containing

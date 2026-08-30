@@ -41,7 +41,7 @@ import {
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { claimExtensionInstall } from "../../src/install-guard.ts";
 import { providerFamily } from "../../src/policy.ts";
-import { captureParentThread, renderParentThreadContext, type ParentThreadSnapshot } from "../../src/parent-thread-context.ts";
+import { boundRecentParentThreadContext, captureParentThread, renderParentThreadContext, type ParentThreadSnapshot } from "../../src/parent-thread-context.ts";
 import {
   MAX_ANSWER_CHARS,
   MAX_QUESTION_CHARS,
@@ -92,6 +92,7 @@ import type { WorkflowSnapshot } from "../../src/workflows/types.ts";
 import {
   AdvisorRegistry,
   FileAdvisorStore,
+  MAX_ADVISOR_CONTEXT_BYTES,
   type AdvisorOpenRequest,
   type AdvisorRouteResolver,
 } from "../../src/advisors.ts";
@@ -386,7 +387,9 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     backends,
   });
   const getManager = () => manager ??= createManager();
-  const advisorStore = new FileAdvisorStore(options.advisorRoot ?? resolve(getAgentDir(), "native-subagents/advisors"));
+  const defaultAdvisorRoot = resolve(getAgentDir(), "native-subagents/advisors");
+  const advisorRoot = options.advisorRoot ?? defaultAdvisorRoot;
+  const advisorStore = new FileAdvisorStore(advisorRoot, options.advisorRoot ? dirname(resolve(advisorRoot)) : resolve(getAgentDir()));
   const advisorRouter: AdvisorRouteResolver = {
     async resolve(request: AdvisorOpenRequest, expectedHarness: HarnessName | undefined) {
       const profile = expectedHarness === undefined && request.profile
@@ -1256,7 +1259,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         if (action === "ask" && target && rest.length) {
           const messages = ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
           const parentThread = captureParentThread(messages);
-          const contextPacket = renderParentThreadContext(parentThread, { limit: 8 }).slice(-12_000);
+          const contextPacket = boundRecentParentThreadContext(
+            renderParentThreadContext(parentThread, { limit: 8 }),
+            MAX_ADVISOR_CONTEXT_BYTES,
+          );
           const result = await getAdvisors().consult({
             threadId: advisorThreadId(ctx),
             advisorId: target,

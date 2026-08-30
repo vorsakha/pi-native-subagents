@@ -656,7 +656,9 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || !Number.isSafeInteger(record.result.advisorLineage) || record.result.advisorLineage! < 0
       || !Number.isSafeInteger(record.result.advisorGeneration) || record.result.advisorGeneration! < 1
       || !isWorkflowUsage(record.result.usage)
-      || !record.route || !["pi", "claude", "codex"].includes(record.route.harness ?? ""))) return false;
+      || typeof record.result.queuedMs !== "number" || !Number.isFinite(record.result.queuedMs) || record.result.queuedMs < 0
+      || !record.route || !["pi", "claude", "codex"].includes(record.route.harness ?? "")
+      || record.route.status !== "completed")) return false;
   return record.state === "completed" ? record.result.ok : !record.result.ok;
 }
 
