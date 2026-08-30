@@ -1868,6 +1868,7 @@ test("thrown continued follow-up admission failure journals cumulative lineage u
     assert.deepEqual(followUp?.result?.usage, {
       input: 5, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2,
     });
+    assert.equal(followUp?.result?.progressed, undefined, "prior continuation progress is not attributed to the refused follow-up");
   } finally {
     await f.cleanup();
   }
@@ -4855,6 +4856,7 @@ test("a failed peer answer fails only the question and preserves the completed t
 
     const asked = f.backend.ask(implementerJobId, { question: "which flag?", target: { type: "agent", jobId: plannerJobId } });
     await waitFor(() => f.backend.sends.length === 1, "peer follow-up dispatch");
+    f.backend.emit(plannerJobId, { type: "message", text: "partial peer answer" });
     f.backend.fail(plannerJobId, "peer session crashed");
     await assert.rejects(asked, /peer session crashed/);
 
@@ -4864,6 +4866,7 @@ test("a failed peer answer fails only the question and preserves the completed t
     assert.equal(planner.output, "PLAN: keep the legacy flag");
     assert.equal(planner.outputProvenance, "subagent");
     assert.equal(planner.answering, undefined);
+    assert.equal(planner.progressedCheckpoint, undefined, "peer progress never becomes an agent-call restart checkpoint");
     assert.equal(planner.generations?.at(-1)?.state, "failed", "the answer attempt is still auditable as its own generation");
     assert.equal(planner.generations?.at(-1)?.outputProvenance, "peerAnswer");
     assert.equal(after.agents[1]!.waitingOn, undefined, "the caller's wait clears when the question fails");
@@ -4876,6 +4879,62 @@ test("a failed peer answer fails only the question and preserves the completed t
     const peerRecords = journal.filter((record) => record.kind === "peerQuestion");
     assert.deepEqual(peerRecords.map((record) => record.state), ["started", "failed"]);
     assert.match(peerRecords[1]!.result?.error ?? "", /peer session crashed/);
+
+    const restarted = await f.workflows.restartAgent(final.runId, planner.index);
+    const cancelled = await f.workflows.cancel(restarted.snapshot.runId, "restart policy accepted peer-only progress");
+    assert.equal(cancelled.status, "aborted");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a cancelled peer answer settles native cancellation before usage journaling and preserves restart eligibility", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(PEER_SCRIPT));
+    await waitFor(() => f.backend.requests.length === 1, "planner dispatch");
+    const plannerJobId = f.backend.requests[0]!.jobId;
+    f.backend.complete(plannerJobId, "PLAN", { input: 2, output: 1, turns: 1 });
+    await waitFor(() => f.backend.requests.length === 2, "implementer dispatch");
+    const implementerJobId = f.backend.requests[1]!.jobId;
+
+    const asked = f.backend.ask(implementerJobId, {
+      question: "which plan?",
+      target: { type: "agent", jobId: plannerJobId },
+    });
+    await waitFor(() => f.backend.sends.length === 1, "peer follow-up dispatch");
+    f.backend.emit(plannerJobId, { type: "tool_start", id: "inspect", name: "Read", summary: "inspected state" });
+    const cancellation = f.backend.gateCancellation(plannerJobId, { input: 5, output: 3, turns: 1 });
+    const requestId = f.jobs.pendingInteractions()[0]!.requestId;
+    const rejected = assert.rejects(asked, /cancel peer answer/);
+    f.jobs.dismissInteraction(requestId, "cancel peer answer");
+    await cancellation.waitUntilReached();
+
+    const duringCancellation = await loadWorkflowJournal(f.artifactRoot, started.snapshot.runId);
+    assert.deepEqual(
+      duringCancellation.filter((record) => record.kind === "peerQuestion").map((record) => record.state),
+      ["started"],
+      "the terminal peer record waits for native cancellation and its final usage",
+    );
+
+    cancellation.release();
+    await rejected;
+    f.backend.complete(implementerJobId, "IMPLEMENTED");
+    const final = await started.completion;
+    const planner = final.agents[0]!;
+    assert.equal(planner.state, "completed");
+    assert.equal(planner.progressedCheckpoint, undefined, "cancelled peer progress remains auxiliary");
+    assert.deepEqual(planner.usage, {
+      input: 7, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2,
+    });
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const peer = [...journal].reverse().find((record) => record.kind === "peerQuestion" && record.state === "failed");
+    assert.match(peer?.result?.error ?? "", /cancel peer answer/);
+    assert.deepEqual(peer?.result?.usage, planner.usage);
+
+    const restarted = await f.workflows.restartAgent(final.runId, planner.index);
+    const cancelled = await f.workflows.cancel(restarted.snapshot.runId, "restart policy accepted cancelled peer progress");
+    assert.equal(cancelled.status, "aborted");
   } finally {
     await f.cleanup();
   }

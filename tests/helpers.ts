@@ -590,6 +590,20 @@ export interface FakeRun {
   settled: boolean;
 }
 
+interface ControlledCancellationGate {
+  usage?: Partial<Usage>;
+  reached: boolean;
+  reachedPromise: Promise<void>;
+  reach: () => void;
+  released: Promise<void>;
+  release: () => void;
+}
+
+export interface ControlledCancellationHandle {
+  waitUntilReached(): Promise<void>;
+  release(): void;
+}
+
 /**
  * Backend giving the test full control over every run's lifecycle, addressable
  * either by job id ({@link complete}) or by task text ({@link completeTask}).
@@ -603,6 +617,7 @@ export class ControlledBackend implements Backend {
   readonly sends: Array<{ id: string; message: string; behavior: string }> = [];
   readonly #startWaiters = new Set<() => void>();
   readonly #sendWaiters = new Set<() => void>();
+  readonly #cancellationGates = new Map<string, ControlledCancellationGate>();
   active = 0;
   maxActive = 0;
 
@@ -672,6 +687,14 @@ export class ControlledBackend implements Backend {
       },
       cancel: async (reason) => {
         this.cancels.push({ jobId: request.jobId, reason });
+        const gate = this.#cancellationGates.get(request.jobId);
+        if (gate) {
+          gate.reached = true;
+          gate.reach();
+          await gate.released;
+          this.#cancellationGates.delete(request.jobId);
+          if (gate.usage) emit({ type: "usage", usage: gate.usage });
+        }
         emit({ type: "cancelled", reason });
         run.settle();
       },
@@ -689,6 +712,27 @@ export class ControlledBackend implements Backend {
     const request = this.requestForTask(task);
     assert.ok(request, `backend did not start task ${task}`);
     return askThroughBackend(this.requests, request.jobId, input);
+  }
+
+  /** Holds one native cancellation and can emit final usage before it settles. */
+  gateCancellation(jobId: string, usage?: Partial<Usage>): ControlledCancellationHandle {
+    assert.ok(this.runs.has(jobId), `backend never started job ${jobId}`);
+    assert.equal(this.#cancellationGates.has(jobId), false, `cancellation for ${jobId} is already gated`);
+    let reach!: () => void;
+    let release!: () => void;
+    const gate: ControlledCancellationGate = {
+      usage,
+      reached: false,
+      reachedPromise: new Promise<void>((resolve) => { reach = resolve; }),
+      reach: () => reach(),
+      released: new Promise<void>((resolve) => { release = resolve; }),
+      release: () => release(),
+    };
+    this.#cancellationGates.set(jobId, gate);
+    return {
+      waitUntilReached: () => gate.reached ? Promise.resolve() : gate.reachedPromise,
+      release: gate.release,
+    };
   }
 
   requestForTask(task: string): BackendRequest | undefined {

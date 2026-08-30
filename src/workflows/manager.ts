@@ -1532,13 +1532,12 @@ export class WorkflowManager {
       const owner = this.#jobOwners.get(jobId);
       const record = targetAgent
         ?? (owner?.runId === entry.snapshot.runId ? entry.snapshot.agents[owner.agentIndex] : undefined);
-      const progressed = progressedFailure || record?.progressedCheckpoint === true;
       const failed = {
         ok: false,
         output: "",
         error: boundedText(error),
         usage: record ? clone(record.usage) : undefined,
-        ...(progressed ? { progressed: true as const } : {}),
+        ...(progressedFailure ? { progressed: true as const } : {}),
       } satisfies WorkflowJournalResult;
       await this.#appendJournal(entry, {
         callIndex,
@@ -2917,6 +2916,7 @@ export class WorkflowManager {
       preview: target.preview,
       truncated: target.truncated,
       instructionShaped: target.instructionShaped,
+      progressedCheckpoint: target.progressedCheckpoint,
       error: target.error,
       endedAt: target.timestamps.endedAt,
     };
@@ -2936,6 +2936,7 @@ export class WorkflowManager {
       target.preview = settled.preview;
       target.truncated = settled.truncated;
       target.instructionShaped = settled.instructionShaped;
+      target.progressedCheckpoint = settled.progressedCheckpoint;
       target.error = settled.error;
       target.timestamps.updatedAt = at;
       target.timestamps.endedAt = settled.endedAt ?? at;
@@ -2950,10 +2951,14 @@ export class WorkflowManager {
     };
 
     let abort: (() => void) | undefined;
+    let cancellation: Promise<JobSnapshot> | undefined;
     try {
       const queued = await this.#jobs.continueWorkflowJob(jobId, prompt);
       this.#updateAgentFromJob(queued);
-      abort = () => { void this.#jobs.cancel(jobId, "Peer answer cancelled").catch(() => undefined); };
+      abort = () => {
+        cancellation ??= this.#jobs.cancel(jobId, "Peer answer cancelled");
+        void cancellation.catch(() => undefined);
+      };
       if (input.signal.aborted) abort();
       else input.signal.addEventListener("abort", abort, { once: true });
       const final = await this.#jobs.wait(jobId, { signal: input.signal });
@@ -2972,8 +2977,15 @@ export class WorkflowManager {
         usage: addWorkflowUsage(target.retryUsage, workflowUsage(final.usage)),
       };
     } catch (error) {
-      try { this.#updateAgentFromJob(this.#jobs.check(jobId)); }
-      catch { /* a lost retained session has no newer usage to project */ }
+      if (input.signal.aborted) {
+        abort?.();
+        const cancelled = await cancellation?.catch(() => undefined);
+        if (cancelled) this.#updateAgentFromJob(cancelled);
+      }
+      if (!cancellation) {
+        try { this.#updateAgentFromJob(this.#jobs.check(jobId)); }
+        catch { /* a lost retained session has no newer usage to project */ }
+      }
       failGeneration(boundedText(error));
       throw error;
     } finally {
@@ -3438,7 +3450,9 @@ export class WorkflowManager {
     agent.effort = job.effort;
     agent.preview = job.output.slice(-500);
     agent.error = job.error;
-    if (job.progressed && (job.status === "failed" || job.status === "cancelled")) agent.progressedCheckpoint = true;
+    if (!agent.answering && job.progressed && (job.status === "failed" || job.status === "cancelled")) {
+      agent.progressedCheckpoint = true;
+    }
     agent.usage = addWorkflowUsage(agent.retryUsage, workflowUsage(job.usage));
     agent.context = job.context ? { ...job.context } : undefined;
     agent.timestamps.updatedAt = now;

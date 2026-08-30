@@ -31,9 +31,9 @@ Four non-failure states are reported separately and must not be summarized as fa
 ## State previews and recovery
 
 - A running entity with no question shows `Latest` from bounded semantic activity. Use `s` only for a steerable direct job. Workflow agents have no steer or takeover action; monitor them in `/workflows`.
-- A failed direct session pins its bounded error. Failed and cancelled direct sessions cannot continue, so the inspector does not offer follow-up, restart, or takeover. A workflow-owned direct row sends recovery to `/workflows`.
-- A failed workflow run pins its bounded error. There is no run restart action. Inspect the failed agent and use `r` only when that agent has a recorded call that `/workflows` can restart as a replacement run.
-- Failed, cancelled, or aborted agents show `r` only when restart cannot discard progressed work. The dashboard refuses progressed failures and continued agents; resume the handoff or recover manually.
+- Failed or cancelled direct sessions pin their error and offer no follow-up, restart, or takeover. Workflow-owned rows send recovery to `/workflows`.
+- Failed workflow runs pin their error and have no run restart action. Use `r` only on an agent that `/workflows` can restart in a replacement run.
+- Failed, cancelled, or aborted agents show `r` only when restart cannot discard progressed agent or follow-up work. Peer-answer progress does not block safe suffix restart. Progressed failures and continued agents require the handoff or manual recovery.
 - A completed entity shows one concise result preview. Use `f` for a retained direct session when more work is needed. Completed workflow runs and agents require no action; `r` on an eligible workflow agent starts a replacement run rather than continuing the completed session.
 
 ## Four telemetry concepts stay distinct
