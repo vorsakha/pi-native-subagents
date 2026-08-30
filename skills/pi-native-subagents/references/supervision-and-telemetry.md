@@ -11,7 +11,7 @@ Read this when supervising work or interpreting telemetry. Each dashboard's `?` 
 - Workflow calls and results keep durable transcript cards, run IDs, and artifact references. Activity is keyboard reachable, textual, and narrow-width safe.
 - Workflow-owned jobs stay tagged in `/subagents`; the activity widget counts them separately.
 - Inspectors default to state plus outline, transcript, or result. Press `i` for route/model, usage/budget, context, provenance, isolation, replay, and replacement telemetry. Errors, questions, waits, warnings, and recovery stay pinned. Previews omit full tool calls and result bodies.
-- Continued routes read `primary → replacement (continued)`. Detail shows trigger, checkout, attempts, and historical replacement job provenance; it never claims a closed or persisted job is retained.
+- Continued routes read `primary → replacement (continued)`. Detail shows trigger, checkout, attempts, and historical replacement provenance; it never calls a closed or persisted job retained.
 - Transcripts default to compact tool-call groups with counts and running/failed visibility; full native rendering is a toggle. Workflow inspection preserves run and node identities through refresh, filtering, reordering, replacement, and resize. Missing nodes fall back to their phase, then the current phase, then the first visible node.
 - Wide dashboards keep the grouped run rail beside either the outline or agent detail. Medium dashboards keep a short grouped run list above it. Narrow dashboards show one focus layer at a time. Backtracking restores the prior node identity; no layout adds a permanent third column.
 - Phase rows, omission rows, headers, and filtered or hidden agents are never agent-action targets. Restart and agent cancellation require an eligible selected agent that survived the final rendered outline/detail viewport. Run cancellation remains a separate confirmed action.
@@ -33,7 +33,7 @@ Four non-failure states are reported separately and must not be summarized as fa
 - A running entity with no question shows `Latest` from bounded semantic activity. Use `s` only for a steerable direct job. Workflow agents have no steer or takeover action; monitor them in `/workflows`.
 - A failed direct session pins its bounded error. Failed and cancelled direct sessions cannot continue, so the inspector does not offer follow-up, restart, or takeover. A workflow-owned direct row sends recovery to `/workflows`.
 - A failed workflow run pins its bounded error. There is no run restart action. Inspect the failed agent and use `r` only when that agent has a recorded call that `/workflows` can restart as a replacement run.
-- A failed, cancelled, or aborted workflow agent names `r` only when that selected agent can be restarted. Otherwise the inspector says no restart action is available.
+- A failed/cancelled/aborted workflow agent names `r` only when restart cannot discard a progressed checkpoint. It must resume its durable handoff or recover manually; otherwise no restart is available.
 - A completed entity shows one concise result preview. Use `f` for a retained direct session when more work is needed. Completed workflow runs and agents require no action; `r` on an eligible workflow agent starts a replacement run rather than continuing the completed session.
 
 ## Four telemetry concepts stay distinct

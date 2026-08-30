@@ -71,3 +71,26 @@ test("checkout proof observes an already-cancelled signal before invoking Git", 
   controller.abort(new Error("operator cancelled"));
   await assert.rejects(captureWorkflowCheckout("/path/that/does/not/exist", controller.signal), /operator cancelled/);
 });
+
+test("checkout proof rejects fsmonitor-valid entries that can hide worktree divergence", async () => {
+  const parent = await tempDir("workflow-checkout-fsmonitor");
+  const cwd = join(parent, "repo");
+  try {
+    await mkdir(cwd);
+    const tracked = join(cwd, "tracked.txt");
+    await writeFile(tracked, "base\n");
+    await execFileAsync("git", ["init", "-q"], { cwd });
+    await execFileAsync("git", ["config", "user.email", "workflow-tests@example.invalid"], { cwd });
+    await execFileAsync("git", ["config", "user.name", "Workflow Tests"], { cwd });
+    await execFileAsync("git", ["add", "tracked.txt"], { cwd });
+    await execFileAsync("git", ["commit", "-qm", "fixture"], { cwd });
+    await execFileAsync("git", ["config", "core.fsmonitor", "true"], { cwd });
+    await execFileAsync("git", ["update-index", "--fsmonitor"], { cwd });
+    await execFileAsync("git", ["update-index", "--fsmonitor-valid", "tracked.txt"], { cwd });
+    const flags = (await execFileAsync("git", ["ls-files", "-f"], { cwd })).stdout;
+    assert.match(flags, /^h tracked\.txt$/m, "Git exposes fsmonitor-valid state only through ls-files -f");
+    await assert.rejects(captureWorkflowCheckout(cwd), /fsmonitor-valid index entries/);
+  } finally {
+    await rm(parent, { recursive: true, force: true });
+  }
+});

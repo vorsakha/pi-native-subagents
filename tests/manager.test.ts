@@ -326,6 +326,29 @@ test("cancel removes queued jobs and tears down running backend", async () => {
   await manager.shutdown();
 });
 
+test("cancellation aborts scheduler admission before backend startup", async () => {
+  const { backend, manager } = setup(1);
+  let reached!: () => void;
+  const admissionReached = new Promise<void>((resolve) => { reached = resolve; });
+  const job = manager.spawn({
+    ...request(1),
+    dispatchAdmission: async (signal) => {
+      reached();
+      return new Promise<string | undefined>((_resolve, reject) => {
+        const abort = () => reject(signal.reason);
+        if (signal.aborted) abort();
+        else signal.addEventListener("abort", abort, { once: true });
+      });
+    },
+  });
+  await admissionReached;
+  assert.equal(manager.check(job.id).status, "queued", "admission does not claim backend startup");
+  const final = await manager.cancel(job.id, "cancel admission");
+  assert.equal(final.status, "cancelled");
+  assert.equal(backend.requests.length, 0, "cancelled admission never reaches the backend");
+  await manager.shutdown();
+});
+
 test("cancellation aborts a pending backend start before returning", async () => {
   let startupAborted = false;
   const backend: Backend = {

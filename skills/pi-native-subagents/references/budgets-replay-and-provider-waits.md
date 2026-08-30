@@ -62,9 +62,9 @@ Both attempts share one ordinal and cumulative usage; budget preflight runs agai
 
 ## Progressed continuation accounting
 
-`continuationFallback` is the separate opt-in for one opposite-provider handoff after authoritative unavailability and observed progress. Declaring it owns recovery for that call: an ineligible or pre-inference failure is terminal and never falls through to same-provider waiting. Failed-turn, replacement, and later follow-up usage is cumulative on one logical lineage; each archived attempt stores only its delta. Every original budget remains fixed and is checked before replacement.
+`continuationFallback` opts into one opposite-provider handoff after authoritative unavailability and observed progress. It owns recovery: ineligible or pre-inference failure is terminal, never a same-provider wait. Usage stays cumulative on one stable logical ID; archived attempts store only their generation delta, including on handoff replay. Original budgets remain fixed and are checked before replacement.
 
-A pre-settlement progressed record first forbids primary replay; it cannot authorize replacement. The later durable handoff proves the full index/worktree checkout before target dispatch. Completed replay spends nothing. Interrupted handoff replay runs only the replacement; missing or diverged proof fails closed. Cancellation covers both records, validation, replacement, and retained calls. `/workflows` separates continued, fallback, and waiting routes.
+A pre-settlement progressed record forbids primary replay but cannot authorize replacement. The durable handoff proves the index/worktree checkout before target dispatch and again at scheduler admission. Completed replay spends nothing; interrupted handoff replay runs only the replacement. Missing/diverged proof fails closed. Manual suffix restart cannot discard a progressed checkpoint. Cancellation covers records, admission, replacement, and retained calls. `/workflows` separates continued, fallback, and waiting routes.
 
 ## Recovery
 

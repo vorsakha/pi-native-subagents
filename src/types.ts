@@ -290,6 +290,8 @@ export interface SpawnRequest {
   workflow?: WorkflowJobReference;
   /** Internal synchronous gate checked immediately before a queued job starts. */
   dispatchGate?: () => string | undefined;
+  /** Internal abortable admission check run after scheduler selection and immediately before backend startup. */
+  dispatchAdmission?: (signal: AbortSignal) => Promise<string | undefined>;
   /** Internal session-peer fork data (source provenance plus the already-forked session file to resume). Pi-only; never set by a harness adapter. */
   peer?: PeerSessionReference & { sessionFile: string };
   /** Internal workflow-runtime request for a provider-native structured-result channel; never a model-facing tool field. */

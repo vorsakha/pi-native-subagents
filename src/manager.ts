@@ -554,7 +554,7 @@ export class JobManager {
     // the ordinary terminal no-op so that race cannot orphan peer-answer work.
     this.#cancelJobInteractions(job, reason);
     if (isTerminal(job.snapshot.status)) return clone(job.snapshot);
-    if (job.snapshot.status === "queued") {
+    if (job.snapshot.status === "queued" && !job.inFlight) {
       const index = this.#queue.indexOf(id);
       if (index >= 0) this.#queue.splice(index, 1);
       job.pendingRestart = undefined;
@@ -724,8 +724,13 @@ export class JobManager {
     const backend = this.#backends.get(job.policy.harness)!;
     const startupController = new AbortController();
     job.startupController = startupController;
-    this.#emit(job, { type: "started" });
     try {
+      if (job.request.dispatchAdmission) {
+        const admissionError = await job.request.dispatchAdmission(startupController.signal);
+        if (admissionError) throw new Error(admissionError);
+      }
+      startupController.signal.throwIfAborted();
+      this.#emit(job, { type: "started" });
       const basePrompt = job.request.peer
         ? PEER_SYSTEM_PROMPT
         : job.request.parentThread ? HUMAN_SYSTEM_PROMPT : GENERIC_SYSTEM_PROMPT;

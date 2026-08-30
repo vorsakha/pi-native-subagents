@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, rm } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { CapabilityService } from "../src/capability-service.ts";
 import { JobManager } from "../src/manager.ts";
-import { availabilityFixture, DiscoverableBackend, ScriptedHarnessAvailability, tempDir } from "./helpers.ts";
+import { availabilityFixture, ControlledBackend, DiscoverableBackend, ImmediateBackend, ScriptedHarnessAvailability, StaticWorkflowCheckout, tempDir } from "./helpers.ts";
 import { WorkflowManager } from "../src/workflows/manager.ts";
 import { loadWorkflowJournal } from "../src/workflows/artifacts.ts";
 
@@ -66,6 +66,72 @@ test("workflow agent() with an explicit harness that cannot satisfy requires fai
     assert.equal(f.codex.requests.length, 0, "an unsatisfied capability route never reaches the backend");
   } finally {
     await f.cleanup();
+  }
+});
+
+test("replayed follow-up continuation retains and revalidates the original capability requirements", async () => {
+  const parent = await tempDir("workflow-capability-continuation");
+  const cwd = join(parent, "cwd");
+  await mkdir(cwd);
+  const artifactRoot = join(parent, "artifacts");
+  const codex = new ImmediateBackend("codex");
+  const claude = new ControlledBackend("claude");
+  const jobs = new JobManager({ backends: [codex, claude] });
+  const codexProbe = new DiscoverableBackend("codex", []);
+  const claudeProbe = new DiscoverableBackend("claude", [{ kind: "tool", name: "lint", effect: "inspect" }]);
+  const router = new CapabilityService({ backends: [codexProbe, claudeProbe], fingerprint: () => "stable" });
+  const availability = new ScriptedHarnessAvailability({
+    codex: availabilityFixture("codex"),
+    claude: availabilityFixture("claude"),
+  });
+  const workflows = new WorkflowManager({
+    jobs,
+    artifactRoot,
+    sessionId: "session-1",
+    router,
+    availability,
+    checkout: new StaticWorkflowCheckout(),
+  });
+  const script = `export default async () => {
+    const first = await agent("lint first", {
+      harness: "claude",
+      access: "readOnly",
+      requires: ["tool:lint"],
+      continuationFallback: { harness: "codex" }
+    });
+    return followUp(first.jobId, "lint follow-up");
+  };`;
+  try {
+    const sourceRun = await workflows.start({
+      sessionId: "session-1", name: "capability continuation", script, cwd, trusted: true, defaultHarness: "codex",
+    });
+    await claude.waitForStart();
+    const lineage = claude.starts[0]!;
+    claude.complete(lineage, "initial lint");
+    await claude.waitForSend();
+    claude.emit(lineage, { type: "message", text: "follow-up progress" });
+    claude.fail(lineage, "quota", { provider: "claude", kind: "quota", authoritative: true, detail: "quota after progress" });
+    const source = await sourceRun.completion;
+    assert.equal(codex.requests.length, 0, "the live continuation keeps the capability requirement");
+
+    const journalPath = join(source.artifactDir, "journal.jsonl");
+    const records = (await readFile(journalPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { callIndex: number; state: string });
+    const handoffIndex = records.findIndex((record) => record.callIndex === 1 && record.state === "handoff");
+    assert.ok(handoffIndex >= 0);
+    await writeFile(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
+
+    const replayed = await workflows.start({
+      sessionId: "session-1", name: "capability continuation", script, cwd, trusted: true, defaultHarness: "codex", resumeFromRunId: source.runId,
+    });
+    const final = await replayed.completion;
+    assert.equal((final.result as { ok: boolean }).ok, false);
+    assert.match((final.result as { error?: string }).error ?? "", /required capabilities: tool:lint/);
+    assert.deepEqual(final.agents[0]?.requires, ["tool:lint"]);
+    assert.equal(codex.requests.length, 0, "replay never dispatches a replacement without the original capability ceiling");
+  } finally {
+    await workflows.shutdown(200).catch(() => undefined);
+    await jobs.shutdown(200).catch(() => undefined);
+    await rm(parent, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 

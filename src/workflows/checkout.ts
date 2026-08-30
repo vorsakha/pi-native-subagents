@@ -82,6 +82,11 @@ export async function captureWorkflowCheckout(cwd: string, signal?: AbortSignal)
   if (flaggedEntries.some((entry) => /^[a-zS] /.test(entry))) {
     throw new Error("Workflow continuation does not support checkout index flags that hide worktree changes");
   }
+  const fsmonitorFlags = await git(canonicalCwd, ["ls-files", "-f", "-z"], "buffer", signal) as Buffer;
+  const fsmonitorEntries = fsmonitorFlags.toString("utf8").split("\0").filter(Boolean);
+  if (fsmonitorEntries.some((entry) => /^[a-z] /.test(entry))) {
+    throw new Error("Workflow continuation does not support fsmonitor-valid index entries that can hide worktree changes");
+  }
   const statusArgs = ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--no-renames"];
   const raw = await git(canonicalCwd, statusArgs, "buffer", signal) as Buffer;
   const entries = raw.toString("utf8").split("\0").filter(Boolean);
@@ -90,10 +95,11 @@ export async function captureWorkflowCheckout(cwd: string, signal?: AbortSignal)
   }
 
   const hash = createHash("sha256");
-  hash.update("workflow-checkout-v3\0");
+  hash.update("workflow-checkout-v4\0");
   hash.update(canonicalCwd).update("\0").update(root).update("\0").update(gitDir).update("\0").update(head).update("\0");
   hash.update("index\0").update(index).update("\0");
   hash.update("index-flags\0").update(indexFlags).update("\0");
+  hash.update("index-fsmonitor\0").update(fsmonitorFlags).update("\0");
   for (const entry of entries) {
     signal?.throwIfAborted();
     if (entry.length < 4 || entry[2] !== " ") throw new Error("Workflow continuation could not parse Git checkout status");
@@ -107,12 +113,16 @@ export async function captureWorkflowCheckout(cwd: string, signal?: AbortSignal)
     else await hashRegularFile(hash, absolute, signal);
   }
 
-  const [stableIndex, stableIndexFlags, stableStatus] = await Promise.all([
+  const [stableIndex, stableIndexFlags, stableFsmonitorFlags, stableStatus] = await Promise.all([
     git(canonicalCwd, ["ls-files", "--stage", "-z"], "buffer", signal) as Promise<Buffer>,
     git(canonicalCwd, ["ls-files", "-v", "-z"], "buffer", signal) as Promise<Buffer>,
+    git(canonicalCwd, ["ls-files", "-f", "-z"], "buffer", signal) as Promise<Buffer>,
     git(canonicalCwd, statusArgs, "buffer", signal) as Promise<Buffer>,
   ]);
-  if (!index.equals(stableIndex) || !indexFlags.equals(stableIndexFlags) || !raw.equals(stableStatus)) {
+  if (!index.equals(stableIndex)
+      || !indexFlags.equals(stableIndexFlags)
+      || !fsmonitorFlags.equals(stableFsmonitorFlags)
+      || !raw.equals(stableStatus)) {
     throw new Error("Workflow checkout changed while continuation state was being recorded");
   }
 

@@ -73,7 +73,7 @@ if (!review.ok) return { ok: false, error: review.error };
 
 Rules:
 
-- The target must be this run's completed `agent()` lineage with a retained session. Cross-workflow, direct, expired, failed, cancelled, and unsettled jobs are rejected.
+- The target must be this run's completed retained `agent()` lineage. Its logical ID is stable across continuation and follow-ups. Cross-workflow, direct, expired, failed, cancelled and unsettled jobs are rejected.
 - `options` accepts only `phase` and `schema`. Harness, model, effort, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original `agent()` call.
 - A retained native structured session stays bound to its original schema. Every `followUp()` on that lineage is validated against the original schema and can return `structured` even when the call omits `schema`; a follow-up cannot replace the schema.
 - An `agent()` call that used `isolation: "worktree"` can never be targeted: its worktree is finalized when the call returns, so the follow-up is rejected whether the recorded state is `preserved`, `removed`, or `orphaned`.
@@ -84,7 +84,7 @@ Rules:
 
 A fresh explicit Claude/Codex `agent()` may set one opposite native route. `providerFallback: { harness, model? }` handles authoritative pre-inference failure with zero usage; after dispatch it also requires `readOnly`.
 
-`continuationFallback: { harness, model? }` permits one handoff after authoritative unavailability and current-turn progress, including follow-ups. Pre-settlement proof blocks primary replay; a full index/flags/worktree checkpoint authorizes replacement. It keeps schema, policy, budget, usage, cancellation, and provider independence fixed to the continued lineage. Ineligible failure, unsafe state, unavailable target, isolation, or replacement failure is terminal, with no wait fallthrough. Never combine or loop these options.
+`continuationFallback: { harness, model? }` permits one handoff after authoritative unavailability and current-turn progress, including follow-ups. Progress proof blocks primary replay; a checkout proof rechecked at queued startup authorizes replacement. Schema, requirements, policy, budgets, usage, cancellation, logical ID, and provider independence stay fixed. Ineligible failure, unsafe state, unavailable target, isolation, or replacement failure is terminal; no wait. Never combine or loop these options.
 
 ## Sandbox limits and determinism
 

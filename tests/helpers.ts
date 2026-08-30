@@ -203,6 +203,25 @@ export class CancellationGatedWorkflowCheckout implements WorkflowCheckoutOperat
   }
 }
 
+/** Stable checkout proof double for tests whose risk boundary is not Git state. */
+export class StaticWorkflowCheckout implements WorkflowCheckoutOperations {
+  async capture(cwd: string, signal: AbortSignal): Promise<WorkflowCheckoutProof> {
+    signal.throwIfAborted();
+    return {
+      cwd,
+      root: cwd,
+      gitDir: join(cwd, ".git"),
+      head: "a".repeat(40),
+      changedPaths: 0,
+      digest: `sha256:${"b".repeat(64)}`,
+    };
+  }
+
+  async assert(_proof: WorkflowCheckoutProof, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+  }
+}
+
 export function availabilityFixture(
   harness: HarnessName,
   overrides: Partial<HarnessAvailabilityFacts> = {},
