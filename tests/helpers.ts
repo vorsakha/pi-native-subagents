@@ -22,6 +22,8 @@ import type {
 import type { ProviderUnavailability } from "../src/provider-unavailability.ts";
 import { normalizeTarget, type InteractionAskResult, type PendingInteraction } from "../src/interactions.ts";
 import type { InteractionDeadlineClock } from "../src/manager.ts";
+import type { WorkflowCheckoutProof } from "../src/workflows/checkout.ts";
+import type { WorkflowCheckoutOperations } from "../src/workflows/manager.ts";
 import type { ProviderStatus, ProviderStatusReader, ProviderStatusRequest } from "../src/provider-status.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 import {
@@ -173,6 +175,31 @@ export class GatedHarnessAvailability extends ScriptedHarnessAvailability {
     this.#reached = false;
     this.#releasePromise = new Promise<void>((resolve) => { this.#release = resolve; });
     this.#reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
+  }
+}
+
+/** Checkout proof double that blocks capture until its signal is cancelled. */
+export class CancellationGatedWorkflowCheckout implements WorkflowCheckoutOperations {
+  #reached = false;
+  #reachedResolve!: () => void;
+  readonly #reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
+
+  capture(_cwd: string, signal: AbortSignal): Promise<WorkflowCheckoutProof> {
+    this.#reached = true;
+    this.#reachedResolve();
+    return new Promise((_, reject) => {
+      const abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+      if (signal.aborted) abort();
+      else signal.addEventListener("abort", abort, { once: true });
+    });
+  }
+
+  async assert(_proof: WorkflowCheckoutProof, signal: AbortSignal): Promise<void> {
+    signal.throwIfAborted();
+  }
+
+  waitUntilReached(): Promise<void> {
+    return this.#reached ? Promise.resolve() : this.#reachedPromise;
   }
 }
 

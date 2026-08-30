@@ -181,7 +181,7 @@ function normalizeConvergenceProgress(value: unknown): WorkflowConvergenceProgre
   }
   const optional = (item: unknown, max: number): string | undefined =>
     typeof item === "string" ? item.slice(0, max) : undefined;
-  if ([raw.name, raw.stoppingReason, raw.fingerprint, raw.implementerJobId, raw.reviewerJobId]
+  if ([raw.name, raw.stoppingReason, raw.fingerprint, raw.pendingFindings, raw.implementerJobId, raw.reviewerJobId]
     .some((item) => item !== undefined && typeof item !== "string")) return undefined;
   if (raw.verdict !== undefined && (typeof raw.verdict !== "string" || !CONVERGENCE_VERDICTS.has(raw.verdict))) return undefined;
   if (raw.actionableCount !== undefined && integer(raw.actionableCount, 0, 1_000) === undefined) return undefined;
@@ -193,6 +193,7 @@ function normalizeConvergenceProgress(value: unknown): WorkflowConvergenceProgre
     verdict: raw.verdict as WorkflowConvergenceProgress["verdict"] | undefined,
     actionableCount: raw.actionableCount as number | undefined,
     fingerprint: optional(raw.fingerprint, 64),
+    pendingFindings: optional(raw.pendingFindings, 8_192),
     stoppingReason: optional(raw.stoppingReason, 2_000),
     implementerJobId: optional(raw.implementerJobId, 200),
     reviewerJobId: optional(raw.reviewerJobId, 200),

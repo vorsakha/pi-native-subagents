@@ -62,7 +62,7 @@ Both attempts share one ordinal and cumulative usage; budget preflight runs agai
 
 ## Progressed continuation accounting
 
-`continuationFallback` is the separate opt-in for one opposite-provider handoff after authoritative unavailability and observed progress. It never combines with fallback or waiting. Failed-turn, replacement, and later follow-up usage is cumulative on one logical lineage; each archived attempt stores only its delta. Every original budget remains fixed and is checked before replacement.
+`continuationFallback` is the separate opt-in for one opposite-provider handoff after authoritative unavailability and observed progress. Declaring it owns recovery for that call: an ineligible or pre-inference failure is terminal and never falls through to same-provider waiting. Failed-turn, replacement, and later follow-up usage is cumulative on one logical lineage; each archived attempt stores only its delta. Every original budget remains fixed and is checked before replacement.
 
 A pre-settlement progressed record first forbids primary replay; it cannot authorize replacement. The later durable handoff proves the full index/worktree checkout before target dispatch. Completed replay spends nothing. Interrupted handoff replay runs only the replacement; missing or diverged proof fails closed. Cancellation covers both records, validation, replacement, and retained calls. `/workflows` separates continued, fallback, and waiting routes.
 

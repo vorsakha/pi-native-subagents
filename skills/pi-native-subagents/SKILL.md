@@ -99,7 +99,7 @@ agent("task", {
 });
 ```
 
-This permits one bounded handoff after authoritative provider unavailability and observed progress. It continues the same logical lineage and current Git checkout; it never replays the primary. Do not combine it with `providerFallback` or worktree isolation. Read `references/progressed-continuation.md` first.
+This permits one bounded handoff after authoritative provider unavailability and observed progress. It continues the same logical lineage and current Git checkout; it never replays the primary or falls through to provider waiting. Do not combine it with `providerFallback` or worktree isolation. Read `references/progressed-continuation.md` first.
 
 ```js
 export const meta = { name: "parallel-review" };

@@ -25,7 +25,7 @@ Continuation opens only when all of these are true:
 - the failed generation itself recorded model or tool progress, and the failure is not marked pre-inference; activity from an earlier retained generation never qualifies a new turn;
 - the failed native process has settled and its retained resources are closed;
 - the target freshly reports ready and satisfies the original fixed policy;
-- the shared cwd is a provable Git checkout whose HEAD, complete staged-index entries, status, and changed worktree contents can be checkpointed;
+- the shared cwd is a provable Git checkout whose HEAD, complete staged-index entries and flags, status, and changed worktree contents can be checkpointed; index flags that hide changes are unsupported;
 - this logical lineage has not already used its one continuation.
 
 Ordinary errors, cancellation, missing or ambiguous evidence, a provider mismatch, pre-inference rejection, unsupported isolation, target unavailability, unsafe or changing checkout state, and a failed replacement are terminal. There is no reverse route, chained route, wait, or loop. `providerFallback` remains the pre-inference option; provider waiting retries the same provider and only fresh `agent()` calls.
@@ -46,7 +46,7 @@ Each required section has its own bound, so large objective, prompt, output, or 
 
 External commands, hooks, plugins, MCP calls, and services may have completed before the failed provider stopped. Continuation cannot guarantee exactly-once behavior for those effects. The replacement must inspect state and continue remaining work, not repeat commands merely because it did not author the partial result.
 
-After replacement starts, future `followUp()` calls and later `converge()` implementation rounds target its retained native session while the script-visible logical lineage remains stable. Cancellation covers failure settlement, handoff creation, target validation, replacement execution, and retained follow-ups.
+After replacement starts, future `followUp()` calls and later `converge()` rounds target its retained native session while the script-visible logical lineage remains stable. `independentOf` and `independentReview` resolve against the replacement provider, not the closed primary. Cancellation covers settlement, checkout capture, handoff creation, target validation, replacement execution, and retained follow-ups.
 
 ## Durability, accounting, and inspection
 
@@ -61,7 +61,7 @@ On exact `resumeFromRunId` replay:
 
 Usage is cumulative across the failed turn, replacement, and later logical generations. Archived attempts show their own delta, while replay contributes zero new usage; earlier generations are never counted twice. Call ordinals, workflow and agent budgets, cancellation, approvals, journal order, convergence state, and replay provenance remain attached to the original logical call.
 
-`/workflows` shows the declaration as unused or used, `claude → codex (continued)` (or the reverse), the authoritative trigger, checkpoint digest/time, failed and replacement job provenance, each attempt, and the current retained route. During handoff it shows only the closed failed job; it calls a job retained only after the replacement exists. Provider waiting and pre-inference fallback retain their separate labels.
+`/workflows` shows the declaration as unused or used, `claude → codex (continued)` (or the reverse), the trigger, checkpoint, failed and replacement job provenance, and attempts. Replacement IDs are historical provenance; the dashboard does not claim a persisted or terminal replacement is retained. Provider waiting and pre-inference fallback keep separate labels.
 
 ## Recovery
 

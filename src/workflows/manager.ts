@@ -35,7 +35,7 @@ import {
 import { resolveWorkflowStructured, workflowSchema } from "./schema.ts";
 import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
 import { workflowTaskOutcome } from "./outcome.ts";
-import { assertWorkflowCheckout, captureWorkflowCheckout } from "./checkout.ts";
+import { assertWorkflowCheckout, captureWorkflowCheckout, type WorkflowCheckoutProof } from "./checkout.ts";
 import { finishWorkflowWorktree, prepareWorkflowWorktree, reclaimWorkflowWorktree, type WorkflowWorktreeHandle, type WorkflowWorktreeReclamation } from "./worktree.ts";
 import {
   applyWorkflowRetention,
@@ -456,6 +456,11 @@ function abortError(reason: unknown): Error {
   return error;
 }
 
+export interface WorkflowCheckoutOperations {
+  capture(cwd: string, signal: AbortSignal): Promise<WorkflowCheckoutProof>;
+  assert(proof: WorkflowCheckoutProof, signal: AbortSignal): Promise<void>;
+}
+
 export class WorkflowManager {
   readonly #jobs: JobManager;
   readonly #artifactRoot: string;
@@ -477,6 +482,7 @@ export class WorkflowManager {
   readonly #replaySourceRunIds = new Set<string>();
   readonly #maxRetainedRuns: number;
   readonly #providerWaitClock: ProviderWaitClock;
+  readonly #checkout: WorkflowCheckoutOperations;
 
   constructor(options: {
     jobs: JobManager;
@@ -492,6 +498,8 @@ export class WorkflowManager {
     retainedRuns?: number;
     /** Test-only injection point for provider-quota wait scheduling; defaults to a real, abortable, unref'd timer. */
     providerWaitClock?: ProviderWaitClock;
+    /** Test-only checkout proof injection; production uses abortable Git-backed proof operations. */
+    checkout?: WorkflowCheckoutOperations;
   }) {
     this.#jobs = options.jobs;
     this.#artifactRoot = resolve(options.artifactRoot);
@@ -504,6 +512,10 @@ export class WorkflowManager {
       ? options.retainedRuns!
       : DEFAULT_WORKFLOW_RETAINED_RUNS;
     this.#providerWaitClock = options.providerWaitClock ?? DEFAULT_PROVIDER_WAIT_CLOCK;
+    this.#checkout = options.checkout ?? {
+      capture: captureWorkflowCheckout,
+      assert: assertWorkflowCheckout,
+    };
     this.#unsubscribeJobs = this.#jobs.subscribe((job, event) => this.#updateAgentFromJob(job, event));
     // Same-run peer routing is workflow policy; JobManager owns only the
     // generic lifecycle rules and hands the authorized request over here.
@@ -1206,7 +1218,10 @@ export class WorkflowManager {
           usedContinuation = true;
           break;
         }
-        if (result.progressed) break;
+        // A declared continuation route owns this call's recovery policy. It
+        // never falls through to the run-wide same-provider wait policy,
+        // whether the failed turn progressed or was rejected pre-inference.
+        break;
       }
       if (!policy || policy.providerUnavailable !== "wait") break;
       // `entry.providerWaitBudgetMs` is a run-wide allowance shared by every logical
@@ -1508,6 +1523,38 @@ export class WorkflowManager {
     }
   }
 
+  #resolveIndependenceTarget(
+    entry: RunEntry,
+    requestedJobId: string | undefined,
+  ): { jobId?: string; provider?: ProviderFamily } {
+    if (!requestedJobId) return {};
+    const target = entry.snapshot.agents.find((candidate) =>
+      candidate.logicalJobId === requestedJobId || candidate.jobId === requestedJobId);
+    const replacementJobId = target?.continuation?.replacementJobId;
+    if (replacementJobId) {
+      let replacement: JobSnapshot | undefined;
+      try {
+        replacement = this.#jobs.check(replacementJobId);
+      } catch {
+        // A replayed or evicted native session has no live JobManager target.
+        // Only durable replay provenance may identify its provider below.
+      }
+      if (replacement) {
+        if (replacement.harness !== target.continuation?.toHarness) {
+          throw new Error("Continuation replacement provider does not match its recorded lineage");
+        }
+        return { jobId: replacementJobId, provider: replacement.harness };
+      }
+      const replayProvider = entry.replay?.priorJobProviders.get(requestedJobId);
+      if (replayProvider) return { jobId: requestedJobId, provider: replayProvider };
+      throw new Error("Continuation replacement is unavailable as an independence target");
+    }
+    return {
+      jobId: requestedJobId,
+      provider: entry.replay?.priorJobProviders.get(requestedJobId),
+    };
+  }
+
   async #runFreshAgent(
     entry: RunEntry,
     request: StartWorkflowRequest,
@@ -1714,9 +1761,7 @@ export class WorkflowManager {
       }
     }
 
-    const replayIndependenceProvider = record.independentOf
-      ? entry.replay?.priorJobProviders.get(record.independentOf)
-      : undefined;
+    const independence = this.#resolveIndependenceTarget(entry, record.independentOf);
     let job: JobSnapshot;
     let structuredTransport: WorkflowStructuredTransport | undefined;
     // Persist the requested harness before routing so a fail-closed availability
@@ -1735,14 +1780,14 @@ export class WorkflowManager {
           effort,
           access,
           independent: options.independent === true,
-          independentOf: record.independentOf,
-          independentOfProvider: replayIndependenceProvider,
+          independentOf: independence.jobId,
+          independentOfProvider: independence.provider,
           profile: record.profile,
           defaultHarness: request.defaultHarness,
           parentProvider: request.parentProvider,
         },
         profile: record.profile ? this.#resolveProfile?.(record.profile) : undefined,
-        independentOfProvider: replayIndependenceProvider,
+        independentOfProvider: independence.provider,
         preference: request.defaultHarness ? [request.defaultHarness] : undefined,
         availability: this.#availability,
         requireAvailability: retry?.disposition === "fallback" || retry?.disposition === "continuation",
@@ -1772,8 +1817,8 @@ export class WorkflowManager {
         effort,
         access,
         independent: options.independent === true,
-        independentOf: record.independentOf,
-        independentOfProvider: replayIndependenceProvider,
+        independentOf: independence.jobId,
+        independentOfProvider: independence.provider,
         profile: record.profile,
         defaultHarness: request.defaultHarness,
         parentProvider: request.parentProvider,
@@ -2266,7 +2311,7 @@ export class WorkflowManager {
         if (replayCwd !== checkpoint.checkout.cwd) {
           throw new Error("Workflow continuation cwd no longer resolves to its durable handoff checkout");
         }
-        await assertWorkflowCheckout(checkpoint.checkout);
+        await this.#checkout.assert(checkpoint.checkout, signal);
       } catch (error) {
         record.continuation!.state = "failed";
         record.error = boundedText(error);
@@ -2285,7 +2330,7 @@ export class WorkflowManager {
       });
       await this.#flushCheckpoint(entry);
       if (signal.aborted) throw abortError(signal.reason);
-      await assertWorkflowCheckout(checkpoint.checkout);
+      await this.#checkout.assert(checkpoint.checkout, signal);
       const result = await this.#runFreshAgent(
         entry,
         { ...request, cwd: checkpoint.checkout.cwd },
@@ -2302,7 +2347,7 @@ export class WorkflowManager {
           disposition: "continuation",
           trigger: checkpoint.trigger,
           task: checkpoint.handoffPrompt,
-          beforeSpawn: () => assertWorkflowCheckout(checkpoint.checkout),
+          beforeSpawn: () => this.#checkout.assert(checkpoint.checkout, signal),
         },
       );
       if (!result.ok && record.continuation) record.continuation.state = "failed";
@@ -2926,16 +2971,22 @@ export class WorkflowManager {
       actionableCount: entry.snapshot.convergence.actionableCount,
       fingerprint: entry.snapshot.convergence.fingerprint,
     } : undefined;
+    const pendingFindings = entry.snapshot.convergence?.pendingFindings;
+    const objectiveLimit = pendingFindings ? 1_200 : 1_800;
+    const promptLimit = pendingFindings ? 1_000 : 4_200;
+    const outputLimit = pendingFindings ? 1_500 : 2_500;
+    const toolsLimit = pendingFindings ? 1_000 : 1_800;
     const sections = [
       "Continue the same logical workflow agent from the current checkout. Inspect the existing state first. Do not replay the original task from scratch and do not undo work merely because you did not author it.",
       CONTINUATION_WARNING,
-      `Original objective:\n${boundedText(objective, 1_800)}`,
-      `Current turn and pending findings:\n${boundedText(currentPrompt, 4_200)}`,
+      `Original objective:\n${boundedText(objective, objectiveLimit)}`,
+      `Current turn:\n${boundedText(currentPrompt, promptLimit)}`,
       `Workflow phase: ${boundedText(phase, 160)}`,
       `Authoritative provider failure: ${trigger.provider}/${trigger.kind}: ${boundedText(trigger.detail, 500)}`,
-      `Failed attempt output:\n${boundedText(record.output ?? record.preview ?? "(none)", 2_500)}`,
-      `Recent tool state:\n${boundedText(JSON.stringify(tools), 1_800)}`,
+      `Failed attempt output:\n${boundedText(record.output ?? record.preview ?? "(none)", outputLimit)}`,
+      `Recent tool state:\n${boundedText(JSON.stringify(tools), toolsLimit)}`,
       convergence ? `Pending convergence state:\n${boundedText(JSON.stringify(convergence), 1_000)}` : "",
+      pendingFindings ? `Pending convergence findings:\n${boundedText(pendingFindings, 8_192)}` : "",
       `Checkout checkpoint: ${checkoutDigest}`,
       "Continue from the files and tool effects that are already present. Report the remaining work you completed and the verification you ran.",
     ].filter(Boolean);
@@ -2999,8 +3050,9 @@ export class WorkflowManager {
     return this.#withDispatchSlot(input.entry, input.signal, () => this.#withMutationLock(input.request.cwd, input.signal, async () => {
       let checkout;
       try {
-        checkout = await captureWorkflowCheckout(input.request.cwd);
+        checkout = await this.#checkout.capture(input.request.cwd, input.signal);
       } catch (error) {
+        if (input.signal.aborted) throw abortError(input.signal.reason);
         input.record.error = `Workflow continuation requires a provable Git checkout: ${boundedText(error)}`;
         input.record.timestamps.updatedAt = Date.now();
         input.record.timestamps.endedAt = input.record.timestamps.updatedAt;
@@ -3008,6 +3060,7 @@ export class WorkflowManager {
         return { ok: false, output: String(input.record.output ?? ""), error: input.record.error, progressed: true, usage: clone(input.record.usage) };
       }
 
+      if (input.signal.aborted) throw abortError(input.signal.reason);
       const checkpointAt = Date.now();
       const handoffPrompt = this.#continuationPrompt(input.entry, input.record, input.objective, input.currentPrompt, input.trigger, checkout.digest);
       input.record.continuation = {
@@ -3047,7 +3100,7 @@ export class WorkflowManager {
       });
       await this.#flushCheckpoint(input.entry);
       if (input.signal.aborted) throw abortError(input.signal.reason);
-      await assertWorkflowCheckout(checkout);
+      await this.#checkout.assert(checkout, input.signal);
 
       const policyOptions = this.#continuationPolicyOptions(input.record, input.target, input.schema);
       const result = await this.#runFreshAgent(
@@ -3067,7 +3120,7 @@ export class WorkflowManager {
           trigger: input.trigger,
           task: handoffPrompt,
           attemptUsageBase: input.attemptUsageBase,
-          beforeSpawn: () => assertWorkflowCheckout(checkout),
+          beforeSpawn: () => this.#checkout.assert(checkout, input.signal),
         },
       );
       if (!result.ok && input.record.continuation) input.record.continuation.state = "failed";
@@ -3396,10 +3449,12 @@ export class WorkflowManager {
    * calls, so scheduling, budgets, journaling, and replay are untouched.
    */
   #recordConvergence(entry: RunEntry, progress: WorkflowConvergence): void {
+    const { pendingFindings, ...rest } = progress;
     entry.snapshot.convergence = {
-      ...progress,
+      ...rest,
       name: progress.name === undefined ? undefined : boundedText(progress.name, 200),
       stoppingReason: progress.stoppingReason === undefined ? undefined : boundedText(progress.stoppingReason, 2_000),
+      ...(pendingFindings === undefined ? {} : { pendingFindings: boundedText(pendingFindings, 8_192) }),
       rounds: progress.rounds.slice(-MAX_CONVERGENCE_ROUNDS),
     };
     this.#touch(entry);

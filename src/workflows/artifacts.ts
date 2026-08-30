@@ -300,6 +300,7 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
       ...snapshot.convergence,
       name: snapshot.convergence.name ? truncateUtf8(snapshot.convergence.name, 200) : undefined,
       stoppingReason: snapshot.convergence.stoppingReason ? truncateUtf8(snapshot.convergence.stoppingReason, 2_000) : undefined,
+      pendingFindings: snapshot.convergence.pendingFindings ? truncateUtf8(snapshot.convergence.pendingFindings, 8_192) : undefined,
       rounds: snapshot.convergence.rounds.slice(-MAX_CONVERGENCE_ROUNDS),
     } : undefined,
     logs: snapshot.logs?.slice(-128).map((entry) => ({

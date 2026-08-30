@@ -1181,19 +1181,19 @@ export class JobManager {
 
   #independenceProvider(request: SpawnRequest, independentOf: string | undefined): ProviderFamily | undefined {
     const independenceTarget = independentOf ? this.#jobs.get(independentOf) : undefined;
-    const replayProvider = request.independentOfProvider;
-    if (replayProvider !== undefined && replayProvider !== "claude" && replayProvider !== "codex") {
+    const providerHint = request.independentOfProvider;
+    if (providerHint !== undefined && providerHint !== "claude" && providerHint !== "codex") {
       throw new Error("independentOfProvider must identify native Claude or Codex");
     }
-    if (replayProvider !== undefined && !independentOf) throw new Error("independentOfProvider requires independentOf");
-    if (independentOf && !independenceTarget && !replayProvider) throw new Error(`Unknown independence target job: ${independentOf}`);
+    if (providerHint !== undefined && !independentOf) throw new Error("independentOfProvider requires independentOf");
+    if (independentOf && !independenceTarget && !providerHint) throw new Error(`Unknown independence target job: ${independentOf}`);
     const targetHarness = independenceTarget?.snapshot.harness;
     if (targetHarness === "pi") throw new Error("independentOf requires a target job using the native Claude or Codex harness");
     const retainedProvider = targetHarness === "claude" || targetHarness === "codex" ? targetHarness : undefined;
-    if (retainedProvider && replayProvider && retainedProvider !== replayProvider) {
+    if (retainedProvider && providerHint && retainedProvider !== providerHint) {
       throw new Error("independentOfProvider does not match the retained independence target");
     }
-    return retainedProvider ?? replayProvider;
+    return retainedProvider ?? providerHint;
   }
 
   async #cancelRun(job: InternalJob, run: BackendRun, reason: string): Promise<void> {

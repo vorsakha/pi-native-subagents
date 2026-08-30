@@ -40,10 +40,12 @@ export function isWorkflowConvergence(value: unknown): value is WorkflowConverge
   if (!candidate.rounds.every((entry, index) => validRound(entry, index + 1, maxRounds))) return false;
   if (!boundedString(candidate.name, 200)
     || !boundedString(candidate.stoppingReason, 2_000)
+    || !boundedString(candidate.pendingFindings, 8_192)
     || !boundedString(candidate.implementerJobId, 200)
     || !boundedString(candidate.reviewerJobId, 200)) return false;
 
   const latest = candidate.rounds.at(-1) as WorkflowConvergenceRound | undefined;
+  if (candidate.pendingFindings !== undefined && latest?.verdict !== "request_changes") return false;
   const hasLatestFields = candidate.verdict !== undefined
     || candidate.actionableCount !== undefined
     || candidate.fingerprint !== undefined;

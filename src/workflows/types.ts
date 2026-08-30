@@ -515,6 +515,8 @@ export interface WorkflowConvergence {
   verdict?: WorkflowConvergenceVerdict;
   actionableCount?: number;
   fingerprint?: string;
+  /** Bounded fix prompt containing every pending finding ID and available body evidence. */
+  pendingFindings?: string;
   /** Human-readable reason the loop stopped; present once `state` is terminal. */
   stoppingReason?: string;
   implementerJobId?: string;

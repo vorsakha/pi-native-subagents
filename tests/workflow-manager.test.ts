@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
-import { availabilityFixture, ControlledBackend, delay, GatedHarnessAvailability, ScriptedHarnessAvailability, tempDir, tick, waitFor } from "./helpers.ts";
+import { availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, ScriptedHarnessAvailability, tempDir, tick, waitFor } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import { workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint } from "../src/workflows/journal.ts";
 import {
@@ -76,6 +76,7 @@ async function fixture(
   retainedRuns?: number,
   providerWaitClock?: ProviderWaitClock,
   availability?: ScriptedHarnessAvailability,
+  checkout?: ConstructorParameters<typeof WorkflowManager>[0]["checkout"],
 ) {
   const parent = await tempDir("workflow-manager");
   const cwd = join(parent, "cwd");
@@ -96,6 +97,7 @@ async function fixture(
     retainedRuns,
     providerWaitClock,
     availability,
+    checkout,
   });
   return {
     parent,
@@ -1650,7 +1652,7 @@ test("maximum continuation evidence keeps every required handoff section and fin
     const handoff = f.backend.requests[0]!.task;
     assert.ok(handoff.length <= 16_384);
     assert.match(handoff, /Original objective:/);
-    assert.match(handoff, /Current turn and pending findings:/);
+    assert.match(handoff, /Current turn:/);
     assert.match(handoff, /Workflow phase:/);
     assert.match(handoff, /Authoritative provider failure:/);
     assert.match(handoff, /Failed attempt output:/);
@@ -1780,6 +1782,60 @@ test("continuation fails closed for ordinary, ambiguous, pre-inference, and mism
     } finally {
       await f.cleanup();
     }
+  }
+});
+
+test("continuationFallback never falls through to same-provider waiting", async () => {
+  const { clock } = fakeProviderWaitClock();
+  const f = await fallbackFixture(clock);
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => agent("one recovery policy", {
+      harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+    });`, { retry: { providerUnavailable: "wait", maxWaitMs: 120_000, maxAttempts: 2 } }));
+    await f.claude.waitForStart();
+    f.claude.fail(f.claude.starts[0]!, "quota before inference", fakeQuota(clock.now() + 60_000, "claude"));
+
+    const final = await started.completion;
+    assert.equal((final.result as { ok: boolean }).ok, false);
+    assert.equal(f.claude.requests.length, 1);
+    assert.equal(f.backend.requests.length, 0);
+    assert.equal(final.agents[0]?.providerWait, undefined);
+    assert.equal(final.agents[0]?.attempts, undefined);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("live independentOf routing follows the continuation replacement provider", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const started = await f.workflows.start(f.request(`export default async () => {
+      const producer = await agent("produce", {
+        harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+      });
+      if (!producer.ok) return producer;
+      return agent("independent review", { access: "readOnly", independentOf: producer.jobId });
+    };`));
+    await f.claude.waitForStart();
+    const primary = f.claude.starts[0]!;
+    f.claude.emit(primary, { type: "message", text: "partial production" });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+
+    await f.backend.waitForStart();
+    const replacement = f.backend.starts[0]!;
+    f.backend.complete(replacement, "produced");
+    await waitFor(() => f.claude.requests.length + f.backend.requests.length === 3, "independent reviewer dispatch");
+    assert.equal(f.backend.requests.length, 1, "the reviewer does not reuse the replacement provider");
+    const reviewer = f.claude.requests[1]!;
+    assert.equal(reviewer.policy.harness, "claude", "routing is opposite the Codex replacement, not the failed Claude primary");
+    f.claude.complete(reviewer.jobId, "reviewed");
+
+    const final = await started.completion;
+    assert.equal((final.result as { ok: boolean }).ok, true);
+    assert.equal(final.agents[1]?.independentOf, replacement);
+  } finally {
+    await f.cleanup();
   }
 });
 
@@ -1967,6 +2023,31 @@ test("agent cancellation follows a progressed lineage onto its active replacemen
     assert.equal((final.result as { ok: boolean }).ok, false);
     assert.equal(final.agents[0]?.jobId, replacement);
     assert.equal(final.agents[0]?.continuation?.state, "failed");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("selected-agent cancellation aborts checkout capture before a handoff is journaled", async () => {
+  const checkout = new CancellationGatedWorkflowCheckout();
+  const f = await fixture(4, undefined, undefined, undefined, fallbackAvailability(), checkout);
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => agent("cancel checkout proof", {
+      harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+    });`));
+    await f.claude.waitForStart();
+    const primary = f.claude.starts[0]!;
+    f.claude.emit(primary, { type: "message", text: "progressed work" });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+    await checkout.waitUntilReached();
+
+    await f.workflows.cancelAgent(started.snapshot.runId, 0, "cancel checkout capture");
+    const final = await started.completion;
+    assert.equal((final.result as { ok: boolean }).ok, false);
+    assert.equal(f.backend.requests.length, 0);
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    assert.ok(journal.some((record) => record.state === "progressed"));
+    assert.ok(!journal.some((record) => record.state === "handoff"), "cancellation prevents a post-cancel durable handoff");
   } finally {
     await f.cleanup();
   }
@@ -3053,6 +3134,85 @@ test("converge keeps pending findings and later rounds on a progressed replaceme
     assert.equal(replayedImplementer.logicalJobId, failedLineage);
     assert.equal(replayedImplementer.jobId, replacementJobId);
     assert.equal(replayedImplementer.continuation?.state, "completed");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("independent convergence review routes opposite a continued implementer replacement", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const started = await f.workflows.start(f.request(`export default async () => converge({
+      maxRounds: 1,
+      implement: {
+        prompt: "implement",
+        options: { harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" } }
+      },
+      review: { prompt: "review", options: {} },
+      independentReview: true
+    });`));
+    await f.claude.waitForStart();
+    const primary = f.claude.starts[0]!;
+    f.claude.emit(primary, { type: "message", text: "implementation progress" });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+
+    await f.backend.waitForStart();
+    const replacement = f.backend.starts[0]!;
+    f.backend.complete(replacement, "implemented");
+    await waitFor(() => f.claude.requests.length + f.backend.requests.length === 3, "independent convergence review dispatch");
+    assert.equal(f.backend.requests.length, 1);
+    assert.equal(f.claude.requests[1]?.policy.harness, "claude");
+    f.claude.complete(f.claude.starts[1]!, CONVERGE_APPROVE);
+
+    const final = await started.completion;
+    assert.equal(final.convergence?.state, "approved");
+    assert.equal(final.agents[1]?.independentOf, replacement);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("continuation handoff preserves late convergence finding IDs and bodies outside the current-prompt prefix", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const findings = Array.from({ length: 32 }, (_, index) => ({
+      id: `FINDING-${String(index + 1).padStart(2, "0")}`,
+      severity: "issue",
+      body: `${index === 31 ? "late-evidence-marker " : "evidence "}${String(index + 1).repeat(300)}`,
+      filePath: `src/file-${index + 1}.ts`,
+    }));
+    const started = await f.workflows.start(f.request(`export default async () => converge({
+      maxRounds: 2,
+      implement: {
+        prompt: "implement",
+        options: { harness: "codex", access: "readOnly", continuationFallback: { harness: "claude" } }
+      },
+      review: { prompt: "review", options: { harness: "claude" } }
+    });`));
+    await f.backend.waitForStart();
+    const implementer = f.backend.starts[0]!;
+    f.backend.complete(implementer, "implementation v1");
+    await f.claude.waitForStart();
+    const reviewer = f.claude.starts[0]!;
+    f.claude.complete(reviewer, JSON.stringify({ verdict: "request_changes", summary: "many findings", findings }));
+
+    await f.backend.waitForSend();
+    f.backend.emit(implementer, { type: "message", text: "partial fix" });
+    f.backend.fail(implementer, "quota", progressedQuota("codex"));
+    await f.claude.waitForStart(2);
+    const replacement = f.claude.requests[1]!;
+    assert.match(replacement.task, /Pending convergence findings:/);
+    assert.match(replacement.task, /FINDING-32/);
+    assert.match(replacement.task, /late-evidence-marker/);
+    assert.ok(replacement.task.length <= 16_384);
+    f.claude.complete(replacement.jobId, "implementation v2");
+    await f.claude.waitForSend();
+    f.claude.complete(reviewer, CONVERGE_APPROVE);
+
+    const final = await started.completion;
+    assert.equal(final.convergence?.state, "approved");
   } finally {
     await f.cleanup();
   }

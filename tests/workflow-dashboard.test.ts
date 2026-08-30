@@ -935,7 +935,7 @@ test("provider fallback dashboard metadata sanitizes every model route", (t) => 
   assert.doesNotMatch(inspector, /\u001b\[(?:31|32|33)m/, "caller-controlled model ANSI never reaches the dashboard");
 });
 
-test("progressed continuation dashboard exposes checkpoint, trigger, retained route, and sanitized provenance", (t) => {
+test("progressed continuation dashboard exposes checkpoint, trigger, historical replacement, and sanitized provenance", (t) => {
   const run = workflow("continuation-provenance", "completed");
   const agent = run.agents[0]!;
   agent.harness = "codex";
@@ -971,7 +971,8 @@ test("progressed continuation dashboard exposes checkpoint, trigger, retained ro
   state.overlay.handleInput("g");
   const inspector = state.overlay.render(140).join("\n");
   assert.match(inspector, /Progressed continuation · used · declared codex\/declared MODEL/);
-  assert.match(inspector, /Continuation · completed · claude → codex · failed job .* · retained job/);
+  assert.match(inspector, /Continuation · completed · claude → codex · failed job .* · replacement job/);
+  assert.doesNotMatch(inspector, /retained job/, "terminal snapshots do not claim that replacement sessions remain available");
   assert.match(inspector, /Continuation trigger · claude quota · quota after progress/);
   assert.match(inspector, /Checkout proof · sha256:c/);
   assert.match(inspector, /Continuation warning · exactly-once is not guaranteed/);

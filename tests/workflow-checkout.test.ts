@@ -40,3 +40,34 @@ test("checkout proof detects staged index divergence when status and worktree by
     await rm(parent, { recursive: true, force: true });
   }
 });
+
+for (const flag of ["--assume-unchanged", "--skip-worktree"] as const) {
+  test(`checkout proof rejects ${flag.slice(2)} entries that can hide worktree divergence`, async () => {
+    const parent = await tempDir("workflow-checkout-hidden");
+    const cwd = join(parent, "repo");
+    try {
+      await mkdir(cwd);
+      const tracked = join(cwd, "tracked.txt");
+      await writeFile(tracked, "base\n");
+      await execFileAsync("git", ["init", "-q"], { cwd });
+      await execFileAsync("git", ["config", "user.email", "workflow-tests@example.invalid"], { cwd });
+      await execFileAsync("git", ["config", "user.name", "Workflow Tests"], { cwd });
+      await execFileAsync("git", ["add", "tracked.txt"], { cwd });
+      await execFileAsync("git", ["commit", "-qm", "fixture"], { cwd });
+
+      await execFileAsync("git", ["update-index", flag, "tracked.txt"], { cwd });
+      await writeFile(tracked, "hidden divergence\n");
+      const status = (await execFileAsync("git", ["status", "--porcelain=v1"], { cwd })).stdout;
+      assert.equal(status, "", "the index flag hides the changed worktree bytes from status");
+      await assert.rejects(captureWorkflowCheckout(cwd), /index flags that hide worktree changes/);
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+}
+
+test("checkout proof observes an already-cancelled signal before invoking Git", async () => {
+  const controller = new AbortController();
+  controller.abort(new Error("operator cancelled"));
+  await assert.rejects(captureWorkflowCheckout("/path/that/does/not/exist", controller.signal), /operator cancelled/);
+});

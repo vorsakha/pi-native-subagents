@@ -272,7 +272,7 @@ export interface SpawnRequest {
   independent?: boolean;
   /** Route on a native provider different from this existing session-scoped job. */
   independentOf?: string;
-  /** Internal durable-replay hint used only when independentOf names a prior-session job no longer retained by JobManager. */
+  /** Internal authoritative provider hint for replayed jobs or continued logical IDs; a live target must match it. */
   independentOfProvider?: ProviderFamily;
   profile?: string;
   /** Optional cumulative spend boundary for this retained native session. */
