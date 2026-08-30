@@ -127,6 +127,41 @@ export class ScriptedHarnessAvailability implements HarnessAvailabilityProbe {
   }
 }
 
+/** Scripted availability with one provider probe held until a test releases it. */
+export class GatedHarnessAvailability extends ScriptedHarnessAvailability {
+  readonly #gated: HarnessName;
+  #released = false;
+  #reached = false;
+  #release!: () => void;
+  #reachedResolve!: () => void;
+  readonly #releasePromise = new Promise<void>((resolve) => { this.#release = resolve; });
+  readonly #reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
+
+  constructor(gated: HarnessName, states: Partial<Record<HarnessName, Partial<HarnessAvailabilityFacts> | HarnessAvailability>>) {
+    super(states);
+    this.#gated = gated;
+  }
+
+  override async availability(harness: HarnessName, request: { refresh?: boolean }): Promise<HarnessAvailability> {
+    if (harness === this.#gated && !this.#released) {
+      this.#reached = true;
+      this.#reachedResolve();
+      await this.#releasePromise;
+    }
+    return super.availability(harness, request);
+  }
+
+  waitUntilReached(): Promise<void> {
+    return this.#reached ? Promise.resolve() : this.#reachedPromise;
+  }
+
+  release(): void {
+    if (this.#released) return;
+    this.#released = true;
+    this.#release();
+  }
+}
+
 export function availabilityFixture(
   harness: HarnessName,
   overrides: Partial<HarnessAvailabilityFacts> = {},

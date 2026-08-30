@@ -935,6 +935,51 @@ test("provider fallback dashboard metadata sanitizes every model route", (t) => 
   assert.doesNotMatch(inspector, /\u001b\[(?:31|32|33)m/, "caller-controlled model ANSI never reaches the dashboard");
 });
 
+test("progressed continuation dashboard exposes checkpoint, trigger, retained route, and sanitized provenance", (t) => {
+  const run = workflow("continuation-provenance", "completed");
+  const agent = run.agents[0]!;
+  agent.harness = "codex";
+  agent.model = "replacement\n\u001b[31mMODEL";
+  agent.jobId = "replacement-job-123456";
+  agent.logicalJobId = "failed-job-123456";
+  agent.continuationFallback = { harness: "codex", model: "declared\n\u001b[32mMODEL" };
+  agent.continuation = {
+    state: "completed",
+    fromHarness: "claude",
+    toHarness: "codex",
+    failedJobId: "failed-job-123456",
+    replacementJobId: "replacement-job-123456",
+    checkpointAt: 1_000,
+    checkoutDigest: "sha256:checkout-proof-123456",
+    trigger: { source: "continuation", provider: "claude", kind: "quota", detail: "quota\n\u001b[33mafter progress" },
+    warning: "exactly-once is not guaranteed",
+  };
+  agent.attempts = [{
+    index: 0,
+    harness: "claude",
+    requestedHarness: "claude",
+    model: "primary",
+    disposition: "continuation",
+    trigger: agent.continuation.trigger,
+    usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+  }];
+  const state = harness([run], 34, () => {}, { theme });
+  t.after(() => state.overlay.dispose());
+
+  openAgentDetail(state.overlay, 140);
+  state.overlay.handleInput("i");
+  state.overlay.handleInput("g");
+  const inspector = state.overlay.render(140).join("\n");
+  assert.match(inspector, /Progressed continuation · used · declared codex\/declared MODEL/);
+  assert.match(inspector, /Continuation · completed · claude → codex · failed job .* · retained job/);
+  assert.match(inspector, /Continuation trigger · claude quota · quota after progress/);
+  assert.match(inspector, /Checkout proof · sha256:c/);
+  assert.match(inspector, /Continuation warning · exactly-once is not guaranteed/);
+  assert.match(inspector, /Attempt 1 · claude\/primary · continuation/);
+  assert.match(inspector, /Final route · codex\/replacement MODEL/);
+  assert.doesNotMatch(inspector, /\u001b\[(?:31|32|33)m/);
+});
+
 test("metadata-rich standalone workflow results keep a scrollable result row", (t) => {
   const standalone = workflow("metadata-standalone", "completed");
   standalone.agents = [];

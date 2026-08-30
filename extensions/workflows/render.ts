@@ -527,8 +527,11 @@ function agentRollupValue(snapshot: WorkflowSnapshot, theme: Theme): string {
 
 function agentRow(agent: WorkflowAgentRecord, theme: Theme, now: number): string {
   const status = demoteUnlessAttention(traceStatusMeta(agent.state, now));
+  const continuationAttempt = agent.attempts?.find((attempt) => attempt.disposition === "continuation");
   const fallbackAttempt = agent.attempts?.find((attempt) => attempt.disposition === "fallback");
-  const routeLabel = fallbackAttempt
+  const routeLabel = continuationAttempt
+    ? `${sanitizeInline(continuationAttempt.requestedHarness ?? continuationAttempt.harness ?? "primary")} → ${sanitizeInline(agent.harness ?? "replacement")} (continued)`
+    : fallbackAttempt
     ? `${sanitizeInline(fallbackAttempt.requestedHarness ?? fallbackAttempt.harness ?? "primary")} → ${sanitizeInline(agent.harness ?? "fallback")} (fallback)`
     : agent.harness || agent.model
       ? `${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}`

@@ -56,16 +56,20 @@ Bounds and accounting:
 
 `providerFallback: { harness: "claude" | "codex", model?: string }` names one opposite native route for a fresh `agent()` call and overrides wait.
 
-After dispatch, fallback requires effective `readOnly` access, structured pre-inference proof, and zero usage. Full-access hooks, plugins, or MCP may mutate before visible progress, so a started full-access primary never falls back. Before dispatch, `missing`, `unauthenticated`, or `incompatible` readiness may fall back under either access mode. Other readiness, missing proof, usage, ordinary errors, cancellation, policy rejection, and unsafe worktrees stay terminal. The target must freshly report `ready`; fallback cannot wait, retry, or fall back again.
+After dispatch it requires `readOnly`, authoritative pre-inference proof, zero usage, and a freshly ready target. Safe missing/login/incompatibility readiness may fall back under either access. Other errors, cancellation, policy rejection, worktrees, waits, retries, and another fallback are terminal.
 
-Both attempts share one ordinal and cumulative usage record. Budget preflight runs again. Codex under `maxCost` fails before dispatch. Cancellation covers both jobs and their gap. Isolation must finish as `removed`.
+Both attempts share one ordinal and cumulative usage; budget preflight runs again. The journal and `/workflows` retain the declaration, trigger, attempts, and route. Exact completion replays without probing; an incomplete pre-inference attempt restarts at its primary.
 
-The journal stores the declaration, attempts, trigger, and final route. Exact completed replay restores it without probing; failed or incomplete replay restarts at the primary. `/workflows` shows fallback status and attempts.
+## Progressed continuation accounting
+
+`continuationFallback` is the separate opt-in for one opposite-provider handoff after authoritative unavailability and observed progress. It never combines with fallback or waiting. Failed-turn, replacement, and later follow-up usage is cumulative on one logical lineage; each archived attempt stores only its delta. Every original budget remains fixed and is checked before replacement.
+
+A durable handoff checkpoints the current Git checkout before target dispatch. Exact completed replay spends nothing. Interrupted replay revalidates the proof and runs only the replacement; a progressed primary without a safe checkpoint, or a diverged checkout, fails without redispatch. Cancellation covers settlement, handoff, validation, replacement, and retained calls. `/workflows` distinguishes continued, fallback, and waiting routes.
 
 ## Recovery
 
-- `Workflow ... budget exhausted`: active calls have already finished. Narrow the offending lane, raise the explicit boundary, or replay with a compatible larger budget so completed calls can be reused.
+- `Workflow ... budget exhausted`: narrow the lane or replay with a larger compatible budget; completed calls remain reusable.
 - `Budget maxCost is unsupported`: remove the cost boundary or select Pi/Claude.
-- "...already produced model or tool activity; it was not replayed automatically": a mutating (or otherwise unsafe) call was rejected for provider quota after doing observable work, so automatic retry was refused to avoid duplicating side effects. Inspect the partial result and use `resumeFromRunId` once the provider window has reset.
-- "Workflow provider wait exhausted (attempt N/M)" or "...retry window exceeds the workflow maxWaitMs allowance": the opted-in policy's attempt or wait budget ran out before the provider's reported reset time. Raise `maxAttempts`/`maxWaitMs` and use `resumeFromRunId` to continue, or fall back to `providerUnavailable: "fail"` and retry manually later.
-- A started full-access primary stays terminal even with zero visible progress. Inspect possible side effects, then retry manually after recovery. Use `readOnly` only for non-mutating work.
+- "...already produced model or tool activity": without an eligible continuation checkpoint, inspect partial effects and recover manually; replay never reruns that progressed primary.
+- Provider wait exhausted: raise the explicit attempt/time bound and replay, or retry manually later.
+- A started full-access pre-inference fallback stays terminal. Inspect possible side effects before manual recovery.

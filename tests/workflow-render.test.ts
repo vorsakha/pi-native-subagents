@@ -524,6 +524,31 @@ test("a used provider fallback renders as a route transition, never as provider 
   assert.doesNotMatch(rendered, /waiting for .*quota/i);
 });
 
+test("a progressed continuation renders as a distinct route transition", () => {
+  const snapshot = workflow({
+    status: "completed",
+    currentPhase: 0,
+    phases: [phase({ index: 0, name: "work", status: "completed", agents: [0] })],
+    agents: [agent({
+      state: "completed",
+      harness: "codex",
+      continuationFallback: { harness: "codex" },
+      attempts: [{
+        index: 0,
+        harness: "claude",
+        requestedHarness: "claude",
+        disposition: "continuation",
+        trigger: { source: "continuation", provider: "claude", kind: "quota", detail: "quota after progress" },
+        usage: { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+      }],
+    })],
+  });
+  const rendered = buildWorkflowCardLines(snapshot, theme, { expanded: true, now: 6_000 }).join("\n");
+  assert.match(rendered, /claude → codex \(continued\)/);
+  assert.doesNotMatch(rendered, /\(fallback\)/);
+  assert.doesNotMatch(rendered, /waiting for .*quota/i);
+});
+
 test("Latest identifies the focused agent by name plus its activity, without a status glyph, and never just repeats the word running", () => {
   const withPreview = workflow({
     agents: [

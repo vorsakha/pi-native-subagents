@@ -1445,6 +1445,18 @@ export class WorkflowsDashboardOverlay implements Focusable {
         metadata.push(this.theme.fg("warning", `Fallback trigger · ${trigger.source} · ${trigger.provider} ${trigger.status ?? trigger.kind ?? "unavailable"} · ${boundedInline(trigger.detail, 500)}`));
       }
     }
+    if (agent.continuationFallback) {
+      const continuationAttempt = agent.attempts?.find((attempt) => attempt.disposition === "continuation");
+      const target = `${sanitizeInline(agent.continuationFallback.harness)}/${boundedInline(agent.continuationFallback.model ?? "native default", 256)}`;
+      metadata.push(this.theme.fg(continuationAttempt ? "warning" : "dim", `Progressed continuation · ${continuationAttempt ? "used" : "unused"} · declared ${target}`));
+      if (agent.continuation) {
+        const current = agent.continuation.replacementJobId ?? agent.jobId;
+        metadata.push(this.theme.fg("warning", `Continuation · ${agent.continuation.state} · ${agent.continuation.fromHarness} → ${agent.continuation.toHarness} · failed job ${shortId(sanitizeText(agent.continuation.failedJobId))}${current ? ` · retained job ${shortId(sanitizeText(current))}` : ""}`));
+        metadata.push(this.theme.fg("warning", `Continuation trigger · ${agent.continuation.trigger.provider} ${agent.continuation.trigger.kind} · ${boundedInline(agent.continuation.trigger.detail, 500)}`));
+        metadata.push(this.theme.fg("dim", `Checkout proof · ${shortId(agent.continuation.checkoutDigest)} · checkpoint ${new Date(agent.continuation.checkpointAt).toISOString()}`));
+        metadata.push(this.theme.fg("warning", `Continuation warning · ${boundedInline(agent.continuation.warning, 500)}`));
+      }
+    }
     if (agent.attempts?.length) {
       for (const attempt of agent.attempts.slice(-4)) {
         const route = `${sanitizeInline(attempt.requestedHarness ?? attempt.harness ?? "?")}/${boundedInline(attempt.model ?? "native default", 256)}`;

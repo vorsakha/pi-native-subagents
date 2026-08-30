@@ -78,17 +78,19 @@ Rules:
 - A retained native structured session stays bound to its original schema. Every `followUp()` on that lineage is validated against the original schema and can return `structured` even when the call omits `schema`; a follow-up cannot replace the schema.
 - An `agent()` call that used `isolation: "worktree"` can never be targeted: its worktree is finalized when the call returns, so the follow-up is rejected whether the recorded state is `preserved`, `removed`, or `orphaned`.
 - Each `followUp()` consumes its own agent-call ordinal from the same 32-call budget and appears in `/workflows` as another generation under the same agent, not a new agent card.
-- `followUp()` never waits out a provider-quota rejection, even under `retry.providerUnavailable: "wait"`. It always fails immediately; retry with a fresh `agent()` call instead.
+- `followUp()` never provider-waits. It fails immediately unless its original `agent()` explicitly opted into eligible progressed continuation.
 
-## Explicit provider fallback
+## Provider recovery
 
-Only a fresh `agent()` may set `providerFallback: { harness, model? }`. Its Claude or Codex primary must name the other. Other routes, nesting, arrays, and extra fields are rejected. After dispatch, fallback requires `readOnly`, pre-inference proof, zero usage, and a `ready` target. Full-access hooks, plugins, or MCP may mutate before visible progress, so rejection stays terminal. Pre-dispatch `missing`, `unauthenticated`, or `incompatible` may fall back under either access mode.
+A fresh explicit Claude/Codex `agent()` may set one opposite native route. `providerFallback: { harness, model? }` handles authoritative pre-inference failure with zero usage; after dispatch it also requires `readOnly`.
+
+`continuationFallback: { harness, model? }` instead permits one handoff after authoritative unavailability and progress, including follow-ups. It checkpoints the shared Git checkout, continues without replay, and retains the replacement. Policy, budgets, usage, and cancellation stay fixed. Ambiguity, unsafe state, unavailable target, worktree isolation, or replacement failure is terminal. Never combine or loop these options.
 
 ## Sandbox limits and determinism
 
-- The sandbox allows workflow orchestration only: no imports, filesystem, network, environment variables, subprocesses, credentials, `require`, `process`, or nested delegation.
+- The sandbox exposes only orchestration: no imports, I/O, environment, processes, credentials, or nested delegation.
 - Workflows are deterministic: `Date.now()`, zero-argument `new Date()`, and `Math.random()` all throw.
-- Results, metadata, agent requests, logs, phases, source, and arguments are bounded and must be JSON-serializable; a single agent request is capped at 512 KiB.
+- All workflow data is bounded and JSON-serializable; one agent request is capped at 512 KiB.
 - A run may make at most 32 agent calls (`agent()` and `followUp()` share the budget) and use at most four concurrent workers. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
 - Mutating agents sharing one checkout are serialized; read-only and worktree-isolated calls are not.
 

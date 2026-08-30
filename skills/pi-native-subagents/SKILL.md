@@ -15,6 +15,7 @@ Paths are relative to this file. Read the reference **before** you write the cal
 | --- | --- |
 | write or edit a workflow script, call a saved `workflowName`, declare `meta.phases`, call `followUp()`, or set `approval`/`background`/`pipeline` | `references/workflow-authoring.md` |
 | call `converge()` | `references/convergence.md` |
+| opt into cross-provider continuation after progressed native failure | `references/progressed-continuation.md` |
 | let a child use `subagent_ask`, or answer with `subagent_answer` | `references/routed-questions.md` |
 | set spend limits, send a limited retained follow-up, set a workflow `budget`, use `resumeFromRunId`, `providerFallback`, or `retry` | `references/budgets-replay-and-provider-waits.md` |
 | use `isolation: "worktree"`, or run `/workflows reclaim` | `references/worktrees-and-retention.md` |
@@ -41,7 +42,7 @@ Usage rules:
 
 - Use `access: "readOnly"` for inspection, review, and planning. Request `full` only when mutation is required and the project is trusted. Read-only children are sandboxed by construction, not by instruction.
 - Omit `model` unless a concrete harness-local override is needed. A model name is not a cross-harness tier, and `harness: "auto"` rejects harness-local model overrides.
-- `harness: "auto"` is initial route selection, not post-inference failover. Before dispatch it considers only active harnesses that are installed, enabled, and ready. An explicit route stays fail-closed unless a fresh workflow `agent()` call declares the one eligible `providerFallback` described below. That declaration permits one opposite-provider attempt only for authoritative pre-inference unavailability. It does not permit implicit, wait-driven, ambiguous, or progressed rerouting. Availability checks are read-only and never install, log in, or change configuration.
+- `harness: "auto"` selects an initial ready route; it is not failover. Explicit routes fail closed except for the workflow opt-ins below. Availability checks are read-only and never install, log in, or reconfigure providers.
 - Use `requires` only with IDs returned by `subagent_capabilities`; pair it with `harness: "auto"` when any capable harness is acceptable.
 - Use `independent: true` only when the child must use a different native provider from the parent. A different model on the same provider is not independent.
 - Use `independentOf: "<producer-job-id>"` when a reviewer must differ from the provider that produced the reviewed work. The target must be an existing job.
@@ -87,7 +88,18 @@ agent("task", {
 });
 ```
 
-The primary must explicitly be Claude or Codex. The fallback must name the other and may omit `model` for its native default. No other fallback fields are accepted. After a started primary, provider-triggered fallback requires effective `readOnly` access, structured proof that rejection preceded inference, and zero usage. Full-access native hooks, plugins, or MCP may mutate before progress is visible, so a full-access provider rejection stays terminal. A safe pre-dispatch readiness failure may still use the fallback with either access mode when the primary is missing, unauthenticated, or incompatible. The runtime freshly validates the target as ready before dispatch. Fallback never applies to `followUp()`, direct subagents, ordinary failures, cancellations, unsafe worktrees, or a failed fallback. For that call it takes precedence over provider waiting. `harness: "auto"` still means initial ready-route selection. Read the budget reference before using this option.
+The primary must explicitly name Claude or Codex and the fallback must name the other. After dispatch this requires `readOnly`, authoritative pre-inference proof, and zero usage; full-access rejection stays terminal. Pre-dispatch missing, unauthenticated, or incompatible readiness may fall back under either access. The target must freshly be ready. Fallback never applies to `followUp()`, ordinary failures, cancellation, worktrees, or a failed fallback, and overrides provider waiting. Read the budget reference first.
+
+A progressed native call needs a different explicit opt-in:
+
+```js
+agent("task", {
+  harness: "claude",
+  continuationFallback: { harness: "codex", model: "exact-replacement-model" },
+});
+```
+
+This permits one bounded handoff after authoritative provider unavailability and observed progress. It continues the same logical lineage and current Git checkout; it never replays the primary. Do not combine it with `providerFallback` or worktree isolation. Read `references/progressed-continuation.md` first.
 
 ```js
 export const meta = { name: "parallel-review" };

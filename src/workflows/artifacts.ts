@@ -344,6 +344,21 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
         harness: agent.providerFallback.harness,
         model: agent.providerFallback.model ? truncateUtf8(agent.providerFallback.model, 256) : undefined,
       } : undefined,
+      continuationFallback: agent.continuationFallback ? {
+        harness: agent.continuationFallback.harness,
+        model: agent.continuationFallback.model ? truncateUtf8(agent.continuationFallback.model, 256) : undefined,
+      } : undefined,
+      continuation: agent.continuation ? {
+        ...agent.continuation,
+        failedJobId: truncateUtf8(agent.continuation.failedJobId, 200),
+        replacementJobId: agent.continuation.replacementJobId ? truncateUtf8(agent.continuation.replacementJobId, 200) : undefined,
+        trigger: {
+          ...agent.continuation.trigger,
+          scope: agent.continuation.trigger.scope ? truncateUtf8(agent.continuation.trigger.scope, 300) : undefined,
+          detail: truncateUtf8(agent.continuation.trigger.detail, 500),
+        },
+        warning: truncateUtf8(agent.continuation.warning, 500),
+      } : undefined,
       attempts: agent.attempts?.slice(-4).map((attempt) => ({
         ...attempt,
         model: attempt.model ? truncateUtf8(attempt.model, 256) : undefined,
@@ -415,6 +430,63 @@ function isProviderFallback(value: unknown): boolean {
     && (fallback.model === undefined || typeof fallback.model === "string" && !!fallback.model && fallback.model.length <= 256);
 }
 
+const isContinuationFallback = isProviderFallback;
+
+function isCheckoutProof(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const proof = value as Record<string, unknown>;
+  return typeof proof.cwd === "string" && !!proof.cwd && proof.cwd.length <= 4_096
+    && typeof proof.root === "string" && !!proof.root && proof.root.length <= 4_096
+    && typeof proof.gitDir === "string" && !!proof.gitDir && proof.gitDir.length <= 4_096
+    && typeof proof.head === "string" && /^[a-f0-9]{40,64}$/i.test(proof.head)
+    && Number.isSafeInteger(proof.changedPaths) && (proof.changedPaths as number) >= 0 && (proof.changedPaths as number) <= 4_096
+    && typeof proof.digest === "string" && /^sha256:[a-f0-9]{64}$/.test(proof.digest);
+}
+
+function isContinuationTrigger(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const trigger = value as Record<string, unknown>;
+  return trigger.source === "continuation"
+    && (trigger.provider === "claude" || trigger.provider === "codex")
+    && trigger.kind === "quota"
+    && (trigger.retryAt === undefined || typeof trigger.retryAt === "number" && Number.isFinite(trigger.retryAt))
+    && (trigger.scope === undefined || typeof trigger.scope === "string" && trigger.scope.length <= 300)
+    && typeof trigger.detail === "string" && trigger.detail.length <= 500;
+}
+
+function isAgentContinuation(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const continuation = value as Record<string, unknown>;
+  return ["handoff", "running", "completed", "failed"].includes(String(continuation.state))
+    && (continuation.fromHarness === "claude" || continuation.fromHarness === "codex")
+    && (continuation.toHarness === "claude" || continuation.toHarness === "codex")
+    && continuation.fromHarness !== continuation.toHarness
+    && typeof continuation.failedJobId === "string" && !!continuation.failedJobId && continuation.failedJobId.length <= 200
+    && (continuation.replacementJobId === undefined || typeof continuation.replacementJobId === "string" && !!continuation.replacementJobId && continuation.replacementJobId.length <= 200)
+    && typeof continuation.checkpointAt === "number" && Number.isFinite(continuation.checkpointAt)
+    && continuation.checkpointAt >= 0 && continuation.checkpointAt <= 8_640_000_000_000_000
+    && typeof continuation.checkoutDigest === "string" && /^sha256:[a-f0-9]{64}$/.test(continuation.checkoutDigest)
+    && isContinuationTrigger(continuation.trigger)
+    && typeof continuation.warning === "string" && !!continuation.warning && continuation.warning.length <= 500;
+}
+
+function isContinuationHandoff(value: unknown): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const handoff = value as Record<string, unknown>;
+  return Number.isSafeInteger(handoff.agentIndex) && (handoff.agentIndex as number) >= 0 && (handoff.agentIndex as number) < 32
+    && (handoff.logicalJobId === undefined || typeof handoff.logicalJobId === "string" && !!handoff.logicalJobId && handoff.logicalJobId.length <= 200)
+    && typeof handoff.failedJobId === "string" && !!handoff.failedJobId && handoff.failedJobId.length <= 200
+    && typeof handoff.phase === "string" && handoff.phase.length <= 160
+    && typeof handoff.objective === "string" && handoff.objective.length <= 2_048
+    && typeof handoff.handoffPrompt === "string" && !!handoff.handoffPrompt && handoff.handoffPrompt.length <= 16_384
+    && (handoff.schema === undefined || !!handoff.schema && typeof handoff.schema === "object" && !Array.isArray(handoff.schema)
+      && Buffer.byteLength(JSON.stringify(handoff.schema)) <= 64 * 1_024)
+    && isCheckoutProof(handoff.checkout)
+    && isContinuationFallback(handoff.target)
+    && isContinuationTrigger(handoff.trigger)
+    && isWorkflowUsage(handoff.usage);
+}
+
 function isWorkflowUsage(value: unknown): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const usage = value as Record<string, unknown>;
@@ -448,8 +520,8 @@ function isWorkflowAttempt(value: unknown): boolean {
     && (attempt.error === undefined || typeof attempt.error === "string" && attempt.error.length <= 2_000)
     && isWorkflowUsage(attempt.usage)
     && (attempt.endedAt === undefined || typeof attempt.endedAt === "number" && Number.isFinite(attempt.endedAt))
-    && (attempt.disposition === undefined || attempt.disposition === "wait" || attempt.disposition === "fallback")
-    && (attempt.trigger === undefined || isFallbackTrigger(attempt.trigger));
+    && (attempt.disposition === undefined || attempt.disposition === "wait" || attempt.disposition === "fallback" || attempt.disposition === "continuation")
+    && (attempt.trigger === undefined || isFallbackTrigger(attempt.trigger) || isContinuationTrigger(attempt.trigger));
 }
 
 function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord {
@@ -458,7 +530,7 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
   if (record.version !== 1 || !Number.isSafeInteger(record.sequence) || record.sequence! < 0 || record.sequence! >= MAX_JOURNAL_RECORDS
       || !Number.isSafeInteger(record.callIndex) || record.callIndex! < 0 || record.callIndex! >= 32
       || typeof record.fingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(record.fingerprint)
-      || !["started", "completed", "failed"].includes(record.state ?? "")
+      || !["started", "handoff", "completed", "failed"].includes(record.state ?? "")
       || typeof record.at !== "number" || !Number.isFinite(record.at)) return false;
   if (record.kind !== undefined && !["agent", "followUp", "peerQuestion"].includes(record.kind)) return false;
   // Every peer-question state carries the same bounded lineage provenance.
@@ -490,11 +562,14 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
         || record.route.availabilityChecks.length > 3
         || record.route.availabilityChecks.some((check) => !isAvailabilityEvidence(check)))
       || record.route.jobId !== undefined && (typeof record.route.jobId !== "string" || !record.route.jobId || record.route.jobId.length > 200)
+      || record.route.logicalJobId !== undefined && (typeof record.route.logicalJobId !== "string" || !record.route.logicalJobId || record.route.logicalJobId.length > 200)
       || record.route.model !== undefined && (typeof record.route.model !== "string" || record.route.model.length > 256)
       || record.route.status !== undefined && !["queued", "running", "completed", "failed", "cancelled", "aborted"].includes(record.route.status)
       || record.route.error !== undefined && (typeof record.route.error !== "string" || record.route.error.length > 2_000))) return false;
   if (record.route !== undefined && (
       record.route.providerFallback !== undefined && !isProviderFallback(record.route.providerFallback)
+      || record.route.continuationFallback !== undefined && !isContinuationFallback(record.route.continuationFallback)
+      || record.route.continuation !== undefined && !isAgentContinuation(record.route.continuation)
       || record.route.attempts !== undefined && (!Array.isArray(record.route.attempts)
         || record.route.attempts.length > 4
         || record.route.attempts.some((attempt) => !isWorkflowAttempt(attempt))))) return false;
@@ -508,11 +583,17 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || !["queued", "running", "completed", "failed", "cancelled", "aborted"].includes(record.replacementOf.sourceState)
       || record.replacementOf.sourceError !== undefined && (typeof record.replacementOf.sourceError !== "string" || record.replacementOf.sourceError.length > 2_000)
       || typeof record.replacementOf.reason !== "string" || !record.replacementOf.reason || record.replacementOf.reason.length > 200)) return false;
-  if (record.state === "started") return record.result === undefined && record.route === undefined && record.replayedFrom === undefined && record.replacementOf === undefined;
+  if (record.state === "started") return record.result === undefined && record.route === undefined && record.replayedFrom === undefined && record.replacementOf === undefined && record.continuation === undefined;
+  if (record.state === "handoff") {
+    return record.result === undefined && record.replayedFrom === undefined && record.replacementOf === undefined
+      && isContinuationHandoff(record.continuation) && record.route !== undefined;
+  }
+  if (record.continuation !== undefined) return false;
   if (!record.result || typeof record.result !== "object" || typeof record.result.ok !== "boolean"
       || typeof record.result.output !== "string" || record.result.output.length > JOURNAL_RECORD_BYTES
       || record.result.jobId !== undefined && (typeof record.result.jobId !== "string" || !record.result.jobId || record.result.jobId.length > 200)
       || record.result.error !== undefined && typeof record.result.error !== "string"
+      || record.result.progressed !== undefined && record.result.progressed !== true
       || record.result.transport !== undefined && record.result.transport !== "native" && record.result.transport !== "portable") return false;
   return record.state === "completed" ? record.result.ok : !record.result.ok;
 }

@@ -461,6 +461,32 @@ export class JobManager {
     }).catch(() => undefined);
   }
 
+  /**
+   * Strictly settles a failed workflow-owned native process before a workflow
+   * starts a replacement session. Unlike ordinary end-of-run release, failure
+   * is reported to the caller so continuation can fail closed.
+   */
+  async settleFailedWorkflowJob(id: string): Promise<JobSnapshot> {
+    const job = this.#jobs.get(id);
+    if (!job) throw new Error(`Unknown job: ${id}`);
+    if (!job.snapshot.workflow) throw new Error(`Cannot settle ${id}: job is not workflow-owned`);
+    if (job.snapshot.status !== "failed") throw new Error(`Cannot settle ${id}: job is ${job.snapshot.status}`);
+    const run = job.run;
+    if (!run) return clone(job.snapshot);
+    await this.#serialize(job, async () => {
+      if (job.run !== run) return;
+      try {
+        await withDeadline(Promise.all([run.close(), run.completed]).then(() => undefined), this.#operationTimeoutMs, "Harness settlement");
+      } catch (error) {
+        if (!(error instanceof OperationDeadlineError)) throw error;
+        if (!run.forceClose) throw error;
+        await withDeadline(Promise.all([run.forceClose(), run.completed]).then(() => undefined), Math.min(1_000, this.#operationTimeoutMs), "Harness force-close");
+      }
+      if (job.run === run) job.run = undefined;
+    });
+    return clone(job.snapshot);
+  }
+
   #queueFollowUp(job: InternalJob, message: string): JobSnapshot {
     const id = job.snapshot.id;
     const boundary = firstReachedSpendWarning(job.snapshot.budget, job.snapshot.usage, job.snapshot.harness, "Subagent budget");

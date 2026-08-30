@@ -3,6 +3,7 @@ import type {
   WorkflowJournalRecord,
   WorkflowJournalResult,
   WorkflowReplayCall,
+  WorkflowReplayHandoff,
   WorkflowReplayInteraction,
 } from "./types.ts";
 
@@ -74,6 +75,7 @@ export function workflowDefinitionFingerprint(input: {
  * discarding later parallel calls whose own journal pairs remain valid. */
 export function replayableJournalCalls(records: WorkflowJournalRecord[]): WorkflowReplayCall[] {
   const started = new Map<number, WorkflowJournalRecord>();
+  const handoffs = new Map<number, WorkflowJournalRecord>();
   const completed = new Map<number, WorkflowJournalRecord>();
   const invalid = new Set<number>();
 
@@ -88,11 +90,19 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
       else started.set(record.callIndex, record);
       continue;
     }
+    if (record.state === "handoff") {
+      if (!priorStart || priorStart.fingerprint !== record.fingerprint || handoffs.has(record.callIndex)
+          || completed.has(record.callIndex) || !record.continuation) invalid.add(record.callIndex);
+      else handoffs.set(record.callIndex, record);
+      continue;
+    }
     if (!priorStart || priorStart.fingerprint !== record.fingerprint || completed.has(record.callIndex)) {
       invalid.add(record.callIndex);
       continue;
     }
     if (record.state === "completed" && record.result?.ok === true) completed.set(record.callIndex, record);
+    else if (record.state === "failed" && record.result?.ok === false
+        && (handoffs.has(record.callIndex) || record.result.progressed === true)) completed.set(record.callIndex, record);
     else invalid.add(record.callIndex);
   }
 
@@ -106,6 +116,49 @@ export function replayableJournalCalls(records: WorkflowJournalRecord[]): Workfl
       agentIndex: record.agentIndex,
       result: structuredClone(record.result) as WorkflowJournalResult,
       route: record.route ? { ...record.route } : undefined,
+    }));
+}
+
+/**
+ * Returns durable progressed-work checkpoints whose logical call never reached
+ * a terminal continuation result. Replay may start only from these checkpoints,
+ * never from the original prompt.
+ */
+export function replayableJournalHandoffs(records: WorkflowJournalRecord[]): WorkflowReplayHandoff[] {
+  const started = new Map<number, WorkflowJournalRecord>();
+  const handoffs = new Map<number, WorkflowJournalRecord>();
+  const terminal = new Set<number>();
+  const invalid = new Set<number>();
+
+  for (const record of records) {
+    if (record.kind === "peerQuestion") continue;
+    if (record.state === "started") {
+      if (started.has(record.callIndex)) invalid.add(record.callIndex);
+      else started.set(record.callIndex, record);
+      continue;
+    }
+    const start = started.get(record.callIndex);
+    if (!start || start.fingerprint !== record.fingerprint) {
+      invalid.add(record.callIndex);
+      continue;
+    }
+    if (record.state === "handoff") {
+      if (handoffs.has(record.callIndex) || !record.continuation) invalid.add(record.callIndex);
+      else handoffs.set(record.callIndex, record);
+      continue;
+    }
+    terminal.add(record.callIndex);
+  }
+
+  return [...handoffs.entries()]
+    .filter(([callIndex]) => !invalid.has(callIndex) && !terminal.has(callIndex))
+    .sort(([left], [right]) => left - right)
+    .map(([callIndex, record]) => ({
+      callIndex,
+      fingerprint: record.fingerprint,
+      kind: record.kind === "followUp" ? "followUp" : "agent",
+      checkpoint: structuredClone(record.continuation!),
+      route: record.route ? structuredClone(record.route) : undefined,
     }));
 }
 
