@@ -60,6 +60,8 @@ interface InternalJob {
 
 interface InternalInteraction {
   record: PendingInteraction;
+  /** Physical retained target after same-run logical-lineage resolution. */
+  resolvedTargetJobId?: string;
   settle(outcome: { answer: string; route: InteractionRoute; targetGeneration?: number; label?: string } | { error: Error; state: PendingInteraction["state"] }): void;
   cancelDeadline?: () => void;
   controller: AbortController;
@@ -203,6 +205,7 @@ export interface PeerInteractionResult {
 }
 
 export type PeerInteractionRouter = (request: PeerInteractionRequest) => Promise<PeerInteractionResult>;
+export type PeerInteractionTargetResolver = (source: JobSnapshot, targetJobId: string) => string | undefined;
 
 /** Target kinds this job's grant actually allows, for accurate tool description. */
 function interactionTargetKinds(policy: { orchestrator?: string; peers?: boolean }): InteractionTargetKind[] {
@@ -258,6 +261,7 @@ export class JobManager {
   readonly #interactions = new Map<string, InternalJob>();
   readonly #waitGraph = new InteractionWaitGraph();
   #peerRouter?: PeerInteractionRouter;
+  #peerTargetResolver?: PeerInteractionTargetResolver;
   #active = 0;
   #closed = false;
 
@@ -874,10 +878,16 @@ export class JobManager {
    * cycle); run membership, worktree eligibility, budgets, journalling, and
    * replay stay with the workflow runtime that actually owns those agents.
    */
-  setPeerInteractionRouter(router: PeerInteractionRouter | undefined): () => void {
+  setPeerInteractionRouter(
+    router: PeerInteractionRouter | undefined,
+    resolveTarget?: PeerInteractionTargetResolver,
+  ): () => void {
     this.#peerRouter = router;
+    this.#peerTargetResolver = resolveTarget;
     return () => {
-      if (this.#peerRouter === router) this.#peerRouter = undefined;
+      if (this.#peerRouter !== router) return;
+      this.#peerRouter = undefined;
+      this.#peerTargetResolver = undefined;
     };
   }
 
@@ -957,9 +967,13 @@ export class JobManager {
       if (policy.orchestrator === "foregroundDenied") {
         throw new InteractionError("A foreground subagent cannot ask the parent orchestrator: the parent turn is already blocked awaiting this tool result and cannot start another turn. Ask the parent to re-run this work as a background subagent_spawn job, or proceed with a stated assumption.");
       }
-    } else {
+    }
+    let resolvedTargetJobId: string | undefined;
+    if (target.kind === "agent") {
       if (!policy.peers) throw new InteractionError("This subagent is not authorized to ask peer agents");
-      this.#assertPeerEligible(job, target.jobId!);
+      resolvedTargetJobId = this.#peerTargetResolver?.(clone(job.snapshot), target.jobId!) ?? target.jobId!;
+      if (!resolvedTargetJobId) throw new InteractionError(`Peer agent ${target.jobId} could not be resolved safely`);
+      this.#assertPeerEligible(job, target.jobId!, resolvedTargetJobId);
     }
 
     const now = this.#interactionClock.now();
@@ -1004,7 +1018,7 @@ export class JobManager {
         resolve(record);
       };
     });
-    const pending: InternalInteraction = { record, settle, controller, settled: false };
+    const pending: InternalInteraction = { record, resolvedTargetJobId, settle, controller, settled: false };
     pending.cancelDeadline = this.#interactionClock.schedule(
       () => settle({ error: new InteractionError(`Question ${record.requestId} expired after ${this.#interactionTimeoutMs}ms with no answer`), state: "expired" }),
       this.#interactionTimeoutMs,
@@ -1012,7 +1026,7 @@ export class JobManager {
 
     job.interaction = pending;
     this.#interactions.set(record.requestId, job);
-    if (target.kind === "agent") this.#waitGraph.add(job.snapshot.id, target.jobId!);
+    if (target.kind === "agent") this.#waitGraph.add(job.snapshot.id, resolvedTargetJobId!);
     this.#publishInteraction(job, record);
 
     // The provider has already entered this host tool callback, so the caller's
@@ -1054,13 +1068,15 @@ export class JobManager {
    * legitimately has no live job, and only the workflow runtime can decide
    * whether a recorded answer satisfies it.
    */
-  #assertPeerEligible(job: InternalJob, targetId: string): InternalJob | undefined {
-    if (targetId === job.snapshot.id) throw new InteractionError("A peer question cannot target the asking agent");
+  #assertPeerEligible(job: InternalJob, targetId: string, resolvedTargetId = targetId): InternalJob | undefined {
+    if (targetId === job.snapshot.id || resolvedTargetId === job.snapshot.id) {
+      throw new InteractionError("A peer question cannot target the asking agent");
+    }
     if (!job.snapshot.workflow) throw new InteractionError("Peer questions are limited to agents from the same workflow run");
-    if (this.#waitGraph.wouldCycle(job.snapshot.id, targetId)) {
+    if (this.#waitGraph.wouldCycle(job.snapshot.id, resolvedTargetId)) {
       throw new InteractionError(`Peer question from ${job.snapshot.id} to ${targetId} would create a wait cycle`);
     }
-    const target = this.#jobs.get(targetId);
+    const target = this.#jobs.get(resolvedTargetId);
     if (!target) return undefined;
     if (target.snapshot.workflow?.runId !== job.snapshot.workflow.runId) {
       // A live session owned by another run is never continued from here. The
@@ -1084,10 +1100,11 @@ export class JobManager {
   async #routePeerQuestion(job: InternalJob, pending: InternalInteraction): Promise<void> {
     const record = pending.record;
     const targetId = record.target.jobId!;
+    const resolvedTargetId = pending.resolvedTargetJobId ?? targetId;
     const router = this.#peerRouter;
     let target: InternalJob | undefined;
     try {
-      target = this.#assertPeerEligible(job, targetId);
+      target = this.#assertPeerEligible(job, targetId, resolvedTargetId);
       if (!router) throw new InteractionError("Peer questions require an active workflow run");
     } catch (error) {
       pending.settle({ error: error instanceof Error ? error : new Error(String(error)), state: "dismissed" });

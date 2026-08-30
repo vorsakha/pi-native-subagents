@@ -222,6 +222,45 @@ export class StaticWorkflowCheckout implements WorkflowCheckoutOperations {
   }
 }
 
+/** Stable checkout proof whose scheduler-admission assertion is test-controlled. */
+export class AdmissionGatedWorkflowCheckout extends StaticWorkflowCheckout {
+  #assertions = 0;
+  #admissionReached = false;
+  #admissionReachedResolve!: () => void;
+  readonly #admissionReachedPromise = new Promise<void>((resolve) => { this.#admissionReachedResolve = resolve; });
+  #releaseAdmission!: () => void;
+  readonly #admissionRelease = new Promise<void>((resolve) => { this.#releaseAdmission = resolve; });
+
+  override async assert(proof: WorkflowCheckoutProof, signal: AbortSignal): Promise<void> {
+    await super.assert(proof, signal);
+    this.#assertions++;
+    if (this.#assertions < 3) return;
+    this.#admissionReached = true;
+    this.#admissionReachedResolve();
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+      const cleanup = () => signal.removeEventListener("abort", abort);
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      signal.addEventListener("abort", abort, { once: true });
+      void this.#admissionRelease.then(() => {
+        cleanup();
+        resolve();
+      });
+    });
+  }
+
+  waitUntilAdmission(): Promise<void> {
+    return this.#admissionReached ? Promise.resolve() : this.#admissionReachedPromise;
+  }
+
+  releaseAdmission(): void {
+    this.#releaseAdmission();
+  }
+}
+
 export function availabilityFixture(
   harness: HarnessName,
   overrides: Partial<HarnessAvailabilityFacts> = {},

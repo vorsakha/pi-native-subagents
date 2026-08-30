@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
-import { availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, ScriptedHarnessAvailability, tempDir, tick, waitFor } from "./helpers.ts";
+import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, ScriptedHarnessAvailability, tempDir, tick, waitFor } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import { workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint, workflowInteractionFingerprint } from "../src/workflows/journal.ts";
 import {
@@ -1621,7 +1621,9 @@ test("progressed continuation settles the failed process, hands off current chec
 
     const final = await started.completion;
     assert.equal(final.status, "completed");
-    assert.equal((final.result as { ok: boolean; output: string }).output, "verified");
+    const result = final.result as { ok: boolean; output: string; usage: Record<string, number> };
+    assert.equal(result.output, "verified");
+    assert.deepEqual(result.usage, { input: 10, output: 11, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 3 });
     const agent = final.agents[0]!;
     assert.equal(agent.logicalJobId, failedJobId);
     assert.equal(agent.jobId, replacement.jobId);
@@ -1631,6 +1633,9 @@ test("progressed continuation settles the failed process, hands off current chec
     assert.equal(agent.attempts?.[0]?.disposition, "continuation");
     assert.equal(agent.attempts?.[0]?.trigger?.source, "continuation");
     assert.deepEqual(agent.usage, { input: 10, output: 11, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 3 });
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    const retainedFollowUp = [...journal].reverse().find((record) => record.kind === "followUp" && record.state === "completed");
+    assert.deepEqual(retainedFollowUp?.result?.usage, result.usage, "terminal follow-up journal usage covers the whole logical lineage");
 
     const dispatches = { starts: f.backend.requests.length, sends: f.backend.sends.length };
     const replayed = await f.workflows.start(f.request(script, { resumeFromRunId: final.runId }));
@@ -1642,6 +1647,64 @@ test("progressed continuation settles the failed process, hands off current chec
     assert.equal(replayFinal.agents[0]?.jobId, replacement.jobId);
     assert.equal(replayFinal.agents[0]?.continuation?.replacementJobId, replacement.jobId);
     assert.deepEqual(aggregateWorkflowUsage(replayFinal), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("continuation scheduler admission rechecks workflow usage after its asynchronous policy proof", async () => {
+  const checkout = new AdmissionGatedWorkflowCheckout();
+  const f = await fixture(2, undefined, undefined, undefined, fallbackAvailability(), checkout);
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => parallel([
+      () => agent("continued lane", {
+        harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+      }),
+      () => agent("budget lane", { harness: "codex", access: "readOnly" })
+    ], { concurrency: 2 });`, { budget: { maxTokens: 5, maxConcurrency: 2 } }));
+    await f.claude.waitForStart();
+    await f.backend.waitForStart();
+    const primary = f.claude.starts[0]!;
+    const budgetLane = f.backend.starts[0]!;
+    f.claude.emit(primary, { type: "message", text: "progress before quota" });
+    f.claude.fail(primary, "quota", progressedQuota("claude"));
+
+    await checkout.waitUntilAdmission();
+    assert.equal(f.backend.requests.length, 1, "replacement has not entered the backend during admission");
+    f.backend.emit(budgetLane, { type: "usage", usage: { input: 5, turns: 1 } });
+    checkout.releaseAdmission();
+    f.backend.complete(budgetLane, "budget lane done");
+
+    const final = await started.completion;
+    const results = final.result as Array<{ ok: boolean; error?: string }>;
+    assert.equal(results[0]?.ok, false);
+    assert.match(results[0]?.error ?? "", /Workflow token budget exhausted \(5\/5\)/);
+    assert.equal(results[1]?.ok, true);
+    assert.equal(f.backend.requests.length, 1, "stale pre-admission budget proof never starts the replacement backend");
+    assert.equal(final.agents[0]?.continuation?.state, "failed");
+  } finally {
+    checkout.releaseAdmission();
+    await f.cleanup();
+  }
+});
+
+test("ordinary progressed failure persists dashboard and restart refusal proof", async () => {
+  const f = await fixture();
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => agent("progress then fail");`));
+    await f.backend.waitForStart();
+    const jobId = f.backend.starts[0]!;
+    f.backend.emit(jobId, { type: "tool_start", id: "write", name: "Write", summary: "changed a file" });
+    f.backend.fail(jobId, "ordinary failure after progress");
+
+    const final = await started.completion;
+    assert.equal(final.agents[0]?.progressedCheckpoint, true, "runtime snapshot carries the same proof as the journal");
+    const journal = await loadWorkflowJournal(f.artifactRoot, final.runId);
+    assert.equal([...journal].reverse().find((record) => record.kind !== "peerQuestion")?.result?.progressed, true);
+    await assert.rejects(
+      f.workflows.restartAgent(final.runId, final.agents[0]!.index),
+      /progressed continuation checkpoint/i,
+    );
   } finally {
     await f.cleanup();
   }
@@ -4296,6 +4359,55 @@ test("a workflow child asks a completed peer, and the answer becomes a charged g
     assert.equal(peerRecords[1]!.result?.output, "The legacy header stays.");
     const agentCalls = journal.filter((record) => record.kind !== "peerQuestion").map((record) => record.callIndex);
     assert.deepEqual(agentCalls, [0, 0, 1, 1], "the sandbox call ordinals are untouched by the interaction");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("a peer can address a continued lineage by its stable logical job ID", async () => {
+  const f = await fallbackFixture();
+  try {
+    await initializeGitCheckout(f.cwd);
+    const started = await f.workflows.start(f.request(`export default async () => {
+      const target = await agent("continued peer target", {
+        name: "target", harness: "claude", access: "readOnly",
+        continuationFallback: { harness: "codex" }
+      });
+      const asker = await agent("ask continued target " + target.jobId, {
+        name: "asker", harness: "claude", access: "readOnly"
+      });
+      return { target, asker };
+    };`));
+    await f.claude.waitForStart();
+    const logicalJobId = f.claude.starts[0]!;
+    f.claude.emit(logicalJobId, { type: "message", text: "partial target answer" });
+    f.claude.fail(logicalJobId, "quota", progressedQuota("claude"));
+
+    await f.backend.waitForStart();
+    const replacementJobId = f.backend.starts[0]!;
+    f.backend.complete(replacementJobId, "continued target ready");
+    await f.claude.waitForStart(2);
+    const askerJobId = f.claude.starts[1]!;
+    assert.match(f.claude.requests[1]!.task, new RegExp(logicalJobId));
+
+    const asked = f.claude.ask(askerJobId, {
+      question: "What state should I use?",
+      target: { type: "agent", jobId: logicalJobId },
+    });
+    await f.backend.waitForSend();
+    assert.equal(f.backend.sends[0]?.id, replacementJobId, "logical target resolves to the retained replacement session");
+    f.backend.complete(replacementJobId, "Use the continued state.");
+    const answer = await asked;
+    assert.equal(answer.route, "peer");
+    assert.match(answer.answer, /Use the continued state\./);
+
+    f.claude.complete(askerJobId, "asker done");
+    const final = await started.completion;
+    const target = final.agents.find((agent) => agent.name === "target")!;
+    assert.equal(target.logicalJobId, logicalJobId);
+    assert.equal(target.jobId, replacementJobId);
+    assert.equal(target.generations?.at(-1)?.outputProvenance, "peerAnswer");
+    assert.equal(final.interactions?.at(-1)?.targetAgentIndex, target.index);
   } finally {
     await f.cleanup();
   }

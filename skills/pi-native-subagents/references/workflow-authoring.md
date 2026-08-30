@@ -84,7 +84,7 @@ Rules:
 
 A fresh explicit Claude/Codex `agent()` may set one opposite native route. `providerFallback: { harness, model? }` handles authoritative pre-inference failure with zero usage; after dispatch it also requires `readOnly`.
 
-`continuationFallback: { harness, model? }` permits one handoff after authoritative unavailability and current-turn progress, including follow-ups. Progress proof blocks primary replay. Queued admission rechecks checkout, readiness, and requirements under the startup deadline. Schema, policy, budgets, usage, cancellation, logical ID, and provider independence stay fixed, including on replay. Unsafe state, unavailable target, isolation, or replacement failure is terminal; no wait or loop.
+`continuationFallback: { harness, model? }` permits one handoff after authoritative unavailability and current-turn progress, including follow-ups. Progress proof blocks primary replay. Queued admission rechecks checkout, readiness, requirements, then budget under the startup deadline. Schema, policy, budgets, usage, cancellation, logical ID, and provider independence stay fixed, including on replay. Unsafe state, unavailable target, isolation, or replacement failure is terminal; no wait or loop.
 
 ## Sandbox limits and determinism
 

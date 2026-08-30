@@ -537,7 +537,10 @@ export class WorkflowManager {
     this.#unsubscribeJobs = this.#jobs.subscribe((job, event) => this.#updateAgentFromJob(job, event));
     // Same-run peer routing is workflow policy; JobManager owns only the
     // generic lifecycle rules and hands the authorized request over here.
-    this.#releasePeerRouter = this.#jobs.setPeerInteractionRouter((request) => this.#answerPeerQuestion(request));
+    this.#releasePeerRouter = this.#jobs.setPeerInteractionRouter(
+      (request) => this.#answerPeerQuestion(request),
+      (source, targetJobId) => this.#resolvePeerTargetJobId(source, targetJobId),
+    );
   }
 
   async initialize(): Promise<void> {
@@ -1897,6 +1900,8 @@ export class WorkflowManager {
             }
             applyRoutingEvidence(admitted);
             this.#touch(entry);
+            const budgetError = this.#budgetPreflight(entry);
+            if (budgetError) throw new Error(budgetError);
             return { capabilityRoute: admitted.capabilityRoute };
           } catch (error) {
             return { error: boundedText(error) };
@@ -2183,7 +2188,7 @@ export class WorkflowManager {
               generation.timestamps = { ...generation.timestamps, updatedAt: record.timestamps.updatedAt, endedAt: record.timestamps.endedAt };
             }
             this.#touch(entry);
-            return { ok: false, output: final.output, jobId: final.id, error: outcome.error, usage: clone(final.usage) };
+            return { ok: false, output: final.output, jobId: final.id, error: outcome.error, usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)) };
           }
           record.structured = outcome.value;
           if (generation) {
@@ -2191,16 +2196,16 @@ export class WorkflowManager {
             generation.structuredTransport = nativeLineage ? "native" : "portable";
           }
           this.#touch(entry);
-          return { ok: true, output: final.output, structured: outcome.value, jobId: final.id, usage: clone(final.usage) };
+          return { ok: true, output: final.output, structured: outcome.value, jobId: final.id, usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)) };
         }
-        return { ok: true, output: final.output, jobId: final.id, usage: clone(final.usage) };
+        return { ok: true, output: final.output, jobId: final.id, usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)) };
       }
       return {
         ok: false,
         output: final.output,
         jobId: final.id,
         error: final.error ?? `Agent ${final.status}`,
-        usage: clone(final.usage),
+        usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)),
         unavailable: final.unavailable,
         progressed: final.progressed,
         attemptUsageBase,
@@ -2209,7 +2214,7 @@ export class WorkflowManager {
       await this.#jobs.cancel(retainedJobId, "Workflow follow-up wait aborted").catch(() => undefined);
       const final = this.#jobs.check(retainedJobId);
       this.#updateAgentFromJob(final);
-      return { ok: false, output: final.output, jobId: final.id, error: boundedText(error), usage: clone(final.usage) };
+      return { ok: false, output: final.output, jobId: final.id, error: boundedText(error), usage: addWorkflowUsage(record.retryUsage, workflowUsage(final.usage)) };
     } finally {
       signal.removeEventListener("abort", abort);
     }
@@ -2567,6 +2572,20 @@ export class WorkflowManager {
 
   /* ── routed interactions ─────────────────────────────────────────────── */
 
+  #resolvePeerTargetJobId(source: JobSnapshot, targetJobId: string): string | undefined {
+    const sourceOwner = this.#jobOwners.get(source.id);
+    if (!sourceOwner) return undefined;
+    const entry = this.#runs.get(sourceOwner.runId);
+    if (!entry || terminalWorkflow(entry.snapshot.status)) return undefined;
+    const target = entry.snapshot.agents.find((candidate) =>
+      candidate.logicalJobId === targetJobId || candidate.jobId === targetJobId);
+    if (!target?.jobId) return undefined;
+    const targetOwner = this.#jobOwners.get(target.jobId);
+    return targetOwner?.runId === entry.snapshot.runId && targetOwner.agentIndex === target.index
+      ? target.jobId
+      : undefined;
+  }
+
   /**
    * Admission check for one routed question, run before any interaction state
    * exists. Bounds the run's interaction count and refuses to open a question
@@ -2636,7 +2655,8 @@ export class WorkflowManager {
     interaction: PendingInteraction,
   ): WorkflowInteractionSummary {
     const targetAgentIndex = interaction.target.jobId
-      ? entry.snapshot.agents.findIndex((candidate) => candidate.jobId === interaction.target.jobId)
+      ? entry.snapshot.agents.findIndex((candidate) =>
+        candidate.logicalJobId === interaction.target.jobId || candidate.jobId === interaction.target.jobId)
       : -1;
     return {
       ordinal: this.#interactionOrdinal(entry, interaction.requestId),
@@ -2673,7 +2693,8 @@ export class WorkflowManager {
     if (terminalWorkflow(entry.snapshot.status)) throw new Error(`Workflow ${entry.snapshot.runId} already ${entry.snapshot.status}`);
     const source = entry.snapshot.agents[owner.agentIndex];
     if (!source) throw new Error("The asking agent is no longer part of this workflow run");
-    const targetIndex = entry.snapshot.agents.findIndex((candidate) => candidate.jobId === request.targetJobId);
+    const targetIndex = entry.snapshot.agents.findIndex((candidate) =>
+      candidate.logicalJobId === request.targetJobId || candidate.jobId === request.targetJobId);
     const target = targetIndex >= 0 ? entry.snapshot.agents[targetIndex] : undefined;
     if (!target || targetIndex === owner.agentIndex) {
       throw new Error(`Peer agent ${request.targetJobId} does not belong to this workflow run`);
@@ -3354,6 +3375,7 @@ export class WorkflowManager {
     agent.effort = job.effort;
     agent.preview = job.output.slice(-500);
     agent.error = job.error;
+    if (job.progressed && job.status === "failed") agent.progressedCheckpoint = true;
     agent.usage = addWorkflowUsage(agent.retryUsage, workflowUsage(job.usage));
     agent.context = job.context ? { ...job.context } : undefined;
     agent.timestamps.updatedAt = now;
