@@ -1022,6 +1022,9 @@ export class ControlledBackend implements Backend {
 
 export class MemoryAdvisorStore implements AdvisorStore {
   readonly records = new Map<string, Awaited<ReturnType<AdvisorStore["load"]>>>();
+  readonly saves: Array<Parameters<AdvisorStore["save"]>[1]> = [];
+  readonly saveBarriers = new Map<number, Promise<void>>();
+  readonly saveErrors = new Map<number, Error>();
   loadBarrier?: Promise<void>;
   saveError?: Error;
 
@@ -1031,6 +1034,11 @@ export class MemoryAdvisorStore implements AdvisorStore {
   }
 
   async save(threadId: string, advisors: Parameters<AdvisorStore["save"]>[1]): Promise<void> {
+    const callIndex = this.saves.length;
+    this.saves.push(structuredClone(advisors));
+    await this.saveBarriers.get(callIndex);
+    const plannedError = this.saveErrors.get(callIndex);
+    if (plannedError) throw plannedError;
     if (this.saveError) throw this.saveError;
     this.records.set(threadId, structuredClone(advisors));
   }

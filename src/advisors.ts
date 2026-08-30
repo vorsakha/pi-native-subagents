@@ -249,6 +249,8 @@ interface InternalAdvisor extends Omit<StoredAdvisor, "lineageUsage"> {
   lineageUsage: Usage;
   queued: number;
   jobId?: string;
+  /** Provider settlement awaiting the same roster transaction after a rejected save. */
+  pendingSettlement?: StoredAdvisor;
   tail: Promise<void>;
   idleTimer?: NodeJS.Timeout;
   transition?: "reset" | "close" | "hibernate";
@@ -262,6 +264,7 @@ export class AdvisorRegistry {
   readonly #router: AdvisorRouteResolver;
   readonly #idleMs: number;
   readonly #records = new Map<string, InternalAdvisor>();
+  readonly #persistedRecords = new Map<string, StoredAdvisor>();
   readonly #listeners = new Set<(snapshot: AdvisorSnapshot) => void>();
   readonly #shutdownController = new AbortController();
   #persistChain: Promise<void> = Promise.resolve();
@@ -336,6 +339,7 @@ export class AdvisorRegistry {
         record.state = "defined";
       }
       this.#records.set(record.id, record);
+      this.#persistedRecords.set(record.id, storedSnapshot(record));
     }
     this.#initialized = true;
   }
@@ -432,13 +436,8 @@ export class AdvisorRegistry {
       profileBinding: resolution.profileBinding ? cloneProfileBinding(resolution.profileBinding) : undefined,
       tail: Promise.resolve(),
     };
+    await this.#persistRecord(storedSnapshot(record));
     this.#records.set(id, record);
-    try {
-      await this.#persist();
-    } catch (error) {
-      this.#records.delete(id);
-      throw error;
-    }
     this.#publish(record);
     return publicSnapshot(record);
   }
@@ -466,7 +465,6 @@ export class AdvisorRegistry {
 
     const queuedAt = Date.now();
     record.queued++;
-    record.updatedAt = queuedAt;
     this.#publish(record);
     const previous = record.tail.catch(() => undefined);
     let settle!: () => void;
@@ -493,6 +491,7 @@ export class AdvisorRegistry {
     await this.initialize();
     const record = this.#resolve(threadId, idOrAlias);
     return this.#withLifecycleTransition(record, "reset", async () => {
+      await this.#flushPending(record);
       if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
       record.jobId = undefined;
       const now = Date.now();
@@ -516,18 +515,8 @@ export class AdvisorRegistry {
         endedAt: now,
       });
       next.ledger = next.ledger.slice(-MAX_ADVISOR_LEDGER);
-      await this.#persist(() => [...this.#records.values()]
-        .filter((candidate) => candidate.state !== "closed")
-        .map((candidate) => candidate === record ? next : storedSnapshot(candidate)));
-      record.continuation = undefined;
-      record.invalidContinuation = undefined;
-      record.lineage = next.lineage;
-      record.generation = next.generation;
-      record.lineageUsage = emptyUsage();
-      record.state = next.state;
-      record.error = undefined;
-      record.updatedAt = next.updatedAt;
-      record.ledger = next.ledger.map(cloneLedger);
+      await this.#persistRecord(next);
+      applyStored(record, next);
       this.#publish(record);
       return publicSnapshot(record);
     });
@@ -544,9 +533,8 @@ export class AdvisorRegistry {
         await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
       }
       record.jobId = undefined;
-      await this.#persist(() => [...this.#records.values()]
-        .filter((candidate) => candidate !== record && candidate.state !== "closed")
-        .map(storedSnapshot));
+      await this.#deletePersisted(record.id);
+      record.pendingSettlement = undefined;
       record.continuation = undefined;
       record.state = "closed";
       record.updatedAt = Date.now();
@@ -565,12 +553,15 @@ export class AdvisorRegistry {
 
   async #hibernate(record: InternalAdvisor): Promise<AdvisorSnapshot> {
     return this.#withLifecycleTransition(record, "hibernate", async () => {
+      await this.#flushPending(record);
       if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
       record.jobId = undefined;
-      record.state = record.continuation ? "hibernated" : record.generation ? "unavailable" : "defined";
-      if (record.state === "unavailable") record.error = "Native continuation is missing; explicitly reset or close this advisor.";
-      record.updatedAt = Date.now();
-      await this.#persist();
+      const next = storedSnapshot(record);
+      next.state = next.continuation ? "hibernated" : next.generation ? "unavailable" : "defined";
+      if (next.state === "unavailable") next.error = "Native continuation is missing; explicitly reset or close this advisor.";
+      next.updatedAt = Date.now();
+      await this.#persistRecord(next);
+      applyStored(record, next);
       this.#publish(record);
       return publicSnapshot(record);
     });
@@ -612,16 +603,23 @@ export class AdvisorRegistry {
     await this.initialize();
     await this.#openTail.catch(() => undefined);
     await Promise.allSettled([...this.#records.values()].map((record) => record.tail));
+    const staged = new Map<string, StoredAdvisor>();
     for (const record of this.#records.values()) {
       if (record.idleTimer) clearTimeout(record.idleTimer);
       if (record.jobId) await this.#jobs.releaseAdvisorRun(record.jobId, record.id);
       record.jobId = undefined;
-      if (record.state !== "closed" && record.state !== "unavailable") {
-        record.state = record.continuation ? "hibernated" : record.generation ? "unavailable" : "defined";
-        if (record.state === "unavailable") record.error = "Native continuation is missing; explicitly reset or close this advisor.";
+      const next = cloneStored(record.pendingSettlement ?? storedSnapshot(record));
+      if (next.state !== "closed" && next.state !== "unavailable") {
+        next.state = next.continuation ? "hibernated" : next.generation ? "unavailable" : "defined";
+        if (next.state === "unavailable") next.error = "Native continuation is missing; explicitly reset or close this advisor.";
       }
+      staged.set(record.id, next);
     }
-    await this.#persist();
+    await this.#replacePersisted([...staged.values()]);
+    for (const record of this.#records.values()) {
+      applyStored(record, staged.get(record.id)!);
+      record.pendingSettlement = undefined;
+    }
     this.#listeners.clear();
   }
 
@@ -630,7 +628,9 @@ export class AdvisorRegistry {
     request: AdvisorConsultRequest & { decisions: string[] },
     queuedAt: number,
   ): Promise<AdvisorConsultResult> {
+    await this.#flushPending(record);
     request.signal?.throwIfAborted();
+    const before = this.#persistedSnapshot(record.id);
     const admissionState = record.state;
     const admissionError = record.error;
     try {
@@ -658,11 +658,10 @@ export class AdvisorRegistry {
     record.updatedAt = Date.now();
     this.#publish(record);
     const startedAt = Date.now();
-    const beforeUsage = { ...record.usage };
+    const beforeUsage = { ...before.usage };
     const prompt = consultationPrompt(record, request);
-    const previousContinuation = record.continuation;
+    const previousContinuation = before.continuation;
     let jobId = record.jobId;
-    let lineageUsageAccounted = false;
     try {
       const liveRoute = await this.#router.resolve({
         threadId: record.threadId,
@@ -740,51 +739,58 @@ export class AdvisorRegistry {
         if (cancellationError) throw cancellationError;
       }
       finally { request.signal?.removeEventListener("abort", abort); }
-      record.usage = { ...final.usage };
-      const usage = subtractUsage(record.usage, beforeUsage);
+      const finalUsage = { ...final.usage };
+      const usage = subtractUsage(finalUsage, beforeUsage);
       const endedAt = Date.now();
       if (final.status !== "completed") {
         const privateReferences = this.#jobs.advisorNativeReferences(jobId, record.id);
         const observedContinuation = this.#jobs.continuation(jobId, record.id);
+        const next = cloneStored(before);
+        next.usage = finalUsage;
         if (previousContinuation && observedContinuation
           && sameNativeIdentity(previousContinuation, observedContinuation)) {
-          record.lineageUsage = addUsage(record.lineageUsage, usage);
+          next.lineageUsage = addUsage(next.lineageUsage ?? emptyUsage(), usage);
         }
         await this.#jobs.releaseAdvisorRun(jobId, record.id).catch(() => undefined);
-        record.continuation = previousContinuation;
         record.jobId = undefined;
         const didLaunch = final.startedAt !== undefined;
         const failureMessage = publicAdvisorError(final.error ?? `Advisor consultation ${final.status}`, previousContinuation, privateReferences);
-        record.state = didLaunch ? "unavailable" : admissionState;
-        record.error = didLaunch ? failureMessage : admissionError;
-        this.#appendLedger(record, request, request.signal?.aborted ? "cancelled" : "failed", startedAt, endedAt, usage, final.output, failureMessage);
-        await this.#persist();
+        next.continuation = previousContinuation ? { ...previousContinuation } : undefined;
+        next.state = didLaunch ? "unavailable" : admissionState;
+        next.error = didLaunch ? failureMessage : admissionError;
+        next.updatedAt = endedAt;
+        this.#appendLedger(next, request, request.signal?.aborted ? "cancelled" : "failed", startedAt, endedAt, usage, final.output, failureMessage);
+        const persistenceFailure = await this.#commitConsultation(record, before, next, jobId, usage, startedAt - queuedAt);
+        if (persistenceFailure) return persistenceFailure;
+        this.#publish(record);
         return resultFor(record, false, final.output, failureMessage, usage, startedAt - queuedAt);
       }
       const observedContinuation = this.#jobs.continuation(jobId, record.id);
+      const next = cloneStored(before);
+      next.usage = finalUsage;
       if (previousContinuation) {
         if (!observedContinuation || !sameNativeIdentity(previousContinuation, observedContinuation)) {
           throw new Error("Provider resumed a different native advisor identity; explicitly reset or close this advisor.");
         }
-        record.continuation = previousContinuation;
+        next.continuation = { ...previousContinuation };
       } else {
-        record.continuation = observedContinuation;
+        next.continuation = observedContinuation ? { ...observedContinuation } : undefined;
       }
-      record.lineageUsage = addUsage(record.lineageUsage, usage);
-      lineageUsageAccounted = true;
-      record.generation++;
-      record.lastConsultedAt = endedAt;
-      record.updatedAt = endedAt;
-      record.state = record.continuation ? "idle" : "unavailable";
-      record.error = record.continuation
+      next.lineageUsage = addUsage(next.lineageUsage ?? emptyUsage(), usage);
+      next.generation++;
+      next.lastConsultedAt = endedAt;
+      next.updatedAt = endedAt;
+      next.state = next.continuation ? "idle" : "unavailable";
+      next.error = next.continuation
         ? undefined
         : "The provider returned no native continuation identity; this answer is preserved, but the advisor must be reset or closed before another consultation.";
-      this.#appendLedger(record, request, "completed", startedAt, endedAt, usage, final.output);
-      if (!record.continuation) {
+      this.#appendLedger(next, request, "completed", startedAt, endedAt, usage, final.output);
+      if (!next.continuation) {
         await this.#jobs.releaseAdvisorRun(jobId, record.id).catch(() => undefined);
         record.jobId = undefined;
       }
-      await this.#persist();
+      const persistenceFailure = await this.#commitConsultation(record, before, next, jobId, usage, startedAt - queuedAt);
+      if (persistenceFailure) return persistenceFailure;
       if (record.continuation) this.#scheduleIdle(record);
       this.#publish(record);
       return resultFor(record, true, final.output, undefined, usage, startedAt - queuedAt);
@@ -792,43 +798,75 @@ export class AdvisorRegistry {
       const endedAt = Date.now();
       let privateReferences: string[] = [];
       let observedContinuation: NativeContinuation | undefined;
+      let finalUsage = { ...beforeUsage };
       if (jobId) {
         try {
-          record.usage = { ...this.#jobs.checkAdvisorJob(jobId, record.id).usage };
+          finalUsage = { ...this.#jobs.checkAdvisorJob(jobId, record.id).usage };
           privateReferences = this.#jobs.advisorNativeReferences(jobId, record.id);
           observedContinuation = this.#jobs.continuation(jobId, record.id);
         }
         catch { /* a released/evicted job leaves the last persisted cumulative usage */ }
         await this.#jobs.releaseAdvisorRun(jobId, record.id).catch(() => undefined);
       }
-      const failedUsage = subtractUsage(record.usage, beforeUsage);
-      if (!lineageUsageAccounted && previousContinuation && observedContinuation
+      const failedUsage = subtractUsage(finalUsage, beforeUsage);
+      const next = cloneStored(before);
+      next.usage = finalUsage;
+      if (previousContinuation && observedContinuation
         && sameNativeIdentity(previousContinuation, observedContinuation)) {
-        record.lineageUsage = addUsage(record.lineageUsage, failedUsage);
+        next.lineageUsage = addUsage(next.lineageUsage ?? emptyUsage(), failedUsage);
       }
       const message = publicAdvisorError(error, previousContinuation, privateReferences);
-      record.continuation = previousContinuation;
       record.jobId = undefined;
-      record.state = "unavailable";
-      record.error = message;
-      this.#appendLedger(record, request, request.signal?.aborted ? "cancelled" : "failed", startedAt, endedAt, failedUsage, undefined, message);
-      await this.#persist();
+      next.continuation = previousContinuation ? { ...previousContinuation } : undefined;
+      next.state = "unavailable";
+      next.error = message;
+      next.updatedAt = endedAt;
+      this.#appendLedger(next, request, request.signal?.aborted ? "cancelled" : "failed", startedAt, endedAt, failedUsage, undefined, message);
+      const persistenceFailure = await this.#commitConsultation(record, before, next, jobId, failedUsage, startedAt - queuedAt);
+      if (persistenceFailure) return persistenceFailure;
       this.#publish(record);
       return resultFor(record, false, "", message, failedUsage, startedAt - queuedAt);
     }
   }
 
+  async #commitConsultation(
+    record: InternalAdvisor,
+    before: StoredAdvisor,
+    next: StoredAdvisor,
+    jobId: string | undefined,
+    usage: Usage,
+    queuedMs: number,
+  ): Promise<AdvisorConsultResult | undefined> {
+    try {
+      await this.#persistRecord(next);
+      applyStored(record, next);
+      record.pendingSettlement = undefined;
+      return undefined;
+    } catch {
+      if (jobId) await this.#jobs.releaseAdvisorRun(jobId, record.id).catch(() => undefined);
+      record.jobId = undefined;
+      applyStored(record, before);
+      record.pendingSettlement = cloneStored(next);
+      const message = "Advisor consultation settled, but its private state could not be persisted. Restore advisor storage or close the advisor before continuing.";
+      this.#publish(record);
+      return resultFor(record, false, "", message, usage, queuedMs);
+    }
+  }
+
   async #unavailable(record: InternalAdvisor, message: string, queuedAt: number): Promise<AdvisorConsultResult> {
-    record.state = "unavailable";
-    record.error = boundedText(message, 2_000);
-    record.updatedAt = Date.now();
-    await this.#persist();
+    const before = this.#persistedSnapshot(record.id);
+    const next = cloneStored(before);
+    next.state = "unavailable";
+    next.error = boundedText(message, 2_000);
+    next.updatedAt = Date.now();
+    const persistenceFailure = await this.#commitConsultation(record, before, next, record.jobId, emptyUsage(), Date.now() - queuedAt);
+    if (persistenceFailure) return persistenceFailure;
     this.#publish(record);
     return resultFor(record, false, "", record.error, undefined, Date.now() - queuedAt);
   }
 
   #appendLedger(
-    record: InternalAdvisor,
+    record: StoredAdvisor,
     request: AdvisorConsultRequest,
     state: AdvisorLedgerEntry["state"],
     startedAt: number,
@@ -881,13 +919,46 @@ export class AdvisorRegistry {
     if (threadId !== this.#threadId) throw new Error("Advisor belongs to a different parent thread");
   }
 
-  #persist(
-    snapshot: () => StoredAdvisor[] = () => [...this.#records.values()]
-      .filter((record) => record.state !== "closed")
-      .map(storedSnapshot),
-  ): Promise<void> {
-    const write = this.#persistChain.catch(() => undefined)
-      .then(() => this.#store.save(this.#threadId, snapshot()));
+  async #flushPending(record: InternalAdvisor): Promise<void> {
+    const pending = record.pendingSettlement;
+    if (!pending) return;
+    await this.#persistRecord(pending);
+    applyStored(record, pending);
+    record.pendingSettlement = undefined;
+    this.#publish(record);
+  }
+
+  #persistedSnapshot(id: string): StoredAdvisor {
+    const record = this.#persistedRecords.get(id);
+    if (!record) throw new Error(`Advisor persistence state is missing: ${id}`);
+    return cloneStored(record);
+  }
+
+  #persistRecord(record: StoredAdvisor): Promise<void> {
+    const admitted = cloneStored(record);
+    return this.#persist((records) => records.set(admitted.id, admitted));
+  }
+
+  #deletePersisted(id: string): Promise<void> {
+    return this.#persist((records) => { records.delete(id); });
+  }
+
+  #replacePersisted(records: StoredAdvisor[]): Promise<void> {
+    const admitted = records.map(cloneStored);
+    return this.#persist((next) => {
+      next.clear();
+      for (const record of admitted) next.set(record.id, record);
+    });
+  }
+
+  #persist(update: (records: Map<string, StoredAdvisor>) => void): Promise<void> {
+    const write = this.#persistChain.catch(() => undefined).then(async () => {
+      const next = new Map([...this.#persistedRecords].map(([id, record]) => [id, cloneStored(record)]));
+      update(next);
+      await this.#store.save(this.#threadId, [...next.values()].map(cloneStored));
+      this.#persistedRecords.clear();
+      for (const [id, record] of next) this.#persistedRecords.set(id, cloneStored(record));
+    });
     this.#persistChain = write;
     return write;
   }
@@ -996,6 +1067,13 @@ function cloneStored(record: StoredAdvisor): StoredAdvisor {
     continuation: record.continuation ? { ...record.continuation } : undefined,
     profileBinding: record.profileBinding ? cloneProfileBinding(record.profileBinding) : undefined,
   };
+}
+
+function applyStored(record: InternalAdvisor, snapshot: StoredAdvisor): void {
+  delete record.invalidContinuation;
+  Object.assign(record, cloneStored(snapshot), {
+    lineageUsage: { ...(snapshot.lineageUsage ?? emptyUsage()) },
+  });
 }
 
 function cloneProfileBinding(binding: AdvisorProfileBinding): AdvisorProfileBinding {

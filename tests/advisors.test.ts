@@ -1110,6 +1110,119 @@ test("concurrent advisor opens reserve aliases and capacity atomically and roll 
   await rollback.jobs.shutdown();
 });
 
+test("queued advisor writes cannot persist a later open that rolls back", async () => {
+  const store = new MemoryAdvisorStore();
+  const runtime = setup({ store });
+  const first = await runtime.registry.open({
+    threadId, name: "First", description: "first durable advisor", cwd: process.cwd(), trusted: true, harness: "codex",
+  });
+  const resting = await runtime.registry.open({
+    threadId, name: "Resting", description: "advisor with a blocked hibernate", cwd: process.cwd(), trusted: true, harness: "codex",
+  });
+
+  let releaseHibernate!: () => void;
+  store.saveBarriers.set(2, new Promise<void>((resolve) => { releaseHibernate = resolve; }));
+  const hibernating = runtime.registry.hibernate(threadId, resting.id, true);
+  await waitFor(() => store.saves.length === 3, "blocked hibernate persistence");
+  const closing = runtime.registry.close(threadId, first.id, true);
+  const opening = runtime.registry.open({
+    threadId, name: "Rollback", description: "open whose own save fails", cwd: process.cwd(), trusted: true, harness: "codex",
+  });
+  await waitFor(() => runtime.router.calls.length === 3, "concurrent open admission");
+  store.saveErrors.set(4, new Error("open persistence failed"));
+  releaseHibernate();
+
+  const results = await Promise.allSettled([hibernating, closing, opening]);
+  assert.deepEqual(results.map((result) => result.status), ["fulfilled", "fulfilled", "rejected"]);
+  if (results[2]?.status === "rejected") assert.match(String(results[2].reason), /open persistence failed/);
+  assert.deepEqual(runtime.registry.list(threadId, true).map((advisor) => advisor.id), [resting.id]);
+  assert.deepEqual(store.records.get(threadId)?.map((advisor) => advisor.id), [resting.id]);
+  assert.equal(store.saves[4]?.some((advisor) => advisor.name === "Rollback"), true, "the failed open reached only its own save attempt");
+
+  const restored = setup({ store });
+  await restored.registry.initialize();
+  assert.deepEqual(restored.registry.list(threadId, true).map((advisor) => advisor.id), [resting.id], "restart cannot resurrect the failed open");
+  await restored.registry.shutdown();
+  await restored.jobs.shutdown();
+  await runtime.registry.shutdown();
+  await runtime.jobs.shutdown();
+});
+
+test("consultation persistence failure keeps one pending settlement without corrupting durable accounting", async () => {
+  const { backend, jobs, store, registry } = setup();
+  const opened = await openSecurity(registry);
+  const publicBefore = registry.get(threadId, opened.id, true);
+  const durableBefore = structuredClone(store.records.get(threadId));
+  store.saveError = new Error("consultation persistence failed");
+
+  const first = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "completed while storage is unavailable",
+    sender: "human",
+    trusted: true,
+  });
+  await backend.waitForStart();
+  backend.emitContinuation(backend.starts[0]!, "codex-pending-persistence");
+  backend.complete(backend.starts[0]!, "unpersisted answer", { input: 4, output: 1, turns: 1 });
+  const failed = await first;
+
+  assert.equal(failed.ok, false);
+  assert.match(failed.error ?? "", /private state could not be persisted/i);
+  assert.deepEqual(failed.usage, { input: 4, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 });
+  assert.deepEqual(registry.get(threadId, opened.id, true), publicBefore, "public accounting remains at the last durable generation");
+  assert.deepEqual(store.records.get(threadId), durableBefore, "a rejected save cannot partially charge durable accounting");
+  assert.equal(store.saves.length, 2, "the storage error is not reinterpreted as a second provider failure save");
+  assert.ok(backend.closes.includes(backend.starts[0]!), "the uncommitted retained process is released");
+
+  await assert.rejects(registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "storage is still unavailable",
+    sender: "human",
+    trusted: true,
+  }), /consultation persistence failed/);
+  assert.equal(backend.starts.length, 1, "a repeated persistence failure blocks before another provider turn");
+  assert.deepEqual(registry.get(threadId, opened.id, true), publicBefore);
+  assert.deepEqual(store.records.get(threadId), durableBefore);
+
+  store.saveError = undefined;
+  const recovered = registry.consult({
+    threadId,
+    advisorId: opened.id,
+    question: "continue after storage recovery",
+    sender: "human",
+    trusted: true,
+  });
+  await backend.waitForStart(2);
+  assert.deepEqual(backend.requests[1]?.continuation, {
+    harness: "codex",
+    threadId: "codex-pending-persistence",
+    sessionFile: "/private/codex-pending-persistence.jsonl",
+  });
+  assert.deepEqual(backend.requests[1]?.providerUsageBaseline, {
+    input: 4, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1,
+  });
+  backend.emitContinuation(backend.starts[1]!, "codex-pending-persistence");
+  backend.complete(backend.starts[1]!, "persisted recovery", { input: 3, output: 1, turns: 1 });
+  assert.equal((await recovered).ok, true);
+
+  const settled = registry.get(threadId, opened.id, true);
+  assert.equal(settled.generation, 2);
+  assert.deepEqual(settled.usage, { input: 7, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 2 });
+  assert.deepEqual(settled.ledger.map((entry) => entry.state), ["completed", "completed"]);
+  assert.deepEqual(settled.ledger.map((entry) => entry.question), [
+    "completed while storage is unavailable",
+    "continue after storage recovery",
+  ]);
+  const durable = store.records.get(threadId)?.[0];
+  assert.equal(durable?.generation, 2);
+  assert.deepEqual(durable?.usage, settled.usage);
+  assert.deepEqual(durable?.ledger.map((entry) => entry.state), ["completed", "completed"]);
+  await registry.shutdown();
+  await jobs.shutdown();
+});
+
 test("failed reset and close keep the durable advisor lineage open and retryable", async () => {
   for (const transition of ["reset", "close"] as const) {
     const { backend, jobs, store, registry } = setup();
