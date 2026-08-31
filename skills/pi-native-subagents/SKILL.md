@@ -16,7 +16,7 @@ Paths are relative to this file. Read the reference **before** you write the cal
 | write or edit a workflow script, call a saved `workflowName`, declare `meta.phases`, call `followUp()`, or set `approval`/`background`/`pipeline` | `references/workflow-authoring.md` |
 | call `converge()` | `references/convergence.md` |
 | opt into cross-provider continuation after progressed native failure | `references/progressed-continuation.md` |
-| open, consult, list, reset, close, or workflow-authorize a thread advisor | `references/advisors.md` |
+| open, consult, reset, close, or workflow-authorize a thread advisor | `references/advisors.md` |
 | let a child use `subagent_ask`, or answer with `subagent_answer` | `references/routed-questions.md` |
 | set `speed`, spend limits, replay, provider fallback, or retry | `references/budgets-replay-and-provider-waits.md` |
 | use `isolation: "worktree"`, or run `/workflows reclaim` | `references/worktrees-and-retention.md` |
@@ -26,7 +26,7 @@ Paths are relative to this file. Read the reference **before** you write the cal
 
 - Use `subagent_spawn` for one job or a small independent fan-out. Use `subagent_wait`, `subagent_check`, `subagent_send`, and `subagent_cancel` with the returned job ID when the parent must manage the jobs explicitly.
 - Use `workflow` for phases, bounded parallelism, pipelines, structured fan-in, saved definitions, background execution, replay, or durable progress. Do not wrap a simple two-agent review in a workflow only to run two calls.
-- Use `advisor_open` for a named read-only specialist whose history must persist in this parent thread. Opening is turn-free; advisors advise and ordinary agents execute.
+- Use `advisor_open` for a named read-only specialist retained across this thread. Opening costs no turn; advisors advise, agents execute.
 - Use `subagent_capabilities` before setting `requires`. Capability IDs are live values; never invent them.
 - A child cannot delegate again. Do not ask a child to call subagent or workflow tools. It may have only one outstanding bounded routed question at a time.
 
@@ -36,7 +36,7 @@ Give every child a self-contained task with paths, constraints, result format, a
 
 Usage rules:
 
-- Use `access: "readOnly"` for inspection, review, and planning. Request `full` only when mutation is required and the project is trusted. Read-only children are sandboxed by construction, not by instruction.
+- Use `access: "readOnly"` for inspection, review, and planning. Request `full` only when mutation is required and the project is trusted.
 - Omit `model` unless a concrete harness-local override is needed. A model name is not a cross-harness tier, and `harness: "auto"` rejects harness-local model overrides.
 - Omit `speed` for standard policy. Use `speed: "fast"` only on an explicit Codex route when the human opts in. Fast stays fixed, uses Codex credits, and has no reported monetary cost. Never infer it from model, effort, or profile metadata.
 - `harness: "auto"` selects an initial ready route; it is not failover. Explicit routes fail closed except for the workflow opt-ins below. Availability checks are read-only and never install, log in, or reconfigure providers.
@@ -140,11 +140,11 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 
 ## Result semantics
 
-Every `agent()`/`followUp()` call resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. `consult()` returns bounded advisor identity, lineage/generation, route, queue delay, output/error, and usage; read the advisor reference.
+Every `agent()`/`followUp()` call resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. `consult()` adds advisor identity, lineage/generation, route, and queue delay.
 
 `output` is always a string of the child's narrative text. On the portable structured path it may be JSON text, but never parse it yourself.
 
-When a call is schema-constrained, supported runtimes may use native structured output and others use the portable JSON fallback. Both paths apply the same schema validation, fail clearly on invalid or missing results, and preserve transport metadata through persistence and replay. This is the same caller-facing contract regardless of which transport was actually selected.
+When a call is schema-constrained, supported runtimes may use native structured output and others use the portable JSON fallback. Both paths apply the same schema validation, fail clearly on invalid or missing results, and preserve transport metadata through persistence and replay.
 
 `structured` is the authoritative schema data: it is present when the call succeeded under an effective schema, and it is the already-validated value, ready to use directly. A `followUp()` on a native schema-bound lineage inherits the original `agent()` schema and can return `structured` even when that `followUp()` omitted `schema`. A missing or schema-invalid result is reported as `ok: false` with `structured` left `undefined`, never as a success with narrative-only output. Consume it like this:
 
@@ -186,7 +186,7 @@ These are enforced by the runtime. Do not design around them.
 - A clean mid-turn Codex app-server exit is a lifecycle failure, not proof a required capability is unsupported. Retry before dropping the requirement.
 - A harness rejected for login or readiness: the error names the normalized state (missing executable, login required, incompatible, temporarily unhealthy, or status unknown). Check `/subagents providers` for the active set and each harness's actionable reason, then switch routes or use `harness: "auto"` rather than guessing at the account state. The extension never logs in or installs a CLI for you.
 - A workflow or child fails: inspect the returned `ok`, `error`, route, and job ID; use `/workflows` for durable workflow state. Do not hide a failed route behind a success-only summary.
-- An advisor is unavailable, reset, queued, or budget-blocked: follow `references/advisors.md`; never silently substitute a specialist identity.
+- An advisor is unavailable, reset, queued, or budget-blocked: follow `references/advisors.md`; never substitute another specialist.
 - `/workflows` pins live-only `Now` and workflow `Context`. It uses bounded event evidence, never thoughts, response text, raw commands/results, credentials, or absolute paths. An active provider wait exposes only structured provider, window, retry, and attempt data; raw attempt errors stay private. Questions, failures, peer answers, provider waits, and queueing outrank routine activity. Replay never restores `Now`. Use `?` for navigation and `i` for telemetry.
 - A provider-quota, replay, worktree, or routed-question error: the matching reference above lists the exact message and its recovery.
 

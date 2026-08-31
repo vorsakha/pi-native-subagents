@@ -83,6 +83,10 @@ A fresh explicit Claude/Codex `agent()` may set one opposite native route. `prov
 
 `continuationFallback: { harness, model? }` permits one handoff after authoritative unavailability and current-turn progress, including follow-ups. Progress proof blocks primary replay. Queued admission rechecks readiness and requirements, then checkout and budget under the startup deadline. Schema, policy, budgets, usage, cancellation, logical ID, and provider independence stay fixed, including on replay. Unsafe state, unavailable target, isolation, or replacement failure is terminal; no wait or loop.
 
+## Consulting an advisor
+
+`consult(advisorId, question, { phase?, context? })` reaches a thread advisor whose stable ID is in the tool's `advisors` allowlist. Advisor calls, active turns, per-call tokens, usage, and Codex cost support meet the same enforcement, warnings, and dashboard metrics as agents, and dispatch uses the workflow lane of the global four-turn scheduler so direct work keeps priority. Calls are journaled with identity, lineage/generation, completed route, usage, queue delay, bounded result, and provenance; cancellation reaches queued and active calls.
+
 ## Sandbox limits and determinism
 
 - The sandbox exposes only orchestration: no imports, I/O, environment, processes, credentials, or nested delegation.
