@@ -1196,6 +1196,9 @@ export class WorkflowsDashboardOverlay implements Focusable {
         : "no run restart action is available here; inspect the failed agent or result";
       return [line("error", `Error · ${summary.text}`), line("text", `Recovery · ${recovery}`)];
     }
+    if (run.agents.some((agent) => agent.answering)) {
+      return [line("accent", `Now · ${summary.text}`), line("muted", "Next · peer answer is in progress; no human action required")];
+    }
     if (run.status === "paused") {
       return [line("warning", `Paused · ${summary.text}`), line("text", "Next · press p to resume; human action is required")];
     }
@@ -1750,6 +1753,7 @@ function workflowDashboardCollection(
 }
 
 function workflowRunStatusLabel(run: WorkflowSnapshot): string {
+  if (run.agents.some((agent) => agent.answering)) return run.status;
   const providerWait = [...run.agents].reverse().find((agent) => agent.state === "waiting" && agent.providerWait)?.providerWait;
   if (providerWait) {
     return `${run.status} · waiting for ${sanitizeInline(providerWait.provider)} ${sanitizeInline(providerWait.kind)}`;

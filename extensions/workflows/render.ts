@@ -243,16 +243,18 @@ export function workflowAgentDashboardSummary(agent: WorkflowAgentRecord, now: n
   return { kind: "lifecycle", text: agent.state };
 }
 
-function latestActiveWorkflowSummary(snapshot: WorkflowSnapshot, now: number): { at: number; text: string } | undefined {
+function latestActiveWorkflowSummary(snapshot: WorkflowSnapshot, now: number): { at: number; text: string; agentName?: string } | undefined {
   const hasExplicitWait = snapshot.agents.some((agent) => agent.state === "queued" || agent.state === "waiting");
-  let latest: { at: number; text: string } | undefined;
+  let latest: { at: number; text: string; agentName?: string } | undefined;
 
   for (const agent of snapshot.agents) {
+    if (!agent.activity) continue;
     const summary = activeAgentSummary(agent, now);
     if (!summary) continue;
     const candidate = {
-      at: agent.activity?.at ?? -1,
+      at: agent.activity.at,
       text: summary.text,
+      agentName: agent.name,
     };
     if (!latest || candidate.at > latest.at) latest = candidate;
   }
@@ -263,9 +265,13 @@ function latestActiveWorkflowSummary(snapshot: WorkflowSnapshot, now: number): {
       return { at: log.at, text };
     }, undefined);
   }
+  if (!latest) {
+    const agent = [...snapshot.agents].reverse().find((candidate) => candidate.state === "running");
+    const fallback = agent ? activeAgentSummary(agent, now) : undefined;
+    if (fallback) latest = { at: -1, text: fallback.text };
+  }
   if (latest && snapshot.agents.filter((agent) => agent.state === "running").length > 1) {
-    const agent = snapshot.agents.find((candidate) => candidate.activity?.at === latest?.at);
-    if (agent) latest.text = `${sanitizeInline(agent.name)}: ${latest.text}`;
+    if (latest.agentName) latest.text = `${sanitizeInline(latest.agentName)}: ${latest.text}`;
   }
   return latest;
 }
@@ -295,6 +301,9 @@ export function workflowDashboardSummary(snapshot: WorkflowSnapshot, now: number
       text: summaryPreview(snapshot.error ?? failedAgent?.error ?? failedPhase?.error) || fallback,
     };
   }
+
+  const answering = [...snapshot.agents].reverse().find((agent) => agent.answering);
+  if (answering) return workflowAgentDashboardSummary(answering, now);
 
   const providerWait = [...snapshot.agents].reverse().find((agent) => agent.state === "waiting" && agent.providerWait);
   if (providerWait) {

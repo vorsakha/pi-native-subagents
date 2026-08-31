@@ -148,6 +148,18 @@ test("workflow run and agent summaries preserve semantic priority and wait disti
   });
   assert.equal(workflowDashboardSummary(providerWait, 6_000).text, "tests: waiting for codex quota · retry in 1m · attempt 1/3");
 
+  providerWait.agents.unshift(agent({
+    index: 2,
+    name: "retained reviewer",
+    state: "completed",
+    answering: { requestId: "peer-1", sourceAgentIndex: 3, sourceName: "implementer" },
+  }));
+  providerWait.agents.push(agent({ index: 3, name: "queued verifier", state: "queued" }));
+  assert.deepEqual(workflowDashboardSummary(providerWait, 6_000), {
+    kind: "activity",
+    text: "answering peer question from implementer",
+  });
+
   assert.deepEqual(workflowDashboardSummary(workflow({
     status: "completed",
     taskOutcome: "unsuccessful",
@@ -155,6 +167,27 @@ test("workflow run and agent summaries preserve semantic priority and wait disti
   }), 6_000), {
     kind: "result",
     text: "task unsuccessful: Release rejected",
+  });
+});
+
+test("workflow run activity uses logs only when active agents lack direct evidence", () => {
+  const run = workflow({
+    logs: [
+      { index: 0, message: "Preparing verification", at: 4_000 },
+      { index: 1, message: "Running the authoritative release check", at: 5_000 },
+    ],
+  });
+  run.agents[1]!.activity = undefined;
+
+  assert.deepEqual(workflowDashboardSummary(run, 6_000), {
+    kind: "activity",
+    text: "Running the authoritative release check",
+  });
+
+  run.agents[1]!.activity = { kind: "reasoning", at: 3_000 };
+  assert.deepEqual(workflowDashboardSummary(run, 6_000), {
+    kind: "activity",
+    text: "Reasoning · provider activity 3s ago",
   });
 });
 

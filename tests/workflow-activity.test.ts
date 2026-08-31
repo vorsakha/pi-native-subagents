@@ -137,3 +137,26 @@ test("workflow activity keeps textual status and never exceeds narrow terminal w
     }
   }
 });
+
+test("workflow editor rows show a retained peer answer ahead of other run activity", () => {
+  const run = workflowFixture({ runId: "wf_peer_answer", name: "peer answer" });
+  const active = run.agents[0]!;
+  active.state = "completed";
+  active.activity = undefined;
+  active.answering = { requestId: "peer-1", sourceAgentIndex: 1, sourceName: "reviewer" };
+  run.agents.push({
+    ...run.agents[0]!,
+    index: 1,
+    name: "provider wait",
+    state: "waiting",
+    answering: undefined,
+    providerWait: { provider: "codex", kind: "quota", detail: "limit", retryAt: 66_000, attempt: 1, maxAttempts: 3 },
+  });
+
+  const store = new WorkflowActivityStore();
+  store.observe(run);
+  const snapshot = store.snapshot(6_000);
+  assert.equal(snapshot.rows[0]?.activity, "answering peer question from reviewer");
+  assert.match(renderWorkflowActivity(snapshot, theme, 160).join("\n"), /answering peer question from reviewer/);
+  assert.doesNotMatch(renderWorkflowActivity(snapshot, theme, 160).join("\n"), /waiting for codex quota/);
+});

@@ -202,6 +202,37 @@ test("run and agent summaries render across wide, medium, and narrow dashboard r
   }
 });
 
+test("run rows and inspectors show retained peer answers ahead of provider and scheduler waits", (t) => {
+  const run = workflow("peer-answer-priority");
+  run.name = "peer";
+  run.agents[0]!.answering = { requestId: "peer-1", sourceAgentIndex: 1, sourceName: "tests" };
+  run.agents[1]!.state = "waiting";
+  run.agents[1]!.providerWait = {
+    provider: "codex",
+    kind: "quota",
+    detail: "usage limit",
+    retryAt: 125_000,
+    attempt: 1,
+    maxAttempts: 3,
+  };
+  run.agents.push({
+    ...run.agents[1]!,
+    index: 2,
+    name: "queued verifier",
+    state: "queued",
+    providerWait: undefined,
+    activity: undefined,
+  });
+
+  const state = harness([run], 30, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+  const lines = state.overlay.render(72);
+  const text = lines.join("\n");
+  assert.match(lines.find((line) => line.includes("peer")) ?? "", /answering peer question from test/);
+  assert.match(text, /Now · answering peer question from tests/);
+  assert.doesNotMatch(text, /Provider wait ·|Waiting · queued/);
+});
+
 test("workflow runs render attention groups with counts and keep grouped states exact", (t) => {
   const input = workflow("input");
   input.name = "IN";
