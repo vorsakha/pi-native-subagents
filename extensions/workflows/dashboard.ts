@@ -1430,6 +1430,26 @@ export class WorkflowsDashboardOverlay implements Focusable {
         width,
       ));
     }
+    if (agent.waitingOn?.context) {
+      pinned.push(truncateWorkflowDashboardLine(
+        this.theme.fg("dim", `Question context · ${boundedInline(agent.waitingOn.context, 1_000)}`),
+        width,
+      ));
+    }
+
+    // A live inspector is a status view, not a transcript view. Keep this
+    // branch ahead of every prompt, provider-output, tool, result, and optional
+    // metadata renderer so neither display toggles nor empty fallbacks can
+    // disclose data before the agent settles.
+    if (!workflowAgentIsTerminal(agent.state)) {
+      this.#scroll = 0;
+      this.#scrollKey = undefined;
+      this.#followTail = true;
+      this.#resultRows = 0;
+      this.#resultTotal = 0;
+      return fitDashboardRows([...pinned, identity], rows);
+    }
+
     const metadata: string[] = [
       this.theme.fg("dim", `${policy} · effort ${agent.effort ?? "adaptive"} · ${route} · ${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${formatAgentElapsed(agent, this.#now())}`),
       this.theme.fg("dim", `${phase ? `${boundedInline(run.name, 1_000)} · ${boundedInline(phase.name, 1_000)}` : boundedInline(run.name, 1_000)}${usage ? ` · ${usage}` : ""}`),
@@ -1484,7 +1504,6 @@ export class WorkflowsDashboardOverlay implements Focusable {
       const finalRoute = `${sanitizeInline(agent.requestedHarness ?? agent.harness ?? "?")}/${boundedInline(agent.model ?? "native default", 256)}`;
       metadata.push(this.theme.fg("dim", `Final route · ${finalRoute}`));
     }
-    if (agent.waitingOn?.context) pinned.push(this.theme.fg("dim", `Question context · ${boundedInline(agent.waitingOn.context, 1_000)}`));
     if (agent.generations?.length) metadata.push(this.theme.fg("dim", `Generations · ${agent.generations.length} (call ${agent.callIndex ?? agent.generations.at(-1)?.callIndex})`));
     if (agent.independentOf) metadata.push(this.theme.fg("muted", `Provenance · independent of ${shortId(sanitizeText(agent.independentOf))}`));
     if (agent.replayedFrom) metadata.push(this.theme.fg("muted", `Replay · ${shortId(sanitizeText(agent.replayedFrom.runId))} call ${agent.replayedFrom.callIndex}`));

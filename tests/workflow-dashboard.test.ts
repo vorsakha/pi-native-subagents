@@ -534,37 +534,129 @@ test("workflow results use native Markdown while transcript roles and workflow m
   assert.match(compactDetail, /FINAL_SUFFIX/);
 });
 
-test("agent detail activity does not duplicate tool detail already shown in the transcript", (t) => {
-  const run = workflow("no-duplication");
+const PRIVATE_ACTIVE_AGENT_DATA =
+  /PRIVATE_(?:PROVIDER_RESPONSE|THINKING|TOOL_ARGUMENT|COMMAND|TOOL_SUMMARY|TOOL_RESULT|CREDENTIAL|EXTERNAL_PATH|OUTPUT|PREVIEW|PROMPT|STRUCTURED)/;
+
+function addPrivateActiveAgentData(run: WorkflowSnapshot, withTranscript: boolean): void {
   const agent = run.agents[0]!;
   agent.state = "running";
-  agent.liveThinking = "narrowing down the failing assertion";
-  agent.activity = { kind: "reasoning", at: 64_000 };
-  agent.tools = [{ id: "bash-1", name: "bash", summary: "DISTINCT_TOOL_SUMMARY_MARKER", status: "completed" }];
-  agent.transcript = [
-    { kind: "assistant", text: "investigating" },
-    { kind: "tool", toolId: "bash-1", name: "bash", text: "DISTINCT_TOOL_SUMMARY_MARKER" },
-  ];
+  agent.prompt = "PRIVATE_PROMPT";
+  agent.liveThinking = "\u001b[31mPRIVATE_THINKING\u001b[0m";
+  agent.activity = { kind: "tool", at: 64_000, tool: "read", state: "running", target: "tests/検証.ts" };
+  agent.preview = "PRIVATE_PREVIEW";
+  agent.output = "PRIVATE_OUTPUT";
+  agent.structured = { secret: "PRIVATE_STRUCTURED" };
+  agent.tools = [{
+    id: "shell-1",
+    name: "bash",
+    args: {
+      command: "PRIVATE_COMMAND",
+      token: "PRIVATE_CREDENTIAL",
+      path: "/outside/workspace/PRIVATE_EXTERNAL_PATH",
+    },
+    result: { content: [{ type: "text", text: "PRIVATE_TOOL_RESULT" }], isError: false },
+    summary: "PRIVATE_TOOL_SUMMARY",
+    status: "running",
+  }];
+  agent.transcript = withTranscript
+    ? [
+        { kind: "assistant", text: "PRIVATE_PROVIDER_RESPONSE" },
+        { kind: "thinking", text: "PRIVATE_THINKING" },
+        {
+          kind: "tool",
+          phase: "start",
+          toolId: "shell-1",
+          name: "bash",
+          args: {
+            command: "PRIVATE_COMMAND",
+            argument: "PRIVATE_TOOL_ARGUMENT",
+            token: "PRIVATE_CREDENTIAL",
+            path: "/outside/workspace/PRIVATE_EXTERNAL_PATH",
+          },
+        },
+        {
+          kind: "tool",
+          phase: "end",
+          toolId: "shell-1",
+          name: "bash",
+          result: { content: [{ type: "text", text: "PRIVATE_TOOL_RESULT" }], isError: false },
+        },
+      ]
+    : undefined;
+}
 
-  // Tall enough that the full-mode Pi tool render and every surrounding row fit
-  // without scrolling, so tail-following after the toggle can't hide any of them.
-  const { overlay } = harness([run], 40, () => {}, { renderMarkdown: (text) => text.split("\n") });
+function assertPrivateActiveAgentDataHidden(lines: string[], width: number, rows: number): void {
+  assertPanel(lines, width, rows);
+  const rendered = lines.join("\n");
+  assert.match(rendered, /Now · Reading tests\/検証\.ts/);
+  assert.match(rendered, /Context · review · phase/);
+  assert.doesNotMatch(rendered, PRIVATE_ACTIVE_AGENT_DATA);
+  assert.doesNotMatch(rendered, /outside\/workspace/);
+  assert.doesNotMatch(rendered, /Prompt|Structured result|Transcript|Final result|\(no result yet\)/);
+}
+
+test("running agent inspectors keep provider and tool data private in compact and full modes", (t) => {
+  const run = workflow("active-inspector-privacy");
+  addPrivateActiveAgentData(run, true);
+
+  const { overlay } = harness([run], 30, () => {}, { fullscreen: true, renderMarkdown: (text) => text.split("\n") });
   t.after(() => overlay.dispose());
 
   openAgentDetail(overlay, 72);
-  const compactLines = overlay.render(72);
-  assert.ok(!compactLines.some((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER")), "compact mode is the default and does not surface per-tool detail anywhere, including Activity");
-  assert.ok(compactLines.some((line) => line.includes("Now") && line.includes("Reasoning")), "the state preview surfaces bounded live progress in compact mode");
+  overlay.handleInput("i");
+  assertPrivateActiveAgentDataHidden(overlay.render(72), 72, 30);
 
   overlay.handleInput("t");
-  const lines = overlay.render(72);
-  assert.ok(lines.some((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER")), "the tool lifecycle row still appears in the Transcript section in full mode, via Pi's native execution component");
-  assert.ok(lines.some((line) => line.includes("Now") && line.includes("Reasoning")), "the state preview still surfaces bounded live progress");
+  assertPrivateActiveAgentDataHidden(overlay.render(72), 72, 30);
 
-  const activityLine = lines.find((line) => line.includes("Now"));
-  assert.ok(activityLine && !activityLine.includes("DISTINCT_TOOL_SUMMARY_MARKER"), "the state preview does not repeat the tool detail already in the transcript");
-  const toolMentions = lines.filter((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER"));
-  assert.equal(toolMentions.length, 1, "tool detail is rendered exactly once, in the transcript, not duplicated in Activity");
+  const agent = run.agents[0]!;
+  agent.state = "completed";
+  agent.timestamps.endedAt = 66_000;
+  const terminalFull = overlay.render(72).join("\n");
+  assert.match(terminalFull, /PRIVATE_PROVIDER_RESPONSE/);
+  assert.match(terminalFull, /PRIVATE_COMMAND/);
+  assert.match(terminalFull, /PRIVATE_TOOL_RESULT/);
+  assert.match(terminalFull, /PRIVATE_OUTPUT/);
+
+  overlay.handleInput("t");
+  const terminalCompact = overlay.render(72).join("\n");
+  assert.match(terminalCompact, /PRIVATE_PROVIDER_RESPONSE/);
+  assert.match(terminalCompact, /1 tool call/);
+  assert.match(terminalCompact, /PRIVATE_OUTPUT/);
+});
+
+test("running agent inspectors block empty-transcript fallbacks at Unicode widths and short geometry", (t) => {
+  for (const { width, rows } of [{ width: 52, rows: 8 }, { width: 31, rows: 10 }]) {
+    const run = workflow(`empty-active-${width}`);
+    addPrivateActiveAgentData(run, false);
+    const state = harness([run], rows, () => {}, { fullscreen: true });
+    t.after(() => state.overlay.dispose());
+
+    openAgentDetail(state.overlay, width);
+    assertPrivateActiveAgentDataHidden(state.overlay.render(width), width, rows);
+    state.overlay.handleInput("t");
+    assertPrivateActiveAgentDataHidden(state.overlay.render(width), width, rows);
+
+    run.agents[0]!.state = "completed";
+    run.agents[0]!.timestamps.endedAt = 66_000;
+    assert.match(state.overlay.render(width).join("\n"), /PRIVATE_OUTPUT/);
+    state.overlay.handleInput("t");
+    assert.match(state.overlay.render(width).join("\n"), /PRIVATE_OUTPUT/);
+  }
+});
+
+test("queued agent inspectors show queue state without result fallbacks", (t) => {
+  const run = workflow("queued-inspector-privacy");
+  addPrivateActiveAgentData(run, false);
+  run.agents[0]!.state = "queued";
+  const state = harness([run], 8, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  openAgentDetail(state.overlay, 52);
+  const rendered = state.overlay.render(52).join("\n");
+  assert.match(rendered, /Waiting · queued for workflow dispatch/);
+  assert.doesNotMatch(rendered, PRIVATE_ACTIVE_AGENT_DATA);
+  assert.doesNotMatch(rendered, /Result|Transcript|\(no result yet\)/);
 });
 
 test("narrow workflows drill from runs to outline to agent detail with layered Escape and Pi cancel backtracking", (t) => {
@@ -856,7 +948,7 @@ test("terminal workflow agents use end labels while their workflow remains activ
   assert.doesNotMatch(label, /live|resumes live/);
 });
 
-test("short workflow agent inspectors pin recovery details above the transcript reserve", (t) => {
+test("short workflow agent inspectors pin active state or terminal recovery details", (t) => {
   const failedRun = workflow("short-failed-agent", "failed");
   failedRun.agents[1]!.state = "failed";
   failedRun.agents[1]!.error = "bounded agent failure";
@@ -889,7 +981,7 @@ test("short workflow agent inspectors pin recovery details above the transcript 
   const providerText = provider.overlay.render(52).join("\n");
   assert.match(providerText, /Provider wait ·/);
   assert.match(providerText, /Retry · 1m · attempt 1\/3 · automatic/);
-  assert.match(providerText, /test result 59/, "provider waits also retain the transcript body row");
+  assert.doesNotMatch(providerText, /test result 59|WAIT_TRANSCRIPT|transcript|result yet/i, "provider waits retain only safe wait metadata until the agent settles");
 
   const questionRun = workflow("short-question");
   questionRun.agents[1]!.waitingOn = {
@@ -911,8 +1003,7 @@ test("short workflow agent inspectors pin recovery details above the transcript 
   assert.match(questionText, /Question · Which behavior should remain\?/);
   assert.match(questionText, /Route · tests → parent orchestrator/);
   assert.match(questionText, /Next · parent: subagent_answer; do not steer/);
-  assert.match(questionText, /transcript/);
-  assert.match(questionText, /test result 59/, "questions also retain the transcript body row");
+  assert.doesNotMatch(questionText, /test result 59|transcript|result yet/i, "questions retain only safe routing metadata until the agent settles");
 });
 
 test("workflow run preview stays pinned ahead of result rows and routine info is opt-in", (t) => {
