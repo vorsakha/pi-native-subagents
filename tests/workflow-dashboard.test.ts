@@ -591,7 +591,8 @@ function assertPrivateActiveAgentDataHidden(lines: string[], width: number, rows
   const rendered = lines.join("\n");
   assert.match(rendered, /Now · Reading tests\/検証\.ts/);
   assert.match(rendered, /Context · review · phase/);
-  assert.match(rendered, /Codex credits apply/);
+  assert.match(rendered, /requested fast/, "the Fast opt-in remains visible before optional billing detail truncates");
+  if (width >= 52) assert.match(rendered, /Codex credits apply/);
   assert.doesNotMatch(rendered, PRIVATE_ACTIVE_AGENT_DATA);
   assert.doesNotMatch(rendered, /outside\/workspace/);
   assert.doesNotMatch(rendered, /Prompt|Structured result|Transcript|Final result|\(no result yet\)/);
