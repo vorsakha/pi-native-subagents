@@ -625,6 +625,73 @@ test("a waiting agent renders distinctly from failed/queued, is excluded from th
   assert.ok(coloredAgentsLine.includes("[warning]1 waiting"), "waiting keeps an attention color distinct from failed/error");
 });
 
+test("a collapsed provider-wait card hides a stale run error", () => {
+  const staleError = "legacy token=sk-collapsed-secret at /outside/workspace/collapsed.log";
+  const waiting = workflow({
+    error: staleError,
+    agents: [agent({
+      name: "quota-check",
+      state: "waiting",
+      error: "legacy token=sk-agent-secret at /outside/workspace/provider.log",
+      providerWait: {
+        provider: "codex",
+        kind: "quota",
+        detail: "raw provider rejection",
+        retryAt: 66_000,
+        attempt: 1,
+        maxAttempts: 3,
+      },
+    })],
+  });
+
+  const rendered = buildWorkflowCardLines(waiting, theme, { expanded: false, now: 6_000 }).join("\n");
+  assert.match(rendered, /waiting for codex quota · retry in 1m · attempt 1\/3/);
+  assert.doesNotMatch(rendered, /sk-(?:collapsed|agent)-secret|outside\/workspace/);
+  assert.equal(waiting.error, staleError, "rendering does not discard private historical provenance");
+});
+
+test("an expanded provider-wait card hides a stale run error", () => {
+  const staleError = "legacy token=sk-expanded-secret at /outside/workspace/expanded.log";
+  const waiting = workflow({
+    error: staleError,
+    agents: [agent({
+      name: "quota-check",
+      state: "waiting",
+      error: "legacy token=sk-agent-secret at /outside/workspace/provider.log",
+      providerWait: {
+        provider: "claude",
+        kind: "quota",
+        detail: "raw provider rejection",
+        retryAt: 66_000,
+        attempt: 2,
+        maxAttempts: 4,
+      },
+    })],
+  });
+
+  const rendered = buildWorkflowCardLines(waiting, theme, { expanded: true, now: 6_000 }).join("\n");
+  assert.match(rendered, /waiting for claude quota · retry in 1m · attempt 2\/4/);
+  assert.doesNotMatch(rendered, /sk-(?:expanded|agent)-secret|outside\/workspace/);
+  assert.equal(waiting.error, staleError, "rendering does not discard private historical provenance");
+});
+
+test("terminal provider-wait exhaustion remains visible on workflow cards", () => {
+  const terminalError = "Provider wait exhausted (attempt 3/3) for codex quota.";
+  const exhausted = workflow({
+    status: "failed",
+    error: terminalError,
+    currentPhase: 0,
+    phases: [phase({ index: 0, name: "work", status: "failed", error: terminalError, agents: [0] })],
+    agents: [agent({ state: "failed", error: terminalError })],
+    timestamps: { createdAt: 1_000, startedAt: 2_000, updatedAt: 6_000, endedAt: 6_000 },
+  });
+
+  for (const expanded of [false, true]) {
+    const rendered = buildWorkflowCardLines(exhausted, theme, { expanded, now: 6_000 }).join("\n");
+    assert.match(rendered, /Provider wait exhausted \(attempt 3\/3\) for codex quota\./);
+  }
+});
+
 test("a used provider fallback renders as a route transition, never as provider waiting", () => {
   const snapshot = workflow({
     status: "completed",

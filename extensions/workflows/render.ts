@@ -651,7 +651,8 @@ export function buildWorkflowCardLines(
     lines.push(group(theme, "Usage", value));
   }
 
-  if (snapshot.error) {
+  const providerWaiting = snapshot.agents.some((agent) => agent.state === "waiting" && agent.providerWait);
+  if (snapshot.error && !providerWaiting) {
     const errorLines = sanitizeText(snapshot.error).split("\n").map(sanitizeInline).filter(Boolean);
     for (const error of errorLines.slice(0, options.expanded ? 3 : 1)) lines.push(theme.fg("error", error));
   }
