@@ -228,6 +228,75 @@ test("background workflow cards follow live state without periodic rerenders", a
   await pi.handlers.get("session_shutdown")?.();
 });
 
+test("inline workflow cards keep live activity through compact projection but discard replayed activity", async () => {
+  const backend = new ControlledBackend("pi");
+  const { pi } = await setup({ backends: [backend] });
+  const { ctx } = context({ hasUI: true });
+  pi.handlers.get("session_start")?.({}, ctx);
+  const result = await pi.tools.get("workflow").execute("wf-live-activity", {
+    name: "Live activity",
+    script: `export default async () => agent("inspect", { name: "inspection", access: "readOnly" })`,
+    background: true,
+  }, new AbortController().signal, undefined, ctx);
+  await backend.waitForStart();
+  backend.emit(backend.starts[0]!, {
+    type: "tool_start",
+    id: "read-live",
+    name: "Read",
+    args: { path: "src/live-policy.ts" },
+    at: Date.now(),
+  });
+
+  const liveCards: Array<{ expanded: boolean; lines: string }> = [];
+  let liveCompactSnapshot: typeof result.details.workflow | undefined;
+  for (const expanded of [false, true]) {
+    const renderContext = { args: {}, state: {}, invalidate() {} };
+    const lines = pi.tools.get("workflow").renderResult(
+      result,
+      { expanded, isPartial: false },
+      theme,
+      renderContext,
+    ).render(120).join("\n");
+    liveCards.push({ expanded, lines });
+    liveCompactSnapshot = structuredClone((renderContext.state as { nativeWorkflowSnapshot?: typeof result.details.workflow }).nativeWorkflowSnapshot);
+  }
+
+  const replayDetails = structuredClone(result);
+  assert.ok(liveCompactSnapshot?.agents[0], "live compact projection includes the active agent");
+  replayDetails.details.workflow = liveCompactSnapshot;
+  replayDetails.details.workflow.runId = `wf_${"f".repeat(24)}`;
+  replayDetails.details.workflow.agents[0]!.activity = {
+    kind: "tool",
+    at: Date.now(),
+    tool: "Read",
+    state: "running",
+    target: "REPLAYED_SECRET.ts",
+  };
+  const replayContext = { args: {}, state: {}, invalidate() {} };
+  const replayCards: Array<{ expanded: boolean; lines: string }> = [];
+  for (const expanded of [false, true]) {
+    const lines = pi.tools.get("workflow").renderResult(
+      replayDetails,
+      { expanded, isPartial: false },
+      theme,
+      replayContext,
+    ).render(120).join("\n");
+    replayCards.push({ expanded, lines });
+  }
+
+  backend.complete(backend.starts[0]!, "done");
+  await waitFor(() => pi.messages.length === 1, "live activity workflow delivery");
+  await pi.handlers.get("session_shutdown")?.();
+
+  assert.ok(result.details.workflow.agents.every((agent: { activity?: unknown }) => agent.activity === undefined), "durable tool details never receive live activity");
+  for (const { expanded, lines } of liveCards) {
+    assert.match(lines, /Reading src\/live-policy\.ts/, `${expanded ? "expanded" : "collapsed"} live card retains activity`);
+  }
+  for (const { expanded, lines } of replayCards) {
+    assert.doesNotMatch(lines, /REPLAYED_SECRET|Reading/, `${expanded ? "expanded" : "collapsed"} replay card drops stale activity`);
+  }
+});
+
 test("workflow tool resolves saved definitions and enforces one script source", async () => {
   const { pi, savedWorkflowRoot } = await setup();
   await writeFile(join(savedWorkflowRoot, "saved-review.js"), `export default async () => agent("saved " + args.subject, { access: "readOnly" });`);

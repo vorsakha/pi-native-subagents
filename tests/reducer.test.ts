@@ -132,6 +132,34 @@ test("reducer derives bounded private activity from event evidence", () => {
   });
   assert.deepEqual(command.activity, { kind: "tool", at: 6_500, tool: "bash", state: "running", target: undefined });
   assert.doesNotMatch(JSON.stringify(command.activity), /curl|password|example/);
+
+  for (const name of ["mcp__filesystem__read", "plugin.vault.write", "hook/read"]) {
+    let namespaced = reduceJob({ ...job(), cwd: "/workspace/project", status: "running" }, {
+      type: "tool_start",
+      id: name,
+      name,
+      args: { path: "secrets/private.txt", file_path: "secrets/private.txt", content: "credential" },
+      at: 6_600,
+    });
+    assert.deepEqual(namespaced.activity, { kind: "tool", at: 6_600, tool: name, state: "running", target: undefined });
+    namespaced = reduceJob(namespaced, {
+      type: "tool_end",
+      id: name,
+      name: "Read",
+      at: 6_650,
+    });
+    assert.deepEqual(namespaced.activity, { kind: "tool", at: 6_650, tool: name, state: "completed", target: undefined });
+  }
+
+  const credentialUrl = reduceJob({ ...job(), cwd: "/workspace/project", status: "running" }, {
+    type: "tool_start",
+    id: "url-read",
+    name: "Read",
+    args: { path: "https://user:password@example.test/private?token=sk-secret" },
+    at: 6_700,
+  });
+  assert.deepEqual(credentialUrl.activity, { kind: "tool", at: 6_700, tool: "Read", state: "running", target: undefined });
+  assert.doesNotMatch(JSON.stringify(credentialUrl.activity), /password|example|token|secret/);
   assert.equal(reduceJob(outside, { type: "completed", at: 7_000 }).activity, undefined);
 });
 

@@ -174,6 +174,8 @@ interface RunEntry {
   callControllers: Map<number, AbortController>;
   /** Shared, run-wide `retry.maxWaitMs` allowance. Synchronously decremented by every call (sequential or concurrent) so the total time spent waiting across the whole run never exceeds the configured budget. */
   providerWaitBudgetMs: number;
+  /** Provider failures held privately until fallback, wait, or terminal policy has settled. */
+  settlingProviderAgents: Set<number>;
   /** Interaction ordinal assigned to each routed question, keyed by host request ID. */
   interactionOrdinals: Map<string, number>;
 }
@@ -649,16 +651,14 @@ export class WorkflowManager {
 
   list(): WorkflowSnapshot[] {
     return [...this.#runs.values()]
-      .map((entry) => clone(entry.snapshot))
+      .map((entry) => this.#observerSnapshot(entry, false))
       .sort((left, right) => right.timestamps.createdAt - left.timestamps.createdAt);
   }
 
   check(runId: string): WorkflowSnapshot {
     const entry = this.#runs.get(runId);
     if (!entry) throw new Error(`Unknown workflow: ${runId}`);
-    const snapshot = clone(entry.snapshot);
-    snapshot.agents = snapshot.agents.map((agent) => this.#projectAgent(agent));
-    return snapshot;
+    return this.#observerSnapshot(entry, true);
   }
 
   subscribe(listener: (snapshot: WorkflowSnapshot) => void): () => void {
@@ -787,6 +787,7 @@ export class WorkflowManager {
       metadataReceived: false,
       providerWaits: new Map(),
       callControllers: new Map(),
+      settlingProviderAgents: new Set(),
       providerWaitBudgetMs: retry?.maxWaitMs ?? 0,
       interactionOrdinals: new Map(),
     };
@@ -836,6 +837,7 @@ export class WorkflowManager {
       metadataReceived: true,
       providerWaits: new Map(),
       callControllers: new Map(),
+      settlingProviderAgents: new Set(),
       providerWaitBudgetMs: snapshot.retry?.maxWaitMs ?? 0,
       interactionOrdinals: new Map(),
     };
@@ -1323,6 +1325,7 @@ export class WorkflowManager {
       record ??= entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
       if (result.ok || !record) break;
       if (attemptSignal.aborted) {
+        entry.settlingProviderAgents.delete(record.index);
         record.state = "cancelled";
         record.error = boundedText(attemptSignal.reason ?? "Workflow agent cancelled");
         record.timestamps.updatedAt = Date.now();
@@ -1350,9 +1353,15 @@ export class WorkflowManager {
         }
         // Declaring a fallback takes precedence over the run-wide provider wait
         // policy for this call, even when the failure is not fallback-eligible.
+        entry.settlingProviderAgents.delete(record.index);
+        this.#touch(entry);
         break;
       }
-      if (usedFallback) break;
+      if (usedFallback) {
+        entry.settlingProviderAgents.delete(record.index);
+        this.#touch(entry);
+        break;
+      }
       if ("fallback" in continuationDeclaration && continuationDeclaration.fallback) {
         const trigger = this.#planContinuation(record, result, continuationDeclaration.primary!, continuationDeclaration.fallback);
         if (trigger) {
@@ -1381,15 +1390,23 @@ export class WorkflowManager {
         // A declared continuation route owns this call's recovery policy. It
         // never falls through to the run-wide same-provider wait policy,
         // whether the failed turn progressed or was rejected pre-inference.
+        entry.settlingProviderAgents.delete(record.index);
+        this.#touch(entry);
         break;
       }
-      if (!policy || policy.providerUnavailable !== "wait") break;
+      if (!policy || policy.providerUnavailable !== "wait") {
+        entry.settlingProviderAgents.delete(record.index);
+        this.#touch(entry);
+        break;
+      }
       // `entry.providerWaitBudgetMs` is a run-wide allowance shared by every logical
       // call, including concurrent ones from `parallel()`. Reading and decrementing
       // it here happens synchronously (no `await` in between), so concurrent calls
       // never see a stale or double-spent balance.
       const decision = this.#planProviderWait(record, result, policy, attempt, entry.providerWaitBudgetMs);
       if (!decision.wait) {
+        this.#clearProviderAttemptDisplay(record);
+        entry.settlingProviderAgents.delete(record.index);
         record.state = "failed";
         record.providerWait = undefined;
         record.error = boundedText(decision.reason);
@@ -1420,6 +1437,7 @@ export class WorkflowManager {
         // both to leave a clean terminal record and because "waiting" is not
         // a valid persisted route status.
         record.state = "cancelled";
+        entry.settlingProviderAgents.delete(record.index);
         record.providerWait = undefined;
         record.error = boundedText(error);
         record.timestamps.updatedAt = Date.now();
@@ -1825,6 +1843,7 @@ export class WorkflowManager {
         trigger: retry.trigger ? { ...retry.trigger } : undefined,
       } satisfies WorkflowAgentAttempt);
       if (attempts.length > 4) attempts.splice(0, attempts.length - 4);
+      entry.settlingProviderAgents.delete(record.index);
       // record.usage already includes every prior attempt (see above), so the new
       // baseline for the next attempt IS record.usage, not retryUsage + record.usage
       // — adding retryUsage again would double-count every attempt before this one.
@@ -2121,7 +2140,8 @@ export class WorkflowManager {
       }
       record.timestamps.updatedAt = Date.now();
       record.timestamps.endedAt = record.timestamps.updatedAt;
-      this.#touch(entry);
+      if (fallbackTrigger) entry.settlingProviderAgents.add(record.index);
+      else this.#touch(entry);
       return { ok: false, output: "", error: record.error, fallbackTrigger };
     }
 
@@ -3563,6 +3583,8 @@ export class WorkflowManager {
     attempt: number,
     maxAttempts: number,
   ): void {
+    this.#clearProviderAttemptDisplay(record);
+    entry.settlingProviderAgents.delete(record.index);
     record.state = "waiting";
     // The failed native attempt's raw detail remains private to the job/session.
     // Once the logical call is waiting, its raw error is no longer the current
@@ -3579,6 +3601,20 @@ export class WorkflowManager {
     };
     record.timestamps.updatedAt = Date.now();
     this.#touch(entry);
+  }
+
+  #clearProviderAttemptDisplay(record: WorkflowAgentRecord): void {
+    record.preview = undefined;
+    record.output = undefined;
+    record.transcript = undefined;
+    record.tools = [];
+    record.liveThinking = undefined;
+    record.activity = undefined;
+    record.context = undefined;
+    record.structured = undefined;
+    record.truncated = undefined;
+    record.outputProvenance = undefined;
+    record.instructionShaped = undefined;
   }
 
   async #withMutationLock<T>(cwd: string, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
@@ -3679,6 +3715,47 @@ export class WorkflowManager {
     };
   }
 
+  #observerSnapshot(entry: RunEntry, projectLive: boolean): WorkflowSnapshot {
+    const snapshot = clone(entry.snapshot);
+    snapshot.agents = snapshot.agents.map((agent) => {
+      if (!entry.settlingProviderAgents.has(agent.index)) {
+        return projectLive ? this.#projectAgent(agent) : agent;
+      }
+      const generation = agent.generations?.at(-1);
+      return {
+        ...agent,
+        state: "running",
+        preview: undefined,
+        output: undefined,
+        transcript: undefined,
+        tools: [],
+        liveThinking: undefined,
+        activity: undefined,
+        context: undefined,
+        structured: undefined,
+        truncated: undefined,
+        error: undefined,
+        providerWait: undefined,
+        outputProvenance: undefined,
+        instructionShaped: undefined,
+        timestamps: { ...agent.timestamps, endedAt: undefined },
+        generations: generation
+          ? agent.generations?.map((candidate, index) => index === agent.generations!.length - 1
+            ? {
+                ...candidate,
+                state: "running",
+                error: undefined,
+                output: undefined,
+                outputProvenance: undefined,
+                timestamps: { ...candidate.timestamps, endedAt: undefined },
+              }
+            : candidate)
+          : agent.generations,
+      };
+    });
+    return snapshot;
+  }
+
   #updateAgentFromJob(job: JobSnapshot, event: BackendEvent = { type: "started" }): void {
     if (event.type === "interaction" || event.type === "interaction_cleared" || event.type === "interaction_answering") {
       this.#applyInteractionEvent(job, event);
@@ -3689,6 +3766,8 @@ export class WorkflowManager {
     const entry = this.#runs.get(owner.runId);
     const agent = entry?.snapshot.agents[owner.agentIndex];
     if (!entry || !agent) return;
+    const stagingProviderFailure = job.status === "failed" && job.unavailable !== undefined;
+    if (stagingProviderFailure) entry.settlingProviderAgents.add(agent.index);
 
     // Publish bounded semantic streaming state without cloning transcripts or
     // scheduling durable checkpoints for each provider token.
@@ -3756,6 +3835,7 @@ export class WorkflowManager {
         generation.outputProvenance = "subagent";
       }
     }
+    if (stagingProviderFailure) return;
     this.#touch(entry);
     this.#recordBudgetWarnings(entry);
   }
@@ -4026,7 +4106,7 @@ export class WorkflowManager {
   }
 
   #publish(entry: RunEntry): void {
-    const snapshot = clone(entry.snapshot);
+    const snapshot = this.#observerSnapshot(entry, false);
     for (const listener of this.#listeners) {
       try { listener(snapshot); } catch { /* observers cannot corrupt lifecycle state */ }
     }

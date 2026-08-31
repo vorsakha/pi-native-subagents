@@ -3769,6 +3769,8 @@ test("provider-wait transition clears raw attempt errors and exhaustion persists
   const { clock, advance } = fakeProviderWaitClock();
   const f = await fixture(4, undefined, undefined, clock);
   const marker = /sk-(?:first|second)-secret|\/outside\/workspace/;
+  const publications: WorkflowSnapshot[] = [];
+  const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
   try {
     const script = `export default async () => agent("quota check");`;
     const started = await f.workflows.start(f.request(
@@ -3776,11 +3778,23 @@ test("provider-wait transition clears raw attempt errors and exhaustion persists
       { retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 1 } },
     ));
     await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    const firstFailurePublication = publications.length;
     f.backend.fail(
       f.backend.starts[0]!,
       "quota rejected token=sk-first-secret at /outside/workspace/first.log",
       fakeQuota(clock.now() + 60_000),
     );
+    for (const snapshot of [
+      f.workflows.check(started.snapshot.runId),
+      f.workflows.list().find((candidate) => candidate.runId === started.snapshot.runId)!,
+      ...publications.slice(firstFailurePublication),
+    ]) {
+      assert.doesNotMatch(JSON.stringify(snapshot), marker);
+      assert.equal(snapshot.agents[0]?.error, undefined);
+      assert.equal(snapshot.agents[0]?.output, undefined);
+      assert.equal(snapshot.agents[0]?.transcript, undefined);
+      assert.deepEqual(snapshot.agents[0]?.tools, []);
+    }
     await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "provider wait");
 
     const waiting = f.workflows.check(started.snapshot.runId);
@@ -3809,12 +3823,19 @@ test("provider-wait transition clears raw attempt errors and exhaustion persists
 
     advance(60_000);
     await waitFor(() => f.backend.requests.length === 2, "provider retry");
+    const exhaustionPublication = publications.length;
     f.backend.fail(
       f.backend.starts[1]!,
       "quota rejected token=sk-second-secret at /outside/workspace/second.log",
       fakeQuota(clock.now() + 60_000),
     );
     const final = await started.completion;
+    for (const snapshot of publications.slice(exhaustionPublication)) {
+      assert.doesNotMatch(JSON.stringify(snapshot), marker, "no subscriber publication exposes the rejected provider attempt");
+      assert.equal(snapshot.agents[0]?.output, undefined);
+      assert.equal(snapshot.agents[0]?.transcript, undefined);
+      assert.deepEqual(snapshot.agents[0]?.tools, []);
+    }
     const result = final.result as { ok: boolean; error?: string };
     assert.equal(result.ok, false);
     assert.match(result.error ?? "", /provider wait exhausted \(attempt 1\/1\)/i);
@@ -3847,6 +3868,7 @@ test("provider-wait transition clears raw attempt errors and exhaustion persists
     assert.equal((replayed.result as { ok?: boolean }).ok, true);
     assert.doesNotMatch(JSON.stringify(replayed), marker);
   } finally {
+    unsubscribe();
     await f.cleanup();
   }
 });

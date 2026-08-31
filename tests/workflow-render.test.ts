@@ -206,6 +206,10 @@ test("workflow activity wording and context stay deterministic and private", () 
   assert.equal(formatAgentActivity({ kind: "tool", at: 3_000, tool: "Read", state: "completed", target: "src/private.ts" }, 6_000), "Working · last action finished 3s ago");
   assert.equal(formatAgentActivity({ kind: "tool", at: 3_000, tool: "read", state: "failed", target: "src/private.ts" }, 6_000), "Working after read failed 3s ago");
   assert.equal(formatAgentActivity({ kind: "tool", at: 5_000, tool: "bash", state: "running" }, 6_000), "Using bash · started 1s ago");
+  assert.equal(
+    formatAgentActivity({ kind: "tool", at: 5_000, tool: "mcp__filesystem__read", state: "running" }, 6_000),
+    "Using mcp__filesystem__read · started 1s ago",
+  );
 
   const run = workflow();
   const active = run.agents[1]!;

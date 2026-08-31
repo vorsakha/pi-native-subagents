@@ -8,7 +8,7 @@ function age(at: number, now: number): string {
 }
 
 function toolVerb(tool: string): string {
-  const kind = tool.toLowerCase().split(/[^a-z]+/).filter(Boolean).at(-1);
+  const kind = tool.toLowerCase();
   switch (kind) {
     case "read": return "Reading";
     case "write": return "Writing";

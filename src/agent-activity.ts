@@ -20,7 +20,7 @@ function clean(value: string, limit: number): string {
 }
 
 function toolKind(name: string): keyof typeof PATH_FIELDS | undefined {
-  const normalized = name.toLowerCase().split(/[^a-z]+/).filter(Boolean).at(-1);
+  const normalized = name.toLowerCase();
   return normalized && normalized in PATH_FIELDS ? normalized as keyof typeof PATH_FIELDS : undefined;
 }
 
@@ -31,6 +31,10 @@ function safeTarget(job: JobSnapshot, event: Extract<BackendEvent, { type: "tool
     .map((field) => event.args?.[field])
     .find((value): value is string => typeof value === "string" && value.trim().length > 0);
   if (!candidate) return undefined;
+  // Filesystem tools occasionally receive URI-shaped input from plugins or
+  // provider mistakes. Never reinterpret a credential-bearing URL as a local
+  // path and expose it through the bounded activity projection.
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(candidate.trim())) return undefined;
 
   const root = resolve(job.cwd);
   const absolute = isAbsolute(candidate) ? resolve(candidate) : resolve(root, candidate);
@@ -63,13 +67,14 @@ export function activityFromEvent(job: JobSnapshot, event: BackendEvent, now = D
     case "tool_end": {
       const active = job.activity?.kind === "tool" ? job.activity : undefined;
       const trace = [...job.tools].reverse().find((tool) => tool.id === event.id);
-      const target = trace?.args && (event.name ?? trace.name)
-        ? safeTarget(job, { type: "tool_start", id: event.id, name: event.name ?? trace.name, args: trace.args })
+      const tool = trace?.name ?? event.name ?? active?.tool ?? "tool";
+      const target = trace?.args
+        ? safeTarget(job, { type: "tool_start", id: event.id, name: trace.name, args: trace.args })
         : active?.target;
       return {
         kind: "tool",
         at,
-        tool: clean(event.name ?? trace?.name ?? active?.tool ?? "tool", MAX_TOOL_CHARS) || "tool",
+        tool: clean(tool, MAX_TOOL_CHARS) || "tool",
         state: event.error === true || event.result?.isError === true ? "failed" : "completed",
         target,
       };
