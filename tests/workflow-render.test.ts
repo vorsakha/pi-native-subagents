@@ -227,6 +227,49 @@ test("workflow activity wording and context stay deterministic and private", () 
   assert.doesNotMatch(rendered, /SECRET_THOUGHT|SECRET_PREVIEW|SECRET_COMMAND|SECRET_FINDING_PROMPT/);
 });
 
+function workflowWithPrivateLiveProviderState(): WorkflowSnapshot {
+  const run = workflow();
+  const active = run.agents[1]!;
+  active.liveThinking = "PRIVATE_LIVE_THINKING_MARKER";
+  active.preview = "PRIVATE_RESPONSE_PREVIEW_MARKER";
+  active.output = "PRIVATE_OUTPUT_IN_PROGRESS_MARKER";
+  active.tools = [{
+    id: "shell",
+    name: "bash",
+    args: { command: "PRIVATE_COMMAND_MARKER" },
+    summary: "PRIVATE_TOOL_SUMMARY_MARKER",
+    status: "running",
+  }];
+  active.transcript = [
+    { kind: "assistant", text: "PRIVATE_TRANSCRIPT_EXCERPT_MARKER" },
+  ];
+  active.activity = { kind: "tool", at: 5_000, tool: "read", state: "running", target: "tests/privacy.test.ts" };
+  return run;
+}
+
+const PRIVATE_LIVE_PROVIDER_MARKERS =
+  /PRIVATE_LIVE_THINKING_MARKER|PRIVATE_RESPONSE_PREVIEW_MARKER|PRIVATE_OUTPUT_IN_PROGRESS_MARKER|PRIVATE_COMMAND_MARKER|PRIVATE_TOOL_SUMMARY_MARKER|PRIVATE_TRANSCRIPT_EXCERPT_MARKER/;
+
+test("collapsed running workflow cards expose semantic activity without live provider text", () => {
+  const rendered = buildWorkflowCardLines(workflowWithPrivateLiveProviderState(), theme, {
+    expanded: false,
+    now: 6_000,
+  }).join("\n");
+
+  assert.match(rendered, /Reading tests\/privacy\.test\.ts · started 1s ago/);
+  assert.doesNotMatch(rendered, PRIVATE_LIVE_PROVIDER_MARKERS);
+});
+
+test("expanded running workflow cards expose semantic activity without live provider text", () => {
+  const rendered = buildWorkflowCardLines(workflowWithPrivateLiveProviderState(), theme, {
+    expanded: true,
+    now: 6_000,
+  }).join("\n");
+
+  assert.match(rendered, /Reading tests\/privacy\.test\.ts · started 1s ago/);
+  assert.doesNotMatch(rendered, PRIVATE_LIVE_PROVIDER_MARKERS);
+});
+
 test("workflow cards enforce one budget, sanitization, and dashboard-pointer contract", () => {
   const huge = workflow({
     status: "failed",

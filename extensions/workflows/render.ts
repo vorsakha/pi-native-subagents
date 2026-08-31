@@ -550,14 +550,6 @@ function agentRow(agent: WorkflowAgentRecord, theme: Theme, now: number): string
   return `${GROUP_INDENT}${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", `${agent.access}${profile}${independent} · ${agent.state}${route} · effort ${agent.effort ?? "adaptive"}${isolation}${warning}`)}`;
 }
 
-/** Live preview of the currently active agent, rendered as an indented `↳` continuation. */
-function agentPreviewLines(snapshot: WorkflowSnapshot, theme: Theme): string[] {
-  const agent = focusedAgent(snapshot);
-  if (!agent || (agent.state !== "running" && agent.state !== "queued")) return [];
-  if (typeof agent.preview !== "string" || !agent.preview) return [];
-  return previewLines(agent.preview, 2, true).map((line) => `${GROUP_INDENT}${theme.fg("dim", "↳")} ${theme.fg("toolOutput", line)}`);
-}
-
 function clampContent(theme: Theme, lines: string[], budget: number): string[] {
   if (lines.length <= budget) return lines;
   const kept = lines.slice(0, Math.max(0, budget - 1));
@@ -611,7 +603,7 @@ export function buildWorkflowCardLines(
     lines.push(group(theme, "Rounds", `${theme.fg(meta.color, meta.glyph)} ${theme.fg(isAttentionStatus(meta.color) ? meta.color : "muted", formatWorkflowConvergence(snapshot.convergence, options.expanded ? 200 : 80))}`));
   }
 
-  // Agents: collapsed is always a rollup of counts; roster rows and the live preview expand only.
+  // Agents: collapsed is always a rollup of counts; roster rows expand only.
   const needInput = workflowNeedsInput(snapshot);
   lines.push(group(theme, "Agents", agentRollupValue(snapshot, theme)
     + (needInput ? theme.fg("warning", ` · ? ${needInput} need input`) : "")));
@@ -620,7 +612,6 @@ export function buildWorkflowCardLines(
     const hiddenBefore = snapshot.agents.length - roster.length;
     if (hiddenBefore > 0) lines.push(`${GROUP_INDENT}${theme.fg("muted", `⋯ ${hiddenBefore} earlier agent${hiddenBefore === 1 ? "" : "s"}`)}`);
     for (const agent of roster) lines.push(agentRow(agent, theme, options.now));
-    for (const line of agentPreviewLines(snapshot, theme)) lines.push(line);
   }
 
   if (options.expanded && snapshot.logs?.length) {
