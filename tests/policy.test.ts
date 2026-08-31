@@ -107,7 +107,7 @@ test("compilePolicy's read-only/full base piTools sets never contain a delegatio
 });
 
 test("full human Pi jobs inherit permitted parent tools while read-only and non-human jobs do not", () => {
-  const inventory = ["mcp", "browser", "subagent_spawn", "workflow", "ask_user"];
+  const inventory = ["mcp", "browser", "subagent_spawn", "workflow", "advisor_consult", "ask_user"];
   const fullHuman = compilePolicy(request({
     harness: "pi",
     access: "full",

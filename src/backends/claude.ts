@@ -385,6 +385,9 @@ export class ClaudeBackend implements Backend {
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     request.signal.throwIfAborted();
+    if (request.continuation && request.continuation.harness !== "claude") {
+      throw new Error(`Claude cannot resume a ${request.continuation.harness} continuation`);
+    }
     const env = sanitizeSubscriptionEnv(request.env, "claude");
     await this.#verifyAuth(this.#command, request.cwd, env, request.signal);
     request.signal.throwIfAborted();
@@ -505,6 +508,7 @@ export class ClaudeBackend implements Backend {
         env: { ...env, CLAUDE_AGENT_SDK_CLIENT_APP: "pi-native-subagents/0.1.0" },
         pathToClaudeCodeExecutable: this.#command,
         ...(request.policy.model ? { model: request.policy.model } : {}),
+        ...(request.continuation?.harness === "claude" ? { resume: request.continuation.sessionId } : {}),
         ...(request.policy.effort ? { effort: request.policy.effort } : {}),
         thinking: request.policy.thinking === "off" ? { type: "disabled" } : { type: "adaptive" },
         systemPrompt: { type: "preset", preset: "claude_code", append: request.systemPrompt },
@@ -553,7 +557,16 @@ export class ClaudeBackend implements Backend {
       try {
         for await (const message of stream) {
           watchdog.touch();
-          const result = handleMessage(message, emit, controller, request.policy.access === "readOnly", hostTools, telemetry, structuredRequested);
+          const result = handleMessage(
+            message,
+            emit,
+            controller,
+            request.policy.access === "readOnly",
+            hostTools,
+            telemetry,
+            structuredRequested,
+            request.continuation?.harness === "claude" ? request.continuation.sessionId : undefined,
+          );
           if (!result) continue;
           resultCount++;
           if (queuedMessages.length) {
@@ -726,6 +739,7 @@ function handleMessage(
   hostTools: string[],
   telemetry: ClaudeTelemetry,
   structuredRequested = false,
+  expectedSessionId?: string,
 ): ClaudeResult | undefined {
   if (message.type === "rate_limit_event") {
     telemetry.rateLimit = message.rate_limit_info;
@@ -737,6 +751,10 @@ function handleMessage(
       emit({ type: "failed", error: "Claude subscription OAuth required; CLI reported a non-subscription auth source" });
       controller.abort();
       return { success: false, output: "", error: "Claude subscription OAuth required" };
+    }
+    if (expectedSessionId !== undefined && message.session_id !== expectedSessionId) {
+      controller.abort();
+      return { success: false, output: "", error: "Claude resumed a different native session identity" };
     }
     const forbidden = forbiddenInitTools(message.tools, readOnly, hostTools);
     if (forbidden.length > 0) {

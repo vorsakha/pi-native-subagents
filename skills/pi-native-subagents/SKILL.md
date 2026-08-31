@@ -1,6 +1,6 @@
 ---
 name: pi-native-subagents
-description: Use when invoking the Pi Native Subagents extension or writing a sandboxed workflow. Covers direct native subagent spawning, capability requirements, provider independence, workflow script shape, deferred parallel tasks, budgets, isolation, replay, and failure recovery.
+description: Use when invoking Pi Native Subagents, thread advisors, or sandboxed workflows. Covers spawning, retained consultation, routing, workflow shape, budgets, isolation, replay, and recovery.
 ---
 
 # Pi Native Subagents
@@ -16,6 +16,7 @@ Paths are relative to this file. Read the reference **before** you write the cal
 | write or edit a workflow script, call a saved `workflowName`, declare `meta.phases`, call `followUp()`, or set `approval`/`background`/`pipeline` | `references/workflow-authoring.md` |
 | call `converge()` | `references/convergence.md` |
 | opt into cross-provider continuation after progressed native failure | `references/progressed-continuation.md` |
+| open, consult, reset, close, or workflow-authorize a thread advisor | `references/advisors.md` |
 | let a child use `subagent_ask`, or answer with `subagent_answer` | `references/routed-questions.md` |
 | set `speed`, spend limits, replay, provider fallback, or retry | `references/budgets-replay-and-provider-waits.md` |
 | use `isolation: "worktree"`, or run `/workflows reclaim` | `references/worktrees-and-retention.md` |
@@ -25,6 +26,7 @@ Paths are relative to this file. Read the reference **before** you write the cal
 
 - Use `subagent_spawn` for one job or a small independent fan-out. Use `subagent_wait`, `subagent_check`, `subagent_send`, and `subagent_cancel` with the returned job ID when the parent must manage the jobs explicitly.
 - Use `workflow` for phases, bounded parallelism, pipelines, structured fan-in, saved definitions, background execution, replay, or durable progress. Do not wrap a simple two-agent review in a workflow only to run two calls.
+- Use `advisor_open` for a named read-only specialist retained across this thread. Opening costs no turn; advisors advise, agents execute.
 - Use `subagent_capabilities` before setting `requires`. Capability IDs are live values; never invent them.
 - A child cannot delegate again. Do not ask a child to call subagent or workflow tools. It may have only one outstanding bounded routed question at a time.
 
@@ -34,7 +36,7 @@ Give every child a self-contained task with paths, constraints, result format, a
 
 Usage rules:
 
-- Use `access: "readOnly"` for inspection, review, and planning. Request `full` only when mutation is required and the project is trusted. Read-only children are sandboxed by construction, not by instruction.
+- Use `access: "readOnly"` for inspection, review, and planning. Request `full` only when mutation is required and the project is trusted.
 - Omit `model` unless a concrete harness-local override is needed. A model name is not a cross-harness tier, and `harness: "auto"` rejects harness-local model overrides.
 - Omit `speed` for standard policy. Use `speed: "fast"` only on an explicit Codex route when the human opts in. Fast stays fixed, uses Codex credits, and has no reported monetary cost. Never infer it from model, effort, or profile metadata.
 - `harness: "auto"` selects an initial ready route; it is not failover. Explicit routes fail closed except for the workflow opt-ins below. Availability checks are read-only and never install, log in, or reconfigure providers.
@@ -70,24 +72,13 @@ Read `references/workflow-authoring.md` before writing a script. The essentials:
 
 The `workflow` tool accepts exactly one source — `script` (inline JavaScript), `workflowName` (a saved definition), or `scriptPath` (a trusted project-local script) — and zero or one input form, either structured `input` or the legacy JSON-string `args`, never both. The selected value reaches the script as the global `args`; omitting both exposes `null`.
 
-A workflow script must export a default async function and use the injected globals: `args`, `phase()`, `log()`, `agent()`, `followUp()`, `parallel()`, `pipeline()`, `converge()`, and `convergenceReviewSchema`. Do not write it as if it receives a context object such as `async ({ phase, agent }) => ...`.
+A workflow script must export a default async function and use the injected globals: `args`, `phase()`, `log()`, `agent()`, `followUp()`, `consult()`, `parallel()`, `pipeline()`, `converge()`, and `convergenceReviewSchema`. Do not write it as if it receives a context object.
 
 Pick the right call before you write it. Use `agent(prompt, options)` for new work. Use `followUp(jobId, prompt)` with a `jobId` from this run's completed `agent()` call to return to that child's retained session. Use `converge()` when findings should drive bounded fix rounds.
 
-A fresh workflow call may declare one opposite native fallback:
+A fresh workflow `agent()` may set `providerFallback: { harness, model? }` between opposite explicit Claude/Codex routes. After dispatch it requires `readOnly`, authoritative pre-inference proof, and zero usage. A pre-dispatch missing, unauthenticated, or incompatible primary may fall back under either access. The target must freshly be ready. It never covers `followUp()`, ordinary failure, cancellation, worktrees, or another fallback, and overrides provider waiting. Read the budget reference first.
 
-```js
-agent("task", {
-  harness: "claude",
-  access: "readOnly",
-  model: "exact-primary-model",
-  providerFallback: { harness: "codex", model: "exact-fallback-model" },
-});
-```
-
-The primary must explicitly name Claude or Codex and the fallback must name the other. After dispatch this requires `readOnly`, authoritative pre-inference proof, and zero usage; full-access rejection stays terminal. Pre-dispatch missing, unauthenticated, or incompatible readiness may fall back under either access. The target must freshly be ready. Fallback never applies to `followUp()`, ordinary failures, cancellation, worktrees, or a failed fallback, and overrides provider waiting. Read the budget reference first.
-
-A progressed native call needs a different explicit opt-in:
+Progressed failure requires a different explicit opt-in:
 
 ```js
 agent("task", {
@@ -149,11 +140,11 @@ Use `parallel` when the next step needs the complete result set. Use `pipeline` 
 
 ## Result semantics
 
-Every `agent()`/`followUp()` call resolves to `{ ok, output, structured?, jobId?, error?, usage? }`.
+Every `agent()`/`followUp()` call resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. `consult()` adds advisor identity, lineage/generation, route, and queue delay.
 
 `output` is always a string of the child's narrative text. On the portable structured path it may be JSON text, but never parse it yourself.
 
-When a call is schema-constrained, supported runtimes may use native structured output and others use the portable JSON fallback. Both paths apply the same schema validation, fail clearly on invalid or missing results, and preserve transport metadata through persistence and replay. This is the same caller-facing contract regardless of which transport was actually selected.
+When a call is schema-constrained, supported runtimes may use native structured output and others use the portable JSON fallback. Both paths apply the same schema validation, fail clearly on invalid or missing results, and preserve transport metadata through persistence and replay.
 
 `structured` is the authoritative schema data: it is present when the call succeeded under an effective schema, and it is the already-validated value, ready to use directly. A `followUp()` on a native schema-bound lineage inherits the original `agent()` schema and can return `structured` even when that `followUp()` omitted `schema`. A missing or schema-invalid result is reported as `ok: false` with `structured` left `undefined`, never as a success with narrative-only output. Consume it like this:
 
@@ -171,15 +162,15 @@ Check every returned result's `ok` field and preserve bounded error details in t
 
 These are enforced by the runtime. Do not design around them.
 
-- **No nested delegation.** Children never receive subagent or workflow capabilities, and cannot answer interactive approvals, escalate permissions, or administer plugins and MCP.
-- **Trusted project and cwd containment.** Execution requires a trusted project, and child working directories must stay inside it. Workflow sources must be contained by the same rules.
+- **No nested delegation.** Children never receive subagent, advisor, or workflow capabilities, and cannot answer interactive approvals, escalate permissions, or administer plugins and MCP.
+- **Trusted project and cwd containment.** Execution requires a trusted project, and child working directories must stay inside it. Every advisor read, lifecycle control, and consultation rechecks trust; consultations also recheck stable realpath cwd identity before dispatch. Workflow sources must be contained by the same rules.
 - **Deny-by-construction read-only.** A read-only child is sandboxed by the native runtime, not asked to behave.
 - **Deterministic sandbox.** Workflow code has no imports, filesystem, network, environment variables, subprocesses, credentials, `require`, or `process`. `Date.now()`, zero-argument `new Date()`, and `Math.random()` all throw. Results, metadata, requests, logs, phases, source, and arguments are bounded and must be JSON-serializable.
-- **Bounded run shape.** At most 32 agent calls per run (`agent()` and `followUp()` share the budget), at most four concurrent workers, and at most four concurrent jobs globally. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
+- **Bounded run shape.** At most 32 workflow calls per run (`agent()`, `followUp()`, and `consult()` share the budget), at most four concurrent workers, and at most four active native turns globally. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
 - **Routed questions fail closed.** One may be open per generation; a second is refused. Peer replay requires durable acceptance after caller settlement.
 - **Provider independence is provider diversity.** `independent`/`independentOf` select a different native provider, never a bigger model on the same one.
 - **Worktree isolation is one-shot and can destroy work.** A finalized worktree can never be continued by `followUp()`, answer a peer question, or be used inside `converge()`. Read `references/worktrees-and-retention.md` before reclaiming or `--force`-discarding any worktree: it may hold the only copy of a child's changed work.
-- **Retained sessions are policy-fixed.** Harness, model, effort, speed, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original call; a follow-up may only change `phase` and `schema`.
+- **Retained sessions are policy-fixed.** Harness, model, effort, speed, access, cwd, trust, profile behavior, capability route, and nesting policy are fixed at the original call; a follow-up may only change `phase` and `schema`.
 - **Privacy.** Keep private transcripts, artifacts, credentials, and machine-local runtime state out of Git and out of ordinary model-facing results. Durable artifacts are for bounded inspection, not for copying into prompts wholesale.
 
 ## Common failures and corrections
@@ -195,6 +186,7 @@ These are enforced by the runtime. Do not design around them.
 - A clean mid-turn Codex app-server exit is a lifecycle failure, not proof a required capability is unsupported. Retry before dropping the requirement.
 - A harness rejected for login or readiness: the error names the normalized state (missing executable, login required, incompatible, temporarily unhealthy, or status unknown). Check `/subagents providers` for the active set and each harness's actionable reason, then switch routes or use `harness: "auto"` rather than guessing at the account state. The extension never logs in or installs a CLI for you.
 - A workflow or child fails: inspect the returned `ok`, `error`, route, and job ID; use `/workflows` for durable workflow state. Do not hide a failed route behind a success-only summary.
+- An advisor is unavailable, reset, queued, or budget-blocked: follow `references/advisors.md`; never substitute another specialist.
 - `/workflows` pins live-only `Now` and workflow `Context`. It uses bounded event evidence, never thoughts, response text, raw commands/results, credentials, or absolute paths. An active provider wait exposes only structured provider, window, retry, and attempt data; raw attempt errors stay private. Questions, failures, peer answers, provider waits, and queueing outrank routine activity. Replay never restores `Now`. Use `?` for navigation and `i` for telemetry.
 - A provider-quota, replay, worktree, or routed-question error: the matching reference above lists the exact message and its recovery.
 

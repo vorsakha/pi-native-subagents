@@ -5,7 +5,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ClaudeBackend, CLAUDE_SUBAGENT_ASK_TOOL, forbiddenInitTools } from "../src/backends/claude.ts";
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
-import { CodexAppServerBackend, classifyCodexUnavailability, codexExitDiagnostic } from "../src/backends/codex.ts";
+import { CodexAppServerBackend, classifyCodexUnavailability, codexExitDiagnostic, codexThreadConfig } from "../src/backends/codex.ts";
 import { MAX_OUTPUT_BYTES } from "../src/reducer.ts";
 import type { BackendEvent, BackendRun, HarnessName, BackendRequest } from "../src/types.ts";
 import {
@@ -17,6 +17,8 @@ import { askThroughInteractionBridge, openInteractionBridge } from "../src/inter
 
 const PI_FIXTURE = `#!/usr/bin/env node
 import fs from "node:fs";
+const sessionAt = process.argv.indexOf("--session");
+const resumedSession = sessionAt >= 0 ? process.argv[sessionAt + 1] : undefined;
 if (process.env.ARG_FILE) fs.writeFileSync(process.env.ARG_FILE, JSON.stringify(process.argv.slice(2)));
 if (process.env.ENV_FILE) fs.writeFileSync(process.env.ENV_FILE, JSON.stringify({
   openai: process.env.OPENAI_API_KEY,
@@ -40,7 +42,7 @@ process.stdin.on("data", chunk => {
     if (process.env.MODE === "hang") continue;
     if (value.id) {
       let data;
-      if (value.type === "get_state") data = { model: { provider: "fixture", id: "fixture-model" } };
+      if (value.type === "get_state") data = { model: { provider: "fixture", id: "fixture-model" }, sessionFile: process.env.PI_SESSION_FILE || resumedSession || "/sessions/pi-fixture.jsonl", sessionId: "pi-fixture" };
       if (value.type === "get_available_models") data = { models: process.env.MODE === "unauthenticated" ? [] : [{ provider: "fixture", id: "fixture-model" }] };
       if (value.type === "get_commands") data = { commands: [{ name: "review", source: "skill" }] };
       process.stdout.write(JSON.stringify({ type: "response", id: value.id, command: value.type, success: true, data }) + "\\n");
@@ -125,6 +127,10 @@ process.stdin.on("data", chunk => {
       if (process.env.THREAD_PARAM_FILE) fs.writeFileSync(process.env.THREAD_PARAM_FILE, JSON.stringify(value.params));
       reply(value.id, { modelProvider: "openai", ...(process.env.THREAD_MODEL ? { model: process.env.THREAD_MODEL } : {}), ...(process.env.THREAD_SERVICE_TIER ? { serviceTier: process.env.THREAD_SERVICE_TIER } : {}), thread: { id: "thread-1", modelProvider: process.env.THREAD_PROVIDER || "openai" } });
     }
+    else if (value.method === "thread/resume") {
+      if (process.env.THREAD_PARAM_FILE) fs.writeFileSync(process.env.THREAD_PARAM_FILE, JSON.stringify(value.params));
+      reply(value.id, { thread: { id: process.env.RESUME_THREAD_ID || value.params.threadId } });
+    }
     else if (value.method === "turn/start") {
       if (process.env.PARAM_FILE) fs.appendFileSync(process.env.PARAM_FILE, JSON.stringify(value.params) + "\\n");
       if (process.env.STDERR_TEXT) process.stderr.write(process.env.STDERR_TEXT);
@@ -150,6 +156,13 @@ process.stdin.on("data", chunk => {
         } };
         process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params }) + "\\n");
         process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params }) + "\\n");
+      }
+      if (process.env.MODE === "resume-usage") {
+        process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: id, tokenUsage: {
+          total: { inputTokens: 925, outputTokens: 230, cachedInputTokens: 325, cacheWriteInputTokens: 50 },
+          last: { inputTokens: 75, outputTokens: 30, cachedInputTokens: 25, cacheWriteInputTokens: 0, totalTokens: 105 },
+          modelContextWindow: 200000,
+        } } }) + "\\n");
       }
       if (process.env.MODE === "latest-turn") {
         process.stdout.write(JSON.stringify({ method: "thread/tokenUsage/updated", params: { threadId: "thread-1", turnId: id, tokenUsage: {
@@ -532,6 +545,9 @@ test("Pi RPC keeps a persistent native session and reopens a completed turn", as
     const run = await backend.start(piRequest, (event) => events.push(event));
     await run.completed;
     assert.deepEqual(terminal(events), { type: "completed", output: "PI_OK" });
+    assert.ok(events.some((event) => event.type === "started"
+      && event.backendSessionId === "pi-fixture"
+      && event.sessionFile === "/sessions/pi-fixture.jsonl"), "fresh Pi runs expose their native continuation without a model turn");
     await run.send("SECOND", "followUp");
     const deadline = Date.now() + 1_000;
     while (events.filter((event) => event.type === "completed").length < 2 && Date.now() < deadline) {
@@ -603,7 +619,7 @@ test("Pi RPC resumes a forked session and sends a peer question verbatim", async
   const events: BackendEvent[] = [];
   try {
     const peerRequest = request("pi", fake.dir, { ...process.env, MODE: "complete", ARG_FILE: argFile });
-    peerRequest.resumeSessionFile = "/sessions/forked-peer.jsonl";
+    peerRequest.continuation = { harness: "pi", sessionFile: "/sessions/forked-peer.jsonl" };
     peerRequest.rawInitialMessage = true;
     peerRequest.task = "What decision did this thread reach?";
     peerRequest.policy.piTools = [];
@@ -612,7 +628,7 @@ test("Pi RPC resumes a forked session and sends a peer question verbatim", async
     await run.completed;
     assert.deepEqual(terminal(events), { type: "completed", output: peerRequest.task });
     const args = JSON.parse(await readFile(argFile, "utf8")) as string[];
-    assert.deepEqual(args.slice(args.indexOf("--session"), args.indexOf("--session") + 2), ["--session", peerRequest.resumeSessionFile]);
+    assert.deepEqual(args.slice(args.indexOf("--session"), args.indexOf("--session") + 2), ["--session", peerRequest.continuation.sessionFile]);
     assert.ok(args.includes("--no-tools"), "clarification peers start without child tools");
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
@@ -756,6 +772,80 @@ test("Claude emits live events and reopens a completed subscription session", as
   assert.ok(Buffer.byteLength(final.output ?? "") <= MAX_OUTPUT_BYTES);
   assert.equal(events.filter((event) => event.type === "completed").length, 2);
   await run.close();
+});
+
+test("Claude resumes only the explicitly typed native session identity", async () => {
+  let options: Record<string, unknown> | undefined;
+  async function* messages() {
+    yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-retained", tools: [] };
+    yield { type: "result", subtype: "success", result: "resumed", usage: {}, total_cost_usd: 0, num_turns: 1 };
+  }
+  const backend = new ClaudeBackend("fixture-claude", {
+    verifyAuth: async () => undefined,
+    queryFn: ((input: { options?: Record<string, unknown> }) => {
+      options = input.options;
+      return Object.assign(messages(), { close() {} });
+    }) as never,
+  });
+  const resumed = request("claude", process.cwd(), process.env);
+  resumed.continuation = { harness: "claude", sessionId: "claude-retained" };
+  const events: BackendEvent[] = [];
+  const run = await backend.start(resumed, (event) => events.push(event));
+  await run.completed;
+  assert.equal(options?.resume, "claude-retained");
+  assert.ok(events.some((event) => event.type === "started" && event.backendSessionId === "claude-retained"));
+  await run.close();
+});
+
+test("native adapters reject a provider-reported continuation identity drift", async () => {
+  const piFixture = await fixture(PI_FIXTURE);
+  const codexFixture = await fixture(CODEX_FIXTURE);
+  let piRun: BackendRun | undefined;
+  let codexRun: BackendRun | undefined;
+  try {
+    const piEvents: BackendEvent[] = [];
+    const piRequest = request("pi", piFixture.dir, {
+      ...process.env,
+      MODE: "complete",
+      PI_SESSION_FILE: "/sessions/replacement.jsonl",
+    });
+    piRequest.continuation = { harness: "pi", sessionFile: "/sessions/recorded.jsonl" };
+    piRun = await new PiRpcBackend(piFixture.command, { requestTimeoutMs: 5_000 })
+      .start(piRequest, (event) => piEvents.push(event));
+    await piRun.completed;
+    assert.match((terminal(piEvents) as Extract<BackendEvent, { type: "failed" }>).error, /different native session identity/);
+
+    async function* messages() {
+      yield { type: "system", subtype: "init", apiKeySource: "oauth", session_id: "claude-replacement", tools: [] };
+    }
+    const claudeEvents: BackendEvent[] = [];
+    const claudeRequest = request("claude", process.cwd(), process.env);
+    claudeRequest.continuation = { harness: "claude", sessionId: "claude-recorded" };
+    const claudeRun = await new ClaudeBackend("fixture-claude", {
+      verifyAuth: async () => undefined,
+      queryFn: (() => Object.assign(messages(), { close() {} })) as never,
+    }).start(claudeRequest, (event) => claudeEvents.push(event));
+    await claudeRun.completed;
+    assert.match((terminal(claudeEvents) as Extract<BackendEvent, { type: "failed" }>).error, /different native session identity/);
+    await claudeRun.close();
+
+    const codexEvents: BackendEvent[] = [];
+    const codexRequest = request("codex", codexFixture.dir, {
+      ...process.env,
+      MODE: "normal",
+      RESUME_THREAD_ID: "thread-replacement",
+    });
+    codexRequest.continuation = { harness: "codex", threadId: "thread-recorded" };
+    codexRun = await new CodexAppServerBackend(codexFixture.command, { requestTimeoutMs: 5_000 })
+      .start(codexRequest, (event) => codexEvents.push(event));
+    await codexRun.completed;
+    assert.match((terminal(codexEvents) as Extract<BackendEvent, { type: "failed" }>).error, /different native thread identity/);
+  } finally {
+    await piRun?.close();
+    await codexRun?.close();
+    await rm(piFixture.dir, { recursive: true, force: true });
+    await rm(codexFixture.dir, { recursive: true, force: true });
+  }
 });
 
 test("Claude fails closed if a read-only CLI init exposes mutating tools", async () => {
@@ -1538,6 +1628,72 @@ test("Codex surfaces a native priority-policy rejection without retrying or down
     assert.equal(contextEvents(events).at(-1)?.context.effectiveSpeed, undefined, "requested Fast is never invented as accepted telemetry");
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex resumes an exact native thread without silently starting a replacement", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  const threadParamFile = join(fake.dir, "resume-thread-params.json");
+  let run: BackendRun | undefined;
+  try {
+    const resumed = request("codex", fake.dir, { ...process.env, MODE: "normal", THREAD_PARAM_FILE: threadParamFile });
+    resumed.continuation = { harness: "codex", threadId: "thread-1" };
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 5_000 })
+      .start(resumed, (event) => events.push(event));
+    await run.completed;
+    const resumeParams = JSON.parse(await readFile(threadParamFile, "utf8"));
+    assert.deepEqual({ ...resumeParams, developerInstructions: undefined }, {
+      threadId: "thread-1",
+      cwd: fake.dir,
+      model: "fixture-model",
+      modelProvider: "openai",
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      config: { mcp_servers: {}, hooks: {}, features: { multi_agent: false, multi_agent_v2: false } },
+      developerInstructions: undefined,
+    });
+    assert.match(resumeParams.developerInstructions, /remain read-only/);
+    assert.ok(events.some((event) => event.type === "started" && event.backendSessionId === "thread-1"));
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex resume subtracts already-accounted native thread usage", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  let run: BackendRun | undefined;
+  try {
+    const resumed = request("codex", fake.dir, { ...process.env, MODE: "resume-usage" });
+    resumed.continuation = { harness: "codex", threadId: "thread-1" };
+    resumed.providerUsageBaseline = { input: 500, output: 200, cacheRead: 300, cacheWrite: 50, cost: 0, turns: 4 };
+    run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 5_000 })
+      .start(resumed, (event) => events.push(event));
+    await run.completed;
+    const usage = events.filter((event): event is Extract<BackendEvent, { type: "usage" }> => event.type === "usage")
+      .reduce((total, event) => ({
+        input: total.input + (event.usage.input ?? 0),
+        output: total.output + (event.usage.output ?? 0),
+        cacheRead: total.cacheRead + (event.usage.cacheRead ?? 0),
+        cacheWrite: total.cacheWrite + (event.usage.cacheWrite ?? 0),
+      }), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+    assert.deepEqual(usage, { input: 50, output: 30, cacheRead: 25, cacheWrite: 0 });
+  } finally {
+    await run?.close();
+    await rm(fake.dir, { recursive: true, force: true });
+  }
+});
+
+test("Codex child threads disable native multi-agent delegation for every access mode", () => {
+  assert.deepEqual(codexThreadConfig({ customization: "native", access: "full" }), {
+    features: { multi_agent: false, multi_agent_v2: false },
+  });
+  assert.deepEqual(codexThreadConfig({ customization: "native", access: "readOnly" }), {
+    mcp_servers: {},
+    hooks: {},
+    features: { multi_agent: false, multi_agent_v2: false },
+  });
 });
 
 test("Codex exposes parent_thread_context as a client-hosted dynamic tool", async () => {

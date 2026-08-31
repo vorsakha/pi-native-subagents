@@ -46,6 +46,7 @@ import { availabilityLabel } from "../../src/harness-availability.ts";
 import { formatWorkflowBudget } from "../../src/workflows/budget.ts";
 import type {
   WorkflowAgentRecord,
+  WorkflowAdvisorRecord,
   WorkflowAgentState,
   WorkflowPhase,
   WorkflowSnapshot,
@@ -81,6 +82,7 @@ import {
   type WorkflowAgentFilter,
   type WorkflowDashboardFocus,
   type WorkflowOutlineAgentNode,
+  type WorkflowOutlineAdvisorNode,
   type WorkflowOutlineModel,
   type WorkflowOutlinePhaseNode,
   type WorkflowOutlineSelection,
@@ -404,7 +406,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
       return;
     }
 
-    if (data === "i") {
+    const advisorDetail = this.#focus === "agent-detail" && !!this.selectedAdvisor(run);
+    if (data === "i" && !advisorDetail) {
       this.#showInfo = !this.#showInfo;
       this.tui.requestRender();
       return;
@@ -429,7 +432,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
       } else if (matchesKey(data, "r")) this.restartAgent(run);
       else if (matchesKey(data, "x")) this.requestAgentCancel(run);
       else if (data === "X" || matchesKey(data, Key.shift("x"))) this.requestRunCancel(run);
-      else if (matchesKey(data, "t") || matchesKey(data, Key.ctrl("t"))) this.toggleToolDisplay();
+      else if (!advisorDetail && (matchesKey(data, "t") || matchesKey(data, Key.ctrl("t")))) this.toggleToolDisplay();
     } else if (this.#focus === "outline") {
       if (matchesKey(data, Key.shift(Key.up))) this.scrollResult(-1);
       else if (matchesKey(data, Key.shift(Key.down))) this.scrollResult(1);
@@ -576,7 +579,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     this.#outlineSelection = model.selected;
     if (before !== this.#outlineSelection?.key) {
       this.resetScroll();
-      if (this.#focus === "agent-detail" && this.#outlineSelection?.kind !== "agent") {
+      if (this.#focus === "agent-detail" && this.#outlineSelection?.kind === "phase") {
         this.#focus = "outline";
       }
     }
@@ -599,6 +602,14 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const selected = model.nodes.find((node): node is WorkflowOutlineAgentNode =>
       node.kind === "agent" && node.key === model.selected?.key);
     return selected?.agent;
+  }
+
+  private selectedAdvisor(run: WorkflowSnapshot | undefined): WorkflowAdvisorRecord | undefined {
+    if (!run || this.#outlineSelection?.kind !== "advisor") return undefined;
+    const model = this.outlineFor(run);
+    const selected = model.nodes.find((node): node is WorkflowOutlineAdvisorNode =>
+      node.kind === "advisor" && node.key === model.selected?.key);
+    return selected?.advisor;
   }
 
   private selectRun(delta: number, runs: readonly WorkflowSnapshot[]): void {
@@ -643,13 +654,13 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const model = this.outlineFor(run);
     const selected = model.nodes[model.selectedIndex];
     if (!selected) return;
-    if (selected.kind === "agent") {
+    if (selected.kind === "agent" || selected.kind === "advisor") {
       this.#focus = "agent-detail";
       this.resetScroll();
       return;
     }
     const next = model.nodes[model.selectedIndex + 1];
-    if (next?.kind !== "agent" || next.phaseKey !== selected.phaseKey) return;
+    if (!next || next.kind === "phase" || next.phaseKey !== selected.phaseKey) return;
     this.#outlineSelection = selectionForNode(next);
     this.resetScroll();
   }
@@ -968,12 +979,12 @@ export class WorkflowsDashboardOverlay implements Focusable {
   private renderHelp(frame: DashboardFrame, layout: DashboardLayout, runs: WorkflowSnapshot[]): string[] {
     return [
       this.renderHeader(frame, runs),
-      ...renderDashboardHelp(this.theme, frame, "help", this.helpGroups(), layout.contentRows),
+      ...renderDashboardHelp(this.theme, frame, "help", this.helpGroups(runs.find((run) => run.runId === this.#selectedRunId)), layout.contentRows),
       frame.hint(`? or ${dashboardCancelKeyLabel(this.keybindings)} close help`),
     ];
   }
 
-  private helpGroups(): DashboardKeyGroup[] {
+  private helpGroups(run: WorkflowSnapshot | undefined): DashboardKeyGroup[] {
     const confirm = dashboardConfirmKeyLabel(this.keybindings);
     const cancel = dashboardCancelKeyLabel(this.keybindings);
     if (this.#focus === "runs") {
@@ -984,6 +995,21 @@ export class WorkflowsDashboardOverlay implements Focusable {
       ];
     }
     if (this.#focus === "agent-detail") {
+      if (this.selectedAdvisor(run)) {
+        const actions: DashboardKeyGroup[] = run && !workflowIsTerminal(run.status)
+          ? [{ title: "Actions", entries: [["X", "cancel the run (press twice)"]] }]
+          : [];
+        return [
+          { title: "Navigate", entries: [["Esc / ← / h", "back to outline"]] },
+          ...actions,
+          { title: "Scroll", entries: [
+            ["j k / ↑↓ / PgUp/PgDn", "scroll advisor output"],
+            ["Ctrl+U/D", "half-page scroll"],
+            ["g / G", "top / bottom"],
+          ] },
+          { title: "Panel", entries: [[cancel, "back / close"], ["?", "close this help"]] },
+        ];
+      }
       return [
         { title: "Navigate", entries: [["Esc / ← / h", "back to outline"]] },
         { title: "Actions", entries: [
@@ -1061,6 +1087,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
   private detailTitle(run: WorkflowSnapshot | undefined): string {
     if (!run) return "inspector";
     if (this.#focus === "agent-detail") {
+      const advisor = this.selectedAdvisor(run);
+      if (advisor) return `advisor · ${sanitizeInline(advisor.advisorName)} · ${advisor.state} · focus`;
       // The tool-display mode also lives in the terse footer hint, but that
       // hint truncates first under width pressure; the title survives longer.
       const agent = this.selectedAgent(run);
@@ -1357,17 +1385,20 @@ export class WorkflowsDashboardOverlay implements Focusable {
       const counts = [
         row.omittedPhases ? `${row.omittedPhases} phase${row.omittedPhases === 1 ? "" : "s"}` : "",
         row.omittedAgents ? `${row.omittedAgents} agent${row.omittedAgents === 1 ? "" : "s"}` : "",
+        row.omittedAdvisors ? `${row.omittedAdvisors} advisor call${row.omittedAdvisors === 1 ? "" : "s"}` : "",
       ].filter(Boolean).join(" · ");
       return truncateWorkflowDashboardLine(this.theme.fg("muted", `  ⋯ ${counts} omitted`), width);
     }
 
     const selected = row.node.key === model.selected?.key;
     if (row.node.kind === "phase") return this.renderOutlinePhase(row.node, selected, width);
-    if (selected && this.#focus === "outline") {
+    if (row.node.kind === "agent" && selected && this.#focus === "outline") {
       const phase = model.phases.find((candidate) => candidate.key === row.node.phaseKey)?.phase;
       this.markVisibleAgent(run, phase, row.node.agent);
     }
-    return this.renderOutlineAgent(row.node, selected, width);
+    return row.node.kind === "agent"
+      ? this.renderOutlineAgent(row.node, selected, width)
+      : this.renderOutlineAdvisor(row.node, selected, width);
   }
 
   private renderOutlinePhase(node: WorkflowOutlinePhaseNode, selected: boolean, width: number): string {
@@ -1379,7 +1410,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const current = node.current ? " · current" : "";
     const planned = node.recorded ? "" : " · planned";
     const hidden = node.hiddenAgentCount ? ` · ${node.hiddenAgentCount} hidden by filter` : "";
-    const progress = `${node.completedAgents}/${node.agentCount} agents complete`;
+    const progress = `${node.completedAgents}/${node.agentCount} calls complete`;
     return truncateWorkflowDashboardLine(
       `${marker} ${this.theme.fg(status.color, status.glyph)} Phase ${node.progressLabel} · ${label} · ${node.status}${current}${planned} · ${progress}${hidden}`,
       width,
@@ -1400,6 +1431,16 @@ export class WorkflowsDashboardOverlay implements Focusable {
     );
   }
 
+  private renderOutlineAdvisor(node: WorkflowOutlineAdvisorNode, selected: boolean, width: number): string {
+    const status = traceStatusMeta(node.state, this.#now());
+    const marker = dashboardNestedSelectionMarker(this.theme, selected);
+    const label = selected ? this.theme.fg("accent", boundedInline(node.name, 1_000)) : this.theme.fg("text", boundedInline(node.name, 1_000));
+    return truncateWorkflowDashboardLine(
+      `  ${marker} ${this.theme.fg(status.color, status.glyph)} ${label} · ${node.state} · ${this.theme.fg(dashboardSummaryColor(node.summary), node.summary.text)}`,
+      width,
+    );
+  }
+
   private workflowResultBody(run: WorkflowSnapshot, phase: WorkflowPhase | undefined, width: number): string[] {
     const logs = run.logs?.slice(-8).map((log) => this.theme.fg("muted", `· ${boundedInline(log.message, 2_000)}`)) ?? [];
     const result = this.renderBoundedResult(run, phase, undefined, width);
@@ -1408,6 +1449,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
 
   private agentInspectorViewport(run: WorkflowSnapshot, rows: number, width: number): string[] {
     const phase = this.phaseFor(run);
+    const advisor = this.selectedAdvisor(run);
+    if (advisor) return this.advisorInspectorViewport(run, phase, advisor, rows, width);
     const agent = this.selectedAgent(run);
     if (!agent) {
       this.#focus = "outline";
@@ -1532,6 +1575,37 @@ export class WorkflowsDashboardOverlay implements Focusable {
       !workflowAgentIsTerminal(agent.state),
     );
     return fitDashboardRows([...visiblePinned, ...identityRows, ...visibleDisclosure, ...resultRows], rows);
+  }
+
+  private advisorInspectorViewport(
+    run: WorkflowSnapshot,
+    phase: WorkflowPhase | undefined,
+    advisor: WorkflowAdvisorRecord,
+    rows: number,
+    width: number,
+  ): string[] {
+    const status = traceStatusMeta(advisor.state, this.#now());
+    const pinned = [
+      `${this.theme.fg("accent", this.theme.bold(`advisor · ${boundedInline(advisor.advisorName, 1_000)}`))} ${this.theme.fg(status.color, `· ${status.glyph} ${advisor.state}`)}`,
+      this.theme.fg("dim", `${advisor.advisorId} · lineage ${advisor.lineage}/${advisor.generation ?? "?"} · ${advisor.harness ?? "?"}/${advisor.model ?? "default"} · ${formatUsage(advisor.usage)}`),
+      this.theme.fg("dim", `${phase ? `${boundedInline(run.name, 1_000)} · ${boundedInline(phase.name, 1_000)}` : boundedInline(run.name, 1_000)} · call ${advisor.callIndex}${advisor.queuedMs ? ` · advisor queue ${advisor.queuedMs}ms` : ""}${advisor.outputProvenance === "replay" ? " · replayed" : ""}`),
+      advisor.error ? this.theme.fg("error", `Error · ${boundedInline(advisor.error, 2_000)}`) : this.theme.fg("muted", `Question · ${boundedInline(advisor.prompt, 2_000)}`),
+      ...(advisor.context ? [this.theme.fg("dim", `Context · ${boundedInline(advisor.context, 2_000)}`)] : []),
+    ];
+    const visiblePinned = pinned.slice(0, Math.max(0, rows - MIN_SCROLLABLE_DETAIL_ROWS));
+    const body = this.renderMarkdownLines(String(advisor.output ?? "(no advisor output)"), width);
+    const resultRows = this.renderScrollableBody(
+      body,
+      rows - visiblePinned.length,
+      `advisor:${run.runId}:${phase?.index ?? "none"}:${advisor.index}`,
+      width,
+      "advisor output",
+      advisor.state === "queued" || advisor.state === "running",
+    );
+    return fitDashboardRows([
+      ...visiblePinned.map((line) => truncateWorkflowDashboardLine(line, width)),
+      ...resultRows,
+    ], rows);
   }
 
   private agentDetailBody(run: WorkflowSnapshot, phase: WorkflowPhase | undefined, agent: WorkflowAgentRecord, width: number): string[] {
@@ -1715,7 +1789,15 @@ export class WorkflowsDashboardOverlay implements Focusable {
       if (live && rendered.includes(runCancelLabel)) this.#renderedRunCancelId = run?.runId;
       return rendered;
     }
-    const actions = this.#focus === "agent-detail"
+    const advisor = this.selectedAdvisor(run);
+    const actions = this.#focus === "agent-detail" && advisor
+      ? [
+        live ? runCancelLabel : "",
+        "Esc/← outline",
+        "jk/Pg scroll · Ctrl+U/D · g/G",
+        "? help",
+      ]
+      : this.#focus === "agent-detail"
       ? [
         agentActionable ? agentCancelLabel : "",
         live ? runCancelLabel : "",

@@ -195,8 +195,9 @@ export function codexExitDiagnostic(context: CodexExitContext): string {
  * that could mutate outside the sandbox.
  */
 export function codexThreadConfig(policy: Pick<BackendPolicy, "customization" | "access">): Record<string, unknown> | undefined {
-  if (policy.customization === "native" && policy.access === "full") return undefined;
-  return { mcp_servers: {}, hooks: {} };
+  const features = { multi_agent: false, multi_agent_v2: false };
+  if (policy.customization === "native" && policy.access === "full") return { features };
+  return { mcp_servers: {}, hooks: {}, features };
 }
 
 export class CodexAppServerBackend implements Backend {
@@ -398,7 +399,14 @@ export class CodexAppServerBackend implements Backend {
     let closing = false;
     let cancellingReason: string | undefined;
     let protocolFailure: string | undefined;
-    let previousTokenTotals: CodexTokenTotals | undefined;
+    let previousTokenTotals: CodexTokenTotals | undefined = request.continuation?.harness === "codex" && request.providerUsageBaseline
+      ? {
+          input: request.providerUsageBaseline.input + request.providerUsageBaseline.cacheRead + request.providerUsageBaseline.cacheWrite,
+          output: request.providerUsageBaseline.output,
+          cacheRead: request.providerUsageBaseline.cacheRead,
+          cacheWrite: request.providerUsageBaseline.cacheWrite,
+        }
+      : undefined;
     /** Model identity reported by the runtime; never seeded from configured policy. */
     let servingModel: string | undefined;
     /** Latest occupancy gauge; carried over (not recomputed) by events that are not a new reading, e.g. a reroute. */
@@ -659,6 +667,19 @@ export class CodexAppServerBackend implements Backend {
       developerInstructions: `${request.systemPrompt}\n\n${request.policy.access === "readOnly" ? "Hard policy: remain read-only; do not mutate files, Git state, or external systems." : "This is a trusted workspace. Work autonomously without asking for per-command approval."}`,
       ...(dynamicTools.length ? { dynamicTools } : {}),
     }, this.#requestTimeoutMs));
+    const resumeThread = async () => {
+      if (request.continuation?.harness !== "codex") throw new Error("Codex continuation is invalid");
+      return asObject(await peer.request("thread/resume", {
+        threadId: request.continuation.threadId,
+        cwd: request.cwd,
+        ...(request.policy.model ? { model: request.policy.model } : {}),
+        modelProvider: "openai",
+        approvalPolicy: request.policy.approvalPolicy,
+        sandbox: request.policy.access === "readOnly" ? "read-only" : "danger-full-access",
+        ...(codexThreadConfig(request.policy) ? { config: codexThreadConfig(request.policy) } : {}),
+        developerInstructions: `${request.systemPrompt}\n\n${request.policy.access === "readOnly" ? "Hard policy: remain read-only; do not mutate files, Git state, or external systems." : "This is a trusted workspace. Work autonomously without asking for per-command approval."}`,
+      }, this.#requestTimeoutMs));
+    };
 
     const initialization = (async () => {
       try {
@@ -673,7 +694,7 @@ export class CodexAppServerBackend implements Backend {
         const baseConfig = codexThreadConfig(request.policy);
         let threadResult: Record<string, unknown>;
         try {
-          threadResult = await startThread(baseConfig);
+          threadResult = request.continuation ? await resumeThread() : await startThread(baseConfig);
         } catch (error) {
           // A broken optional integration must not take down unrelated work, but
           // a job that explicitly required that integration must still fail.
@@ -683,6 +704,7 @@ export class CodexAppServerBackend implements Backend {
           );
           if (required || !OPTIONAL_INTEGRATION.test(detail)) throw error;
           emit({ type: "degraded", source: "codex-native-integrations", detail });
+          if (request.continuation) throw error;
           threadResult = await startThread({ ...(baseConfig ?? {}), mcp_servers: {}, hooks: {} });
         }
         const thread = asObject(threadResult.thread);
@@ -691,11 +713,14 @@ export class CodexAppServerBackend implements Backend {
         // authoritative telemetry about the model that actually served a turn.
         const returnedProviders = [threadResult.modelProvider, thread.modelProvider]
           .filter((value): value is string => typeof value === "string" && value.length > 0);
-        if (returnedProviders.length === 0 || returnedProviders.some((provider) => provider !== "openai")) {
+        if ((!request.continuation && returnedProviders.length === 0) || returnedProviders.some((provider) => provider !== "openai")) {
           throw new Error(`Codex thread/start did not retain the built-in openai provider (got ${returnedProviders.join(",") || "none"})`);
         }
         threadId = String(thread.id ?? "");
         if (!threadId) throw new Error("Codex thread/start returned no thread id");
+        if (request.continuation?.harness === "codex" && threadId !== request.continuation.threadId) {
+          throw new Error("Codex resumed a different native thread identity");
+        }
         emit({ type: "started", backendSessionId: threadId, sessionFile: typeof thread.path === "string" ? thread.path : undefined });
         emitContext();
         await startTurn(`Task: ${request.task}`);

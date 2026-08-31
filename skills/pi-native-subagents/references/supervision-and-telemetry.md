@@ -5,19 +5,18 @@ Read this for supervision and telemetry. Each `?` legend owns its bindings.
 ## Surfaces
 
 - `/subagents` has job-list, job-detail, and composer focus. Enter or Right inspects; `a`, `s`, and `f` answer, steer, and follow up. Escape backs out; `j/k` selects or scrolls. A routed question blocks draft submission. Cancellation requires the eligible job in the latest view.
-- `/workflows` has `runs`, `outline`, and `agent-detail` focus. Its bounded outline models every recorded or planned phase and expands the selected phase's filtered agents. Agent rows show lifecycle state and semantic progress; phase rows remain visible under filters. Control workflow agents through `/workflows`, not `/subagents`.
+- `/workflows` has `runs`, `outline`, and `agent-detail` focus. Its bounded outline models every recorded or planned phase and expands the selected phase's filtered agents and advisor consultations. Agent rows show lifecycle state and semantic progress; phase rows remain visible under filters. Control workflow members through `/workflows`, not `/subagents`.
 - Direct-job and workflow-agent transcript labels show the visible line range. Scrolling away from the tail marks the viewport `paused`; press `G` to resume the live tail or a terminal transcript's end.
-- Direct jobs and workflow-owned child jobs remain in the shared editor activity widget. Workflow runs use one session-level widget keyed by stable run ID. Opening it uses `/workflows`; it never creates a second dashboard.
+- Direct jobs and workflow-owned child jobs remain in the shared editor activity widget, tagged in `/subagents` and counted separately. Workflow runs use one session-level widget keyed by stable run ID; opening it uses `/workflows` and never creates a second dashboard.
 - Workflow calls keep durable transcript cards, run IDs, and artifact references.
-- Workflow jobs stay tagged in `/subagents` and counted separately in activity.
 - Inspectors default to state plus outline, transcript, or result. Press `i` for route/model, usage/budget, context, provenance, isolation, replay, and replacement telemetry. Errors, questions, waits, warnings, and recovery stay pinned. Previews omit full tool calls and result bodies.
 - Continued routes read `primary → replacement (continued)`. A durable handoff marks the declaration used. Detail shows trigger, checkout, attempts, and replacement history; it never calls a closed or persisted job retained.
 - Transcripts default to compact tool-call groups; full native rendering is a toggle. Selection survives refresh, filtering, reordering, replacement, and resize.
 - Wide dashboards use a rail; medium stacks the list; narrow shows one focus layer. No layout adds a permanent third column.
-- Phase rows, omission rows, headers, and filtered or hidden agents are never agent-action targets. Restart and agent cancellation require an eligible selected agent that survived the final rendered outline/detail viewport. Run cancellation remains a separate confirmed action.
+- Phase, omission, header, and advisor rows, and filtered or hidden agents, are never agent-action targets. Restart and agent cancellation require an eligible selected agent that survived the final rendered outline/detail viewport. Run cancellation remains a separate confirmed action.
 - Headers keep needs-input, active, and failed counts under width pressure. Very short panels expose only close and ignore hidden actions.
 - `/subagents providers` shows normalized state, reason, and active status. Email is masked. Refresh re-probes without model calls, installation, login, configuration changes, or credentials.
-- Versions appear only from safe probes. No harness runs a separate version command. Absence proves no compatibility state.
+- Versions appear only from safe probes; no harness runs a version command. Absence proves no compatibility state.
 
 ## Distinguishing waits
 

@@ -164,6 +164,31 @@ export interface WorkflowReplacementReference {
  */
 export type WorkflowOutputProvenance = "subagent" | "replay" | "peerAnswer";
 
+/** One explicitly allowlisted thread-advisor consultation coordinated by the workflow script. */
+export interface WorkflowAdvisorRecord {
+  index: number;
+  callIndex: number;
+  callFingerprint: string;
+  advisorId: string;
+  advisorName: string;
+  lineage: number;
+  generation?: number;
+  phase: number;
+  state: WorkflowAgentState;
+  timestamps: WorkflowTimestamps;
+  prompt: string;
+  context?: string;
+  output?: string;
+  error?: string;
+  harness?: HarnessName;
+  model?: string;
+  usage: WorkflowUsage;
+  queuedMs?: number;
+  replayedFrom?: WorkflowReplayReference;
+  outputProvenance?: "advisor" | "replay";
+  instructionShaped?: boolean;
+}
+
 /**
  * Bounded, display-safe projection of one host-routed question a workflow agent
  * asked. Peer questions stay inside the run; orchestrator questions are mirrored
@@ -308,6 +333,7 @@ export interface WorkflowPhase {
   status: WorkflowStatus;
   timestamps: WorkflowTimestamps;
   agents: number[];
+  advisorConsultations?: number[];
   result?: unknown;
   error?: string;
 }
@@ -330,6 +356,11 @@ export interface WorkflowJournalResult {
   limit?: "budget";
   /** Durable proof that replay must not restart this failed call from its original prompt. */
   progressed?: true;
+  advisorId?: string;
+  advisorName?: string;
+  advisorLineage?: number;
+  advisorGeneration?: number;
+  queuedMs?: number;
 }
 
 export interface WorkflowJournalRoute {
@@ -433,7 +464,7 @@ export interface WorkflowJournalRecord {
   state: "started" | "progressed" | "handoff" | "completed" | "accepted" | "failed";
   at: number;
   /** Absent means "agent" for journals written before followUp() existed. */
-  kind?: "agent" | "followUp" | "peerQuestion";
+  kind?: "agent" | "followUp" | "advisor" | "peerQuestion";
   agentIndex?: number;
   /** Present only on `peerQuestion` records. */
   interaction?: WorkflowInteractionJournalDetail;
@@ -465,7 +496,7 @@ export interface WorkflowReplayInteraction {
 export interface WorkflowReplayCall {
   callIndex: number;
   fingerprint: string;
-  kind: "agent" | "followUp";
+  kind: "agent" | "followUp" | "advisor";
   /** The lineage this call belongs to; required to reconstruct a followUp() replay. */
   agentIndex?: number;
   result: WorkflowJournalResult;
@@ -569,6 +600,9 @@ export interface WorkflowSnapshot {
   /** Present when the workflow declared its complete phase plan in metadata. */
   plannedPhaseCount?: number;
   agents: WorkflowAgentRecord[];
+  /** Advisors this invocation was explicitly authorized to consult. */
+  advisors?: string[];
+  advisorConsultations?: WorkflowAdvisorRecord[];
   /** Bounded narrator-style progress emitted by workflow log(). */
   logs?: WorkflowLogRecord[];
   /** Present once this run's script called `converge()`; absent otherwise. */

@@ -83,3 +83,26 @@ test("workflowBudgetHealth distinctly names hard call and spend exhaustion as ab
     { text: "budget reached (tokens, turns, cost)", abnormal: true },
   );
 });
+
+test("advisor turns contribute to workflow call, concurrency, per-call token, and route accounting", () => {
+  const snapshot = {
+    budget: { maxAgents: 2, maxConcurrency: 1, maxTokensPerAgent: 10, maxCost: 1 },
+    agents: [],
+    advisorConsultations: [{
+      state: "running",
+      harness: "codex",
+      usage: { input: 8, output: 4, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+    }],
+  } as unknown as Pick<WorkflowSnapshot, "budget" | "agents" | "advisorConsultations">;
+
+  assert.deepEqual(workflowBudgetMetrics(snapshot, { input: 8, output: 4, cost: 0, turns: 1 }), [
+    { key: "agents", used: 1, limit: 2, remaining: 1, reached: false, supported: true },
+    { key: "concurrency", used: 1, limit: 1, remaining: 0, reached: true, supported: true },
+    { key: "agentTokens", used: 12, limit: 10, remaining: 0, reached: true, supported: true },
+    { key: "cost", used: 0, limit: 1, remaining: 1, reached: false, supported: false },
+  ]);
+  assert.deepEqual(
+    workflowBudgetHealth(snapshot, { input: 8, output: 4, cost: 0, turns: 1 }),
+    { text: "budget reached (agentTokens) · cost unsupported", abnormal: true },
+  );
+});

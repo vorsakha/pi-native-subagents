@@ -69,6 +69,35 @@ test("runs sequential agent calls and exposes args through globals and arguments
   } finally { await cleanup(f.cwd); }
 });
 
+test("consult() uses the bounded host bridge and shares contiguous call ordinals with agents", async () => {
+  const calls: Array<{ advisorId: string; question: string; options: Record<string, unknown>; callIndex: number }> = [];
+  const f = await fixture(`
+    export default async () => {
+      const advice = await consult("adv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "review this", { phase: "Review", context: "facts" });
+      const work = await agent("use advice");
+      return { advice, work };
+    }
+  `, {
+    onConsult: async (advisorId, question, options, _signal, callIndex) => {
+      calls.push({ advisorId, question, options, callIndex });
+      return { ok: true, output: "advice", advisorId, lineage: 2, generation: 3 };
+    },
+  });
+  try {
+    const value = await runWorkflowSandbox(f.options);
+    assert.deepEqual(calls, [{
+      advisorId: "adv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      question: "review this",
+      options: { phase: "Review", context: "facts" },
+      callIndex: 0,
+    }]);
+    assert.deepEqual(value.result, {
+      advice: { ok: true, output: "advice", advisorId: "adv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", lineage: 2, generation: 3 },
+      work: { ok: true, output: "use advice:", jobId: "job-1" },
+    });
+  } finally { await cleanup(f.cwd); }
+});
+
 test("pipelines items without a stage barrier and emits bounded progress logs", async () => {
   const events: string[] = [];
   const callIndices: number[] = [];

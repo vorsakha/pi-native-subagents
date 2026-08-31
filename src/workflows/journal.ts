@@ -46,6 +46,14 @@ export function workflowFollowUpFingerprint(input: { jobId: string; prompt: stri
   return fingerprint("followup-call", { jobId: input.jobId, options: input.options, prompt: input.prompt });
 }
 
+export function workflowAdvisorFingerprint(input: {
+  advisorId: string;
+  question: string;
+  options: Record<string, unknown>;
+}): string {
+  return fingerprint("advisor-call", input);
+}
+
 /**
  * Binds the exact question text and optional context so a replayed answer can
  * only satisfy the same question. The asking agent's identity and the target's
@@ -63,11 +71,13 @@ export function workflowDefinitionFingerprint(input: {
   defaultHarness?: string;
   approval?: string;
   budget?: unknown;
+  advisors?: string[];
 }): string {
   return fingerprint("workflow-definition", {
     approval: input.approval ?? "auto",
     argsJson: input.argsJson,
     budget: input.budget ?? null,
+    ...(input.advisors?.length ? { advisors: input.advisors } : {}),
     cwd: input.cwd,
     defaultHarness: input.defaultHarness ?? null,
     parentProvider: input.parentProvider ?? null,
@@ -447,7 +457,7 @@ export function replayableJournalCalls(
     .map(([callIndex, record]) => ({
       callIndex,
       fingerprint: record.fingerprint,
-      kind: record.kind === "followUp" ? "followUp" : "agent",
+      kind: record.kind === "followUp" ? "followUp" : record.kind === "advisor" ? "advisor" : "agent",
       agentIndex: record.agentIndex,
       result: structuredClone(record.result) as WorkflowJournalResult,
       route: record.route ? { ...record.route } : undefined,

@@ -28,6 +28,16 @@ import type { ProviderStatus, ProviderStatusReader, ProviderStatusRequest } from
 import type { ManagedProcess } from "../src/process-tree.ts";
 import type { WorkflowJournalRecord, WorkflowSnapshot } from "../src/workflows/types.ts";
 import { appendWorkflowJournal } from "../src/workflows/artifacts.ts";
+import type {
+  AdvisorSnapshot,
+  AdvisorConsultRequest,
+  AdvisorConsultResult,
+  AdvisorOpenRequest,
+  AdvisorRouteResolution,
+  AdvisorRouteResolver,
+  AdvisorStore,
+} from "../src/advisors.ts";
+import type { WorkflowAdvisorGateway } from "../src/workflows/manager.ts";
 import {
   harnessAvailability,
   type HarnessAvailability,
@@ -562,6 +572,46 @@ export function workflowSnapshotFixture(
   };
 }
 
+export function advisorSnapshotFixture(overrides: Partial<AdvisorSnapshot> = {}): AdvisorSnapshot {
+  return {
+    id: "adv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    threadId: "thread-advisors",
+    name: "Security advisor",
+    aliases: ["security", "sec"],
+    description: "Review security and containment boundaries",
+    state: "idle",
+    policy: {
+      cwd: "/workspace",
+      trusted: true,
+      harness: "claude",
+      model: "claude-advisor",
+      requires: ["claude:skill:security"],
+      budget: { maxTokens: 10_000 },
+    },
+    lineage: 1,
+    generation: 3,
+    usage: usage({ input: 100, output: 20, turns: 3 }),
+    createdAt: 1_000,
+    updatedAt: 3_000,
+    lastConsultedAt: 3_000,
+    queued: 0,
+    ledger: [{
+      index: 0,
+      lineage: 1,
+      generation: 3,
+      sender: "workflow",
+      question: "Is the boundary safe?",
+      state: "completed",
+      output: "Keep it read-only.",
+      usage: usage({ input: 10, output: 2, turns: 1 }),
+      startedAt: 2_000,
+      endedAt: 3_000,
+      workflow: { runId: "run-1", phase: "Security", callIndex: 0 },
+    }],
+    ...overrides,
+  };
+}
+
 /* ── backends ────────────────────────────────────────────────────────────── */
 
 function discovery(name: HarnessName, capabilities: DiscoveredCapability[]): DiscoveryResult {
@@ -743,6 +793,8 @@ export class ControlledBackend implements Backend {
   readonly #cancellationGates = new Map<string, ControlledCancellationGate>();
   readonly #closeGates = new Map<string, ControlledCancellationGate>();
   readonly #closeFailures = new Map<string, Error>();
+  cancelBarrier?: Promise<void>;
+  closeBarrier?: Promise<void>;
   active = 0;
   maxActive = 0;
 
@@ -820,6 +872,7 @@ export class ControlledBackend implements Backend {
           this.#cancellationGates.delete(request.jobId);
           if (gate.usage) emit({ type: "usage", usage: gate.usage });
         }
+        await this.cancelBarrier;
         emit({ type: "cancelled", reason });
         run.settle();
       },
@@ -834,6 +887,7 @@ export class ControlledBackend implements Backend {
         }
         const error = this.#closeFailures.get(request.jobId);
         if (error) throw error;
+        await this.closeBarrier;
       },
     };
   }
@@ -930,6 +984,17 @@ export class ControlledBackend implements Backend {
     run.emit(event);
   }
 
+  /** Emits the private native continuation identity produced by this harness. */
+  emitContinuation(jobId: string, identity = `${this.name}-retained-1`): void {
+    if (this.name === "pi") {
+      this.emit(jobId, { type: "started", backendSessionId: identity, sessionFile: `/private/${identity}.jsonl` });
+    } else if (this.name === "claude") {
+      this.emit(jobId, { type: "started", backendSessionId: identity });
+    } else {
+      this.emit(jobId, { type: "started", backendSessionId: identity, sessionFile: `/private/${identity}.jsonl` });
+    }
+  }
+
   /** Resolves the most recent *active* run for a task, so typos fail loudly. */
   #activeRunForTask(task: string): FakeRun {
     const request = this.requestForTask(task);
@@ -950,6 +1015,94 @@ export class ControlledBackend implements Backend {
     const run = this.#activeRunForTask(task);
     run.emit({ type: "failed", error, unavailable });
     run.settle();
+  }
+}
+
+/* ── advisors ────────────────────────────────────────────────────────────── */
+
+export class MemoryAdvisorStore implements AdvisorStore {
+  readonly records = new Map<string, Awaited<ReturnType<AdvisorStore["load"]>>>();
+  readonly saves: Array<Parameters<AdvisorStore["save"]>[1]> = [];
+  readonly saveBarriers = new Map<number, Promise<void>>();
+  readonly saveErrors = new Map<number, Error>();
+  loadBarrier?: Promise<void>;
+  saveError?: Error;
+
+  async load(threadId: string): ReturnType<AdvisorStore["load"]> {
+    await this.loadBarrier;
+    return structuredClone(this.records.get(threadId) ?? []);
+  }
+
+  async save(threadId: string, advisors: Parameters<AdvisorStore["save"]>[1]): Promise<void> {
+    const callIndex = this.saves.length;
+    this.saves.push(structuredClone(advisors));
+    await this.saveBarriers.get(callIndex);
+    const plannedError = this.saveErrors.get(callIndex);
+    if (plannedError) throw plannedError;
+    if (this.saveError) throw this.saveError;
+    this.records.set(threadId, structuredClone(advisors));
+  }
+}
+
+export class ScriptedAdvisorRouter implements AdvisorRouteResolver {
+  readonly calls: Array<{ request: AdvisorOpenRequest; expectedHarness?: HarnessName }> = [];
+  resolution: AdvisorRouteResolution;
+  error?: Error;
+  barrier?: Promise<void>;
+
+  constructor(harness: HarnessName = "codex", requires: string[] = []) {
+    this.resolution = { harness, requires };
+  }
+
+  async resolve(request: AdvisorOpenRequest, expectedHarness: HarnessName | undefined): Promise<AdvisorRouteResolution> {
+    this.calls.push({ request: structuredClone({ ...request, signal: undefined }), expectedHarness });
+    await this.barrier;
+    if (this.error) throw this.error;
+    return structuredClone(this.resolution);
+  }
+}
+
+export class ControlledAdvisorGateway implements WorkflowAdvisorGateway {
+  readonly requests: Array<Parameters<WorkflowAdvisorGateway["consult"]>[0]> = [];
+  readonly descriptors = new Map<string, Awaited<ReturnType<WorkflowAdvisorGateway["describe"]>>>();
+  results: AdvisorConsultResult[] = [];
+  pending?: Promise<AdvisorConsultResult>;
+  consultHandler?: (request: Parameters<WorkflowAdvisorGateway["consult"]>[0]) => Promise<AdvisorConsultResult>;
+
+  add(advisorId: string, overrides: Partial<Awaited<ReturnType<WorkflowAdvisorGateway["describe"]>>> = {}): void {
+    this.descriptors.set(advisorId, {
+      id: advisorId,
+      name: "Security advisor",
+      lineage: 0,
+      harness: "claude",
+      ...overrides,
+    });
+  }
+
+  async describe(_threadId: string, advisorId: string): Promise<Awaited<ReturnType<WorkflowAdvisorGateway["describe"]>>> {
+    const descriptor = this.descriptors.get(advisorId);
+    assert.ok(descriptor, `unknown advisor fixture ${advisorId}`);
+    return { ...descriptor };
+  }
+
+  async consult(request: Parameters<WorkflowAdvisorGateway["consult"]>[0]): Promise<AdvisorConsultResult> {
+    this.requests.push(request);
+    if (this.consultHandler) return this.consultHandler(request);
+    if (this.pending) return this.pending;
+    const result = this.results.shift();
+    if (result) return structuredClone(result);
+    const descriptor = await this.describe(request.threadId, request.advisorId);
+    return {
+      ok: true,
+      advisorId: descriptor.id,
+      advisorName: descriptor.name,
+      lineage: descriptor.lineage,
+      generation: 1,
+      output: "advisor-ok",
+      usage: usage({ input: 10, output: 2, turns: 1 }),
+      route: { harness: descriptor.harness, model: descriptor.model },
+      queuedMs: 0,
+    };
   }
 }
 

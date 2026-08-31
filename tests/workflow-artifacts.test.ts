@@ -4,13 +4,15 @@ import { tempDir } from "./helpers.ts";
 import { mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  appendWorkflowJournal,
   checkpointWorkflow,
   createWorkflowArtifacts,
+  loadWorkflowJournal,
   loadWorkflowSummaries,
   writeWorkflowReport,
   writeWorkflowResult,
 } from "../src/workflows/artifacts.ts";
-import type { WorkflowSnapshot } from "../src/workflows/types.ts";
+import type { WorkflowJournalRecord, WorkflowSnapshot } from "../src/workflows/types.ts";
 
 function snapshot(sessionId: string, now = Date.now()): Omit<WorkflowSnapshot, "runId" | "artifactDir"> {
   return {
@@ -114,6 +116,65 @@ test("checkpoints and result writes remain atomic under concurrent updates", asy
   assert.match(workflow.description, /^checkpoint-\d+$/);
   assert.equal(typeof result.index, "number");
   assert.deepEqual((await readdir(created.artifactDir)).filter((name) => name.includes(".tmp")), []);
+});
+
+test("completed advisor journal records require replay-safe identity, accounting, lineage, and route provenance", async () => {
+  const { root } = await fixture();
+  const created = await createWorkflowArtifacts(root, {
+    script: "export default async () => null;\n",
+    args: {},
+    snapshot: snapshot("advisor-journal"),
+  });
+  const complete: WorkflowJournalRecord = {
+    version: 1,
+    sequence: 0,
+    callIndex: 0,
+    fingerprint: `sha256:${"a".repeat(64)}`,
+    kind: "advisor",
+    state: "completed",
+    at: Date.now(),
+    result: {
+      ok: true,
+      output: "bounded advice",
+      advisorId: "adv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      advisorName: "Security",
+      advisorLineage: 2,
+      advisorGeneration: 4,
+      usage: { input: 10, output: 2, cacheRead: 1, cacheWrite: 0, cost: 0.01, turns: 1 },
+      queuedMs: 3,
+    },
+    route: { harness: "claude", model: "advisor-model", status: "completed" },
+  };
+  const omissions: Array<[string, (record: WorkflowJournalRecord) => void]> = [
+    ["advisor ID", (record) => { delete record.result!.advisorId; }],
+    ["advisor name", (record) => { delete record.result!.advisorName; }],
+    ["lineage", (record) => { delete record.result!.advisorLineage; }],
+    ["generation", (record) => { delete record.result!.advisorGeneration; }],
+    ["usage", (record) => { delete record.result!.usage; }],
+    ["queue delay", (record) => { delete record.result!.queuedMs; }],
+    ["route", (record) => { delete record.route; }],
+  ];
+  for (const [field, omit] of omissions) {
+    const malformed = structuredClone(complete);
+    omit(malformed);
+    await assert.rejects(
+      appendWorkflowJournal(root, created.runId, malformed),
+      /Invalid workflow journal record/,
+      `missing ${field} must stop replay provenance at the durable boundary`,
+    );
+  }
+  for (const status of [undefined, "failed"] as const) {
+    const malformed = structuredClone(complete);
+    if (status === undefined) delete malformed.route!.status;
+    else malformed.route!.status = status;
+    await assert.rejects(
+      appendWorkflowJournal(root, created.runId, malformed),
+      /Invalid workflow journal record/,
+      `completed advisor replay rejects ${status ?? "missing"} route status`,
+    );
+  }
+  await appendWorkflowJournal(root, created.runId, complete);
+  assert.deepEqual(await loadWorkflowJournal(root, created.runId), [complete]);
 });
 
 test("loads session summaries, ignores corrupt files, and durably aborts stale runs", async () => {

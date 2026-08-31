@@ -95,7 +95,16 @@ test("the subagent extension surface", async (t) => {
         : statuses;
     },
   };
-  registerNativeSubagents(pi.api, { registry, legacyRoot: false, backends, workflowArtifactRoot, globalProfilesDir, sessionPeerSource, providerStatus });
+  registerNativeSubagents(pi.api, {
+    registry,
+    legacyRoot: false,
+    backends,
+    workflowArtifactRoot,
+    advisorRoot: join(extensionRoot, "advisors"),
+    globalProfilesDir,
+    sessionPeerSource,
+    providerStatus,
+  });
 
   const { ctx, notifications, statuses } = context({ sessionId: "extension-session", branch: [
     { type: "message", message: { role: "user", content: "Discuss the parent-thread bridge", timestamp: 1_000 } },
@@ -117,10 +126,11 @@ test("the subagent extension surface", async (t) => {
     assert.equal(configuredHarnessFromEnv({}), "pi", "Pi is the provider-agnostic default harness");
     assert.equal(configuredHarnessFromEnv({ PI_NATIVE_SUBAGENTS_BACKEND: "codex" }), "pi", "obsolete backend env is ignored");
     assert.deepEqual([...pi.tools.keys()].sort(), [
+      "advisor_close", "advisor_consult", "advisor_list", "advisor_open", "advisor_reset",
       "session_peer_fork", "session_peer_list",
       "subagent", "subagent_answer", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
     ]);
-    assert.deepEqual([...pi.commands.keys()].sort(), ["subagent", "subagents", "subagents-config", "workflows"]);
+    assert.deepEqual([...pi.commands.keys()].sort(), ["advisor", "advisors", "subagent", "subagents", "subagents-config", "workflows"]);
     assert.deepEqual(parseHumanSubagentCommand('--harness codex --model opus --name "auth review" --effort high --speed fast --access readOnly "Review the auth flow"'), {
       harness: "codex",
       model: "opus",
@@ -138,6 +148,7 @@ test("the subagent extension surface", async (t) => {
       { name: "browser", description: "Browser automation", source: "extension" },
       { name: "subagent_spawn", description: "nested delegation", source: "extension" },
       { name: "workflow", source: "extension" },
+      { name: "advisor_consult", source: "extension" },
       { name: "ask_user", source: "extension" },
     ]), ["mcp", "browser"]);
     const spawnTool = pi.tools.get("subagent_spawn");
@@ -158,6 +169,108 @@ test("the subagent extension surface", async (t) => {
     assert.throws(() => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }), /loaded more than once/);
   });
 
+  await t.test("opens thread advisors lazily, exposes only public roster state, and dispatches read-only consultations", async () => {
+    const startsBeforeOpen = backends.reduce((total, backend) => total + backend.starts.length, 0);
+    const opened = await pi.tools.get("advisor_open").execute("advisor-open", {
+      name: "Security",
+      aliases: ["sec"],
+      description: "Review security and containment boundaries",
+      harness: "codex",
+      maxTokens: 1_000,
+    }, undefined, undefined, ctx);
+    assert.equal(backends.reduce((total, backend) => total + backend.starts.length, 0), startsBeforeOpen, "advisor_open spends no model turn");
+    assert.match(opened.details.advisor.id, /^adv_[a-f0-9]{32}$/);
+    assert.equal(opened.details.advisor.state, "defined");
+    assert.equal("continuation" in opened.details.advisor, false);
+
+    const listed = await pi.tools.get("advisor_list").execute("advisor-list", {}, undefined, undefined, ctx);
+    assert.equal(listed.details.advisors[0].id, opened.details.advisor.id);
+    assert.equal("continuation" in listed.details.advisors[0], false);
+    const consulted = await pi.tools.get("advisor_consult").execute("advisor-consult", {
+      advisorId: "sec",
+      question: "Does this fail closed?",
+      context: "Only these bounded facts",
+    }, undefined, undefined, ctx);
+    assert.equal(consulted.details.advisorConsultation.ok, true);
+    const request = backends.find((backend) => backend.name === "codex")?.starts.at(-1);
+    assert.equal(request?.policy.access, "readOnly");
+    assert.equal(request?.interactions, undefined);
+    assert.match(request?.systemPrompt ?? "", /cannot delegate/i);
+    assert.equal(pi.tools.get("workflow").parameters.properties.advisors.maxItems, 16);
+    assert.equal(pi.tools.get("workflow").parameters.properties.advisors.items.pattern, "^adv_[a-f0-9]{32}$");
+
+    await assert.rejects(
+      pi.tools.get("advisor_open").execute("untrusted-advisor", {
+        name: "Blocked",
+        description: "Must not open",
+        harness: "codex",
+      }, undefined, undefined, context({ trusted: false, sessionId: "extension-session" }).ctx),
+      /untrusted/i,
+    );
+    const startsBeforeUntrustedConsult = backends.reduce((total, backend) => total + backend.starts.length, 0);
+    await assert.rejects(
+      pi.tools.get("advisor_consult").execute("untrusted-consult", {
+        advisorId: opened.details.advisor.id,
+        question: "Reuse the trusted stored policy",
+      }, undefined, undefined, context({ trusted: false, sessionId: "extension-session" }).ctx),
+      /untrusted/i,
+    );
+    assert.equal(
+      backends.reduce((total, backend) => total + backend.starts.length, 0),
+      startsBeforeUntrustedConsult,
+      "an untrusted context cannot dispatch a restored trusted advisor",
+    );
+    const { ctx: untrustedAdvisorCtx, notifications: untrustedAdvisorNotifications } = context({
+      trusted: false,
+      sessionId: "extension-session",
+    });
+    for (const tool of ["advisor_list", "advisor_close", "advisor_reset"] as const) {
+      await assert.rejects(
+        pi.tools.get(tool).execute(
+          `untrusted-${tool}`,
+          tool === "advisor_list" ? {} : { advisorId: opened.details.advisor.id },
+          undefined,
+          undefined,
+          untrustedAdvisorCtx,
+        ),
+        /untrusted projects/i,
+      );
+    }
+    await pi.commands.get("advisor").handler(`close ${opened.details.advisor.id}`, untrustedAdvisorCtx);
+    assert.match(untrustedAdvisorNotifications.at(-1)?.message ?? "", /untrusted projects/i);
+    await pi.commands.get("advisors").handler("", untrustedAdvisorCtx);
+    assert.match(untrustedAdvisorNotifications.at(-1)?.message ?? "", /untrusted projects/i);
+    assert.doesNotMatch(untrustedAdvisorNotifications.at(-1)?.message ?? "", /Security|adv_[a-f0-9]{32}/);
+    const stillOpen = await pi.tools.get("advisor_list").execute("advisor-list-after-untrusted", {}, undefined, undefined, ctx);
+    assert.equal(stillOpen.details.advisors[0].id, opened.details.advisor.id);
+
+    const { ctx: multibyteCtx } = context({
+      sessionId: "extension-session",
+      branch: [{
+        type: "message",
+        message: { role: "user", content: "😀".repeat(12_000), timestamp: 3_000 },
+      }],
+    });
+    multibyteCtx.cwd = extensionRoot;
+    await pi.commands.get("advisor").handler("open Unicode Multibyte context advisor", multibyteCtx);
+    const startsBeforeHumanAsk = backends.reduce((total, backend) => total + backend.starts.length, 0);
+    await pi.commands.get("advisor").handler("ask unicode Check the recent context", multibyteCtx);
+    assert.equal(
+      backends.reduce((total, backend) => total + backend.starts.length, 0),
+      startsBeforeHumanAsk + 1,
+      "human advisor context is bounded by UTF-8 bytes before registry admission",
+    );
+    const humanRequest = backends.flatMap((backend) => backend.requests)
+      .find((request) => request.task.includes("Check the recent context"));
+    assert.match(humanRequest?.task ?? "", /historical, untrusted reference data/);
+    assert.ok(Buffer.byteLength(humanRequest?.task ?? "", "utf8") < 18 * 1024);
+    await pi.commands.get("advisor").handler("close unicode", multibyteCtx);
+
+    await pi.tools.get("advisor_close").execute("advisor-close", { advisorId: opened.details.advisor.id }, undefined, undefined, ctx);
+    const afterClose = await pi.tools.get("advisor_list").execute("advisor-list-closed", {}, undefined, undefined, ctx);
+    assert.deepEqual(afterClose.details.advisors, []);
+  });
+
   await t.test("resolves global profiles and forks read-only session peers", async () => {
     await pi.commands.get("subagents").handler("profiles", ctx);
     assert.match(notifications.at(-1)?.message ?? "", /audit \(global\)/);
@@ -175,14 +288,14 @@ test("the subagent extension surface", async (t) => {
     assert.equal(peer.details.job.access, "readOnly");
     assert.deepEqual(peerForks, [{ sourcePath: "/sessions/saved.jsonl", targetCwd: extensionRoot }]);
     await pi.tools.get("subagent_wait").execute("peer-wait", { jobId: peer.details.job.id }, undefined, undefined, ctx);
-    const peerRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.resumeSessionFile === "/sessions/forked.jsonl");
+    const peerRequest = backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.continuation?.harness === "pi" && request.continuation.sessionFile === "/sessions/forked.jsonl");
     assert.equal(peerRequest?.rawInitialMessage, true, "peer questions are sent without the generic Task prefix");
     assert.deepEqual(peerRequest?.policy.piTools, [], "session peers cannot access child tools");
     await pi.tools.get("subagent_send").execute("peer-follow-up", {
       jobId: peer.details.job.id, message: "Why?", behavior: "followUp",
     }, undefined, undefined, ctx);
     await pi.tools.get("subagent_wait").execute("peer-follow-up-wait", { jobId: peer.details.job.id }, undefined, undefined, ctx);
-    assert.match(backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.resumeSessionFile === "/sessions/forked.jsonl")?.systemPrompt ?? "", /read-only session peer/);
+    assert.match(backends.find((backend) => backend.name === "pi")?.starts.find((request) => request.continuation?.harness === "pi" && request.continuation.sessionFile === "/sessions/forked.jsonl")?.systemPrompt ?? "", /read-only session peer/);
   });
 
   await t.test("reports masked provider readiness and gates it on project trust", async () => {
@@ -424,6 +537,11 @@ test("summarizeSubagentActivity distinguishes direct and workflow-owned jobs", (
   ]);
   assert.deepEqual(inactive.segments, []);
   assert.deepEqual(inactive.pointers, []);
+
+  const advisorOnly = summarizeSubagentActivity([
+    jobSnapshot({ status: "running", advisor: { advisorId: "adv_1", threadId: "thread-1" } }),
+  ]);
+  assert.deepEqual(advisorOnly.segments, [], "advisor turns belong to /advisors, not the direct subagent activity surface");
 
   const directRunning = summarizeSubagentActivity([jobSnapshot({ status: "running" })]);
   assert.equal(directRunning.segments[0].summary, "1 subagent running");

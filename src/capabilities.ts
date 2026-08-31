@@ -98,6 +98,7 @@ const DENIAL_RULES: Array<{ test: RegExp; effect: CapabilityEffect; reason: stri
   { test: /(^|[^a-z])(agents?|tasks?)([^a-z]|$)/i, effect: "delegation", reason: "nested agent orchestration is denied" },
   { test: /sub[-_ ]?agent/i, effect: "delegation", reason: "nested agent orchestration is denied" },
   { test: /work[-_ ]?flow/i, effect: "delegation", reason: "nested workflow orchestration is denied" },
+  { test: /advis(?:or|er)/i, effect: "delegation", reason: "nested advisor consultation is denied" },
   { test: /session[-_ ]?peer/i, effect: "delegation", reason: "session-peer forking is denied" },
   { test: /\bdelegat/i, effect: "delegation", reason: "nested delegation is denied" },
   { test: /(plugin|marketplace|extension)[-_ /]?(install|uninstall|add|remove|upgrade|enable|disable|share)/i, effect: "external-write", reason: "plugin administration is denied" },

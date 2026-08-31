@@ -65,6 +65,7 @@ export function selectHarness(
 
 /** Effective access ceiling. A profile's readOnly access cannot be elevated per call. */
 export function selectAccess(request: SpawnRequest, profile?: ProfileDefinition): AccessMode {
+  if (request.advisor) return "readOnly";
   return profile?.access === "readOnly" ? "readOnly" : request.access ?? profile?.access ?? "full";
 }
 

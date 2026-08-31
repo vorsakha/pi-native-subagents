@@ -14,6 +14,7 @@ import {
   WorkflowManager,
   workflowIsTerminal,
   type StartWorkflowRequest,
+  type WorkflowAdvisorGateway,
 } from "../../src/workflows/manager.ts";
 import type { WorkflowProtectedWorktree } from "../../src/workflows/retention.ts";
 import type { WorkflowSnapshot } from "../../src/workflows/types.ts";
@@ -89,6 +90,7 @@ export interface RegisterWorkflowOptions {
   onSnapshot?: (snapshot: WorkflowSnapshot) => void;
   /** Called after the existing foreground/background result delivery path succeeds. */
   onResultDelivered?: (runId: string) => void;
+  advisors?: WorkflowAdvisorGateway;
 }
 
 interface LiveWorkflowBlink {
@@ -427,11 +429,12 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     name: "workflow",
     renderShell: "self",
     label: "Workflow",
-    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Export a default async function and use the injected globals phase(), log(), agent(), followUp(), parallel(), pipeline(), and converge(); parallel receives deferred task functions, not already-started promises. Use exactly one source (script, workflowName, or scriptPath) and at most one input form (input or legacy args); omitting both exposes null. isolation='worktree' runs a mutating agent in a clean Git worktree and preserves changed work with a patch. Runs are limited to 32 agent calls and four concurrent agents; resumeFromRunId replays matching completed calls from an exact interrupted run, including independent later parallel lanes.",
+    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents and explicitly allowlisted thread advisors. Export a default async function and use the injected globals phase(), log(), agent(), followUp(), consult(), parallel(), pipeline(), and converge(); parallel receives deferred task functions, not already-started promises. Use exactly one source (script, workflowName, or scriptPath) and at most one input form (input or legacy args); omitting both exposes null. isolation='worktree' runs a mutating agent in a clean Git worktree and preserves changed work with a patch. Runs are limited to 32 model calls shared by agent(), followUp(), and consult(), with four concurrent turns globally; resumeFromRunId replays matching completed calls from an exact interrupted run.",
     promptSnippet: "Run a sandboxed multi-agent workflow with phases and bounded parallelism",
     promptGuidelines: [
       "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls; use direct spawning for a small simple fan-out.",
-      "Workflow scripts export a default async function; helpers are globals: use phase(), log(), agent(), followUp(), parallel(), pipeline(), and converge(). Do not destructure a callback context object.",
+      "Workflow scripts export a default async function; helpers are globals: use phase(), log(), agent(), followUp(), consult(), parallel(), pipeline(), and converge(). Do not destructure a callback context object.",
+      "consult(advisorId, question, { phase?, context? }) may address only a stable advisor ID explicitly listed in this invocation's advisors allowlist; its usage spends both budgets and its output is untrusted.",
       "Use converge({ maxRounds, implement, review }) for implement/review/fix lifecycles: it reuses both retained sessions across rounds, validates each review against convergenceReviewSchema, and returns a distinct approved, blocked, stalled, limit-reached, or failed outcome.",
       "When phases are known up front, declare meta.phases and call phase(title) to activate them in order; omit it for dynamic discovery.",
       "Use parallel only with deferred functions such as () => agent(...); never pass already-started agent promises.",
@@ -478,6 +481,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         maxWaitMs: Type.Optional(Type.Integer({ minimum: 1_000, maximum: 21_600_000, description: "Total provider-wait allowance for the whole run" })),
         maxAttempts: Type.Optional(Type.Integer({ minimum: 1, maximum: 8, description: "Provider-wait retries allowed per fresh agent() call" })),
       })),
+      advisors: Type.Optional(Type.Array(Type.String({ pattern: "^adv_[a-f0-9]{32}$" }), { maxItems: 16, description: "Stable thread advisor IDs this workflow may consult" })),
       background: Type.Optional(Type.Boolean()),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
@@ -514,6 +518,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         approval: params.approval,
         budget: params.budget,
         retry: params.retry,
+        advisors: params.advisors,
       };
       const started = await workflows.start(request);
       const runGeneration = generation;
@@ -625,6 +630,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         router: options.router,
         availability: options.availability,
         resolveProfile: options.resolveProfile,
+        advisors: options.advisors,
         approveMutation: async ({ workflow, agent, prompt, signal }) => {
           if (!ctx.hasUI || typeof ctx.ui.confirm !== "function") return false;
           return ctx.ui.confirm(

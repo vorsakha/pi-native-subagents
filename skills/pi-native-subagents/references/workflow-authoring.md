@@ -1,14 +1,10 @@
 # Workflow authoring
 
-Read this before writing or editing a workflow script. It covers the source contract, the sandbox API, phases, fan-out shapes, `followUp()`, and how a run's lifecycle differs from its task outcome.
+Read this before editing a workflow. It covers sources, sandbox APIs, phases, fan-out, retained calls, and task outcome.
 
 ## Source and input contract
 
-The `workflow` tool accepts exactly one source:
-
-- `script` — inline JavaScript;
-- `workflowName` — a saved user/project definition;
-- `scriptPath` — a trusted project-local script.
+The `workflow` tool accepts exactly one source: inline `script`, saved `workflowName`, or trusted project-local `scriptPath`.
 
 Use zero or one input form: structured `input` or the legacy JSON-string `args`, never both. The selected value is exposed to the script as the global `args`; omitting both exposes `null`. Workflows must be trusted and use a source contained by the trusted project rules.
 
@@ -20,15 +16,14 @@ Use zero or one input form: structured `input` or the legacy JSON-string `args`,
 
 A workflow script must export a default async function. The helpers are globals, not a context object:
 
-- `args` — parsed workflow input;
-- `phase(title)` — report bounded progress;
-- `log(message)` — report bounded progress text;
-- `agent(prompt, options)` — request one generic child and return a result object;
-- `followUp(jobId, prompt, options)` — continue a completed `agent()` call's own retained native session and return the same result shape;
-- `parallel(tasks, { concurrency })` — run deferred tasks with a bounded worker pool;
-- `pipeline(items, ...stages)` — process independent items through ordered stages;
-- `converge(options)` — run a bounded implement/review/fix loop over two retained sessions;
-- `convergenceReviewSchema` — the review schema `converge()` validates every verdict against.
+- `args` — parsed input;
+- `phase(title)` / `log(message)` — report bounded progress;
+- `agent(prompt, options)` — run one generic child;
+- `followUp(jobId, prompt, options)` — continue this run's retained child;
+- `consult(advisorId, question, options)` — consult an allowlisted thread advisor;
+- `parallel(tasks, { concurrency })` — run deferred tasks in a bounded pool;
+- `pipeline(items, ...stages)` — process items through stages;
+- `converge(options)` and `convergenceReviewSchema` — run and validate bounded fix loops.
 
 Do not write the function as if it receives a context object such as `async ({ phase, agent }) => ...`. Positional helper arguments are retained for compatibility, but the global API is the canonical form.
 
@@ -53,13 +48,13 @@ const processed = await pipeline(files, (file) => agent(`Summarize ${file}.`, { 
 const failed = files.filter((_, index) => processed[index] === null);
 ```
 
-Always await every `agent()`/`followUp()` call before returning from the default function. A forgotten promise fails the workflow rather than silently losing the child result.
+Always await every `agent()`, `followUp()`, and `consult()` call before returning from the default function. A forgotten promise fails the workflow rather than silently losing the child result.
 
 `agent("task", { harness: "codex", speed: "fast" })` explicitly opts one Codex lineage into Fast mode. Omit `speed` for standard policy. A selected profile never supplies this opt-in. Fast is unsupported by Pi and Claude, does not choose a route for `harness: "auto"`, and cannot combine with provider or continuation fallback.
 
 ## Continuing a retained agent with followUp
 
-`followUp(jobId, prompt, options?)` sends another turn to an `agent()` call this same workflow run already completed successfully, reusing its retained native session instead of starting a fresh child. This is the only supported way to return to earlier reasoning:
+`followUp(jobId, prompt, options?)` reuses a successfully completed `agent()` call's retained session. It is the only supported return to earlier reasoning:
 
 ```js
 phase("plan");
@@ -88,12 +83,16 @@ A fresh explicit Claude/Codex `agent()` may set one opposite native route. `prov
 
 `continuationFallback: { harness, model? }` permits one handoff after authoritative unavailability and current-turn progress, including follow-ups. Progress proof blocks primary replay. Queued admission rechecks readiness and requirements, then checkout and budget under the startup deadline. Schema, policy, budgets, usage, cancellation, logical ID, and provider independence stay fixed, including on replay. Unsafe state, unavailable target, isolation, or replacement failure is terminal; no wait or loop.
 
+## Consulting an advisor
+
+`consult(advisorId, question, { phase?, context? })` reaches a thread advisor whose stable ID is in the tool's `advisors` allowlist. Advisor calls, active turns, per-call tokens, usage, and Codex cost support meet the same enforcement, warnings, and dashboard metrics as agents, and dispatch uses the workflow lane of the global four-turn scheduler so direct work keeps priority. Calls are journaled with identity, lineage/generation, completed route, usage, queue delay, bounded result, and provenance; cancellation reaches queued and active calls.
+
 ## Sandbox limits and determinism
 
 - The sandbox exposes only orchestration: no imports, I/O, environment, processes, credentials, or nested delegation.
 - Workflows are deterministic: `Date.now()`, zero-argument `new Date()`, and `Math.random()` all throw.
 - Workflow data is bounded and JSON-serializable; one agent request is capped at 512 KiB.
-- A run may make at most 32 agent calls (`agent()` and `followUp()` share the budget) and use at most four concurrent workers. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
+- A run may make at most 32 calls (`agent()`, `followUp()`, and `consult()` share the budget) and use at most four concurrent workers. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
 - Mutating agents sharing one checkout are serialized; read-only and worktree-isolated calls are not.
 
 ## Lifecycle versus task outcome

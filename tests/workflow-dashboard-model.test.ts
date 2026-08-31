@@ -44,6 +44,44 @@ test("workflow outline construction includes planned phases and expands only the
   assert.equal(completed.phases[1]!.hiddenAgentCount, 1);
 });
 
+test("workflow outline treats advisor consultations as distinct ordered calls with stable selection", () => {
+  const run = workflowSnapshotFixture("advisor-outline");
+  run.agents[1]!.callIndex = 2;
+  run.phases[0]!.advisorConsultations = [0];
+  run.advisorConsultations = [{
+    index: 0,
+    callIndex: 1,
+    callFingerprint: "advisor-fingerprint",
+    advisorId: "adv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    advisorName: "Security advisor",
+    lineage: 2,
+    generation: 5,
+    phase: 0,
+    state: "completed",
+    timestamps: { createdAt: 1_000, updatedAt: 2_000, startedAt: 1_100, endedAt: 2_000 },
+    prompt: "Review containment",
+    output: "Keep it read-only",
+    harness: "claude",
+    model: "advisor-model",
+    usage: { input: 10, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+    queuedMs: 4,
+    outputProvenance: "advisor",
+  }];
+  const model = buildWorkflowOutline(run, "all", {
+    kind: "advisor",
+    key: "advisor:0",
+    phaseKey: "phase:0",
+  }, 65_000);
+  assert.deepEqual(model.nodes.map((node) => node.key), ["phase:0", "agent:0", "advisor:0", "agent:1"]);
+  const advisor = model.nodes.find((node) => node.kind === "advisor");
+  assert.ok(advisor?.kind === "advisor");
+  assert.equal(advisor.name, "advisor · Security advisor");
+  assert.equal(advisor.summary.text, "Keep it read-only");
+  assert.deepEqual(model.selected, { kind: "advisor", key: "advisor:0", phaseKey: "phase:0" });
+  assert.equal(model.phases[0]?.agentCount, 3);
+  assert.equal(model.phases[0]?.completedAgents, 2);
+});
+
 test("workflow outline phase labels preserve declared, dynamic-active, terminal, and no-current semantics", () => {
   const dynamic = workflowSnapshotFixture("dynamic-progress");
   const template = dynamic.phases[0]!;

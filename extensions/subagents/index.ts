@@ -41,7 +41,7 @@ import {
 import { isTerminal, JobManager } from "../../src/manager.ts";
 import { claimExtensionInstall } from "../../src/install-guard.ts";
 import { providerFamily } from "../../src/policy.ts";
-import { captureParentThread, type ParentThreadSnapshot } from "../../src/parent-thread-context.ts";
+import { boundRecentParentThreadContext, captureParentThread, renderParentThreadContext, type ParentThreadSnapshot } from "../../src/parent-thread-context.ts";
 import {
   MAX_ANSWER_CHARS,
   MAX_QUESTION_CHARS,
@@ -89,6 +89,14 @@ import { formatSpendBudget } from "../../src/budget.ts";
 import { renderWorkflowActivity, WorkflowActivityStore, type WorkflowActivitySnapshot } from "../workflows/activity.ts";
 import { configuredWorkflowsShortcut, formatWorkflowsShortcutHint, registerWorkflows } from "../workflows/index.ts";
 import type { WorkflowSnapshot } from "../../src/workflows/types.ts";
+import {
+  AdvisorRegistry,
+  FileAdvisorStore,
+  MAX_ADVISOR_CONTEXT_BYTES,
+  type AdvisorOpenRequest,
+  type AdvisorRouteResolver,
+} from "../../src/advisors.ts";
+import { openAdvisorsDashboard } from "../advisors/dashboard.ts";
 
 /** Production session-peer source backed by Pi's real SessionManager. Never mutates the source session. */
 export function createRealSessionPeerSource(): SessionPeerSource {
@@ -157,7 +165,7 @@ export interface SubagentActivity {
 
 /** Buckets active jobs by ownership so the activity widget can point to the right dashboard(s) without conflating counts. */
 export function summarizeSubagentActivity(
-  jobs: ReadonlyArray<Pick<JobSnapshot, "status" | "workflow" | "interaction">>,
+  jobs: ReadonlyArray<Pick<JobSnapshot, "status" | "workflow" | "advisor" | "interaction">>,
 ): SubagentActivity {
   const counts = {
     direct: { running: 0, queued: 0 },
@@ -165,6 +173,7 @@ export function summarizeSubagentActivity(
   };
   let needInput = 0;
   for (const job of jobs) {
+    if (job.advisor) continue;
     if (job.interaction && (job.interaction.state === "pending" || job.interaction.state === "answering")) needInput++;
     if (job.status !== "running" && job.status !== "queued") continue;
     counts[job.workflow ? "workflow" : "direct"][job.status]++;
@@ -218,6 +227,7 @@ export interface RegistrationOptions {
   backends?: Backend[];
   workflowArtifactRoot?: string;
   savedWorkflowRoot?: string;
+  advisorRoot?: string;
   setInterval?: typeof setInterval;
   clearInterval?: typeof clearInterval;
   globalProfilesDir?: string;
@@ -319,6 +329,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const workflowsShortcutHint = formatWorkflowsShortcutHint(workflowsShortcut);
   let activeHarness = configuredHarness;
   let manager: JobManager | undefined;
+  let advisors: AdvisorRegistry | undefined;
   let unsubscribeManager: (() => void) | undefined;
   let sessionContext: { isIdle(): boolean } | undefined;
   let sessionUi: ExtensionUIContext | undefined;
@@ -376,6 +387,52 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     backends,
   });
   const getManager = () => manager ??= createManager();
+  const defaultAdvisorRoot = resolve(getAgentDir(), "native-subagents/advisors");
+  const advisorRoot = options.advisorRoot ?? defaultAdvisorRoot;
+  const advisorStore = new FileAdvisorStore(advisorRoot, options.advisorRoot ? dirname(resolve(advisorRoot)) : resolve(getAgentDir()));
+  const advisorRouter: AdvisorRouteResolver = {
+    async resolve(request: AdvisorOpenRequest, expectedHarness: HarnessName | undefined) {
+      const profile = expectedHarness === undefined && request.profile
+        ? profileCatalog.profiles.get(request.profile.trim())
+        : undefined;
+      if (expectedHarness === undefined && request.profile && !profile) throw new Error(`Unknown subagent profile: ${request.profile}`);
+      const routed = await routeCapabilities(capabilities, {
+        request: {
+          name: request.name,
+          task: request.description,
+          cwd: request.cwd,
+          trusted: request.trusted,
+          harness: request.harness,
+          requires: request.requires,
+          model: request.model,
+          effort: request.effort,
+          access: "readOnly",
+          profile: expectedHarness === undefined ? request.profile : undefined,
+          defaultHarness: activeHarness,
+        },
+        profile,
+        preference: [expectedHarness ?? activeHarness],
+        availability,
+        requireAvailability: true,
+        signal: request.signal,
+      });
+      const harness = routed.harness ?? (request.harness === "auto" || request.harness === undefined ? activeHarness : request.harness);
+      if (expectedHarness && harness !== expectedHarness) {
+        throw new Error(`Advisor route ${expectedHarness} is unavailable; silent migration to ${harness} is forbidden`);
+      }
+      return {
+        harness,
+        requires: routed.requires ?? [],
+        capabilityRoute: routed.capabilityRoute,
+        effort: request.effort ?? profile?.effort,
+        profileBinding: profile ? { name: profile.name, systemPrompt: profile.systemPrompt } : undefined,
+      };
+    },
+  };
+  const getAdvisors = () => {
+    if (!advisors) throw new Error("Advisor registry is unavailable before session_start");
+    return advisors;
+  };
   const workflowActivity = new WorkflowActivityStore();
   const clearActivityWidget = (ui: ExtensionUIContext) => {
     ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, undefined);
@@ -567,11 +624,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     expanded: boolean,
     context?: LiveCardRenderContext,
   ) => {
-    const jobs = manager?.list() ?? fallback;
+    const jobs = (manager?.list() ?? fallback).filter((job) => !job.advisor);
     syncCardBlink(
       context,
       !!manager && jobs.some((job) => !isTerminal(job.status)),
-      () => !!manager && manager.list().some((job) => !isTerminal(job.status)),
+      () => !!manager && manager.list().some((job) => !job.advisor && !isTerminal(job.status)),
     );
     return renderJobListCard(jobs, theme, { expanded, now: Date.now() });
   };
@@ -585,6 +642,23 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     resolveProfile: (name) => profileCatalog.profiles.get(name),
     setInterval: options.setInterval,
     clearInterval: options.clearInterval,
+    advisors: {
+      async describe(threadId, advisorId, trusted) {
+        if (!trusted) throw new Error("Advisors are disabled for untrusted projects");
+        await getAdvisors().initialize();
+        const advisor = getAdvisors().get(threadId, advisorId, trusted);
+        return {
+          id: advisor.id,
+          name: advisor.name,
+          lineage: advisor.lineage,
+          harness: advisor.policy.harness,
+          model: advisor.policy.model,
+        };
+      },
+      consult(request) {
+        return getAdvisors().consult({ ...request, sender: "workflow" });
+      },
+    },
     onSnapshot: (snapshot) => {
       workflowActivity.observe(snapshot);
       observeFollowThroughWorkflow(snapshot);
@@ -905,7 +979,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       return;
     }
     const key = resultKey(job.id, job.generation);
-    if (job.workflow || consumedResults.has(key) || (waitInterest.get(key) ?? 0) > 0) return;
+    if (job.workflow || job.advisor || consumedResults.has(key) || (waitInterest.get(key) ?? 0) > 0) return;
     deferredResults.set(key, job);
     if (sessionContext?.isIdle()) flushDeferredResults();
   };
@@ -951,6 +1025,16 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       ctx.isProjectTrusted() ? resolve(ctx.cwd, CONFIG_DIR_NAME, "subagents") : undefined,
     );
     manager = createManager();
+    advisors = new AdvisorRegistry({
+      jobs: manager,
+      threadId: ctx.sessionManager.getSessionId(),
+      projectRoot: ctx.cwd,
+      store: advisorStore,
+      router: advisorRouter,
+    });
+    void advisors.initialize().catch((error) => {
+      ctx.ui.notify(`Advisor roster unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+    });
     // A new session may open a different project or follow a configuration change.
     capabilities.invalidate();
     providerStatus.invalidate?.();
@@ -1059,10 +1143,12 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     displayedActivity = undefined;
     try {
       await workflows.sessionShutdown();
+      await advisors?.shutdown();
       await manager?.shutdown();
     }
     finally {
       manager = undefined;
+      advisors = undefined;
       releaseInstall();
     }
   });
@@ -1142,12 +1228,223 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     }
   };
 
+  const advisorThreadId = (ctx: { sessionManager: { getSessionId(): string } }) => ctx.sessionManager.getSessionId();
+  const advisorSummary = (advisor: ReturnType<AdvisorRegistry["list"]>[number]) =>
+    `${advisor.id} · ${advisor.name} · ${advisor.state} · ${advisor.policy.harness}/${advisor.policy.model ?? "default"} · lineage ${advisor.lineage} generation ${advisor.generation} · queued ${advisor.queued} · ${advisor.usage.input + advisor.usage.output} tokens`;
+
+  pi.registerCommand("advisors", {
+    description: "Open the thread advisor dashboard.",
+    handler: async (_args, ctx) => {
+      if (!ctx.isProjectTrusted()) {
+        ctx.ui.notify("Advisors are disabled for untrusted projects.", "error");
+        return;
+      }
+      await getAdvisors().initialize();
+      await openAdvisorsDashboard(ctx, getAdvisors());
+    },
+  });
+
+  pi.registerCommand("advisor", {
+    description: "Open, ask, close, or explicitly reset a thread-scoped advisor.",
+    getArgumentCompletions: (prefix) => ["open", "ask", "close", "reset"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    handler: async (args, ctx) => {
+      const [action, target, ...rest] = tokenizeCommandArgs(args);
+      try {
+        if (action === "open" && target && rest.length) {
+          const advisor = await getAdvisors().open({
+            threadId: advisorThreadId(ctx),
+            name: target,
+            description: rest.join(" "),
+            cwd: ctx.cwd,
+            trusted: ctx.isProjectTrusted(),
+          });
+          ctx.ui.notify(`Advisor registered without a model turn:\n${advisorSummary(advisor)}`, "info");
+          return;
+        }
+        if (action === "ask" && target && rest.length) {
+          const messages = ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
+          const parentThread = captureParentThread(messages);
+          const contextPacket = boundRecentParentThreadContext(
+            renderParentThreadContext(parentThread, { limit: 8 }),
+            MAX_ADVISOR_CONTEXT_BYTES,
+          );
+          const result = await getAdvisors().consult({
+            threadId: advisorThreadId(ctx),
+            advisorId: target,
+            question: rest.join(" "),
+            context: contextPacket,
+            sender: "human",
+            trusted: ctx.isProjectTrusted(),
+          });
+          ctx.ui.notify(result.ok ? result.output || "Advisor returned no text." : result.error ?? "Advisor consultation failed", result.ok ? "info" : "error");
+          return;
+        }
+        if ((action === "close" || action === "reset") && target && rest.length === 0) {
+          const advisor = action === "close"
+            ? await getAdvisors().close(advisorThreadId(ctx), target, ctx.isProjectTrusted())
+            : await getAdvisors().reset(advisorThreadId(ctx), target, ctx.isProjectTrusted());
+          ctx.ui.notify(advisorSummary(advisor), action === "close" ? "info" : "warning");
+          return;
+        }
+        ctx.ui.notify("Usage: /advisor open <name> <description> | /advisor ask <name-or-id> <question> | /advisor close <name-or-id> | /advisor reset <name-or-id>", "warning");
+      } catch (error) {
+        ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
+    },
+  });
+
+  const advisorOpenParameters = Type.Object({
+    name: Type.String({ minLength: 1, maxLength: 160 }),
+    description: Type.String({ minLength: 1, maxLength: 4_000 }),
+    aliases: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 160 }), { maxItems: 8 })),
+    cwd: Type.Optional(Type.String()),
+    harness: Type.Optional(StringEnum(REQUESTED_HARNESSES)),
+    requires: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: MAX_REQUIREMENT_LENGTH }), { maxItems: MAX_REQUIREMENTS })),
+    model: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+    effort: Type.Optional(StringEnum(EFFORTS)),
+    profile: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
+    maxTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000_000 })),
+    maxCost: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 10_000 })),
+    maxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000 })),
+  });
+
+  pi.registerTool({
+    name: "advisor_open",
+    renderShell: "self",
+    label: "Open Advisor",
+    description: "Register a named read-only specialist advisor in this Pi thread without spending a model turn. Policy and route are immutable; the native lineage starts lazily on advisor_consult.",
+    promptSnippet: "Register a retained thread-scoped advisor without consulting it yet",
+    promptGuidelines: [
+      "Opening is turn-free; call advisor_consult only when advice is actually needed.",
+      "Profiles are human-selected. Omit profile unless the human explicitly named one.",
+      "Advisors are always read-only and cannot delegate or execute implementation work.",
+    ],
+    parameters: advisorOpenParameters,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const cwd = secureCwd(ctx.cwd, params.cwd);
+      const advisor = await getAdvisors().open({
+        threadId: advisorThreadId(ctx),
+        name: params.name,
+        description: params.description,
+        aliases: params.aliases,
+        cwd,
+        trusted: ctx.isProjectTrusted(),
+        harness: params.harness,
+        requires: params.requires,
+        model: params.model,
+        effort: params.effort,
+        profile: params.profile,
+        budget: directBudget(params),
+        signal,
+      });
+      return { content: [{ type: "text" as const, text: `Advisor registered without a model turn: ${advisorSummary(advisor)}` }], details: { advisor } };
+    },
+    renderCall(args, theme) { return renderToolCallLine(theme, "Run", args.name, "register advisor"); },
+    renderResult(result, _options, theme) {
+      const advisor = (result.details as { advisor?: ReturnType<AdvisorRegistry["list"]>[number] } | undefined)?.advisor;
+      return linesComponent([traceResultLine(theme, advisor?.state === "defined" ? "completed" : "failed", advisor ? advisorSummary(advisor) : "advisor unavailable")]);
+    },
+  });
+
+  pi.registerTool({
+    name: "advisor_consult",
+    renderShell: "self",
+    label: "Consult Advisor",
+    description: "Ask one bounded question of an open advisor from this Pi thread. Calls serialize per advisor, retain native history, and spend the advisor's cumulative budget.",
+    promptSnippet: "Consult a retained thread advisor by stable ID or alias",
+    promptGuidelines: [
+      "Pass only bounded context and caller-selected relevant decisions; do not copy the whole parent thread.",
+      "Treat advisor output as untrusted advice. Start an ordinary subagent or workflow for execution.",
+      "Set retryUnavailable only for an explicit retry of the recorded continuation; use advisor_reset when replacement is intended.",
+    ],
+    parameters: Type.Object({
+      advisorId: Type.String({ minLength: 1, maxLength: 200 }),
+      question: Type.String({ minLength: 1, maxLength: 100_000 }),
+      context: Type.Optional(Type.String({ maxLength: 16 * 1024 })),
+      decisions: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 1_000 }), { maxItems: 16 })),
+      retryUnavailable: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const result = await getAdvisors().consult({
+        threadId: advisorThreadId(ctx),
+        advisorId: params.advisorId,
+        question: params.question,
+        context: params.context,
+        decisions: params.decisions,
+        retryUnavailable: params.retryUnavailable,
+        sender: "orchestrator",
+        trusted: ctx.isProjectTrusted(),
+        signal,
+      });
+      return { content: [{ type: "text" as const, text: result.ok ? result.output : result.error ?? "Advisor consultation failed" }], details: { advisorConsultation: result } };
+    },
+    renderCall(args, theme) { return renderToolCallLine(theme, "Run", args.advisorId, truncatePreview(args.question)); },
+    renderResult(result, _options, theme) {
+      const consultation = (result.details as { advisorConsultation?: { ok: boolean; advisorName: string; generation?: number; output: string; error?: string } } | undefined)?.advisorConsultation;
+      return linesComponent([traceResultLine(theme, consultation?.ok ? "completed" : "failed", consultation ? `${consultation.advisorName} · generation ${consultation.generation ?? "?"} · ${truncatePreview(consultation.output || consultation.error || "no output", 160)}` : "advisor result unavailable")]);
+    },
+  });
+
+  pi.registerTool({
+    name: "advisor_list",
+    renderShell: "self",
+    label: "List Advisors",
+    description: "List the bounded advisor roster for this Pi thread. Native continuation references remain private.",
+    promptSnippet: "List this thread's retained advisors",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+      if (!ctx.isProjectTrusted()) throw new Error("Advisors are disabled for untrusted projects");
+      await getAdvisors().initialize();
+      const roster = getAdvisors().list(advisorThreadId(ctx), ctx.isProjectTrusted());
+      return { content: [{ type: "text" as const, text: roster.length ? roster.map(advisorSummary).join("\n") : "No advisors are open in this thread." }], details: { advisors: roster } };
+    },
+    renderCall(_args, theme) { return renderToolCallLine(theme, "List", "advisors"); },
+    renderResult(result, _options, theme) {
+      const roster = (result.details as { advisors?: ReturnType<AdvisorRegistry["list"]> } | undefined)?.advisors ?? [];
+      return linesComponent([traceResultLine(theme, "completed", `${roster.length} advisor${roster.length === 1 ? "" : "s"}`)]);
+    },
+  });
+
+  for (const action of ["close", "reset"] as const) {
+    pi.registerTool({
+      name: `advisor_${action}`,
+      renderShell: "self",
+      label: action === "close" ? "Close Advisor" : "Reset Advisor",
+      description: action === "close"
+        ? "Close an advisor and delete its private continuation from this thread roster."
+        : "Explicitly replace an unavailable advisor lineage while preserving its stable advisor ID, cumulative spend, and audit ledger.",
+      promptSnippet: action === "close" ? "Close a thread advisor" : "Explicitly reset an advisor's missing or invalid lineage",
+      parameters: Type.Object({ advisorId: Type.String({ minLength: 1, maxLength: 200 }) }),
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        const advisor = action === "close"
+          ? await getAdvisors().close(advisorThreadId(ctx), params.advisorId, ctx.isProjectTrusted())
+          : await getAdvisors().reset(advisorThreadId(ctx), params.advisorId, ctx.isProjectTrusted());
+        return { content: [{ type: "text" as const, text: advisorSummary(advisor) }], details: { advisor } };
+      },
+      renderCall(args, theme) { return renderToolCallLine(theme, "Run", args.advisorId, action); },
+      renderResult(result, _options, theme) {
+        const advisor = (result.details as { advisor?: ReturnType<AdvisorRegistry["list"]>[number] } | undefined)?.advisor;
+        return linesComponent([traceResultLine(theme, "completed", advisor ? advisorSummary(advisor) : `advisor ${action}d`)]);
+      },
+    });
+  }
+
   pi.registerCommand("subagents", {
     description: "Open the subagent dashboard; inspect profiles with /subagents profiles, provider login state with /subagents providers, and native capabilities with /subagents capabilities.",
     getArgumentCompletions: (prefix) => ["status", "profiles", "providers", "providers refresh", "capabilities", "capabilities refresh", ...HARNESSES, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (args.trim()) await configure(args, ctx);
-      else await openSubagentsDashboard(ctx, getManager(), { availability: currentHarnessActivations });
+      else {
+        const direct = getManager();
+        await openSubagentsDashboard(ctx, {
+          concurrency: direct.concurrency,
+          list: () => direct.list().filter((job) => !job.advisor),
+          subscribe: (listener) => direct.subscribe((job) => { if (!job.advisor) listener(job); }),
+          send: (id, message, behavior) => direct.send(id, message, behavior),
+          cancel: (id, reason) => direct.cancel(id, reason),
+          answerInteraction: (requestId, answer, route) => direct.answerInteraction(requestId, answer, route),
+        }, { availability: currentHarnessActivations });
+      }
     },
   });
 
@@ -1478,7 +1775,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     description: "List all jobs scoped to the current Pi session.",
     parameters: Type.Object({}),
     async execute() {
-      const jobs = getManager().list();
+      const jobs = getManager().list().filter((job) => !job.advisor);
       const text = jobs.length ? jobs.map(statusLine).join("\n") : "No subagent jobs in this session.";
       return { content: [{ type: "text", text }], details: { jobs: jobs.map(compactJob) } };
     },

@@ -29,6 +29,12 @@ export interface WorkflowAgentResult {
    * from failure prose.
    */
   limit?: "budget";
+  advisorId?: string;
+  advisorName?: string;
+  lineage?: number;
+  generation?: number;
+  route?: { harness: string; model?: string };
+  queuedMs?: number;
 }
 
 /** Bounded convergence progress reported by the sandbox `converge()` helper. */
@@ -60,6 +66,13 @@ export interface WorkflowSandboxOptions {
     signal: AbortSignal,
     callIndex: number,
   ): Promise<WorkflowAgentResult>;
+  onConsult?(
+    advisorId: string,
+    question: string,
+    options: Record<string, unknown>,
+    signal: AbortSignal,
+    callIndex: number,
+  ): Promise<WorkflowAgentResult>;
   onMeta(meta: unknown): void;
   onPhase(title: string): void;
   /** Checks proposed phase titles against the manager's authoritative run state. */
@@ -76,6 +89,7 @@ export interface WorkflowSandboxResult {
 type ChildMessage =
   | { token: string; type: "agent"; id: number; prompt: string; options: Record<string, unknown> }
   | { token: string; type: "followUp"; id: number; jobId: string; prompt: string; options: Record<string, unknown> }
+  | { token: string; type: "advisor"; id: number; advisorId: string; prompt: string; options: Record<string, unknown> }
   | { token: string; type: "meta"; meta: unknown }
   | { token: string; type: "phase"; title: string }
   | { token: string; type: "phase-capacity"; id: number; titles: string[] }
@@ -343,13 +357,16 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
         catch (error) { fail(error instanceof Error ? error : new Error(String(error))); }
         return;
       }
-      if (message.type === "agent" || message.type === "followUp") {
+      if (message.type === "agent" || message.type === "followUp" || message.type === "advisor") {
         if (!Number.isSafeInteger(message.id) || typeof message.prompt !== "string" ||
             !message.options || typeof message.options !== "object" || Array.isArray(message.options)) {
           return fail(new Error("Invalid agent request from workflow sandbox"));
         }
         if (message.type === "followUp" && (typeof message.jobId !== "string" || !message.jobId.trim() || message.jobId.length > 200)) {
           return fail(new Error("Invalid follow-up request from workflow sandbox"));
+        }
+        if (message.type === "advisor" && (typeof message.advisorId !== "string" || !message.advisorId.trim() || message.advisorId.length > 200)) {
+          return fail(new Error("Invalid advisor consultation request from workflow sandbox"));
         }
         if (message.id !== agentCalls + 1) return fail(new Error("Workflow sandbox agent call IDs are not contiguous"));
         agentCalls++;
@@ -361,7 +378,11 @@ export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promi
         agentControllers.set(message.id, controller);
         const dispatch = message.type === "followUp"
           ? () => options.onFollowUp(message.jobId, message.prompt, message.options, controller.signal, message.id - 1)
-          : () => options.onAgent(message.prompt, message.options, controller.signal, message.id - 1);
+          : message.type === "advisor"
+            ? () => options.onConsult
+              ? options.onConsult(message.advisorId, message.prompt, message.options, controller.signal, message.id - 1)
+              : Promise.resolve({ ok: false, output: "", error: "Workflow advisor consultation is unavailable" })
+            : () => options.onAgent(message.prompt, message.options, controller.signal, message.id - 1);
         const task = Promise.resolve()
           .then(dispatch)
           .catch(safeAgentFailure)

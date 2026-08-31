@@ -7,7 +7,7 @@ import type { JobManager, PeerInteractionRequest, PeerInteractionResult } from "
 import { isTerminal } from "../manager.ts";
 import { renderPeerQuestionPrompt, type PendingInteraction } from "../interactions.ts";
 import { normalizeModel, selectSpeed } from "../policy.ts";
-import { reachedSpendWarning, spendBudgetMetrics, validateSpendBudget } from "../budget.ts";
+import { assertSupportedSpendBudget, reachedSpendWarning, spendBudgetMetrics, validateSpendBudget } from "../budget.ts";
 import { waitDecision, type ProviderUnavailability } from "../provider-unavailability.ts";
 import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SpawnRequest, StructuredOutputSupport, Usage } from "../types.ts";
 import {
@@ -32,6 +32,7 @@ import {
   workflowFollowUpFingerprint,
   workflowInteractionFingerprint,
   workflowReplayReferenceKey,
+  workflowAdvisorFingerprint,
 } from "./journal.ts";
 import { resolveWorkflowStructured, workflowSchema } from "./schema.ts";
 import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
@@ -50,6 +51,7 @@ import {
 } from "./retention.ts";
 import type {
   WorkflowAgentAttempt,
+  WorkflowAdvisorRecord,
   WorkflowAgentGeneration,
   WorkflowAgentRecord,
   WorkflowAgentState,
@@ -97,6 +99,35 @@ export const MAX_WORKFLOW_INTERACTIONS = 32;
 const MAX_WORKFLOW_INTERACTION_HISTORY = 16;
 /** followUp() options are presentation/validation only; every policy field stays fixed at the original agent() call. */
 const FOLLOWUP_OPTION_KEYS = new Set(["phase", "schema"]);
+const ADVISOR_OPTION_KEYS = new Set(["phase", "context"]);
+
+class WorkflowAdvisorBudgetError extends Error {}
+
+export interface WorkflowAdvisorGateway {
+  describe(threadId: string, advisorId: string, trusted: boolean): Promise<{ id: string; name: string; lineage: number; harness: HarnessName; model?: string }>;
+  consult(request: {
+    threadId: string;
+    advisorId: string;
+    question: string;
+    context?: string;
+    trusted: boolean;
+    signal: AbortSignal;
+    requiredLineage?: number;
+    workflow: { runId: string; phase?: string; callIndex: number };
+    dispatchGate?: () => string | undefined;
+  }): Promise<{
+    ok: boolean;
+    advisorId: string;
+    advisorName: string;
+    lineage: number;
+    generation?: number;
+    output: string;
+    error?: string;
+    usage?: Usage;
+    route: { harness: HarnessName; model?: string };
+    queuedMs: number;
+  }>;
+}
 
 export interface StartWorkflowRequest {
   sessionId: string;
@@ -119,6 +150,8 @@ export interface StartWorkflowRequest {
   budget?: WorkflowBudgetPolicy;
   /** Opt-in provider-quota wait policy; absent preserves today's immediate-failure behavior. */
   retry?: WorkflowRetryPolicy;
+  /** Stable IDs of thread advisors this invocation may consult. */
+  advisors?: string[];
 }
 
 export interface StartedWorkflow {
@@ -182,6 +215,8 @@ interface RunEntry {
   settlingProviderCalls: Set<string>;
   /** Interaction ordinal assigned to each routed question, keyed by host request ID. */
   interactionOrdinals: Map<string, number>;
+  /** Advisor host calls owned by this run, retained through teardown and journal settlement. */
+  advisorCalls: Set<Promise<WorkflowAgentResult>>;
 }
 
 interface ProviderSettlementOwner {
@@ -594,6 +629,7 @@ export class WorkflowManager {
   readonly #router?: CapabilityRouter;
   readonly #availability?: HarnessAvailabilityProbe;
   readonly #resolveProfile?: (name: string) => ProfileDefinition | undefined;
+  readonly #advisors?: WorkflowAdvisorGateway;
   #initializing?: Promise<void>;
   #closed = false;
   #retentionChain: Promise<void> = Promise.resolve();
@@ -622,6 +658,7 @@ export class WorkflowManager {
     checkout?: WorkflowCheckoutOperations;
     /** Test-only journal injection for deterministic persistence races. */
     journalAppender?: typeof appendWorkflowJournal;
+    advisors?: WorkflowAdvisorGateway;
   }) {
     this.#jobs = options.jobs;
     this.#artifactRoot = resolve(options.artifactRoot);
@@ -630,6 +667,7 @@ export class WorkflowManager {
     this.#router = options.router;
     this.#availability = options.availability;
     this.#resolveProfile = options.resolveProfile;
+    this.#advisors = options.advisors;
     this.#maxRetainedRuns = Number.isSafeInteger(options.retainedRuns) && options.retainedRuns! > 0
       ? options.retainedRuns!
       : DEFAULT_WORKFLOW_RETAINED_RUNS;
@@ -697,6 +735,7 @@ export class WorkflowManager {
     if (!["auto", "plan", "onMutate"].includes(approval)) throw new Error(`Unknown workflow approval mode: ${approval}`);
     const budget = normalizeWorkflowBudget(request.budget);
     const retry = normalizeWorkflowRetry(request.retry);
+    const advisorIds = normalizeAdvisorAllowlist(request.advisors);
     const fingerprintInput = {
       script: request.script,
       argsJson,
@@ -704,6 +743,7 @@ export class WorkflowManager {
       parentProvider: request.parentProvider,
       defaultHarness: request.defaultHarness,
       approval,
+      advisors: advisorIds,
     };
     const replayBaseFingerprint = workflowDefinitionFingerprint(fingerprintInput);
     const definitionFingerprint = workflowDefinitionFingerprint({
@@ -769,6 +809,8 @@ export class WorkflowManager {
       approval,
       budget,
       retry,
+      advisors: advisorIds.length ? advisorIds : undefined,
+      advisorConsultations: [],
       warnings: warnings.length ? warnings : undefined,
       replay: replay ? {
         sourceRunId: replay.sourceRunId,
@@ -813,6 +855,7 @@ export class WorkflowManager {
       settlingProviderCalls: new Set(),
       providerWaitBudgetMs: retry?.maxWaitMs ?? 0,
       interactionOrdinals: new Map(),
+      advisorCalls: new Set(),
     };
     this.#runs.set(snapshot.runId, entry);
     entry.completion = this.#execute(entry, request);
@@ -865,6 +908,7 @@ export class WorkflowManager {
       settlingProviderCalls: new Set(),
       providerWaitBudgetMs: snapshot.retry?.maxWaitMs ?? 0,
       interactionOrdinals: new Map(),
+      advisorCalls: new Set(),
     };
     this.#runs.set(snapshot.runId, entry);
     return entry;
@@ -1152,6 +1196,7 @@ export class WorkflowManager {
         onConvergence: (progress) => this.#recordConvergence(entry, progress),
         onAgent: (prompt, options, signal, callIndex) => this.#runAgent(entry, request, prompt, options, signal, callIndex),
         onFollowUp: (jobId, prompt, options, signal, callIndex) => this.#runFollowUpCall(entry, request, jobId, prompt, options, signal, callIndex),
+        onConsult: (advisorId, question, options, signal, callIndex) => this.#runAdvisorCall(entry, request, advisorId, question, options, signal, callIndex),
       });
       this.#applyMeta(entry, sandbox.meta, false);
       entry.snapshot.result = sandbox.result;
@@ -1161,10 +1206,11 @@ export class WorkflowManager {
       await writeWorkflowResult(this.#artifactRoot, entry.snapshot.runId, sandbox.result);
     } catch (error) {
       const aborted = entry.controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
-      entry.snapshot.status = aborted ? "aborted" : "failed";
+      const status = aborted ? "aborted" : "failed";
       entry.snapshot.error = boundedText(entry.snapshot.error || error);
       await this.#cancelMemberJobs(entry, entry.snapshot.error);
-      this.#finishPhases(entry, entry.snapshot.status);
+      entry.snapshot.status = status;
+      this.#finishPhases(entry, status);
     } finally {
       this.#releasePause(entry);
       await this.#releaseMemberRuns(entry);
@@ -1812,6 +1858,254 @@ export class WorkflowManager {
       jobId: requestedJobId,
       provider: entry.replay?.priorJobProviders.get(requestedJobId),
     };
+  }
+
+  #runAdvisorCall(
+    entry: RunEntry,
+    request: StartWorkflowRequest,
+    advisorId: string,
+    question: string,
+    options: Record<string, unknown>,
+    signal: AbortSignal,
+    callIndex: number,
+  ): Promise<WorkflowAgentResult> {
+    const call = this.#runAdvisorCallOwned(entry, request, advisorId, question, options, signal, callIndex);
+    entry.advisorCalls.add(call);
+    void call.then(
+      () => entry.advisorCalls.delete(call),
+      () => entry.advisorCalls.delete(call),
+    );
+    return call;
+  }
+
+  async #runAdvisorCallOwned(
+    entry: RunEntry,
+    request: StartWorkflowRequest,
+    advisorId: string,
+    question: string,
+    options: Record<string, unknown>,
+    signal: AbortSignal,
+    callIndex: number,
+  ): Promise<WorkflowAgentResult> {
+    if (callIndex !== entry.nextCallIndex || callIndex < 0 || callIndex >= 32) {
+      throw new Error(`Workflow advisor call ordinal is invalid or out of sequence: ${callIndex}`);
+    }
+    entry.nextCallIndex++;
+    const fingerprint = workflowAdvisorFingerprint({ advisorId, question, options });
+    await this.#appendJournal(entry, { callIndex, fingerprint, kind: "advisor", state: "started", at: Date.now() });
+    await this.#waitUntilResumed(entry, signal);
+
+    const expected = entry.replay?.active && callIndex < (entry.snapshot.budget?.maxAgents ?? 32)
+      ? entry.replay.calls.find((call) => call.callIndex === callIndex)
+      : undefined;
+    if (entry.replay?.active && expected?.fingerprint === fingerprint && expected.kind === "advisor") {
+      const record = this.#recordReplayedAdvisor(entry, advisorId, question, options, callIndex, fingerprint, expected);
+      entry.snapshot.replay!.matchedCalls++;
+      await this.#appendJournal(entry, {
+        callIndex,
+        fingerprint,
+        kind: "advisor",
+        state: "completed",
+        at: Date.now(),
+        result: clone(expected.result),
+        route: expected.route ? { ...expected.route } : undefined,
+        replayedFrom: { runId: entry.replay.sourceRunId, callIndex: expected.callIndex },
+      });
+      this.#touch(entry);
+      return {
+        ok: true,
+        output: expected.result.output,
+        usage: workflowUsage(),
+        advisorId: record.advisorId,
+        advisorName: record.advisorName,
+        lineage: record.lineage,
+        generation: record.generation,
+        route: { harness: record.harness ?? "unknown", model: record.model },
+        queuedMs: record.queuedMs,
+      };
+    }
+    if (entry.replay?.active) {
+      entry.snapshot.replay!.invalidatedAt ??= callIndex;
+      this.#touch(entry);
+    }
+
+    let result: WorkflowAgentResult;
+    let record: WorkflowAdvisorRecord | undefined;
+    try {
+      if (!this.#advisors) throw new Error("Workflow advisor consultation is unavailable in this host");
+      if (!(entry.snapshot.advisors ?? []).includes(advisorId)) {
+        throw new Error(`Advisor ${advisorId} is not allowlisted for this workflow invocation`);
+      }
+      if (!question.trim()) throw new Error("consult() requires a non-empty question");
+      const unknown = Object.keys(options).filter((key) => !ADVISOR_OPTION_KEYS.has(key));
+      if (unknown.length) throw new Error(`consult() does not accept options: ${unknown.join(", ")}`);
+      if (options.context !== undefined && typeof options.context !== "string") throw new Error("consult context must be a string");
+      if (typeof options.context === "string" && Buffer.byteLength(options.context) > 16 * 1024) throw new Error("consult context exceeds 16384 bytes");
+      if (callIndex >= (entry.snapshot.budget?.maxAgents ?? 32)) {
+        throw new WorkflowAdvisorBudgetError(`Workflow agent budget exceeded (${entry.snapshot.budget?.maxAgents} calls)`);
+      }
+      const preflight = this.#budgetPreflight(entry);
+      if (preflight) throw new WorkflowAdvisorBudgetError(preflight);
+      const advisor = await this.#advisors.describe(request.sessionId, advisorId, request.trusted);
+      assertSupportedSpendBudget(entry.snapshot.budget, advisor.harness);
+      const phase = this.#resolveAgentPhase(entry, options.phase);
+      this.#markPhaseRunning(entry, phase);
+      const now = Date.now();
+      record = {
+        index: entry.snapshot.advisorConsultations?.length ?? 0,
+        callIndex,
+        callFingerprint: fingerprint,
+        advisorId: advisor.id,
+        advisorName: advisor.name,
+        lineage: advisor.lineage,
+        phase,
+        state: "queued",
+        timestamps: { createdAt: now, updatedAt: now },
+        prompt: boundedText(question, 2 * 1024),
+        context: typeof options.context === "string" ? boundedText(options.context, 2 * 1024) : undefined,
+        harness: advisor.harness,
+        model: advisor.model,
+        usage: workflowUsage(),
+      };
+      (entry.snapshot.advisorConsultations ??= []).push(record);
+      (entry.snapshot.phases[phase]!.advisorConsultations ??= []).push(record.index);
+      this.#touch(entry);
+      const requiredLineage = expected?.kind === "advisor" ? expected.result.advisorLineage : undefined;
+      const execute = async () => {
+        const queuedPreflight = this.#budgetPreflight(entry);
+        if (queuedPreflight) throw new WorkflowAdvisorBudgetError(queuedPreflight);
+        record!.state = "running";
+        record!.timestamps.startedAt = Date.now();
+        record!.timestamps.updatedAt = record!.timestamps.startedAt;
+        this.#touch(entry);
+        const consulted = await this.#advisors!.consult({
+          threadId: request.sessionId,
+          advisorId,
+          question,
+          context: typeof options.context === "string" ? options.context : undefined,
+          trusted: request.trusted,
+          signal,
+          requiredLineage,
+          workflow: {
+            runId: entry.snapshot.runId,
+            phase: entry.snapshot.phases[phase]?.name,
+            callIndex,
+          },
+          dispatchGate: () => this.#budgetPreflight(entry),
+        });
+        const endedAt = Date.now();
+        record!.state = consulted.ok ? "completed" : signal.aborted ? "cancelled" : "failed";
+        record!.advisorName = consulted.advisorName;
+        record!.lineage = consulted.lineage;
+        record!.generation = consulted.generation;
+        record!.output = boundedText(consulted.output, 16 * 1024);
+        record!.error = consulted.error ? boundedText(consulted.error, 2_000) : undefined;
+        record!.harness = consulted.route.harness;
+        record!.model = consulted.route.model;
+        record!.usage = workflowUsage(consulted.usage);
+        record!.queuedMs = consulted.queuedMs;
+        record!.outputProvenance = "advisor";
+        record!.instructionShaped = looksInstructionShaped(consulted.output);
+        record!.timestamps.updatedAt = endedAt;
+        record!.timestamps.endedAt = endedAt;
+        this.#recordBudgetWarnings(entry);
+        this.#touch(entry);
+        return consulted;
+      };
+      const consulted = await this.#withDispatchSlot(entry, signal, execute);
+      const launchBudget = this.#budgetPreflight(entry);
+      if (!consulted.ok && launchBudget && consulted.error === launchBudget) {
+        throw new WorkflowAdvisorBudgetError(launchBudget);
+      }
+      result = {
+        ok: consulted.ok,
+        output: consulted.output,
+        error: consulted.error,
+        usage: consulted.usage,
+        advisorId: consulted.advisorId,
+        advisorName: consulted.advisorName,
+        lineage: consulted.lineage,
+        generation: consulted.generation,
+        route: consulted.route,
+        queuedMs: consulted.queuedMs,
+      };
+    } catch (error) {
+      const message = boundedText(error);
+      if (record) {
+        record.state = signal.aborted ? "cancelled" : "failed";
+        record.error = message;
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt = record.timestamps.updatedAt;
+        this.#touch(entry);
+      }
+      result = {
+        ok: false,
+        output: "",
+        error: message,
+        limit: error instanceof WorkflowAdvisorBudgetError ? "budget" : undefined,
+      };
+    }
+    const journalResult: WorkflowJournalResult = {
+      ok: result.ok,
+      output: result.output,
+      error: result.error,
+      usage: result.usage as Usage | undefined,
+      advisorId: result.advisorId,
+      advisorName: result.advisorName,
+      advisorLineage: result.lineage,
+      advisorGeneration: result.generation,
+      queuedMs: result.queuedMs,
+      limit: result.limit,
+    };
+    await this.#appendJournal(entry, {
+      callIndex,
+      fingerprint,
+      kind: "advisor",
+      state: result.ok ? "completed" : "failed",
+      at: Date.now(),
+      result: journalResult,
+      route: record ? { harness: record.harness, model: record.model, status: record.state, error: record.error } : undefined,
+    });
+    return result;
+  }
+
+  #recordReplayedAdvisor(
+    entry: RunEntry,
+    advisorId: string,
+    question: string,
+    options: Record<string, unknown>,
+    callIndex: number,
+    fingerprint: string,
+    replay: WorkflowReplayCall,
+  ): WorkflowAdvisorRecord {
+    const phase = this.#resolveAgentPhase(entry, options.phase);
+    this.#markPhaseRunning(entry, phase);
+    const now = Date.now();
+    const record: WorkflowAdvisorRecord = {
+      index: entry.snapshot.advisorConsultations?.length ?? 0,
+      callIndex,
+      callFingerprint: fingerprint,
+      advisorId: replay.result.advisorId!,
+      advisorName: replay.result.advisorName!,
+      lineage: replay.result.advisorLineage!,
+      generation: replay.result.advisorGeneration!,
+      phase,
+      state: "completed",
+      timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now },
+      prompt: boundedText(question, 2 * 1024),
+      context: typeof options.context === "string" ? boundedText(options.context, 2 * 1024) : undefined,
+      output: replay.result.output,
+      harness: replay.route?.harness,
+      model: replay.route?.model,
+      usage: workflowUsage(),
+      queuedMs: replay.result.queuedMs,
+      replayedFrom: { runId: entry.replay!.sourceRunId, callIndex: replay.callIndex },
+      outputProvenance: "replay",
+      instructionShaped: looksInstructionShaped(replay.result.output),
+    };
+    (entry.snapshot.advisorConsultations ??= []).push(record);
+    (entry.snapshot.phases[phase]!.advisorConsultations ??= []).push(record.index);
+    return record;
   }
 
   async #runFreshAgent(
@@ -3405,8 +3699,11 @@ export class WorkflowManager {
     if (budget.maxTokens !== undefined && tokens >= budget.maxTokens) return `Workflow token budget exhausted (${tokens}/${budget.maxTokens})`;
     if (budget.maxCost !== undefined && usage.cost >= budget.maxCost) return `Workflow cost budget exhausted ($${usage.cost.toFixed(4)}/$${budget.maxCost})`;
     if (budget.maxTurns !== undefined && usage.turns >= budget.maxTurns) return `Workflow turn budget exhausted (${usage.turns}/${budget.maxTurns})`;
-    const agent = budget.maxTokensPerAgent === undefined ? undefined : entry.snapshot.agents.find((candidate) => candidate.usage.input + candidate.usage.output >= budget.maxTokensPerAgent!);
-    if (agent) return `Workflow per-agent token budget exhausted for ${agent.name} (${agent.usage.input + agent.usage.output}/${budget.maxTokensPerAgent})`;
+    const call = this.#reachedCallTokenBudget(entry);
+    if (call) {
+      const scope = call.kind === "agent" ? "per-agent" : "per-call";
+      return `Workflow ${scope} token budget exhausted for ${call.label} (${call.tokens}/${budget.maxTokensPerAgent})`;
+    }
     return undefined;
   }
 
@@ -4055,7 +4352,10 @@ export class WorkflowManager {
   #recordBudgetWarnings(entry: RunEntry): void {
     const usage = aggregateWorkflowUsage(entry.snapshot);
     let changed = false;
-    const harnesses = new Set(entry.snapshot.agents.map((agent) => agent.harness).filter((value): value is HarnessName => value === "pi" || value === "claude" || value === "codex"));
+    const harnesses = new Set([
+      ...entry.snapshot.agents.map((agent) => agent.harness),
+      ...(entry.snapshot.advisorConsultations ?? []).map((advisor) => advisor.harness),
+    ].filter((value): value is HarnessName => value === "pi" || value === "claude" || value === "codex"));
     for (const harness of harnesses) {
       for (const metric of spendBudgetMetrics(entry.snapshot.budget, usage, harness)) {
         const key = `aggregate:${metric.key}`;
@@ -4068,14 +4368,36 @@ export class WorkflowManager {
       }
     }
     const limit = entry.snapshot.budget?.maxTokensPerAgent;
-    const agent = limit === undefined ? undefined : entry.snapshot.agents.find((candidate) => candidate.usage.input + candidate.usage.output >= limit);
-    if (agent && !entry.reachedBudgetWarnings.has("agentTokens")) {
-      const warning = `Workflow budget agent tokens limit reached for ${agent.name} (${agent.usage.input + agent.usage.output}/${limit}); later dispatches are blocked`;
+    const call = this.#reachedCallTokenBudget(entry);
+    if (call && !entry.reachedBudgetWarnings.has("agentTokens")) {
+      const warning = call.kind === "agent"
+        ? `Workflow budget agent tokens limit reached for ${call.label} (${call.tokens}/${limit}); later dispatches are blocked`
+        : `Workflow budget per-call tokens limit reached for ${call.label} (${call.tokens}/${limit}); later dispatches are blocked`;
       entry.reachedBudgetWarnings.add("agentTokens");
       entry.snapshot.warnings = [...(entry.snapshot.warnings ?? []), warning].slice(-16);
       changed = true;
     }
     if (changed) this.#touch(entry);
+  }
+
+  #reachedCallTokenBudget(entry: RunEntry): { kind: "agent" | "advisor"; label: string; tokens: number } | undefined {
+    const limit = entry.snapshot.budget?.maxTokensPerAgent;
+    if (limit === undefined) return undefined;
+    const calls = [
+      ...entry.snapshot.agents.map((agent) => ({
+        callIndex: agent.callIndex ?? agent.index,
+        kind: "agent" as const,
+        label: agent.name,
+        tokens: agent.usage.input + agent.usage.output,
+      })),
+      ...(entry.snapshot.advisorConsultations ?? []).map((advisor) => ({
+        callIndex: advisor.callIndex,
+        kind: "advisor" as const,
+        label: `advisor ${advisor.advisorName}`,
+        tokens: advisor.usage.input + advisor.usage.output,
+      })),
+    ].sort((left, right) => left.callIndex - right.callIndex);
+    return calls.find((call) => call.tokens >= limit);
   }
 
   #ensurePhase(entry: RunEntry, rawTitle: string): number {
@@ -4284,7 +4606,10 @@ export class WorkflowManager {
         catch { return []; }
       })
       .filter((job) => !isTerminal(job.status));
-    await Promise.allSettled(jobs.map((job) => this.#jobs.cancel(job.id, reason)));
+    await Promise.allSettled([
+      ...jobs.map((job) => this.#jobs.cancel(job.id, reason)),
+      ...entry.advisorCalls,
+    ]);
   }
 
   /** A completed workflow-owned job keeps its retained native session only for
@@ -4339,7 +4664,7 @@ export class WorkflowManager {
 }
 
 export function aggregateWorkflowUsage(snapshot: WorkflowSnapshot): WorkflowUsage {
-  return snapshot.agents.reduce((total, agent) => ({
+  const agents = snapshot.agents.reduce((total, agent) => ({
     input: total.input + agent.usage.input,
     output: total.output + agent.usage.output,
     cacheRead: total.cacheRead + agent.usage.cacheRead,
@@ -4347,6 +4672,26 @@ export function aggregateWorkflowUsage(snapshot: WorkflowSnapshot): WorkflowUsag
     cost: total.cost + agent.usage.cost,
     turns: total.turns + agent.usage.turns,
   }), workflowUsage());
+  return (snapshot.advisorConsultations ?? []).reduce((total, advisor) => ({
+    input: total.input + advisor.usage.input,
+    output: total.output + advisor.usage.output,
+    cacheRead: total.cacheRead + advisor.usage.cacheRead,
+    cacheWrite: total.cacheWrite + advisor.usage.cacheWrite,
+    cost: total.cost + advisor.usage.cost,
+    turns: total.turns + advisor.usage.turns,
+  }), agents);
+}
+
+function normalizeAdvisorAllowlist(value: string[] | undefined): string[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 16) throw new Error("Workflow advisors must be an array of at most 16 stable advisor IDs");
+  const normalized = value.map((advisorId) => {
+    if (typeof advisorId !== "string" || !/^adv_[a-f0-9]{32}$/.test(advisorId)) {
+      throw new Error("Workflow advisors must contain stable adv_ IDs returned by advisor_open or advisor_list");
+    }
+    return advisorId;
+  });
+  return normalized.filter((advisorId, index) => normalized.indexOf(advisorId) === index);
 }
 
 function normalizeWorkflowBudget(value: WorkflowBudgetPolicy | undefined): WorkflowBudgetPolicy | undefined {

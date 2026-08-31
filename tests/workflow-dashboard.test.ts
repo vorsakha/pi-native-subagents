@@ -395,6 +395,127 @@ test("workflow dashboard marks completed unsuccessful runs with warning color", 
   assert.match(rendered, /! completed · task unsuccessful/);
 });
 
+test("workflow advisor output uses the shared scroll viewport instead of truncating", (t) => {
+  const run = workflow("advisor-scroll", "completed");
+  run.agents = [];
+  run.phases[0]!.agents = [];
+  run.phases[0]!.advisorConsultations = [0];
+  run.advisorConsultations = [{
+    index: 0,
+    callIndex: 0,
+    callFingerprint: `sha256:${"a".repeat(64)}`,
+    advisorId: "adv_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    advisorName: "Security advisor",
+    lineage: 1,
+    generation: 2,
+    phase: 0,
+    state: "completed",
+    timestamps: { createdAt: 1_000, startedAt: 2_000, updatedAt: 3_000, endedAt: 3_000 },
+    prompt: "Review the boundary",
+    output: Array.from({ length: 40 }, (_, index) => `advisor output ${index}`).join("\n"),
+    harness: "claude",
+    usage: { input: 10, output: 40, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+    queuedMs: 2,
+    outputProvenance: "advisor",
+  }];
+  const state = harness([run], 16, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+  openOutline(state.overlay, 72);
+  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput(ENTER);
+  let text = state.overlay.render(72).join("\n");
+  assert.match(text, /advisor output.*\d+–40\/40/);
+  assert.match(text, /advisor output 39/);
+  assert.doesNotMatch(text, /advisor output 0(?:\D|$)/);
+
+  state.overlay.handleInput("g");
+  text = state.overlay.render(72).join("\n");
+  assert.match(text, /advisor output 0/);
+  assert.doesNotMatch(text, /advisor output 39/);
+  state.overlay.handleInput(PAGE_DOWN);
+  assert.match(state.overlay.render(72).join("\n"), /advisor output [1-9]/);
+});
+
+test("workflow advisor output wraps wide lines before scrolling", (t) => {
+  const run = workflow("advisor-wide", "completed");
+  run.agents = [];
+  run.phases[0]!.agents = [];
+  run.phases[0]!.advisorConsultations = [0];
+  const suffix = "WIDE-ADVISOR-SUFFIX";
+  run.advisorConsultations = [{
+    index: 0,
+    callIndex: 0,
+    callFingerprint: `sha256:${"b".repeat(64)}`,
+    advisorId: "adv_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    advisorName: "Architecture advisor",
+    lineage: 0,
+    generation: 1,
+    phase: 0,
+    state: "completed",
+    timestamps: { createdAt: 1_000, startedAt: 2_000, updatedAt: 3_000, endedAt: 3_000 },
+    prompt: "Inspect the wide result",
+    output: `${"wide paragraph ".repeat(80)}${suffix}`,
+    harness: "codex",
+    usage: { input: 10, output: 40, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+    queuedMs: 1,
+    outputProvenance: "advisor",
+  }];
+  const state = harness([run], 16, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+  openOutline(state.overlay, 52);
+  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput(ENTER);
+  assert.match(state.overlay.render(52).join("\n"), new RegExp(suffix));
+  state.overlay.handleInput("g");
+  assert.doesNotMatch(state.overlay.render(52).join("\n"), new RegExp(suffix));
+  state.overlay.handleInput("G");
+  assert.match(state.overlay.render(52).join("\n"), new RegExp(suffix));
+});
+
+test("workflow advisor detail uses advisor labels and exposes only applicable controls", (t) => {
+  const run = workflow("advisor-controls");
+  run.agents = [];
+  run.phases[0]!.agents = [];
+  run.phases[0]!.advisorConsultations = [0];
+  run.advisorConsultations = [{
+    index: 0,
+    callIndex: 0,
+    callFingerprint: `sha256:${"c".repeat(64)}`,
+    advisorId: "adv_cccccccccccccccccccccccccccccccc",
+    advisorName: "Security advisor",
+    lineage: 1,
+    generation: 2,
+    phase: 0,
+    state: "running",
+    timestamps: { createdAt: 1_000, startedAt: 2_000, updatedAt: 3_000 },
+    prompt: "Review the boundary",
+    harness: "claude",
+    usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+  }];
+  const state = harness([run], 30, () => {}, { fullscreen: true });
+  t.after(() => state.overlay.dispose());
+
+  openOutline(state.overlay, 100);
+  state.overlay.handleInput(ENTER);
+  state.overlay.handleInput(ENTER);
+  const detail = state.overlay.render(100).join("\n");
+  assert.match(detail, /advisor · Security advisor · running · focus/);
+  assert.match(detail, /X cancel run/);
+  assert.doesNotMatch(detail, /\bt (?:full|compact)\b|\bi (?:info|hide info)\b|x cancel agent|r restart agent/);
+
+  state.overlay.handleInput("?");
+  const help = state.overlay.render(100).join("\n");
+  assert.match(help, /scroll advisor output/);
+  assert.match(help, /cancel the run/);
+  assert.doesNotMatch(help, /this agent|tool display|routine info/);
+
+  state.overlay.handleInput("?");
+  const before = state.overlay.render(100).join("\n");
+  state.overlay.handleInput("i");
+  state.overlay.handleInput("t");
+  assert.equal(state.overlay.render(100).join("\n"), before, "agent-only toggles are inert in advisor detail");
+});
+
 test("minimum-width live run and agent cancellation keep Unicode controls visible through confirmation", (t) => {
   const runState = harness([workflow("cancel-run")], 30, () => {}, { fullscreen: true });
   runState.manager.list()[0]!.name = "Release 你好👩🏽‍💻";
