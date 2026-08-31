@@ -1124,6 +1124,7 @@ export function jobSnapshot(overrides: Partial<JobSnapshot> = {}): JobSnapshot {
     usage: usage(),
     tools: [],
     ...overrides,
+    speed: overrides.speed ?? "standard",
     generation: overrides.generation ?? 0,
     transcript: overrides.transcript ?? [],
     liveThinking: overrides.liveThinking ?? "",

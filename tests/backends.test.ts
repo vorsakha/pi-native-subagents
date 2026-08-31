@@ -123,14 +123,19 @@ process.stdin.on("data", chunk => {
     else if (value.method === "account/read") reply(value.id, { account: { type: "chatgpt" } });
     else if (value.method === "thread/start") {
       if (process.env.THREAD_PARAM_FILE) fs.writeFileSync(process.env.THREAD_PARAM_FILE, JSON.stringify(value.params));
-      reply(value.id, { modelProvider: "openai", ...(process.env.THREAD_MODEL ? { model: process.env.THREAD_MODEL } : {}), thread: { id: "thread-1", modelProvider: process.env.THREAD_PROVIDER || "openai" } });
+      reply(value.id, { modelProvider: "openai", ...(process.env.THREAD_MODEL ? { model: process.env.THREAD_MODEL } : {}), ...(process.env.THREAD_SERVICE_TIER ? { serviceTier: process.env.THREAD_SERVICE_TIER } : {}), thread: { id: "thread-1", modelProvider: process.env.THREAD_PROVIDER || "openai" } });
     }
     else if (value.method === "turn/start") {
       if (process.env.PARAM_FILE) fs.appendFileSync(process.env.PARAM_FILE, JSON.stringify(value.params) + "\\n");
       if (process.env.STDERR_TEXT) process.stderr.write(process.env.STDERR_TEXT);
       if (process.env.MODE === "exit-turn-start-pending") process.exit(0);
+      if (process.env.MODE === "reject-priority") {
+        process.stdout.write(JSON.stringify({ id: value.id, error: { code: -32602, message: "priority service tier is unavailable for this model" } }) + "\\n");
+        return;
+      }
       const number = ++turns; const id = "turn-" + number;
       reply(value.id, { turn: { id } });
+      if (process.env.SETTINGS_TIER) process.stdout.write(JSON.stringify({ method: "thread/settings/updated", params: { threadId: "thread-1", threadSettings: { serviceTier: process.env.SETTINGS_TIER } } }) + "\\n");
       if (process.env.MODE === "large-item" || process.env.MODE === "oversized") {
         // Unsolicited notification, not a response to any pending request.
         process.stdout.write(JSON.stringify({ method: "item/completed", params: { item: {
@@ -252,6 +257,7 @@ function request(harness: HarnessName, cwd: string, env: NodeJS.ProcessEnv): Bac
     signal: new AbortController().signal,
     policy: {
       harness, access: "readOnly", customization: "isolated", model: "fixture-model", thinking: "low",
+      speed: "standard",
       piTools: [], claudeTools: [], approvalPolicy: "never",
       codexSandbox: { type: "readOnly", networkAccess: false },
     },
@@ -1483,7 +1489,53 @@ test("Codex reuses its native thread for queued and post-settlement follow-ups",
       assert.equal(params.approvalPolicy, "never");
       assert.equal(params.cwd, fake.dir);
       assert.equal(params.effort, "high", "explicit Codex effort is forwarded");
+      assert.equal(params.serviceTier, undefined, "standard policy preserves native Codex tier configuration");
     }
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex sends priority on every fast retained turn without manufacturing effective speed", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  const paramFile = join(fake.dir, "turn-params.jsonl");
+  try {
+    const codexRequest = request("codex", fake.dir, {
+      ...process.env,
+      MODE: "normal",
+      PARAM_FILE: paramFile,
+      THREAD_SERVICE_TIER: "default",
+      SETTINGS_TIER: "priority",
+    });
+    codexRequest.policy.speed = "fast";
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 5_000, inactivityTimeoutMs: 5_000 })
+      .start(codexRequest, (event) => events.push(event));
+    await run.completed;
+    await run.send("FOLLOW", "followUp");
+    const deadline = Date.now() + 1_000;
+    while (events.filter((event) => event.type === "completed").length < 2 && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const turns = (await readFile(paramFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    assert.deepEqual(turns.map((params) => params.serviceTier), ["priority", "priority"]);
+    assert.deepEqual(contextEvents(events), [], "request acceptance, thread defaults, and next-turn settings are not served-tier receipts");
+    await run.close();
+  } finally { await rm(fake.dir, { recursive: true, force: true }); }
+});
+
+test("Codex surfaces a native priority-policy rejection without retrying or downgrading", async () => {
+  const fake = await fixture(CODEX_FIXTURE);
+  const events: BackendEvent[] = [];
+  try {
+    const codexRequest = request("codex", fake.dir, { ...process.env, MODE: "reject-priority" });
+    codexRequest.policy.speed = "fast";
+    const run = await new CodexAppServerBackend(fake.command, { requestTimeoutMs: 5_000, inactivityTimeoutMs: 5_000 })
+      .start(codexRequest, (event) => events.push(event));
+    await run.completed;
+    const failed = terminal(events) as Extract<BackendEvent, { type: "failed" }>;
+    assert.equal(failed.type, "failed");
+    assert.match(failed.error, /priority service tier is unavailable for this model/);
+    assert.equal(contextEvents(events).at(-1)?.context.effectiveSpeed, undefined, "requested Fast is never invented as accepted telemetry");
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });

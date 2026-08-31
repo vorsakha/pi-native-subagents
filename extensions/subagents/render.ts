@@ -152,6 +152,14 @@ export function formatContext(context?: ContextSnapshot): string {
   return `context ${occupancy}${serving}`;
 }
 
+export function formatSpeedBilling(input: { speed?: JobSnapshot["speed"]; effectiveSpeed?: ContextSnapshot["effectiveSpeed"] }): string {
+  const requested = input.speed ?? "standard";
+  const effective = input.effectiveSpeed;
+  if (requested !== "fast" && effective !== "fast") return "";
+  const observed = effective ? `observed ${effective}` : "effective speed unknown";
+  return `requested ${requested} · Codex credits apply · monetary cost unreported · ${observed}`;
+}
+
 export type TraceStatusColor = "accent" | "success" | "warning" | "error" | "muted" | "dim";
 
 /** Shared width-stable status vocabulary for subagents and workflows. */
@@ -257,6 +265,8 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
   const header = `${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(job.name)))} ${theme.fg("dim", `${shortId(sanitizeText(job.id))} · ${statusLabel} · ${formatElapsed(job, now)}`)}`;
   const policy = theme.fg("dim", `${job.access}${profile}${independent}${peerMarker} · effort ${formatEffort(job.effort)} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}`);
   lines.push(header, policy);
+  const speedBilling = formatSpeedBilling({ speed: job.speed, effectiveSpeed: job.context?.effectiveSpeed });
+  if (speedBilling) lines.push(theme.fg("warning", speedBilling));
 
   const pending = pendingInteraction(job);
   if (pending) {

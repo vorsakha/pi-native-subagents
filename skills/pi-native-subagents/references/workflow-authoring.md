@@ -40,13 +40,13 @@ For a workflow with a known plan, add `phases` to the exported metadata:
 export const meta = { name: "release review", phases: ["review", "verify", "summarize"] };
 ```
 
-The plan accepts 1–64 unique names; names are trimmed and internal whitespace is collapsed, matching is case-sensitive, and each normalized name is limited to 160 characters. Declared phases appear as pending before the first `phase(title)` call, and `phase(title)` must activate them forward in plan order (conditional phases may be skipped). Repeating the active phase is harmless; use `phase(title)` to advance rather than `agent({ phase })`. Omit `meta.phases` when phases are discovered dynamically.
+The plan accepts 1–64 unique normalized names of at most 160 characters. Matching is case-sensitive. Activate them forward with `phase(title)`; conditional phases may be skipped. Omit `meta.phases` for dynamic phases.
 
 ## parallel versus pipeline
 
 `parallel` receives functions, not started promises. The runner owns order, concurrency, call numbers, cancellation, and replay. Concurrency is 1 to 4 and defaults to 4. Use it when the next step needs all results; check every result's `ok`.
 
-`pipeline(items, ...stages)` accepts at most 4096 items, advances each item through the ordered stages independently with up to four concurrent lanes, and needs no global barrier between stages. **A stage that throws does not fail the run: that item's slot in the returned array becomes `null`.** Filter or branch on `null` explicitly, and never assume the returned array is item-shaped throughout:
+`pipeline(items, ...stages)` accepts at most 4096 items and up to four lanes. **A thrown stage makes that item's result `null`; it does not fail the run.** Branch on `null`:
 
 ```js
 const processed = await pipeline(files, (file) => agent(`Summarize ${file}.`, { access: "readOnly" }));
@@ -54,6 +54,8 @@ const failed = files.filter((_, index) => processed[index] === null);
 ```
 
 Always await every `agent()`/`followUp()` call before returning from the default function. A forgotten promise fails the workflow rather than silently losing the child result.
+
+`agent("task", { harness: "codex", speed: "fast" })` explicitly opts one Codex lineage into Fast mode. Omit `speed` for standard policy. A selected profile never supplies this opt-in. Fast is unsupported by Pi and Claude, does not choose a route for `harness: "auto"`, and cannot combine with provider or continuation fallback.
 
 ## Continuing a retained agent with followUp
 
@@ -74,7 +76,7 @@ if (!review.ok) return { ok: false, error: review.error };
 Rules:
 
 - The target must be this run's completed retained `agent()` lineage. Its logical ID is stable across continuation and follow-ups. Cross-workflow, direct, expired, failed, cancelled and unsettled jobs are rejected.
-- `options` accepts only `phase` and `schema`. Harness, model, effort, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original `agent()` call.
+- `options` accepts only `phase` and `schema`. Harness, model, effort, speed, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original `agent()` call.
 - A retained native structured session stays bound to its original schema. Every `followUp()` on that lineage is validated against the original schema and can return `structured` even when the call omits `schema`; a follow-up cannot replace the schema.
 - An `agent()` call that used `isolation: "worktree"` can never be targeted: its worktree is finalized when the call returns, so the follow-up is rejected whether the recorded state is `preserved`, `removed`, or `orphaned`.
 - Each `followUp()` consumes its own agent-call ordinal from the same 32-call budget and appears in `/workflows` as another generation under the same agent, not a new agent card.
@@ -90,7 +92,7 @@ A fresh explicit Claude/Codex `agent()` may set one opposite native route. `prov
 
 - The sandbox exposes only orchestration: no imports, I/O, environment, processes, credentials, or nested delegation.
 - Workflows are deterministic: `Date.now()`, zero-argument `new Date()`, and `Math.random()` all throw.
-- All workflow data is bounded and JSON-serializable; one agent request is capped at 512 KiB.
+- Workflow data is bounded and JSON-serializable; one agent request is capped at 512 KiB.
 - A run may make at most 32 agent calls (`agent()` and `followUp()` share the budget) and use at most four concurrent workers. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
 - Mutating agents sharing one checkout are serialized; read-only and worktree-isolated calls are not.
 

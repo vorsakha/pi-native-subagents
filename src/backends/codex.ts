@@ -442,6 +442,7 @@ export class CodexAppServerBackend implements Backend {
         approvalPolicy: request.policy.approvalPolicy,
         sandboxPolicy: request.policy.codexSandbox,
         cwd: request.cwd,
+        ...(request.policy.speed === "fast" ? { serviceTier: "priority" } : {}),
       }, this.#requestTimeoutMs));
       watchdog.touch();
       turnId = String(asObject(turnResult.turn).id ?? "");

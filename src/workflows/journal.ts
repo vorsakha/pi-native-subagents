@@ -35,7 +35,9 @@ function fingerprint(kind: string, value: unknown): string {
 }
 
 export function workflowCallFingerprint(prompt: string, options: Record<string, unknown>): string {
-  return fingerprint("agent-call", { options, prompt });
+  const canonicalOptions = { ...options };
+  if (canonicalOptions.speed === "standard") delete canonicalOptions.speed;
+  return fingerprint("agent-call", { options: canonicalOptions, prompt });
 }
 
 /** Binds prompt, options, and the exact retained target so a follow-up cannot
@@ -77,8 +79,8 @@ function callKind(record: WorkflowJournalRecord): "agent" | "followUp" {
   return record.kind === "followUp" ? "followUp" : "agent";
 }
 
-function routeIdentity(route: WorkflowJournalRoute): Omit<WorkflowJournalRoute, "continuation"> {
-  const { continuation: _continuation, ...identity } = route;
+function routeIdentity(route: WorkflowJournalRoute): Omit<WorkflowJournalRoute, "continuation" | "effectiveSpeed"> {
+  const { continuation: _continuation, effectiveSpeed: _effectiveSpeed, ...identity } = route;
   return identity;
 }
 
@@ -181,6 +183,7 @@ function continuationTerminalMatches(
     && terminalRoute.jobId === completed.replacementJobId
     && terminalRoute.logicalJobId === logicalJobId
     && terminalRoute.harness === handoff.target.harness
+    && (terminalRoute.speed ?? "standard") === (handoffRoute.speed ?? "standard")
     && terminalRecord.result.jobId === logicalJobId
     && canonicalJson(terminalRoute.continuationFallback ?? null) === canonicalJson(handoff.target)
     && (handoff.target.model === undefined || terminalRoute.model === handoff.target.model);

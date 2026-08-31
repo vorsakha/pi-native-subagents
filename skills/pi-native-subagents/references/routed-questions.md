@@ -41,8 +41,7 @@ agent when present. The workflow's ordinary final result remains authoritative;
 no checkpoint is sent after the workflow settles. Direct jobs retain their normal
 terminal delivery only.
 
-The watch is keyed by request ID, source job ID, and source generation, is bounded,
-and is one-shot. A newer question on that source supersedes it. Stale generations,
+The bounded one-shot watch uses request, job, and generation IDs. A newer question supersedes it. Stale generations,
 eviction, cancellation, session reset, shutdown, and send races are dropped; a
 busy parent defers delivery to `agent_settled`, where ready checkpoints are
 coalesced into one follow-up turn. Repeated lifecycle events cannot redeliver it.
@@ -63,6 +62,7 @@ coalesced into one follow-up turn. Repeated lifecycle events cannot redeliver it
 - Asking parks the caller and releases its scheduler slot, so the four-job cap counts active model turns, not parked provider processes. The caller resolves its tool call only after it reacquires a slot; provider inactivity watchdogs are suspended for the wait, and each question still has its own bounded deadline (15 minutes by default) after which it expires.
 - Cancelling the caller or shutting down rejects the parked callback. Dismissal or expiry removes queued answer work and cancels a started answer, making the target unavailable to `followUp()`. The workflow awaits cancellation before restoring the target or journaling, retains cancellation usage, and rechecks after native completion and provisional-answer persistence. Replay requires a separate accepted record written after caller settlement; dismissal or any acceptance/invalidation write failure leaves no replayable answer.
 - A peer answer is a real model turn on the target lineage: it is charged to that agent's usage, rechecks that agent's cumulative retained-session budget, counts toward workflow token/cost/turn budgets, and appears as another bounded generation (`peerAnswer`) under the same agent card — never a new agent. Successful, failed, and cancelled answer journals include all target-lineage usage, including a continued lineage's failed primary and answer-turn spend. A failed or cancelled peer answer marks only its own generation failed; the lineage result the script already consumed is preserved. Its progress does not create an agent-call checkpoint or block an otherwise safe suffix restart.
+- A peer-answer turn inherits the target lineage's fixed speed. It cannot change or downgrade Fast policy.
 - `resumeFromRunId` replays a recorded peer answer only when the asking lineage and generation, the target lineage and its call fingerprint, and the question all match; the recorded answer is returned without dispatching or re-charging the target. Anything else reruns live, or fails with an actionable error when the replayed target has no retained session. Parent answers are never replayed: the live parent thread may have changed.
 
 ## Recovery

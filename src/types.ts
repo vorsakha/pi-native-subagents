@@ -13,6 +13,7 @@ export type ProviderFamily = "claude" | "codex" | "other";
 export type AccessMode = "readOnly" | "full";
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type EffortLevel = "low" | "medium" | "high" | "xhigh" | "max";
+export type AgentSpeed = "standard" | "fast";
 export type JobStatus = "queued" | "running" | "completed" | "failed" | "cancelled";
 
 export interface Usage {
@@ -34,6 +35,8 @@ export interface ContextSnapshot {
   window?: number;
   /** Model identity reported by the native runtime for the current turn; never the configured policy model. */
   servingModel?: string;
+  /** Authoritative served tier reported for the current turn; never inferred from request or settings. */
+  effectiveSpeed?: AgentSpeed;
 }
 
 export interface ToolResultContent {
@@ -109,6 +112,8 @@ export interface BackendPolicy {
   thinking: ThinkingLevel;
   /** Optional provider hint. Omitted by default so the model/provider remains adaptive. */
   effort?: EffortLevel;
+  /** Requested service policy. `standard` preserves the provider's native configuration. */
+  speed: AgentSpeed;
   piTools: string[];
   claudeTools: string[];
   approvalPolicy: "never";
@@ -214,6 +219,8 @@ export interface ProfileDefinition {
   access?: AccessMode;
   harness?: HarnessName;
   effort?: EffortLevel;
+  /** Optional speed ceiling or permission. Never authorizes Fast without request.speed. */
+  speed?: AgentSpeed;
   independent?: boolean;
   lockedHarness?: HarnessName;
   systemPrompt: string;
@@ -268,6 +275,8 @@ export interface SpawnRequest {
   /** Harness-local model ID selected by the caller or routing skill. */
   model?: string;
   effort?: EffortLevel;
+  /** Explicit per-agent speed policy; defaults to standard. */
+  speed?: AgentSpeed;
   access?: AccessMode;
   independent?: boolean;
   /** Route on a native provider different from this existing session-scoped job. */
@@ -347,6 +356,8 @@ export interface JobSnapshot {
   model: string;
   /** Explicit request-scoped provider effort; omitted means provider-adaptive. */
   effort?: EffortLevel;
+  /** Resolved requested policy, fixed for the retained lineage. */
+  speed: AgentSpeed;
   task: string;
   cwd: string;
   status: JobStatus;

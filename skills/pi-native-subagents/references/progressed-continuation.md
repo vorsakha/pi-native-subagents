@@ -17,7 +17,9 @@ const worker = await agent("Implement the change and verify it.", {
 
 The primary must explicitly be `claude` or `codex`; the target must be the other. The object accepts only `harness` and optional exact `model`. It cannot be combined with `providerFallback`, `harness: "auto"`, Pi, nesting, multiple targets, or `isolation: "worktree"`. Omit it unless the human accepts cross-provider continuation and the exactly-once limitation below.
 
-## Eligibility and safety
+It cannot combine with `speed: "fast"`. A cross-provider replacement cannot preserve Codex Fast policy, so the runtime rejects that declaration before primary dispatch. Standard speed remains fixed through the replacement.
+
+## Eligibility
 
 Continuation opens only when all of these are true:
 
@@ -34,7 +36,7 @@ Continuation never widens trust, access, cwd, profile, capabilities, approval mo
 
 ## Handoff semantics
 
-The replacement continues the same workflow call and logical lineage in the same cwd and current checkout. It does **not** receive a blind replay of the original task. The bounded handoff includes:
+The replacement continues the same call and lineage in the current checkout. It does **not** receive a blind replay. The handoff includes:
 
 - durable original objective and current turn;
 - authoritative failure evidence and phase;
@@ -42,7 +44,7 @@ The replacement continues the same workflow call and logical lineage in the same
 - current convergence round and pending findings when present;
 - the durable checkout digest and a direction to inspect existing state first.
 
-Each required section has its own bound, so large objective, prompt, output, or tool evidence cannot truncate the phase, convergence state, checkout digest, or final continue-from-existing-state direction.
+Each section has its own bound, preserving phase, convergence state, checkout digest, and direction.
 
 External commands, hooks, plugins, MCP calls, and services may have completed before the failed provider stopped. Continuation cannot guarantee exactly-once behavior for those effects. The replacement must inspect state and continue remaining work, not repeat commands merely because it did not author the partial result.
 
@@ -69,4 +71,4 @@ Usage is cumulative across the failed turn, replacement, and later generations. 
 - `checkout is missing or diverged`: the durable handoff no longer describes the current checkout. Do not force replay; inspect the source run and current changes, then choose a manual recovery.
 - target readiness or policy error: the replacement did not start. Restore the declared target or continue manually; the one route never silently changes.
 - failed process-tree cleanup: the bound includes cleanup already queued on the job. Descendants may remain; no replacement started. Inspect and terminate the failed provider tree before manual recovery.
-- replacement provider failure: inspect its cumulative partial state. The automatic route is exhausted and cannot loop back.
+- replacement failure: inspect partial state. The route cannot loop back.

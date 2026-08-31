@@ -30,6 +30,13 @@ const reviewer: ProfileDefinition = {
   origin: "global",
 };
 
+const fastReviewer: ProfileDefinition = {
+  ...reviewer,
+  name: "fast-reviewer",
+  speed: "fast",
+  filePath: "fast-reviewer.md",
+};
+
 const execFileAsync = promisify(execFile);
 
 
@@ -86,9 +93,10 @@ async function fixture(
   const artifactRoot = join(parent, "artifacts");
   const backend = new ControlledBackend("codex");
   const claude = new ControlledBackend("claude");
+  const profiles = new Map([[reviewer.name, reviewer], [fastReviewer.name, fastReviewer]]);
   const jobs = new JobManager({
     backends: [backend, claude],
-    profiles: new Map([[reviewer.name, reviewer]]),
+    profiles,
     concurrency,
   });
   const workflows = new WorkflowManager({
@@ -101,6 +109,7 @@ async function fixture(
     availability,
     checkout,
     journalAppender,
+    resolveProfile: (name) => profiles.get(name),
   });
   return {
     parent,
@@ -318,6 +327,69 @@ test("runs sequential and parallel agents through one JobManager and its global 
   }
 });
 
+test("workflow agent speed is explicit, fixed, and rejected before unsupported or fallback dispatch", async () => {
+  const f = await fixture();
+  try {
+    const fastScript = `
+      export default async () => agent("fast-work", { harness: "codex", speed: "fast", access: "readOnly" });
+    `;
+    const fast = await f.workflows.start(f.request(fastScript));
+    await waitFor(() => f.backend.requests.length === 1, "fast Codex dispatch");
+    assert.equal(f.backend.requests[0]?.policy.speed, "fast");
+    f.backend.completeTask("fast-work", "done");
+    const completed = await fast.completion;
+    assert.equal(completed.agents[0]?.speed, "fast");
+    assert.equal(completed.agents[0]?.effectiveSpeed, undefined, "successful priority dispatch is not an observed Fast receipt");
+    const persistedFast = (await loadWorkflowSummaries(f.artifactRoot)).find((run) => run.runId === completed.runId);
+    assert.equal(persistedFast?.agents[0]?.speed, "fast");
+    assert.equal(persistedFast?.agents[0]?.effectiveSpeed, undefined);
+    const replayed = await f.workflows.start(f.request(fastScript, { resumeFromRunId: completed.runId }));
+    const replayedFinal = await replayed.completion;
+    assert.equal(replayedFinal.agents[0]?.speed, "fast");
+    assert.equal(replayedFinal.agents[0]?.effectiveSpeed, undefined);
+    assert.equal(replayedFinal.agents[0]?.outputProvenance, "replay");
+    assert.equal(f.backend.requests.length, 1, "exact Fast replay spends no new turn or credits");
+
+    const profiled = await f.workflows.start(f.request(`
+      export default async () => agent("profile-fast", { profile: "fast-reviewer", access: "readOnly" });
+    `));
+    await waitFor(() => f.backend.requests.length === 2, "profiled standard dispatch");
+    assert.equal(f.backend.requests[1]?.policy.speed, "standard", "profile metadata alone cannot authorize Fast");
+    f.backend.completeTask("profile-fast", "done");
+    assert.equal((await profiled.completion).agents[0]?.speed, "standard");
+
+    const overridden = await f.workflows.start(f.request(`
+      export default async () => agent("profile-authorized-fast", { profile: "fast-reviewer", speed: "fast", access: "readOnly" });
+    `));
+    await waitFor(() => f.backend.requests.length === 3, "explicit Fast profile dispatch");
+    assert.equal(f.backend.requests[2]?.policy.speed, "fast");
+    f.backend.completeTask("profile-authorized-fast", "done");
+    await overridden.completion;
+
+    const unsupported = await f.workflows.start(f.request(`
+      export default async () => agent("unsupported", { harness: "claude", speed: "fast" });
+    `));
+    assert.match(((await unsupported.completion).result as { error?: string }).error ?? "", /Fast speed is unsupported by the claude route/);
+
+    const fallback = await f.workflows.start(f.request(`
+      export default async () => agent("no-primary", {
+        harness: "codex", speed: "fast", access: "readOnly", providerFallback: { harness: "claude" }
+      });
+    `));
+    assert.match(((await fallback.completion).result as { error?: string }).error ?? "", /Fast speed cannot be combined/);
+    const continuation = await f.workflows.start(f.request(`
+      export default async () => agent("no-continuation", {
+        harness: "codex", speed: "fast", access: "readOnly", continuationFallback: { harness: "claude" }
+      });
+    `));
+    assert.match(((await continuation.completion).result as { error?: string }).error ?? "", /Fast speed cannot be combined/);
+    assert.equal(f.claude.requests.length, 0);
+    assert.equal(f.backend.requests.length, 3, "invalid declarations dispatch neither primary nor fallback");
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("journals failed agent routes with status and bounded error details", async () => {
   const f = await fixture();
   try {
@@ -337,6 +409,7 @@ test("journals failed agent routes with status and bounded error details", async
       harness: "codex",
       requestedHarness: "codex",
       model: "default",
+      speed: "standard",
       status: "failed",
       error: "provider exploded",
     });
@@ -3695,7 +3768,7 @@ test("an opted-in workflow waits for a fake provider quota window, then redispat
   const f = await fixture(4, undefined, undefined, clock);
   try {
     const started = await f.workflows.start(f.request(
-      `export default async () => agent("quota check");`,
+      `export default async () => agent("quota check", { harness: "codex", speed: "fast" });`,
       { retry: { providerUnavailable: "wait", maxWaitMs: 10 * 60_000, maxAttempts: 2 } },
     ));
     await waitFor(() => f.backend.requests.length === 1, "first attempt");
@@ -3709,6 +3782,7 @@ test("an opted-in workflow waits for a fake provider quota window, then redispat
 
     advance(5 * 60_000);
     await waitFor(() => f.backend.requests.length === 2, "second attempt redispatched");
+    assert.deepEqual(f.backend.requests.map((request) => request.policy.speed), ["fast", "fast"], "same-provider quota waiting keeps the fixed Fast policy");
     assert.equal(f.claude.requests.length, 0, "waiting never reroutes to a different provider");
     f.backend.complete(f.backend.starts[1]!, "done");
     const final = await started.completion;
@@ -4269,7 +4343,7 @@ test("followUp reuses the same jobId/native session across phases for a planner 
     const started = await f.workflows.start(f.request(`
       export default async () => {
         phase("plan");
-        const planner = await agent("Plan the change.", { name: "planner", access: "readOnly" });
+        const planner = await agent("Plan the change.", { name: "planner", harness: "codex", speed: "fast", access: "readOnly" });
         phase("implement");
         const implementer = await agent("Implement the plan.", { name: "implementer" });
         phase("review");
@@ -4299,6 +4373,7 @@ test("followUp reuses the same jobId/native session across phases for a planner 
     assert.equal(final.status, "completed");
     assert.equal(f.backend.requests.length, 2, "no fresh child was spawned for either follow-up");
     assert.equal(final.agents.length, 2, "follow-ups extend the existing lineage instead of creating new agent records");
+    assert.equal(final.agents[0]?.speed, "fast", "workflow followUp retains the originating Fast policy");
 
     const result = final.result as {
       review: { ok: boolean; output: string };

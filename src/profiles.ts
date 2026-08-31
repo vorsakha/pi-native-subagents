@@ -3,6 +3,7 @@ import { join } from "node:path";
 import YAML from "yaml";
 import type {
   AccessMode,
+  AgentSpeed,
   HarnessName,
   EffortLevel,
   ProfileDefinition,
@@ -13,6 +14,7 @@ import type {
 const HARNESSES = new Set<HarnessName>(["pi", "claude", "codex"]);
 const ACCESS = new Set<AccessMode>(["readOnly", "full"]);
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
+const SPEEDS = new Set<AgentSpeed>(["standard", "fast"]);
 
 export interface ProfileCatalog {
   profiles: Map<string, ProfileDefinition>;
@@ -60,6 +62,7 @@ function readDirectory(directory: string, origin: ProfileOrigin, catalog: Profil
         access: optionalEnum(meta, "access", ACCESS),
         harness,
         effort: optionalEnum(meta, "effort", EFFORTS),
+        speed: optionalEnum(meta, "speed", SPEEDS),
         independent: meta.independent as boolean | undefined,
         lockedHarness,
         systemPrompt: body.trim(),

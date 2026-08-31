@@ -121,15 +121,17 @@ test("the subagent extension surface", async (t) => {
       "subagent", "subagent_answer", "subagent_cancel", "subagent_capabilities", "subagent_check", "subagent_list", "subagent_send", "subagent_spawn", "subagent_wait", "workflow",
     ]);
     assert.deepEqual([...pi.commands.keys()].sort(), ["subagent", "subagents", "subagents-config", "workflows"]);
-    assert.deepEqual(parseHumanSubagentCommand('--harness claude --model opus --name "auth review" --effort high --access readOnly "Review the auth flow"'), {
-      harness: "claude",
+    assert.deepEqual(parseHumanSubagentCommand('--harness codex --model opus --name "auth review" --effort high --speed fast --access readOnly "Review the auth flow"'), {
+      harness: "codex",
       model: "opus",
       name: "auth review",
       effort: "high",
+      speed: "fast",
       access: "readOnly",
       task: "Review the auth flow",
     });
     assert.throws(() => parseHumanSubagentCommand("--harness nope investigate"), /Unknown harness/);
+    assert.throws(() => parseHumanSubagentCommand("--speed turbo investigate"), /Unknown speed/);
     assert.throws(() => parseHumanSubagentCommand("--model opus"), /A task is required/);
     assert.deepEqual(permittedHumanPiToolNames([
       { name: "mcp", description: "MCP gateway", source: "extension" },
@@ -142,6 +144,11 @@ test("the subagent extension surface", async (t) => {
     const spawnProperties = spawnTool.parameters.properties;
     assert.ok(spawnProperties.harness);
     assert.ok(spawnProperties.model);
+    assert.deepEqual(spawnProperties.speed.enum, ["standard", "fast"]);
+    const fastCall = spawnTool.renderCall({ task: "urgent review", harness: "codex", speed: "fast" }, theme).render(120).join("\n");
+    assert.match(fastCall, /speed:fast · Codex credits apply/, "the direct trace warns before Fast dispatch");
+    const foregroundFastCall = pi.tools.get("subagent").renderCall({ task: "urgent review", harness: "codex", speed: "fast" }, theme).render(120).join("\n");
+    assert.match(foregroundFastCall, /speed:fast · Codex credits apply/, "the foreground direct trace warns before Fast dispatch");
     assert.equal(spawnProperties.backend, undefined, "backend compatibility is intentionally absent");
     assert.equal(spawnProperties.modelTier, undefined, "tier compatibility is intentionally absent");
     assert.ok(pi.messageRenderers.has("native-workflow-result"));

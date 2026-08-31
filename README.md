@@ -100,7 +100,7 @@ Pi uses its configured default provider unless you choose another one. `/subagen
 
 ```text
 /subagent [--harness pi|claude|codex] [--model ID] [--effort LEVEL]
-          [--access readOnly|full] [--cwd DIR] [--profile NAME]
+          [--speed standard|fast] [--access readOnly|full] [--cwd DIR] [--profile NAME]
           [--max-tokens N] [--max-cost USD] [--max-turns N]
           [--independent] [--independent-of JOB] <task>
 
@@ -108,6 +108,12 @@ Pi uses its configured default provider unless you choose another one. `/subagen
 /subagents [pi|claude|codex]
 /subagents-config [status|pi|claude|codex]
 /workflows
+```
+
+Use Codex Fast mode for one job without changing global Codex configuration:
+
+```text
+/subagent --harness codex --speed fast "Review the release diff"
 ```
 
 Add `refresh` to rerun the provider or capability checks.

@@ -1,6 +1,6 @@
 # Supervision surfaces and telemetry
 
-Read this when supervising work or interpreting telemetry. Each dashboard's `?` legend owns bindings.
+Read this for supervision and telemetry. Each `?` legend owns its bindings.
 
 ## Surfaces
 
@@ -8,8 +8,8 @@ Read this when supervising work or interpreting telemetry. Each dashboard's `?` 
 - `/workflows` has `runs`, `outline`, and `agent-detail` focus. Its bounded outline models every recorded or planned phase and expands the selected phase's filtered agents. Agent rows show lifecycle state and semantic progress; phase rows remain visible under filters. Control workflow agents through `/workflows`, not `/subagents`.
 - Direct-job and workflow-agent transcript labels show the visible line range. Scrolling away from the tail marks the viewport `paused`; press `G` to resume the live tail or a terminal transcript's end.
 - Direct jobs and workflow-owned child jobs remain in the shared editor activity widget. Workflow runs use one session-level widget keyed by stable run ID. Opening it uses `/workflows`; it never creates a second dashboard.
-- Workflow calls and results keep durable transcript cards, run IDs, and artifact references.
-- Workflow-owned jobs stay tagged in `/subagents`; the activity widget counts them separately.
+- Workflow calls keep durable transcript cards, run IDs, and artifact references.
+- Workflow jobs stay tagged in `/subagents` and counted separately in activity.
 - Inspectors default to state plus outline, transcript, or result. Press `i` for route/model, usage/budget, context, provenance, isolation, replay, and replacement telemetry. Errors, questions, waits, warnings, and recovery stay pinned. Previews omit full tool calls and result bodies.
 - Continued routes read `primary → replacement (continued)`. A durable handoff marks the declaration used. Detail shows trigger, checkout, attempts, and replacement history; it never calls a closed or persisted job retained.
 - Transcripts default to compact tool-call groups; full native rendering is a toggle. Selection survives refresh, filtering, reordering, replacement, and resize.
@@ -17,7 +17,7 @@ Read this when supervising work or interpreting telemetry. Each dashboard's `?` 
 - Phase rows, omission rows, headers, and filtered or hidden agents are never agent-action targets. Restart and agent cancellation require an eligible selected agent that survived the final rendered outline/detail viewport. Run cancellation remains a separate confirmed action.
 - Headers keep needs-input, active, and failed counts under width pressure. Very short panels expose only close and ignore hidden actions.
 - `/subagents providers` shows normalized state, reason, and active status. Email is masked. Refresh re-probes without model calls, installation, login, configuration changes, or credentials.
-- A version appears only when a safe probe reports one. Pi, Claude, and Codex do not run a separate version command. Do not infer compatibility from an absent version.
+- Versions appear only from safe probes. No harness runs a separate version command. Absence proves no compatibility state.
 
 ## Distinguishing waits
 
@@ -38,12 +38,14 @@ Four non-failure states are reported separately and must not be summarized as fa
 - Failed, cancelled, or aborted agents show `r` only when restart cannot discard progressed agent or follow-up work. Exact replay restores that proof. Peer-answer progress does not block safe suffix restart. Progressed failures and continued agents require the handoff or manual recovery.
 - A completed entity shows one concise result preview. Use `f` for a retained direct session when more work is needed. Completed workflow runs and agents require no action; `r` on an eligible workflow agent starts a replacement run rather than continuing the completed session.
 
-## Four telemetry concepts stay distinct
+## Telemetry concepts stay distinct
 
 - **Configured model** — routing intent recorded on the job at spawn time.
 - **Effective serving model** (`serving …`) — the model identity the native runtime itself reports for the current turn. Codex reports it only via `model`/`rerouted`; `thread/start`'s model field just echoes the requested or resolved routing intent, not observed serving behavior. Claude reports it on init, assistant, and refusal-fallback events. Pi reports it as `responseModel`, never its `model` alias. When the runtime does not report it, it is omitted — never guessed from the configured model.
+- **Requested speed** is fixed policy. Omitted means standard; Fast requires request-level Codex authorization. Profiles cannot opt in. **Effective speed** requires an authoritative served-tier receipt. Request acceptance and settings are not receipts. Codex emits none, so effective speed stays unknown.
 - **Aggregate usage** — cumulative across follow-ups and bound by budgets.
 - **Context occupancy** — the latest request/turn gauge. It is replaced rather than summed on each reading, cleared at the start of every retained follow-up so a prior generation's reading is never shown as current, and shown as `unknown` rather than zero when the runtime omits it.
+- Requested Fast shows `Codex credits apply · monetary cost unreported` before dispatch and while retained. Authoritative observed Fast shows the same warning. Requested and observed labels stay separate; no receipt renders as `effective speed unknown`.
 
 ## Reporting rules
 

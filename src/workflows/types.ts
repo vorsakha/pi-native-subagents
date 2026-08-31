@@ -1,4 +1,4 @@
-import type { AccessMode, AgentActivitySnapshot, ContextSnapshot, EffortLevel, HarnessName, ProviderFamily, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
+import type { AccessMode, AgentActivitySnapshot, AgentSpeed, ContextSnapshot, EffortLevel, HarnessName, ProviderFamily, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
 import type { RequestedHarness } from "../capability-routing.ts";
 import type { HarnessAvailabilityStatus } from "../harness-availability.ts";
 import type { InteractionRoute, InteractionState } from "../interactions.ts";
@@ -109,6 +109,8 @@ export interface WorkflowAgentAttempt {
   executableVersion?: string;
   capabilityRevision?: string;
   model?: string;
+  speed?: AgentSpeed;
+  effectiveSpeed?: AgentSpeed;
   error?: string;
   usage: WorkflowUsage;
   endedAt?: number;
@@ -249,6 +251,10 @@ export interface WorkflowAgentRecord {
   availabilityChecks?: WorkflowHarnessAvailabilityEvidence[];
   model?: string;
   effort?: EffortLevel;
+  /** Resolved requested speed, fixed across the logical lineage. */
+  speed?: AgentSpeed;
+  /** Latest authoritative provider receipt for the tier that served a turn. */
+  effectiveSpeed?: AgentSpeed;
   /** Authoritative originating agent() objective, fixed across bounded history truncation. */
   objective?: string;
   /** Latest caller prompt, bounded before persistence; excludes schema scaffolding. */
@@ -341,6 +347,9 @@ export interface WorkflowJournalRoute {
   /** Candidate availability observed for auto routing. */
   availabilityChecks?: WorkflowHarnessAvailabilityEvidence[];
   model?: string;
+  /** Additive requested and observed tier metadata; absent on legacy journals. */
+  speed?: AgentSpeed;
+  effectiveSpeed?: AgentSpeed;
   /** Actual child lifecycle state and bounded failure detail for durable review. */
   status?: WorkflowAgentState;
   error?: string;

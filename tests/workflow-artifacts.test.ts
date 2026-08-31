@@ -40,6 +40,9 @@ function snapshot(sessionId: string, now = Date.now()): Omit<WorkflowSnapshot, "
       timestamps: { createdAt: now, startedAt: now, updatedAt: now },
       harness: "codex",
       model: "review-model",
+      speed: "fast",
+      effectiveSpeed: "fast",
+      context: { effectiveSpeed: "fast" },
       preview: "working",
       transcript: [
         { kind: "user", text: "inspect" },
@@ -141,6 +144,8 @@ test("loads session summaries, ignores corrupt files, and durably aborts stale r
   assert.equal(summaries[0]!.agents[0]!.state, "aborted");
   assert.equal(summaries[0]!.phases[0]!.status, "aborted");
   assert.equal(summaries[0]!.timestamps.endedAt, 10_000);
+  assert.equal(summaries[0]!.agents[0]!.speed, "fast");
+  assert.equal(summaries[0]!.agents[0]!.effectiveSpeed, "fast");
 
   const saved = JSON.parse(await readFile(join(first.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
   assert.equal(saved.status, "aborted");
@@ -394,8 +399,14 @@ test("convergence state is bounded on the way to disk, restores unchanged, and s
 
   const other = await createWorkflowArtifacts(f.root, { script: "export default async () => 'ok';\n", args: null, snapshot: snapshot("session-2", now) });
   await checkpointWorkflow(f.root, { ...other, status: "completed" });
+  const legacyPath = join(other.artifactDir, "workflow.json");
+  const legacyRaw = JSON.parse(await readFile(legacyPath, "utf8")) as WorkflowSnapshot;
+  delete legacyRaw.agents[0]!.speed;
+  delete legacyRaw.agents[0]!.effectiveSpeed;
+  await writeFile(legacyPath, JSON.stringify(legacyRaw), { mode: 0o600 });
   const [legacy] = await loadWorkflowSummaries(f.root, { sessionId: "session-2" });
   assert.equal(legacy?.convergence, undefined, "a snapshot written without convergence stays loadable");
+  assert.equal(legacy?.agents[0]?.speed, "standard", "legacy snapshots reconstruct the standard requested default");
 
   const corrupted = join(f.root, other.runId, "workflow.json");
   const raw = JSON.parse(await readFile(corrupted, "utf8")) as Record<string, unknown>;

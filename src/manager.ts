@@ -339,6 +339,7 @@ export class JobManager {
       harness: policy.harness,
       model: policy.model ?? "default",
       effort: policy.effort,
+      speed: policy.speed,
       task: request.task,
       cwd: request.cwd,
       status: "queued",

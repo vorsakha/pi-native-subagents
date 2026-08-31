@@ -51,6 +51,8 @@ test("workflow fingerprints are canonical and bind definitions to execution cont
     workflowCallFingerprint("inspect", { access: "readOnly", schema: { type: "object", required: ["ok"] } }),
   );
   assert.notEqual(workflowCallFingerprint("inspect", {}), workflowCallFingerprint("review", {}));
+  assert.equal(workflowCallFingerprint("inspect", {}), workflowCallFingerprint("inspect", { speed: "standard" }));
+  assert.notEqual(workflowCallFingerprint("inspect", {}), workflowCallFingerprint("inspect", { speed: "fast" }));
   const first = workflowDefinitionFingerprint({ script: "export default 1", argsJson: "null", cwd: "/one", defaultHarness: "codex" });
   const second = workflowDefinitionFingerprint({ script: "export default 1", argsJson: "null", cwd: "/two", defaultHarness: "codex" });
   assert.notEqual(first, second);
@@ -132,6 +134,8 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
     harness: "claude" as const,
     requestedHarness: "claude" as const,
     model: "primary-model",
+    speed: "standard" as const,
+    effectiveSpeed: "standard" as const,
     status: "failed" as const,
     error: "quota",
     continuationFallback: target,
@@ -158,6 +162,7 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
     agentIndex: 0,
     route: {
       ...route,
+      effectiveSpeed: "fast",
       continuation: {
         state: "handoff",
         fromHarness: "claude",
@@ -207,6 +212,7 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
       record.route!.continuation!.failedJobId = "different-failed-job";
     },
     (record: WorkflowJournalRecord) => { record.route!.model = "different-primary-route"; },
+    (record: WorkflowJournalRecord) => { record.route!.speed = "fast"; },
     (record: WorkflowJournalRecord) => {
       record.continuation!.trigger.detail = "different trigger";
       record.route!.continuation!.trigger.detail = "different trigger";

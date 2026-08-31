@@ -5,7 +5,7 @@ import type { JobSnapshot } from "../src/types.ts";
 import { interactionSnapshot } from "./helpers.ts";
 
 function job(): JobSnapshot {
-  return { id: "j", name: "worker", access: "full", independent: false, harness: "codex", model: "m", task: "t", cwd: "/tmp", status: "queued", generation: 0, createdAt: 1, output: "", truncated: false, usage: emptyUsage(), tools: [], transcript: [], liveThinking: "", queuedMessages: [] };
+  return { id: "j", name: "worker", access: "full", independent: false, harness: "codex", model: "m", speed: "standard", task: "t", cwd: "/tmp", status: "queued", generation: 0, createdAt: 1, output: "", truncated: false, usage: emptyUsage(), tools: [], transcript: [], liveThinking: "", queuedMessages: [] };
 }
 
 test("reducer tracks lifecycle, tools, usage, and authoritative final message", () => {

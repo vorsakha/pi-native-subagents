@@ -47,6 +47,8 @@ export function detailSignature(run: WorkflowSnapshot, phase: WorkflowPhase | un
     agent?.tools,
     agent?.usage,
     agent?.context,
+    agent?.speed,
+    agent?.effectiveSpeed,
     agent?.isolation,
     agent?.outputProvenance,
     agent?.instructionShaped,

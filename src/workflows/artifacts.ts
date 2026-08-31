@@ -534,6 +534,8 @@ function isWorkflowAttempt(value: unknown): boolean {
     && (attempt.executableVersion === undefined || typeof attempt.executableVersion === "string" && attempt.executableVersion.length <= 120)
     && (attempt.capabilityRevision === undefined || typeof attempt.capabilityRevision === "string" && attempt.capabilityRevision.length <= 200)
     && (attempt.model === undefined || typeof attempt.model === "string" && attempt.model.length <= 256)
+    && (attempt.speed === undefined || attempt.speed === "standard" || attempt.speed === "fast")
+    && (attempt.effectiveSpeed === undefined || attempt.effectiveSpeed === "standard" || attempt.effectiveSpeed === "fast")
     && (attempt.error === undefined || typeof attempt.error === "string" && attempt.error.length <= 2_000)
     && isWorkflowUsage(attempt.usage)
     && (attempt.endedAt === undefined || typeof attempt.endedAt === "number" && Number.isFinite(attempt.endedAt))
@@ -586,6 +588,8 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || record.route.jobId !== undefined && (typeof record.route.jobId !== "string" || !record.route.jobId || record.route.jobId.length > 200)
       || record.route.logicalJobId !== undefined && (typeof record.route.logicalJobId !== "string" || !record.route.logicalJobId || record.route.logicalJobId.length > 200)
       || record.route.model !== undefined && (typeof record.route.model !== "string" || record.route.model.length > 256)
+      || record.route.speed !== undefined && record.route.speed !== "standard" && record.route.speed !== "fast"
+      || record.route.effectiveSpeed !== undefined && record.route.effectiveSpeed !== "standard" && record.route.effectiveSpeed !== "fast"
       || record.route.status !== undefined && !["queued", "running", "completed", "failed", "cancelled", "aborted"].includes(record.route.status)
       || record.route.error !== undefined && (typeof record.route.error !== "string" || record.route.error.length > 2_000))) return false;
   if (record.route !== undefined && (
@@ -918,7 +922,16 @@ function isWorkflowSnapshot(value: unknown): value is WorkflowSnapshot {
     && candidate.agents.every((agent) => !!agent && typeof agent === "object"
       && typeof agent.name === "string"
       && (agent.access === "readOnly" || agent.access === "full")
+      && (agent.speed === undefined || agent.speed === "standard" || agent.speed === "fast")
+      && (agent.effectiveSpeed === undefined || agent.effectiveSpeed === "standard" || agent.effectiveSpeed === "fast")
       && typeof agent.independent === "boolean");
+}
+
+function withDefaultAgentSpeeds(snapshot: WorkflowSnapshot): WorkflowSnapshot {
+  return {
+    ...snapshot,
+    agents: snapshot.agents.map((agent) => ({ ...agent, speed: agent.speed ?? "standard" })),
+  };
 }
 
 function currentPhasePosition(snapshot: WorkflowSnapshot): number | undefined {
@@ -1002,6 +1015,7 @@ export async function loadWorkflowSummaries(
         taskOutcome: parsed.taskOutcome ?? (parsed.status === "completed" ? workflowTaskOutcome(authoritativeResult) : undefined),
         agents: parsed.agents.map((agent) => ({ ...agent, activity: undefined })),
       };
+      snapshot = withDefaultAgentSpeeds(snapshot);
       if (snapshot.transcriptArtifact) {
         try {
           const rawTranscripts = JSON.parse(await readFile(join(directory, snapshot.transcriptArtifact), "utf8")) as Record<string, unknown>;
@@ -1050,7 +1064,7 @@ export async function readWorkflowRunSummary(root: string, runId: string): Promi
     const directory = runDirectory(root, runId);
     const parsed: unknown = JSON.parse(await readFile(join(directory, "workflow.json"), "utf8"));
     if (!isWorkflowSnapshot(parsed) || parsed.runId !== runId) return undefined;
-    return { ...parsed, artifactDir: directory };
+    return withDefaultAgentSpeeds({ ...parsed, artifactDir: directory });
   } catch { return undefined; }
 }
 

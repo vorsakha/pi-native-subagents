@@ -71,6 +71,17 @@ function agent(overrides: Partial<WorkflowAgentRecord>): WorkflowAgentRecord {
   };
 }
 
+test("queued workflow cards warn on requested Fast before dispatch without claiming it was observed", () => {
+  const ordinary = buildWorkflowCardLines(workflow(), theme, { expanded: false, now: 4_000 }).join("\n");
+  assert.doesNotMatch(ordinary, /Codex credits apply|speed standard/);
+  const fastRun = workflow({
+    agents: [agent({ harness: "codex", model: "fixture", speed: "fast", state: "queued" })],
+  });
+  const fast = buildWorkflowCardLines(fastRun, theme, { expanded: false, now: 4_000 }).join("\n");
+  assert.match(fast, /requested fast · Codex credits apply · monetary cost unreported · effective speed unknown/);
+  assert.doesNotMatch(fast, /\$0/);
+});
+
 test("workflow run and agent summaries preserve semantic priority and wait distinctions", () => {
   const question = {
     ordinal: 0,
