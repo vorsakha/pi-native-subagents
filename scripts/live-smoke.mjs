@@ -44,6 +44,7 @@ function policy(name, access = "readOnly") {
     customization: "native",
     thinking: accessMode ? "medium" : "low",
     effort: accessMode ? "medium" : "low",
+    speed: "standard",
     piTools: [],
     claudeTools: access === "full"
       ? ["Read", "Write", "Edit", "Bash"]

@@ -50,7 +50,7 @@ import type {
   WorkflowPhase,
   WorkflowSnapshot,
 } from "../../src/workflows/types.ts";
-import { formatContext, formatUsage, sanitizeInline, sanitizeText, shortId, traceStatusMeta } from "../subagents/render.ts";
+import { formatContext, formatSpeedBilling, formatUsage, sanitizeInline, sanitizeText, shortId, traceStatusMeta } from "../subagents/render.ts";
 import {
   formatWorkflowConvergence,
   formatWorkflowInteraction,
@@ -1436,6 +1436,8 @@ export class WorkflowsDashboardOverlay implements Focusable {
         width,
       ));
     }
+    const speedBilling = formatSpeedBilling({ speed: agent.speed, effectiveSpeed: agent.effectiveSpeed });
+    if (speedBilling) pinned.push(this.theme.fg("warning", speedBilling));
 
     // A live inspector is a status view, not a transcript view. Keep this
     // branch ahead of every prompt, provider-output, tool, result, and optional
@@ -1451,7 +1453,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     }
 
     const metadata: string[] = [
-      this.theme.fg("dim", `${policy} · effort ${agent.effort ?? "adaptive"} · ${route} · ${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${formatAgentElapsed(agent, this.#now())}`),
+      this.theme.fg("dim", `${policy} · effort ${agent.effort ?? "adaptive"}${agent.speed === "fast" ? " · speed fast" : ""} · ${route} · ${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${formatAgentElapsed(agent, this.#now())}`),
       this.theme.fg("dim", `${phase ? `${boundedInline(run.name, 1_000)} · ${boundedInline(phase.name, 1_000)}` : boundedInline(run.name, 1_000)}${usage ? ` · ${usage}` : ""}`),
     ];
     if (agent.availability || agent.requestedHarness || agent.executableVersion || agent.capabilityRevision || agent.availabilityChecks?.length) {
@@ -1498,7 +1500,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
     }
     if (agent.attempts?.length) {
       for (const attempt of agent.attempts.slice(-4)) {
-        const route = `${sanitizeInline(attempt.requestedHarness ?? attempt.harness ?? "?")}/${boundedInline(attempt.model ?? "native default", 256)}`;
+        const route = `${sanitizeInline(attempt.requestedHarness ?? attempt.harness ?? "?")}/${boundedInline(attempt.model ?? "native default", 256)}${attempt.speed === "fast" ? " · speed fast" : ""}`;
         metadata.push(this.theme.fg("dim", `Attempt ${(attempt.index ?? 0) + 1} · ${route} · ${attempt.disposition ?? "terminal"}${attempt.error ? ` · ${boundedInline(attempt.error, 500)}` : ""}`));
       }
       const finalRoute = `${sanitizeInline(agent.requestedHarness ?? agent.harness ?? "?")}/${boundedInline(agent.model ?? "native default", 256)}`;

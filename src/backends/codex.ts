@@ -20,6 +20,7 @@ import {
   normalizeTarget,
 } from "../interactions.ts";
 import type {
+  AgentSpeed,
   Backend,
   BackendEvent,
   BackendPolicy,
@@ -37,6 +38,13 @@ import type {
 export const CODEX_CLIENT_INFO = { name: "pi-native-subagents", title: "Pi Native Subagents", version: "0.1.0" };
 /** Optional native integrations whose failure must not take down unrelated work. */
 const OPTIONAL_INTEGRATION = /mcp|plugin|marketplace|oauth|invalid_grant|refresh token|hook/i;
+
+export function normalizeCodexSpeed(value: unknown): AgentSpeed | undefined {
+  const tier = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (tier === "default" || tier === "standard") return "standard";
+  if (tier === "priority" || tier === "fast") return "fast";
+  return undefined;
+}
 
 interface CodexBackendOptions {
   requestTimeoutMs?: number;
@@ -401,11 +409,17 @@ export class CodexAppServerBackend implements Backend {
     let previousTokenTotals: CodexTokenTotals | undefined;
     /** Model identity reported by the runtime; never seeded from configured policy. */
     let servingModel: string | undefined;
+    /** Native active tier observation for the current generation. */
+    let effectiveSpeed: AgentSpeed | undefined;
     /** Latest occupancy gauge; carried over (not recomputed) by events that are not a new reading, e.g. a reroute. */
     let lastOccupancy: { tokens?: number; window?: number } = {};
     const emitContext = () => {
-      const context: ContextSnapshot = { ...lastOccupancy, ...(servingModel ? { servingModel } : {}) };
-      if (context.tokens !== undefined || context.window !== undefined || context.servingModel !== undefined) {
+      const context: ContextSnapshot = {
+        ...lastOccupancy,
+        ...(servingModel ? { servingModel } : {}),
+        ...(effectiveSpeed ? { effectiveSpeed } : {}),
+      };
+      if (context.tokens !== undefined || context.window !== undefined || context.servingModel !== undefined || context.effectiveSpeed !== undefined) {
         emit({ type: "context", context });
       }
     };
@@ -442,10 +456,15 @@ export class CodexAppServerBackend implements Backend {
         approvalPolicy: request.policy.approvalPolicy,
         sandboxPolicy: request.policy.codexSandbox,
         cwd: request.cwd,
+        ...(request.policy.speed === "fast" ? { serviceTier: "priority" } : {}),
       }, this.#requestTimeoutMs));
       watchdog.touch();
       turnId = String(asObject(turnResult.turn).id ?? "");
       if (!turnId) throw new Error("Codex turn/start returned no turn id");
+      if (request.policy.speed === "fast") {
+        effectiveSpeed = "fast";
+        emitContext();
+      }
       turnState = "inProgress";
     };
 
@@ -575,6 +594,10 @@ export class CodexAppServerBackend implements Backend {
             servingModel = toModel;
             emitContext();
           }
+        } else if (method === "thread/settings/updated") {
+          if (params.threadId !== threadId) return;
+          effectiveSpeed = normalizeCodexSpeed(asObject(params.threadSettings).serviceTier);
+          emitContext();
         } else if (method === "turn/completed") {
           const turn = asObject(params.turn);
           const status = String(turn.status ?? "failed");
@@ -685,6 +708,7 @@ export class CodexAppServerBackend implements Backend {
           threadResult = await startThread({ ...(baseConfig ?? {}), mcp_servers: {}, hooks: {} });
         }
         const thread = asObject(threadResult.thread);
+        effectiveSpeed = normalizeCodexSpeed(threadResult.serviceTier ?? thread.serviceTier);
         // ThreadStartResponse.model echoes the model this backend itself requested (configured routing
         // intent, resolved but not yet observed serving); only a later model/rerouted notification is
         // authoritative telemetry about the model that actually served a turn.
@@ -721,6 +745,7 @@ export class CodexAppServerBackend implements Backend {
         // A new generation's occupancy is unread until this turn's own thread/tokenUsage/updated notification
         // reports it; the prior generation's gauge must not be re-emitted labeled as current.
         lastOccupancy = {};
+        effectiveSpeed = undefined;
         watchdog.arm();
         emit({ type: "started" });
         await startTurn(message);

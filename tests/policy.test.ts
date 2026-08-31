@@ -77,6 +77,22 @@ test("compilePolicy defaults customization to native and normalizes requires", (
   assert.throws(() => compilePolicy(request({ requires: [42] as unknown as string[] })), /requires must contain capability ID strings/);
 });
 
+test("compilePolicy resolves explicit and profile speed without inferring it from effort or model", () => {
+  assert.equal(compilePolicy(request({ harness: "codex", effort: "max", model: "fast-looking-model" })).policy.speed, "standard");
+  assert.equal(compilePolicy(request({ harness: "codex", speed: "fast" })).policy.speed, "fast");
+  const profile: ProfileDefinition = {
+    name: "urgent", description: "", systemPrompt: "", filePath: "urgent.md", origin: "global", harness: "codex", speed: "fast",
+  };
+  assert.equal(compilePolicy(request(), profile).policy.speed, "fast");
+  assert.equal(compilePolicy(request({ speed: "standard" }), profile).policy.speed, "standard");
+});
+
+test("compilePolicy rejects fast after final route resolution when the harness is unsupported", () => {
+  assert.throws(() => compilePolicy(request({ harness: "pi", speed: "fast" })), /Fast speed is unsupported by the pi route/);
+  assert.throws(() => compilePolicy(request({ harness: "claude", speed: "fast" })), /Fast speed is unsupported by the claude route/);
+  assert.throws(() => compilePolicy(request({ defaultHarness: "pi", speed: "fast" })), /unsupported by the pi route/);
+});
+
 test("compilePolicy's read-only/full base piTools sets never contain a delegation-shaped tool (the recursion ceiling)", () => {
   const readOnly = compilePolicy(request({ access: "readOnly" })).policy.piTools;
   const full = compilePolicy(request({ access: "full" })).policy.piTools;

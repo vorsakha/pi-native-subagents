@@ -141,6 +141,18 @@ test("renderer sanitizes output and enforces collapsed/expanded line budgets", (
   assert.ok(expandedLines.every((line) => !line.includes("tool-")), "expanded card no longer lists recent tool calls as primary activity");
 });
 
+test("direct cards show Fast credit caveats and keep ordinary standard cards quiet", () => {
+  const standard = buildJobCardLines(job({ speed: "standard" }), theme, { expanded: false, now: 2_000 }).join("\n");
+  assert.doesNotMatch(standard, /speed standard|Codex credits/);
+
+  const fast = buildJobCardLines(job({ speed: "fast", context: { effectiveSpeed: "fast" } }), theme, { expanded: false, now: 2_000 }).join("\n");
+  assert.match(fast, /speed fast · Codex credits apply · monetary cost unreported/);
+
+  const nativeFast = buildJobCardLines(job({ speed: "standard", context: { effectiveSpeed: "fast" } }), theme, { expanded: false, now: 2_000 }).join("\n");
+  assert.match(nativeFast, /speed fast · Codex credits apply · monetary cost unreported · requested standard/);
+  assert.doesNotMatch(nativeFast, /\$0/);
+});
+
 test("answered-question receipts and workflow checkpoints stay live, bounded, and width-safe", () => {
   const interaction = interactionSnapshot({
     sourceName: "reviewer",

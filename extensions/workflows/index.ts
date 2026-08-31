@@ -153,6 +153,8 @@ function compactSnapshot(snapshot: WorkflowSnapshot, options: { liveActivity?: b
       activity: options.liveActivity && !workflowIsTerminal(snapshot.status) && agent.state === "running" && agent.activity
         ? structuredClone(agent.activity)
         : undefined,
+      speed: agent.speed,
+      effectiveSpeed: agent.effectiveSpeed,
       preview: agent.preview?.slice(-500),
       structured: agent.structured === undefined ? undefined : structuredClone(agent.structured),
       structuredTransport: agent.structuredTransport,
@@ -437,6 +439,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       "agent(prompt) is generic and defaults to full access after project trust; set access=readOnly for inspection.",
       "Use independent=true only for a different native provider; use independentOf=<jobId> to review with a provider different from the producer.",
       "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
+      "Set speed='fast' only on an explicit Codex agent() route. It uses Codex credits, reports no authoritative monetary cost, and cannot be combined with providerFallback or continuationFallback. Omit it for standard policy.",
       "Scripts cannot access files, network, environment variables, subprocesses, imports, or credentials; only agent, followUp, parallel, pipeline, phase, log, and JSON args are available.",
       "Use background=true for independent long work; completion is delivered automatically as a follow-up.",
       "Keep workflow results JSON-serializable and branch explicitly on each agent result's ok field.",

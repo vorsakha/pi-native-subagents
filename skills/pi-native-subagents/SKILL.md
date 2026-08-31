@@ -5,7 +5,7 @@ description: Use when invoking the Pi Native Subagents extension or writing a sa
 
 # Pi Native Subagents
 
-Use this skill whenever the task calls any tool from the Pi Native Subagents extension. This skill documents the package contract. The host's routing skill, not this package contract, decides model, harness, effort, and quota preferences.
+Use this skill for Pi Native Subagents tools. The host's routing skill decides model, harness, effort, and quota preferences.
 
 ## Read the right reference before acting
 
@@ -17,7 +17,7 @@ Paths are relative to this file. Read the reference **before** you write the cal
 | call `converge()` | `references/convergence.md` |
 | opt into cross-provider continuation after progressed native failure | `references/progressed-continuation.md` |
 | let a child use `subagent_ask`, or answer with `subagent_answer` | `references/routed-questions.md` |
-| set spend limits, send a limited retained follow-up, set a workflow `budget`, use `resumeFromRunId`, `providerFallback`, or `retry` | `references/budgets-replay-and-provider-waits.md` |
+| set `speed`, spend limits, replay, provider fallback, or retry | `references/budgets-replay-and-provider-waits.md` |
 | use `isolation: "worktree"`, or run `/workflows reclaim` | `references/worktrees-and-retention.md` |
 | run `/subagents providers` or `/subagents providers refresh`, supervise or recover a selected job/workflow/agent, report on running work, or interpret usage and model numbers | `references/supervision-and-telemetry.md` |
 
@@ -30,24 +30,19 @@ Paths are relative to this file. Read the reference **before** you write the cal
 
 ## Direct native subagents
 
-Give every child a self-contained task packet:
-
-- objective and relevant paths;
-- current facts and constraints;
-- required access level;
-- expected result format;
-- focused acceptance checks and verification evidence.
+Give every child a self-contained task with paths, constraints, result format, and verification.
 
 Usage rules:
 
 - Use `access: "readOnly"` for inspection, review, and planning. Request `full` only when mutation is required and the project is trusted. Read-only children are sandboxed by construction, not by instruction.
 - Omit `model` unless a concrete harness-local override is needed. A model name is not a cross-harness tier, and `harness: "auto"` rejects harness-local model overrides.
+- Omit `speed` for standard policy. Use `speed: "fast"` only on an explicit Codex route when the human opts in. Fast is fixed for the retained lineage, uses Codex credits, and has no reported monetary cost. It never follows from model or effort.
 - `harness: "auto"` selects an initial ready route; it is not failover. Explicit routes fail closed except for the workflow opt-ins below. Availability checks are read-only and never install, log in, or reconfigure providers.
 - Use `requires` only with IDs returned by `subagent_capabilities`; pair it with `harness: "auto"` when any capable harness is acceptable.
 - Use `independent: true` only when the child must use a different native provider from the parent. A different model on the same provider is not independent.
 - Use `independentOf: "<producer-job-id>"` when a reviewer must differ from the provider that produced the reviewed work. The target must be an existing job.
 - Omit `profile` unless the human explicitly names one. Profiles may impose access, harness, or routing ceilings.
-- At most four jobs run concurrently, globally, whether work starts directly or through a workflow. Prefer direct spawning over manually recreating workflow scheduling.
+- At most four jobs run concurrently across direct and workflow work.
 - `maxTokens`, `maxCost`, and `maxTurns` are optional; omit all three for an open spend budget. They bind the retained session cumulatively across every follow-up, never just the current turn, and reaching one blocks later follow-ups instead of cancelling active work. Codex reports no cost, so a Codex route with `maxCost` is rejected before dispatch.
 
 ```ts
@@ -63,6 +58,8 @@ const review = await subagent_spawn({
   harness: "auto",
   requires: ["<capability-id-from-discovery>"],
 });
+
+const urgent = await subagent_spawn({ task: "Review the release diff.", harness: "codex", speed: "fast", access: "readOnly" });
 
 await subagent_wait({ jobId: review.jobId, timeoutMs: 600_000 });
 ```
@@ -182,7 +179,7 @@ These are enforced by the runtime. Do not design around them.
 - **Routed questions fail closed.** One may be open per generation; a second is refused. Peer replay requires durable acceptance after caller settlement.
 - **Provider independence is provider diversity.** `independent`/`independentOf` select a different native provider, never a bigger model on the same one.
 - **Worktree isolation is one-shot and can destroy work.** A finalized worktree can never be continued by `followUp()`, answer a peer question, or be used inside `converge()`. Read `references/worktrees-and-retention.md` before reclaiming or `--force`-discarding any worktree: it may hold the only copy of a child's changed work.
-- **Retained sessions are policy-fixed.** Harness, model, effort, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original call; a follow-up may only change `phase` and `schema`.
+- **Retained sessions are policy-fixed.** Harness, model, effort, speed, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original call; a follow-up may only change `phase` and `schema`.
 - **Privacy.** Keep private transcripts, artifacts, credentials, and machine-local runtime state out of Git and out of ordinary model-facing results. Durable artifacts are for bounded inspection, not for copying into prompts wholesale.
 
 ## Common failures and corrections
@@ -203,7 +200,6 @@ These are enforced by the runtime. Do not design around them.
 
 ## Safe routing defaults
 
-- Prefer generic task-driven children over role-specific prompts or fixed model tiers.
 - Keep reviewers read-only unless mutation is explicitly required.
-- Make harness, model, effort, access, independence, and verification requirements explicit when the human asks for them.
+- Make harness, model, effort, speed, access, independence, and verification requirements explicit when the human asks for them.
 - Unless the caller explicitly asks for a one-shot review, give an implementation/review workflow at least one bounded fix round.

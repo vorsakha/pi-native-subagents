@@ -317,7 +317,8 @@ test("snapshots preserve explicit effort and distinguish provider-adaptive defau
 
 test("wait resolves terminal state and timeout returns current state", async () => {
   const { backend, manager } = setup(1);
-  const job = manager.spawn(request(1));
+  const job = manager.spawn({ ...request(1), speed: "fast" });
+  assert.equal(job.speed, "fast");
   await tick();
   assert.equal((await manager.wait(job.id, { timeoutMs: 5 })).status, "running");
   backend.complete(job.id, "done");
@@ -641,7 +642,7 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
     observed.push(`${job.status}:${event.type}`);
     if (event.type === "started" || event.type === "text_delta" || event.type === "thinking_delta") streamedSnapshots.push(job);
   });
-  const job = manager.spawn(request(1));
+  const job = manager.spawn({ ...request(1), speed: "fast" });
   await tick();
   backend.runs.get(job.id)!.emit({ type: "text_delta", text: "partial" });
   backend.runs.get(job.id)!.emit({ type: "thinking_delta", text: "thinking" });
@@ -650,13 +651,14 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
   assert.equal(streamedSnapshots[2]!.tools, streamedSnapshots[1]!.tools, "observer projections reuse unchanged tool clones across deltas");
   await manager.send(job.id, "change course", "steer");
   assert.deepEqual(backend.sends, [{ id: job.id, message: "change course", behavior: "steer" }]);
-  backend.runs.get(job.id)!.emit({ type: "context", context: { tokens: 1_000, servingModel: "gen-0-model" } });
+  backend.runs.get(job.id)!.emit({ type: "context", context: { tokens: 1_000, servingModel: "gen-0-model", effectiveSpeed: "fast" } });
   backend.complete(job.id, "done", { input: 3 });
   await manager.wait(job.id);
   assert.ok(observed.includes("completed:completed"));
   const queued = await manager.send(job.id, "review the fixes", "followUp");
   assert.ok(queued.status === "queued" || queued.status === "running");
   assert.equal(queued.context, undefined, "the retained generation boundary clears the prior generation's context before any new telemetry arrives, even if this generation never reports one");
+  assert.equal(queued.speed, "fast", "requested speed is fixed across retained generations");
   await tick();
   assert.deepEqual(backend.sends.at(-1), { id: job.id, message: "review the fixes", behavior: "followUp" });
   backend.runs.get(job.id)!.emit({ type: "context", context: { tokens: 2_000, servingModel: "gen-1-model" } });

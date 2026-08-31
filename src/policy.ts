@@ -1,7 +1,15 @@
 import { capabilityDenial, normalizeRequirements } from "./capabilities.ts";
 import { PARENT_THREAD_TOOL_NAME } from "./parent-thread-context.ts";
 import { SUBAGENT_ASK_TOOL_NAME } from "./interactions.ts";
-import type { AccessMode, HarnessName, BackendPolicy, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
+import type { AccessMode, AgentSpeed, HarnessName, BackendPolicy, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
+
+const SPEEDS = new Set<AgentSpeed>(["standard", "fast"]);
+
+export function selectSpeed(request: SpawnRequest, profile?: ProfileDefinition): AgentSpeed {
+  const speed = request.speed ?? profile?.speed ?? "standard";
+  if (!SPEEDS.has(speed)) throw new Error(`Unknown speed: ${String(speed)}`);
+  return speed;
+}
 
 export function normalizeModel(value: unknown): string | undefined {
   if (value === undefined) return undefined;
@@ -67,6 +75,10 @@ export function compilePolicy(
   if (!request.trusted) throw new Error("Subagents are disabled for untrusted projects");
   const independent = isIndependent(request, profile, independentOfProvider);
   const selected = selectHarness(request, profile, independentOfProvider);
+  const speed = selectSpeed(request, profile);
+  if (speed === "fast" && selected !== "codex") {
+    throw new Error(`Fast speed is unsupported by the ${selected} route`);
+  }
 
   const model = normalizeModel(request.model);
   const access = selectAccess(request, profile);
@@ -93,6 +105,7 @@ export function compilePolicy(
       model,
       thinking: "medium",
       effort: request.effort ?? profile?.effort,
+      speed,
       piTools: [...new Set([
         ...(readOnly ? ["read", "grep", "find", "ls"] : ["read", "write", "edit", "bash", "grep", "find", "ls"]),
         ...requiredPiTools,

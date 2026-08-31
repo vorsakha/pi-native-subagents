@@ -71,6 +71,17 @@ function agent(overrides: Partial<WorkflowAgentRecord>): WorkflowAgentRecord {
   };
 }
 
+test("workflow cards expose Fast policy and unreported monetary cost without standard clutter", () => {
+  const ordinary = buildWorkflowCardLines(workflow(), theme, { expanded: false, now: 4_000 }).join("\n");
+  assert.doesNotMatch(ordinary, /Codex credits apply|speed standard/);
+  const fastRun = workflow({
+    agents: [agent({ harness: "codex", model: "fixture", speed: "fast", effectiveSpeed: "fast", state: "running" })],
+  });
+  const fast = buildWorkflowCardLines(fastRun, theme, { expanded: false, now: 4_000 }).join("\n");
+  assert.match(fast, /speed fast · Codex credits apply · monetary cost unreported/);
+  assert.doesNotMatch(fast, /\$0/);
+});
+
 test("workflow run and agent summaries preserve semantic priority and wait distinctions", () => {
   const question = {
     ordinal: 0,

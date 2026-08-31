@@ -21,6 +21,8 @@ Fresh input plus output consumes `maxTokens`; cache reads do not. Never infer a 
 
 Pi and Claude report token, turn, and cost metrics. Codex reports tokens and turns but not cost, so a Codex route with `maxCost` is rejected before dispatch — both directly and in a workflow. The runtime validates the final live route, including the provider opposite an `independentOf` producer, instead of comparing the limit with a synthetic zero. Never treat Codex's absent cost metric as zero.
 
+Codex Fast mode is the explicit `speed: "fast"` policy. It may consume credits faster, but the adapter reports neither exact credits nor authoritative monetary cost. Cards therefore say `Codex credits apply · monetary cost unreported`; no credit estimate or budget is synthesized.
+
 ## Replay with resumeFromRunId
 
 `resumeFromRunId` replays every independently matching completed call, including later calls from a parallel batch when an earlier lane failed. Failed, incomplete, duplicated, or fingerprint-mismatched ordinals rerun live.
@@ -28,6 +30,7 @@ Pi and Claude report token, turn, and cost metrics. Codex reports tokens and tur
 - Keep source, input, project, and routing context identical; only increase replay budgets when the runtime permits it.
 - A terminal retained source can be looked up by run ID across Pi sessions; the source summary and journal are read under the retention lock before replay starts.
 - New journal records add available route evidence: requested and resolved harness, normalized auto-candidate checks, executable version, model, and capability fingerprint. Older journals still load without it. A matched completion reuses its result and evidence; invalidation or mismatch dispatches fresh and may resolve `harness: "auto"` again.
+- Requested speed is replay identity. Explicit `standard` matches a legacy omitted value; `fast` does not. Exact Fast replay dispatches nothing and consumes no new credits. Effective speed is telemetry and never changes continuation identity.
 - `retry` is not part of the replay definition fingerprint, so changing it does not invalidate a prior run for `resumeFromRunId`.
 
 ## Opt-in provider waits
@@ -36,9 +39,9 @@ Pi and Claude report token, turn, and cost metrics. Codex reports tokens and tur
 
 **Scope: fresh `agent()` calls only.** A `followUp()` resumes a native session the job manager has already closed once its generation fails, so there is nothing left to redispatch; it always fails immediately regardless of the policy. Retry with a fresh `agent()` call instead.
 
-Even for `agent()`, waiting applies only when:
+Waiting applies only when:
 
-- the harness is Claude or Codex and it reported a recognized quota rejection with an authoritative retry time. For Claude, recognized session-limit boilerplate on the terminal refusal counts as metadata only when it is the entire assistant content; genuine text, thinking, or tool activity still blocks automatic replay. Unsupported providers or rejections without enough retry information fail immediately;
+- Claude or Codex reports recognized quota rejection with an authoritative retry time. Claude limit boilerplate counts only when it is the entire assistant content;
 - the failed attempt produced no model or tool activity — replaying observable work could duplicate side effects;
 - the failed attempt used no isolated worktree that had not fully finalized.
 
@@ -46,9 +49,10 @@ Either refusal is terminal and actionable, not a silent fallthrough.
 
 Bounds and accounting:
 
-- `maxWaitMs` (default 30 minutes, up to 6 hours) bounds the total wait allowance for the whole run, shared across concurrent calls. `maxAttempts` (default 1) bounds retries per fresh `agent()` call.
+- `maxWaitMs` defaults to 30 minutes, caps at 6 hours, and is shared by the run. `maxAttempts` defaults to 1 per fresh call.
 - Waiting occupies no native inference slot and holds no workflow concurrency lane, so sibling agents and other direct or workflow work can still dispatch.
 - Routing stays pinned to the harness the first attempt resolved to. Waiting never reroutes Claude to Codex or back.
+- Requested speed stays pinned across every same-provider retry.
 - A retried call keeps its original call ordinal and never consumes another of the 32 agent calls. Usage that a retried attempt actually spent counts toward `maxTokens`/`maxCost`/`maxTurns` and per-agent budgets.
 - While waiting, the agent has no current error. Summaries expose only bounded provider/window/retry/attempt data. Raw errors stay private; durable attempts keep route, job, usage, and disposition provenance. Exhaustion fails with the wait-policy reason and recovery.
 - Waiting is session-local: a live, in-memory schedule, not a durable or detached runner. A session shutdown aborts a pending wait exactly like any other in-flight work, and cancelling a waiting agent settles it immediately as a terminal failure while the run continues.
@@ -57,9 +61,11 @@ Bounds and accounting:
 
 `providerFallback: { harness: "claude" | "codex", model?: string }` names one opposite native route for a fresh `agent()` call and overrides wait.
 
+Fast speed cannot combine with `providerFallback` or `continuationFallback`; the declaration fails before primary dispatch because an opposite provider cannot preserve Fast policy.
+
 After dispatch it requires `readOnly`, authoritative pre-inference proof, zero usage, and a freshly ready target. Safe missing/login/incompatibility readiness may fall back under either access. Other errors, cancellation, policy rejection, worktrees, waits, retries, and another fallback are terminal.
 
-Both attempts share one ordinal and cumulative usage; budget preflight runs again. The journal and `/workflows` retain the declaration, trigger, attempts, and route. Exact completion replays without probing; an incomplete pre-inference attempt restarts at its primary.
+Attempts share one ordinal and cumulative usage. Journals retain declaration, trigger, attempts, and route. Exact completion replays without probing.
 
 ## Progressed continuation accounting
 

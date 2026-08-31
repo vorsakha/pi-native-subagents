@@ -12,6 +12,7 @@ import type {
 } from "../../src/workflows/types.ts";
 import {
   formatEffort,
+  formatSpeedBilling,
   formatUsage,
   isAttentionStatus,
   linesComponent,
@@ -553,7 +554,8 @@ function agentRow(agent: WorkflowAgentRecord, theme: Theme, now: number): string
   const independent = agent.independent ? " · independent" : "";
   const warning = agent.instructionShaped ? " · ⚠ instruction-like output" : "";
   const isolation = agent.isolation ? ` · worktree ${agent.isolation.state}` : "";
-  return `${GROUP_INDENT}${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", `${agent.access}${profile}${independent} · ${agent.state}${route} · effort ${agent.effort ?? "adaptive"}${isolation}${warning}`)}`;
+  const speed = agent.speed === "fast" ? " · speed fast" : "";
+  return `${GROUP_INDENT}${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", `${agent.access}${profile}${independent} · ${agent.state}${route} · effort ${agent.effort ?? "adaptive"}${speed}${isolation}${warning}`)}`;
 }
 
 function clampContent(theme: Theme, lines: string[], budget: number): string[] {
@@ -598,6 +600,8 @@ export function buildWorkflowCardLines(
   const description = sanitizeInline(snapshot.description);
   if (options.expanded && description) lines.push(theme.fg("dim", description));
   for (const warning of snapshot.warnings?.slice(0, options.expanded ? 3 : 1) ?? []) lines.push(theme.fg("warning", `⚠ ${sanitizeInline(warning)}`));
+  const billedAgent = [...snapshot.agents].reverse().find((agent) => formatSpeedBilling({ speed: agent.speed, effectiveSpeed: agent.effectiveSpeed }));
+  if (billedAgent) lines.push(theme.fg("warning", formatSpeedBilling({ speed: billedAgent.speed, effectiveSpeed: billedAgent.effectiveSpeed })));
 
   // Phases: bounded spine plus an authoritative current/total fraction; roster rows expand only.
   lines.push(group(theme, "Phases", phaseGroupValue(snapshot, theme, options.now)));

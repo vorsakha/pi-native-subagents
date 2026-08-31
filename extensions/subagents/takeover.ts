@@ -10,7 +10,7 @@ import {
 } from "@earendil-works/pi-tui";
 import { isTerminal, type JobManager } from "../../src/manager.ts";
 import type { JobSnapshot } from "../../src/types.ts";
-import { formatContext, formatEffort, formatUsage, sanitizeInline, shortId, statusMeta } from "./render.ts";
+import { formatContext, formatEffort, formatSpeedBilling, formatUsage, sanitizeInline, shortId, statusMeta } from "./render.ts";
 import { openSubagentsDashboard, type SubagentsDashboardManager } from "./dashboard.ts";
 import { buildTranscript } from "./transcript.ts";
 import { DEFAULT_TOOL_DISPLAY, type ToolDisplayMode } from "../tool-summary.ts";
@@ -102,7 +102,7 @@ class TakeoverView implements Focusable {
     const usage = formatUsage(job.usage);
     const owner = job.workflow ? ` · workflow ${sanitizeInline(job.workflow.label)}` : "";
     const header = `${this.#theme.fg(status.color, status.glyph)} ${this.#theme.fg("accent", this.#theme.bold(`${sanitizeInline(job.name)} · ${shortId(job.id)}`))}${this.#theme.fg("dim", ` · ${job.status} · ${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}${owner}`)}`;
-    const meta = [job.access, job.profile ? `profile ${job.profile}` : "", job.independent ? "independent" : "", `effort ${formatEffort(job.effort)}`, usage, formatContext(job.context), job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""].filter(Boolean).join(" · ");
+    const meta = [job.access, job.profile ? `profile ${job.profile}` : "", job.independent ? "independent" : "", `effort ${formatEffort(job.effort)}`, usage, formatContext(job.context), formatSpeedBilling({ speed: job.speed, effectiveSpeed: job.context?.effectiveSpeed }), job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""].filter(Boolean).join(" · ");
     const transcript = buildTranscript(job, width, this.#theme, { toolDisplay: this.#toolDisplay });
     const terminalRows = Math.max(1, this.#tui.terminal.rows || 24);
     const reusable = !job.workflow && job.status !== "failed" && job.status !== "cancelled";

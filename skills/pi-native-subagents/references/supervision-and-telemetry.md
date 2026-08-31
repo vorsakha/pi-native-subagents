@@ -38,12 +38,14 @@ Four non-failure states are reported separately and must not be summarized as fa
 - Failed, cancelled, or aborted agents show `r` only when restart cannot discard progressed agent or follow-up work. Exact replay restores that proof. Peer-answer progress does not block safe suffix restart. Progressed failures and continued agents require the handoff or manual recovery.
 - A completed entity shows one concise result preview. Use `f` for a retained direct session when more work is needed. Completed workflow runs and agents require no action; `r` on an eligible workflow agent starts a replacement run rather than continuing the completed session.
 
-## Four telemetry concepts stay distinct
+## Telemetry concepts stay distinct
 
 - **Configured model** — routing intent recorded on the job at spawn time.
 - **Effective serving model** (`serving …`) — the model identity the native runtime itself reports for the current turn. Codex reports it only via `model`/`rerouted`; `thread/start`'s model field just echoes the requested or resolved routing intent, not observed serving behavior. Claude reports it on init, assistant, and refusal-fallback events. Pi reports it as `responseModel`, never its `model` alias. When the runtime does not report it, it is omitted — never guessed from the configured model.
+- **Requested speed** is fixed policy. Omitted means standard; Fast is an explicit Codex-only opt-in. **Effective speed** is separate native telemetry: Codex `default` is standard and `priority`/`fast` is fast. Unknown values stay absent. Requested standard may show effective fast because native configuration still applies.
 - **Aggregate usage** — cumulative across follow-ups and bound by budgets.
 - **Context occupancy** — the latest request/turn gauge. It is replaced rather than summed on each reading, cleared at the start of every retained follow-up so a prior generation's reading is never shown as current, and shown as `unknown` rather than zero when the runtime omits it.
+- A requested or effective Fast tier shows `Codex credits apply · monetary cost unreported`. This is a warning, not a receipt or spend estimate.
 
 ## Reporting rules
 

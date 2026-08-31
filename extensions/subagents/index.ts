@@ -56,6 +56,7 @@ import {
   emptyComponent,
   answeredQuestionReceipt,
   formatEffort,
+  formatSpeedBilling,
   followThroughText,
   renderFollowThroughCard,
   renderInteractionCard,
@@ -82,7 +83,7 @@ import {
   type PeerSessionSummary,
   type SessionPeerSource,
 } from "../../src/session-peers.ts";
-import type { AccessMode, Backend, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SendBehavior } from "../../src/types.ts";
+import type { AccessMode, AgentSpeed, Backend, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SendBehavior } from "../../src/types.ts";
 import type { SpendBudget } from "../../src/budget.ts";
 import { formatSpendBudget } from "../../src/budget.ts";
 import { renderWorkflowActivity, WorkflowActivityStore, type WorkflowActivitySnapshot } from "../workflows/activity.ts";
@@ -132,7 +133,8 @@ const MAX_CAPABILITY_LINES = 40;
 const HUMAN_SUBAGENT_ENTRY = "native-human-subagent";
 const FOLLOW_THROUGH_MESSAGE = "native-subagent-followthrough";
 const SUBAGENT_ACTIVITY_WIDGET = "native-subagents-active";
-const HUMAN_SUBAGENT_USAGE = "/subagent [--harness pi|claude|codex] [--model ID] [--name NAME] [--effort LEVEL] [--access readOnly|full] [--max-tokens N] [--max-cost USD] [--max-turns N] [--cwd PATH] [--profile NAME] [--independent] <task>";
+const HUMAN_SUBAGENT_USAGE = "/subagent [--harness pi|claude|codex] [--model ID] [--name NAME] [--effort LEVEL] [--speed standard|fast] [--access readOnly|full] [--max-tokens N] [--max-cost USD] [--max-turns N] [--cwd PATH] [--profile NAME] [--independent] <task>";
+const SPEEDS = ["standard", "fast"] as const;
 const MAX_FOLLOW_THROUGH_WATCHES = 64;
 
 export interface ActivitySegment {
@@ -976,7 +978,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       if (restored) activeHarness = restored;
       if (entry.customType !== HUMAN_SUBAGENT_ENTRY || !data?.job) continue;
       const key = resultKey(data.job.id, data.job.generation);
-      rememberCardSnapshot(data.job);
+      rememberCardSnapshot({ ...data.job, speed: data.job.speed ?? "standard" });
       if (data.kind === "update" || humanEntryReady.has(key)) hiddenLegacyHumanEntries.add(entry.id);
       else humanEntryReady.add(key);
       if (isTerminal(data.job.status)) humanResultsPublished.add(key);
@@ -1151,7 +1153,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 
   pi.registerCommand("subagent", {
     description: "Spawn a background subagent for the human without notifying the orchestrator.",
-    getArgumentCompletions: (prefix) => ["--harness", "--model", "--name", "--effort", "--access", "--max-tokens", "--max-cost", "--max-turns", "--cwd", "--profile", "--independent", "--independent-of"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    getArgumentCompletions: (prefix) => ["--harness", "--model", "--name", "--effort", "--speed", "--access", "--max-tokens", "--max-cost", "--max-turns", "--cwd", "--profile", "--independent", "--independent-of"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (!args.trim() || args.trim() === "--help" || args.trim() === "-h") {
         ctx.ui.notify(`Usage: ${HUMAN_SUBAGENT_USAGE}`, "info");
@@ -1189,6 +1191,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     )),
     model: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Harness-local model ID; omit with harness auto or to use the explicit harness default" })),
     effort: Type.Optional(StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" })),
+    speed: Type.Optional(StringEnum(SPEEDS, { description: "Per-agent speed policy; fast is an explicit Codex-only opt-in that uses Codex credits" })),
     access: Type.Optional(StringEnum(ACCESS, { description: "Access policy; defaults to full after project trust is established" })),
     independent: Type.Optional(Type.Boolean({ description: "Require a native provider different from the parent" })),
     independentOf: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Route on a native provider different from this existing job ID" })),
@@ -1255,7 +1258,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     name: "subagent_spawn",
     renderShell: "self",
     label: "Spawn Subagent",
-    description: "Spawn a generic task-driven native background subagent. Maximum four jobs run concurrently. Unconsumed results are delivered automatically as one follow-up.",
+    description: "Spawn a generic task-driven native background subagent. Maximum four jobs run concurrently. Set speed=fast only for an explicit Codex route; Codex credits apply and monetary cost is unreported. Unconsumed results are delivered automatically as one follow-up.",
     promptSnippet: "Spawn a native Pi, Claude Code, or Codex subagent in the background",
     promptGuidelines: [
       "Give each isolated agent a complete task with all relevant paths, requirements, constraints, and expected verification.",
@@ -1263,6 +1266,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       "Use access=readOnly for inspection; use independent=true only for a different native provider, or independentOf=<jobId> to review with a different provider than the producer.",
       "Use requires only for capabilities confirmed by subagent_capabilities; pair it with harness=auto to let the capable harness be chosen.",
       "Omit model to use the native harness default; a different model on the same provider is not independent.",
+      "Omit speed for standard policy. Set speed=fast only when explicitly requested for Codex; it is fixed across retained follow-ups and may consume Codex credits faster.",
     ],
     parameters: spawnParameters,
     async execute(_id, params, signal, _onUpdate, ctx) {
@@ -1277,7 +1281,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const route = args.independentOf ? `independent-of:${shortId(args.independentOf)}` : args.independent ? "independent" : args.harness
         ? `${args.harness}${args.model ? `/${args.model}` : ""}`
         : args.model ?? "";
-      const detail = [args.access ?? "full", args.profile ? `profile:${args.profile}` : "", route, args.effort ? `effort:${args.effort}` : "", truncatePreview(args.task)].filter(Boolean).join(" · ");
+      const detail = [args.access ?? "full", args.profile ? `profile:${args.profile}` : "", route, args.effort ? `effort:${args.effort}` : "", args.speed === "fast" ? "speed:fast · Codex credits apply" : "", truncatePreview(args.task)].filter(Boolean).join(" · ");
       return renderToolCallLine(theme, "Spawn", args.name ?? "agent", detail);
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
@@ -1739,6 +1743,13 @@ export function parseHumanSubagentCommand(input: string): SpawnToolParams {
         index = taken.nextIndex;
         break;
       }
+      case "--speed": {
+        const taken = takeValue(flag, inlineValue, index);
+        if (!(SPEEDS as readonly string[]).includes(taken.value)) throw new Error(`Unknown speed '${taken.value}'. Choose ${SPEEDS.join(" or ")}.`);
+        params.speed = taken.value as AgentSpeed;
+        index = taken.nextIndex;
+        break;
+      }
       case "--max-tokens":
       case "--max-turns": {
         const taken = takeValue(flag, inlineValue, index);
@@ -1837,6 +1848,7 @@ export interface SpawnToolParams {
   requires?: string[];
   model?: string;
   effort?: EffortLevel;
+  speed?: AgentSpeed;
   access?: AccessMode;
   independent?: boolean;
   independentOf?: string;
@@ -1878,6 +1890,7 @@ async function spawn(
     trusted: context.trusted,
     model: params.model,
     effort: params.effort,
+    speed: params.speed,
     access: params.access,
     independent: params.independent,
     independentOf: params.independentOf,
@@ -1944,7 +1957,8 @@ export function normalizeHarness(value: unknown): HarnessName | undefined {
 
 function statusLine(job: JobSnapshot): string {
   const profile = job.profile ? `; profile ${job.profile}` : "";
-  return `${job.id} ${job.status} ${job.name} [${job.access}; ${job.harness}/${job.model}; effort ${formatEffort(job.effort)}${profile}; budget ${formatSpendBudget(job.budget, job.usage, job.harness)}]`;
+  const speed = formatSpeedBilling({ speed: job.speed, effectiveSpeed: job.context?.effectiveSpeed });
+  return `${job.id} ${job.status} ${job.name} [${job.access}; ${job.harness}/${job.model}; effort ${formatEffort(job.effort)}${profile}${speed ? `; ${speed}` : ""}; budget ${formatSpendBudget(job.budget, job.usage, job.harness)}]`;
 }
 
 function directBudget(params: Pick<SpawnToolParams, "maxTokens" | "maxCost" | "maxTurns">): SpendBudget | undefined {

@@ -9,7 +9,7 @@ import { renderPeerQuestionPrompt, type PendingInteraction } from "../interactio
 import { normalizeModel } from "../policy.ts";
 import { reachedSpendWarning, spendBudgetMetrics, validateSpendBudget } from "../budget.ts";
 import { waitDecision, type ProviderUnavailability } from "../provider-unavailability.ts";
-import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SpawnRequest, StructuredOutputSupport, Usage } from "../types.ts";
+import type { AccessMode, AgentSpeed, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SpawnRequest, StructuredOutputSupport, Usage } from "../types.ts";
 import {
   appendWorkflowJournal,
   checkpointWorkflow,
@@ -81,6 +81,7 @@ import type {
 
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
 const ACCESS = new Set<AccessMode>(["readOnly", "full"]);
+const SPEEDS = new Set<AgentSpeed>(["standard", "fast"]);
 const CHECKPOINT_DELAY_MS = 150;
 const MAX_WORKFLOW_LOGS = 128;
 export const MAX_WORKFLOW_PHASES = 64;
@@ -444,6 +445,8 @@ function journalRoute(agent?: WorkflowAgentRecord): WorkflowJournalRoute | undef
     capabilityRevision: agent.capabilityRevision,
     availabilityChecks: agent.availabilityChecks?.map((check) => ({ ...check })),
     model: agent.model,
+    speed: agent.speed,
+    effectiveSpeed: agent.effectiveSpeed,
     status: agent.state,
     error: agent.error ? boundedText(agent.error, 2_000) : undefined,
     providerFallback: agent.providerFallback ? {
@@ -458,6 +461,8 @@ function journalRoute(agent?: WorkflowAgentRecord): WorkflowJournalRoute | undef
     attempts: agent.attempts?.slice(-4).map((attempt) => ({
       ...attempt,
       model: attempt.model ? boundedText(attempt.model, 256) : undefined,
+      speed: attempt.speed,
+      effectiveSpeed: attempt.effectiveSpeed,
       error: attempt.error ? boundedText(attempt.error, 2_000) : undefined,
       usage: { ...attempt.usage },
       trigger: attempt.trigger ? {
@@ -1852,6 +1857,14 @@ export class WorkflowManager {
     const effortValue = options.effort;
     const effort = effortValue === undefined ? undefined : String(effortValue) as EffortLevel;
     if (effort && !EFFORTS.has(effort)) return { ok: false, output: "", error: `Unknown effort: ${effort}` };
+    const profileName = typeof options.profile === "string" ? options.profile.trim() : undefined;
+    const selectedProfile = profileName ? this.#resolveProfile?.(profileName) : undefined;
+    const speedValue = retry?.record.speed ?? options.speed ?? selectedProfile?.speed ?? "standard";
+    const speed = String(speedValue) as AgentSpeed;
+    if (!SPEEDS.has(speed)) return { ok: false, output: "", error: `Unknown speed: ${speed}` };
+    if (speed === "fast" && (fallbackDeclaration.fallback || continuationDeclaration.fallback)) {
+      return { ok: false, output: "", error: "Fast speed cannot be combined with providerFallback or continuationFallback" };
+    }
     const access = options.access === undefined ? undefined : String(options.access) as AccessMode;
     if (access && !ACCESS.has(access)) return { ok: false, output: "", error: `Unknown access: ${access}` };
     if (callIndex >= (entry.snapshot.budget?.maxAgents ?? 32)) {
@@ -1890,6 +1903,8 @@ export class WorkflowManager {
         executableVersion: record.executableVersion,
         capabilityRevision: record.capabilityRevision,
         model: record.model,
+        speed: record.speed,
+        effectiveSpeed: record.effectiveSpeed,
         error: record.error,
         // record.usage is already cumulative (prior retryUsage + this attempt's own
         // usage); isolate just this attempt's contribution for bounded provenance.
@@ -1912,6 +1927,8 @@ export class WorkflowManager {
       record.harness = harness && harness !== "auto" ? harness : undefined;
       record.requestedHarness = harness ?? request.defaultHarness ?? "pi";
       record.model = model;
+      record.speed = speed;
+      record.effectiveSpeed = undefined;
       record.availability = undefined;
       record.executableVersion = undefined;
       record.capabilityRevision = undefined;
@@ -1959,6 +1976,7 @@ export class WorkflowManager {
         objective: boundedText(prompt, 2 * 1024),
         prompt: boundedText(prompt, 2 * 1024),
         effort,
+        speed,
         tools: [],
         usage: workflowUsage(),
         providerFallback: fallbackDeclaration.fallback,
@@ -2051,6 +2069,7 @@ export class WorkflowManager {
           requires: options.requires as string[] | undefined,
           model,
           effort,
+          speed,
           access,
           independent: options.independent === true,
           independentOf: independence.jobId,
@@ -2092,6 +2111,7 @@ export class WorkflowManager {
         capabilityRoute: routing.capabilityRoute,
         model,
         effort,
+        speed,
         access,
         independent: options.independent === true,
         independentOf: independence.jobId,
@@ -2220,6 +2240,8 @@ export class WorkflowManager {
     record.independentOf = job.independentOf;
     record.harness = job.harness;
     record.model = job.model;
+    record.speed = job.speed;
+    record.effectiveSpeed = job.context?.effectiveSpeed;
     record.timestamps.updatedAt = Date.now();
     this.#jobOwners.set(job.id, { runId: entry.snapshot.runId, agentIndex: index });
     this.#bindProviderJob(entry, job, record.index, callIndex);
@@ -2559,6 +2581,8 @@ export class WorkflowManager {
       record.capabilityRevision = replay.route.capabilityRevision ?? record.capabilityRevision;
       record.availabilityChecks = replay.route.availabilityChecks?.map((check) => ({ ...check })) ?? record.availabilityChecks;
       record.model = replay.route.model ?? record.model;
+      record.speed = replay.route.speed ?? record.speed ?? "standard";
+      record.effectiveSpeed = replay.route.effectiveSpeed;
       record.providerFallback = replay.route.providerFallback ? { ...replay.route.providerFallback } : record.providerFallback;
       record.continuationFallback = replay.route.continuationFallback ? { ...replay.route.continuationFallback } : record.continuationFallback;
       record.continuation = replay.route.continuation ? clone(replay.route.continuation) : record.continuation;
@@ -2633,6 +2657,8 @@ export class WorkflowManager {
     record.capabilityRevision = route?.capabilityRevision;
     record.availabilityChecks = route?.availabilityChecks?.map((check) => ({ ...check }));
     record.model = route?.model;
+    record.speed = route?.speed ?? "standard";
+    record.effectiveSpeed = route?.effectiveSpeed;
     record.usage = clone(checkpoint.usage);
     record.providerFallback = route?.providerFallback ? { ...route.providerFallback } : record.providerFallback;
     record.continuationFallback = { ...checkpoint.target };
@@ -2865,6 +2891,8 @@ export class WorkflowManager {
         trigger: attempt.trigger ? { ...attempt.trigger } : undefined,
       })),
       model: replay.route?.model,
+      speed: replay.route?.speed ?? "standard",
+      effectiveSpeed: replay.route?.effectiveSpeed,
       effort: replayEffort,
       objective: boundedText(prompt, 2 * 1024),
       prompt: boundedText(prompt, 2 * 1024),
@@ -3487,6 +3515,7 @@ export class WorkflowManager {
       harness: target.harness,
       model: target.model,
       effort: record.effort,
+      speed: record.speed ?? "standard",
       access: record.access,
       independent: record.independentOf ? undefined : record.independent || undefined,
       independentOf: record.independentOf,
@@ -3716,6 +3745,7 @@ export class WorkflowManager {
     record.liveThinking = undefined;
     record.activity = undefined;
     record.context = undefined;
+    record.effectiveSpeed = undefined;
     record.structured = undefined;
     record.truncated = undefined;
     record.outputProvenance = undefined;
@@ -3868,6 +3898,8 @@ export class WorkflowManager {
       harness: job.harness,
       model: job.model,
       effort: job.effort,
+      speed: job.speed,
+      effectiveSpeed: job.context?.effectiveSpeed,
       preview: job.output.slice(-500),
       output: isTerminal(job.status) ? job.output : agent.output,
       transcript: job.transcript.map((item) => ({ ...item })),
@@ -3918,6 +3950,7 @@ export class WorkflowManager {
         liveThinking: undefined,
         activity: undefined,
         context: undefined,
+        effectiveSpeed: undefined,
         structured: undefined,
         truncated: undefined,
         error: undefined,
@@ -3977,6 +4010,8 @@ export class WorkflowManager {
     agent.harness = job.harness;
     agent.model = job.model;
     agent.effort = job.effort;
+    agent.speed = job.speed;
+    agent.effectiveSpeed = job.context?.effectiveSpeed;
     agent.preview = job.output.slice(-500);
     agent.error = job.error;
     if (!agent.answering && job.progressed && (job.status === "failed" || job.status === "cancelled")) {

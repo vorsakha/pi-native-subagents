@@ -56,6 +56,7 @@ import {
   formatContext,
   formatEffort,
   formatElapsed,
+  formatSpeedBilling,
   formatUsage,
   interactionWaitLabel,
   jobDashboardSummary,
@@ -1197,12 +1198,15 @@ class DashboardOverlay implements Focusable {
       job.independent ? "independent" : "",
       `effort ${formatEffort(job.effort)}`,
       `${sanitizeInline(job.harness)}/${sanitizeInline(job.model)}`,
+      job.speed === "fast" ? "speed fast" : "",
       job.capabilities?.auto ? "auto-routed" : "",
     ].filter(Boolean).join(" · ");
     info.push(truncate(this.theme.fg("muted", `Route · ${route}`), width));
     const meter = [formatUsage(job.usage), `budget ${formatSpendBudget(job.budget, job.usage, job.harness)}`, formatContext(job.context), job.backendSessionId ? `session ${shortId(job.backendSessionId)}` : ""]
       .filter(Boolean).join(" · ");
     if (meter) info.push(truncate(this.theme.fg("dim", `Usage · ${meter}`), width));
+    const speedBilling = formatSpeedBilling({ speed: job.speed, effectiveSpeed: job.context?.effectiveSpeed });
+    if (speedBilling) pinned.push(truncate(this.theme.fg("warning", speedBilling), width));
     if (job.capabilities || job.requires?.length) {
       const capability = [
         job.capabilities?.auto ? "auto-routed" : "explicit route",

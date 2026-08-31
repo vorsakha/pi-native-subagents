@@ -73,6 +73,7 @@ test("the workflow tool's retry schema accepts opt-in wait policies and rejects 
   const { ctx } = context({ hasUI: true });
   pi.handlers.get("session_start")?.({}, ctx);
   const tool = pi.tools.get("workflow");
+  assert.match(tool.promptGuidelines.join("\n"), /speed='fast'.*explicit Codex/);
   const schema = tool.parameters;
   assert.ok(Object.hasOwn(schema.properties, "retry"), "workflow exposes a retry field");
   const base = { name: "wf", script: "export default async () => 1;" };
