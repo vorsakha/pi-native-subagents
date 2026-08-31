@@ -142,6 +142,21 @@ test("spawn, check, and list snapshots cannot mutate the enforced budget", async
   await manager.shutdown();
 });
 
+test("job snapshots clone live activity without exposing manager state", async () => {
+  const { backend, manager } = setup(1);
+  const job = manager.spawn(request(1));
+  await tick();
+  backend.emit(job.id, { type: "tool_start", id: "read", name: "Read", args: { path: "/tmp/src/index.ts" }, at: 2_000 });
+  const checked = manager.check(job.id);
+  assert.deepEqual(checked.activity, { kind: "tool", at: 2_000, tool: "Read", state: "running", target: "src/index.ts" });
+  if (checked.activity?.kind === "tool") checked.activity.target = "tampered";
+  const unchanged = manager.check(job.id).activity;
+  assert.equal(unchanged?.kind === "tool" ? unchanged.target : undefined, "src/index.ts");
+  backend.complete(job.id, "done");
+  assert.equal((await manager.wait(job.id)).activity, undefined);
+  await manager.shutdown();
+});
+
 test("a synchronous completion subscriber can queue the next generation without cleanup clobbering it", async () => {
   const backend = new ImmediateBackend("codex", { echoSend: true });
   const manager = new JobManager({ backends: [backend], concurrency: 1 });

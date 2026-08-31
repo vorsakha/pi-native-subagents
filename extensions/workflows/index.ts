@@ -109,7 +109,7 @@ function expandHint(): string {
   catch { return "to expand"; }
 }
 
-function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
+function compactSnapshot(snapshot: WorkflowSnapshot, options: { liveActivity?: boolean } = {}): WorkflowSnapshot {
   const serializedResult = serializeWorkflowValue(snapshot.result, { maxTotalBytes: 64 * 1024, maxStringBytes: 24 * 1024 });
   const result = serializedResult === undefined ? undefined : JSON.parse(JSON.stringify(serializedResult));
   return {
@@ -150,6 +150,9 @@ function compactSnapshot(snapshot: WorkflowSnapshot): WorkflowSnapshot {
       availabilityChecks: agent.availabilityChecks?.map((check) => ({ ...check })),
       model: agent.model,
       effort: agent.effort,
+      activity: options.liveActivity && !workflowIsTerminal(snapshot.status) && agent.state === "running" && agent.activity
+        ? structuredClone(agent.activity)
+        : undefined,
       preview: agent.preview?.slice(-500),
       structured: agent.structured === undefined ? undefined : structuredClone(agent.structured),
       structuredTransport: agent.structuredTransport,
@@ -349,11 +352,11 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     }
   };
   const liveSnapshot = (fallback: WorkflowSnapshot, context?: LiveWorkflowRenderContext): WorkflowSnapshot => {
-    let snapshot = context?.state.nativeWorkflowSnapshot ?? fallback;
+    let snapshot = compactSnapshot(context?.state.nativeWorkflowSnapshot ?? fallback);
     let tracked = false;
     if (manager) {
       try {
-        snapshot = compactSnapshot(manager.check(fallback.runId));
+        snapshot = compactSnapshot(manager.check(fallback.runId), { liveActivity: true });
         tracked = true;
       } catch { /* durable transcript snapshot survives history eviction */ }
     }

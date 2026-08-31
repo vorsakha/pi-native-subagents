@@ -336,6 +336,41 @@ export class StaticWorkflowCheckout implements WorkflowCheckoutOperations {
   }
 }
 
+/** Stable checkout proof whose capture is held until a test releases or cancels it. */
+export class GatedWorkflowCheckout extends StaticWorkflowCheckout {
+  #reached = false;
+  #reachedResolve!: () => void;
+  readonly #reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
+  #release!: () => void;
+  readonly #releasePromise = new Promise<void>((resolve) => { this.#release = resolve; });
+
+  override async capture(cwd: string, signal: AbortSignal): Promise<WorkflowCheckoutProof> {
+    this.#reached = true;
+    this.#reachedResolve();
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      signal.addEventListener("abort", abort, { once: true });
+      void this.#releasePromise.then(() => {
+        signal.removeEventListener("abort", abort);
+        resolve();
+      });
+    });
+    return super.capture(cwd, signal);
+  }
+
+  waitUntilReached(): Promise<void> {
+    return this.#reached ? Promise.resolve() : this.#reachedPromise;
+  }
+
+  release(): void {
+    this.#release();
+  }
+}
+
 /** Stable checkout proof whose scheduler-admission assertion is test-controlled. */
 export class AdmissionGatedWorkflowCheckout extends StaticWorkflowCheckout {
   #assertions = 0;
@@ -515,6 +550,7 @@ export function workflowSnapshotFixture(
         jobId: "tests-job-0002",
         prompt: "\u001b[31mRun the affected tests\u001b[0m",
         liveThinking: "\u001b]0;bad\u0007checking failures",
+        activity: { kind: "tool", at: 64_000, tool: "read", state: "running", target: "tests/failures.test.ts" },
         tools: [{ id: "bash-1", name: "bash", summary: "npm test", status: "running" }],
         output: Array.from({ length: 60 }, (_, index) => `test result ${index}`).join("\n"),
         preview: "test result 59",
@@ -705,6 +741,7 @@ export class ControlledBackend implements Backend {
   readonly #startWaiters = new Set<() => void>();
   readonly #sendWaiters = new Set<() => void>();
   readonly #cancellationGates = new Map<string, ControlledCancellationGate>();
+  readonly #closeGates = new Map<string, ControlledCancellationGate>();
   readonly #closeFailures = new Map<string, Error>();
   active = 0;
   maxActive = 0;
@@ -788,6 +825,13 @@ export class ControlledBackend implements Backend {
       },
       close: async () => {
         this.closes.push(request.jobId);
+        const gate = this.#closeGates.get(request.jobId);
+        if (gate) {
+          gate.reached = true;
+          gate.reach();
+          await gate.released;
+          this.#closeGates.delete(request.jobId);
+        }
         const error = this.#closeFailures.get(request.jobId);
         if (error) throw error;
       },
@@ -821,6 +865,26 @@ export class ControlledBackend implements Backend {
       release: () => release(),
     };
     this.#cancellationGates.set(jobId, gate);
+    return {
+      waitUntilReached: () => gate.reached ? Promise.resolve() : gate.reachedPromise,
+      release: gate.release,
+    };
+  }
+
+  /** Holds native session cleanup after a terminal provider event. */
+  gateClose(jobId: string): ControlledCancellationHandle {
+    assert.ok(this.runs.has(jobId), `backend never started job ${jobId}`);
+    assert.equal(this.#closeGates.has(jobId), false, `cleanup for ${jobId} is already gated`);
+    let reach!: () => void;
+    let release!: () => void;
+    const gate: ControlledCancellationGate = {
+      reached: false,
+      reachedPromise: new Promise<void>((resolve) => { reach = resolve; }),
+      reach: () => reach(),
+      released: new Promise<void>((resolve) => { release = resolve; }),
+      release: () => release(),
+    };
+    this.#closeGates.set(jobId, gate);
     return {
       waitUntilReached: () => gate.reached ? Promise.resolve() : gate.reachedPromise,
       release: gate.release,

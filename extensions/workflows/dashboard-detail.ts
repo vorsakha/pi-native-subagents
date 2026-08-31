@@ -39,7 +39,7 @@ export function detailSignature(run: WorkflowSnapshot, phase: WorkflowPhase | un
     agent?.state,
     agent?.error,
     agent?.prompt,
-    agent?.liveThinking,
+    agent?.activity,
     agent?.structured,
     agent?.output,
     agent?.preview,

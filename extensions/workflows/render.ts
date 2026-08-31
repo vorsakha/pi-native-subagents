@@ -24,6 +24,7 @@ import {
   traceStatusMeta,
   type TraceStatusColor,
 } from "../subagents/render.ts";
+import { formatAgentActivity } from "./current-activity.ts";
 
 /** Hard budgets for workflow tool results, including their footer. */
 export const MAX_COLLAPSED_LINES = 10;
@@ -207,24 +208,25 @@ export function workflowNeedsInput(snapshot: Pick<WorkflowSnapshot, "agents">): 
   return snapshot.agents.filter((agent) => agent.waitingOn).length;
 }
 
-function activeAgentSummary(agent: WorkflowAgentRecord): DashboardSummary | undefined {
+function activeAgentSummary(agent: WorkflowAgentRecord, now: number): DashboardSummary | undefined {
   if (agent.state !== "running") return undefined;
-  if (agent.liveThinking?.trim()) {
-    return { kind: "activity", text: sanitizeInline(agent.liveThinking.slice(-320)) };
-  }
-  const tool = [...(agent.tools ?? [])].reverse().find((candidate) => candidate.status === "running");
-  if (tool) {
-    const detail = sanitizeInline(tool.summary ?? tool.name);
-    return { kind: "activity", text: `running ${detail || "tool"}` };
-  }
-  const preview = summaryPreview(agent.preview);
-  return preview ? { kind: "activity", text: preview } : undefined;
+  return { kind: "activity", text: formatAgentActivity(agent.activity, now) };
 }
 
 /** Operator-first semantic summary for one workflow agent row. */
 export function workflowAgentDashboardSummary(agent: WorkflowAgentRecord, now: number): DashboardSummary {
   if (agent.waitingOn) {
     return { kind: "input", text: formatWorkflowInteraction(agent.waitingOn, now) };
+  }
+  if (agent.state === "waiting" && agent.answering) {
+    return {
+      kind: "activity",
+      text: `answering peer question from ${sanitizeInline(agent.answering.sourceName)}`,
+    };
+  }
+
+  if (agent.state === "waiting") {
+    return { kind: "wait", text: formatProviderWait(agent, now) ?? "waiting for provider" };
   }
   if (agent.error || agent.state === "failed") {
     return { kind: "failure", text: summaryPreview(agent.error) || "Agent failed" };
@@ -235,16 +237,11 @@ export function workflowAgentDashboardSummary(agent: WorkflowAgentRecord, now: n
       text: `answering peer question from ${sanitizeInline(agent.answering.sourceName)}`,
     };
   }
-
-  const active = activeAgentSummary(agent);
-  if (active) return active;
-
-  if (agent.state === "waiting") {
-    return { kind: "wait", text: formatProviderWait(agent, now) ?? "waiting for provider" };
-  }
   if (agent.state === "queued") {
     return { kind: "wait", text: "queued for workflow dispatch" };
   }
+  const active = activeAgentSummary(agent, now);
+  if (active) return active;
   if (agent.state === "completed") {
     const result = summaryPreview(agent.output) || summaryPreview(agent.preview);
     return { kind: "result", text: result || "completed without a result preview" };
@@ -252,24 +249,35 @@ export function workflowAgentDashboardSummary(agent: WorkflowAgentRecord, now: n
   return { kind: "lifecycle", text: agent.state };
 }
 
-function latestActiveWorkflowSummary(snapshot: WorkflowSnapshot): { at: number; text: string } | undefined {
+function latestActiveWorkflowSummary(snapshot: WorkflowSnapshot, now: number): { at: number; text: string; agentName?: string } | undefined {
   const hasExplicitWait = snapshot.agents.some((agent) => agent.state === "queued" || agent.state === "waiting");
-  let latest = hasExplicitWait
-    ? undefined
-    : snapshot.logs?.reduce<{ at: number; text: string } | undefined>((current, log) => {
-        const text = sanitizeInline(log.message);
-        if (!text || (current && current.at > log.at)) return current;
-        return { at: log.at, text };
-      }, undefined);
+  let latest: { at: number; text: string; agentName?: string } | undefined;
 
   for (const agent of snapshot.agents) {
-    const summary = activeAgentSummary(agent);
+    if (!agent.activity) continue;
+    const summary = activeAgentSummary(agent, now);
     if (!summary) continue;
     const candidate = {
-      at: agent.timestamps.updatedAt,
+      at: agent.activity.at,
       text: summary.text,
+      agentName: agent.name,
     };
     if (!latest || candidate.at > latest.at) latest = candidate;
+  }
+  if (!latest && !hasExplicitWait) {
+    latest = snapshot.logs?.reduce<{ at: number; text: string } | undefined>((current, log) => {
+      const text = sanitizeInline(log.message);
+      if (!text || (current && current.at > log.at)) return current;
+      return { at: log.at, text };
+    }, undefined);
+  }
+  if (!latest) {
+    const agent = [...snapshot.agents].reverse().find((candidate) => candidate.state === "running");
+    const fallback = agent ? activeAgentSummary(agent, now) : undefined;
+    if (fallback) latest = { at: -1, text: fallback.text };
+  }
+  if (latest && snapshot.agents.filter((agent) => agent.state === "running").length > 1) {
+    if (latest.agentName) latest.text = `${sanitizeInline(latest.agentName)}: ${latest.text}`;
   }
   return latest;
 }
@@ -282,6 +290,16 @@ export function workflowDashboardSummary(snapshot: WorkflowSnapshot, now: number
     return {
       kind: "input",
       text: `${count} need input: ${formatWorkflowInteraction(waiting, now)}`,
+    };
+  }
+
+  const answering = [...snapshot.agents].reverse().find((agent) => agent.answering);
+  const providerWait = [...snapshot.agents].reverse().find((agent) => agent.state === "waiting" && agent.providerWait);
+  if (answering && providerWait) return workflowAgentDashboardSummary(answering, now);
+  if (providerWait) {
+    return {
+      kind: "wait",
+      text: `${sanitizeInline(providerWait.name)}: ${formatProviderWait(providerWait, now)}`,
     };
   }
 
@@ -299,24 +317,17 @@ export function workflowDashboardSummary(snapshot: WorkflowSnapshot, now: number
       text: summaryPreview(snapshot.error ?? failedAgent?.error ?? failedPhase?.error) || fallback,
     };
   }
-
+  if (answering) return workflowAgentDashboardSummary(answering, now);
+  if (snapshot.status === "pending" || snapshot.agents.some((agent) => agent.state === "queued")) {
+    return { kind: "wait", text: "queued for workflow dispatch" };
+  }
   if (snapshot.status === "running") {
-    const activity = latestActiveWorkflowSummary(snapshot);
+    const activity = latestActiveWorkflowSummary(snapshot, now);
     if (activity) return { kind: "activity", text: activity.text };
   }
 
   if (snapshot.status === "paused") {
     return { kind: "wait", text: "paused by operator" };
-  }
-  const providerWait = [...snapshot.agents].reverse().find((agent) => agent.state === "waiting" && agent.providerWait);
-  if (providerWait) {
-    return {
-      kind: "wait",
-      text: `${sanitizeInline(providerWait.name)}: ${formatProviderWait(providerWait, now)}`,
-    };
-  }
-  if (snapshot.status === "pending" || snapshot.agents.some((agent) => agent.state === "queued")) {
-    return { kind: "wait", text: "queued for workflow dispatch" };
   }
 
   if (snapshot.status === "completed") {
@@ -341,10 +352,9 @@ function agentActivity(agent: WorkflowAgentRecord, now: number): string {
   const interaction = workflowAgentInteraction(agent, now);
   if (interaction) return interaction;
   if (agent.state === "waiting") return formatProviderWait(agent, now) ?? "waiting for provider";
-  if (typeof agent.preview === "string" && agent.preview) return sanitizeInline(agent.preview);
   switch (agent.state) {
     case "queued": return "waiting to start";
-    case "running": return "in progress";
+    case "running": return formatAgentActivity(agent.activity, now);
     case "completed": return "done";
     default: return agent.state;
   }
@@ -546,14 +556,6 @@ function agentRow(agent: WorkflowAgentRecord, theme: Theme, now: number): string
   return `${GROUP_INDENT}${theme.fg(status.color, status.glyph)} ${theme.fg("toolTitle", sanitizeInline(agent.name))} ${theme.fg("dim", `${agent.access}${profile}${independent} · ${agent.state}${route} · effort ${agent.effort ?? "adaptive"}${isolation}${warning}`)}`;
 }
 
-/** Live preview of the currently active agent, rendered as an indented `↳` continuation. */
-function agentPreviewLines(snapshot: WorkflowSnapshot, theme: Theme): string[] {
-  const agent = focusedAgent(snapshot);
-  if (!agent || (agent.state !== "running" && agent.state !== "queued")) return [];
-  if (typeof agent.preview !== "string" || !agent.preview) return [];
-  return previewLines(agent.preview, 2, true).map((line) => `${GROUP_INDENT}${theme.fg("dim", "↳")} ${theme.fg("toolOutput", line)}`);
-}
-
 function clampContent(theme: Theme, lines: string[], budget: number): string[] {
   if (lines.length <= budget) return lines;
   const kept = lines.slice(0, Math.max(0, budget - 1));
@@ -607,7 +609,7 @@ export function buildWorkflowCardLines(
     lines.push(group(theme, "Rounds", `${theme.fg(meta.color, meta.glyph)} ${theme.fg(isAttentionStatus(meta.color) ? meta.color : "muted", formatWorkflowConvergence(snapshot.convergence, options.expanded ? 200 : 80))}`));
   }
 
-  // Agents: collapsed is always a rollup of counts; roster rows and the live preview expand only.
+  // Agents: collapsed is always a rollup of counts; roster rows expand only.
   const needInput = workflowNeedsInput(snapshot);
   lines.push(group(theme, "Agents", agentRollupValue(snapshot, theme)
     + (needInput ? theme.fg("warning", ` · ? ${needInput} need input`) : "")));
@@ -616,7 +618,6 @@ export function buildWorkflowCardLines(
     const hiddenBefore = snapshot.agents.length - roster.length;
     if (hiddenBefore > 0) lines.push(`${GROUP_INDENT}${theme.fg("muted", `⋯ ${hiddenBefore} earlier agent${hiddenBefore === 1 ? "" : "s"}`)}`);
     for (const agent of roster) lines.push(agentRow(agent, theme, options.now));
-    for (const line of agentPreviewLines(snapshot, theme)) lines.push(line);
   }
 
   if (options.expanded && snapshot.logs?.length) {
@@ -650,7 +651,8 @@ export function buildWorkflowCardLines(
     lines.push(group(theme, "Usage", value));
   }
 
-  if (snapshot.error) {
+  const providerWaiting = snapshot.agents.some((agent) => agent.state === "waiting" && agent.providerWait);
+  if (snapshot.error && !providerWaiting) {
     const errorLines = sanitizeText(snapshot.error).split("\n").map(sanitizeInline).filter(Boolean);
     for (const error of errorLines.slice(0, options.expanded ? 3 : 1)) lines.push(theme.fg("error", error));
   }

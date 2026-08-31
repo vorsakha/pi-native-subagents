@@ -99,7 +99,7 @@ agent("task", {
 });
 ```
 
-One handoff follows authoritative progressed failure. Cleanup, checkout identity, capability, budget, and handoff proof fail closed. Copied proof cannot redispatch; corruption cannot erase durable progress. Replay adds carried spend to checkpointed and synced current usage, then rebinds checkpoint indexes to reconstructed lineages. The logical ID survives replacement and follow-ups; the primary never replays or waits. Do not combine this with `providerFallback` or worktree isolation. Read `references/progressed-continuation.md` first.
+One handoff follows authoritative progressed failure. Cleanup, checkout identity, capability, budget, and handoff proof fail closed. Copied proof cannot redispatch; corruption cannot erase durable progress. Replay adds carried spend, then atomically rebinds checkpoint indexes, call ordinal, generation, and native job ownership before live publication. The logical ID survives replacement and follow-ups; the primary never replays or waits. Do not combine this with `providerFallback` or worktree isolation. Read `references/progressed-continuation.md` first.
 
 ```js
 export const meta = { name: "parallel-review" };
@@ -195,10 +195,10 @@ These are enforced by the runtime. Do not design around them.
 - `Budget maxCost is unsupported`: remove the cost boundary or select Pi/Claude. Do not treat Codex's absent cost metric as zero.
 - `independent` rejected for the same provider: independence means provider diversity, not model escalation. Omit it for same-provider escalation, or route to the opposite provider.
 - Requirement rejected: rediscover capabilities with `subagent_capabilities`, use the returned ID, and keep the access ceiling consistent.
-- `Codex app-server exited (0) during an in-progress turn with no terminal result`: a clean mid-turn app-server exit is a Codex lifecycle/result-propagation failure, not proof a `requires` capability is unsupported — pre-dispatch revalidation only confirms the capability was discovered and healthy, not that the turn would exercise it successfully. Retry the job before dropping the requirement.
+- A clean mid-turn Codex app-server exit is a lifecycle failure, not proof a required capability is unsupported. Retry before dropping the requirement.
 - A harness rejected for login or readiness: the error names the normalized state (missing executable, login required, incompatible, temporarily unhealthy, or status unknown). Check `/subagents providers` for the active set and each harness's actionable reason, then switch routes or use `harness: "auto"` rather than guessing at the account state. The extension never logs in or installs a CLI for you.
 - A workflow or child fails: inspect the returned `ok`, `error`, route, and job ID; use `/workflows` for durable workflow state. Do not hide a failed route behind a success-only summary.
-- `/subagents` and `/workflows` use explicit focus layers. Use each contextual `?` legend, press `i` for routine inspector telemetry, and back out one layer at a time. Left edits composer drafts normally. Agent actions require an eligible selected entity that the current view visibly rendered.
+- `/workflows` pins live-only `Now` and workflow `Context`. It uses bounded event evidence, never thoughts, response text, raw commands/results, credentials, or absolute paths. An active provider wait exposes only structured provider, window, retry, and attempt data; raw attempt errors stay private. Questions, failures, peer answers, provider waits, and queueing outrank routine activity. Replay never restores `Now`. Use `?` for navigation and `i` for telemetry.
 - A provider-quota, replay, worktree, or routed-question error: the matching reference above lists the exact message and its recovery.
 
 ## Safe routing defaults

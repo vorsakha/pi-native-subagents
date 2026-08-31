@@ -3,7 +3,7 @@ import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { workflowIsTerminal } from "../../src/workflows/manager.ts";
 import type { WorkflowAgentRecord, WorkflowSnapshot, WorkflowStatus } from "../../src/workflows/types.ts";
 import { sanitizeInline } from "../subagents/render.ts";
-import { formatWorkflowInteraction, workflowNeedsInput, workflowPhaseProgress } from "./render.ts";
+import { workflowDashboardSummary, workflowNeedsInput, workflowPhaseProgress } from "./render.ts";
 
 const MAX_ACTIVITY_CHARS = 180;
 
@@ -75,34 +75,9 @@ function routeLabel(agent: WorkflowAgentRecord | undefined): string | undefined 
   return harness ?? model;
 }
 
-function providerWaitLabel(agent: WorkflowAgentRecord, now: number): string | undefined {
-  const wait = agent.providerWait;
-  if (!wait) return undefined;
-  const remaining = Math.max(0, wait.retryAt - now);
-  const retry = remaining < 60_000
-    ? `${Math.max(1, Math.round(remaining / 1_000))}s`
-    : `${Math.round(remaining / 60_000)}m`;
-  return `waiting for ${sanitizeInline(wait.provider)} ${sanitizeInline(wait.kind)} · retry in ${retry} · attempt ${wait.attempt}/${wait.maxAttempts}`;
-}
-
 function activityLabel(snapshot: WorkflowSnapshot, agent: WorkflowAgentRecord | undefined, now: number): string | undefined {
-  if (agent?.waitingOn) return bounded(formatWorkflowInteraction(agent.waitingOn, now));
-  if (agent?.answering) return bounded(`answering peer question from ${agent.answering.sourceName}`);
-  if (agent) {
-    const providerWait = providerWaitLabel(agent, now);
-    if (providerWait) return bounded(providerWait);
-    if (agent.preview) return bounded(agent.preview);
-  }
-  const latestLog = snapshot.logs?.at(-1)?.message;
-  if (latestLog) return bounded(latestLog);
-  if (!agent) return snapshot.status === "pending" ? "waiting to start" : snapshot.status === "running" ? "starting" : undefined;
-  switch (agent.state) {
-    case "queued": return "waiting to start";
-    case "running": return "in progress";
-    case "waiting": return "waiting for provider";
-    case "completed": return snapshot.taskOutcome ? `task ${snapshot.taskOutcome}` : "done";
-    default: return agent.state;
-  }
+  if (!agent && snapshot.status !== "pending" && snapshot.status !== "running") return undefined;
+  return bounded(workflowDashboardSummary(snapshot, now).text);
 }
 
 function stateLabel(snapshot: WorkflowSnapshot, agent: WorkflowAgentRecord | undefined): string {

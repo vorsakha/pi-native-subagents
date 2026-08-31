@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
-import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, GatedWorkflowJournalAppender, ScriptedHarnessAvailability, tempDir, tick, waitFor, withTimeout } from "./helpers.ts";
+import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, GatedWorkflowCheckout, GatedWorkflowJournalAppender, ScriptedHarnessAvailability, tempDir, theme, tick, waitFor, withTimeout } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import { replayableJournalInteractions, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint, workflowInteractionFingerprint } from "../src/workflows/journal.ts";
 import {
@@ -16,6 +16,7 @@ import {
 } from "../src/workflows/manager.ts";
 import { formatWorkflowBudget, workflowBudgetHealth } from "../src/workflows/budget.ts";
 import { applyWorkflowRetention } from "../src/workflows/retention.ts";
+import { renderWorkflowCard, workflowDashboardSummary } from "../extensions/workflows/render.ts";
 import type { BackendEvent } from "../src/types.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 
@@ -138,6 +139,67 @@ function fallbackAvailability(): ScriptedHarnessAvailability {
 
 function fallbackFixture(providerWaitClock?: ProviderWaitClock) {
   return fixture(4, undefined, undefined, providerWaitClock, fallbackAvailability());
+}
+
+function assertProviderSettlementPublished(
+  workflows: WorkflowManager,
+  final: WorkflowSnapshot,
+  publications: WorkflowSnapshot[],
+): void {
+  const expected = final.agents[0]?.state;
+  assert.ok(
+    expected && ["completed", "failed", "cancelled", "aborted"].includes(expected),
+    `expected a terminal agent, received ${expected}`,
+  );
+  const listed = workflows.list().find((snapshot) => snapshot.runId === final.runId);
+  const published = publications.filter((snapshot) => snapshot.runId === final.runId).at(-1);
+  for (const [surface, snapshot] of [
+    ["completion", final],
+    ["check", workflows.check(final.runId)],
+    ["list", listed],
+    ["subscriber", published],
+  ] as const) {
+    assert.ok(snapshot, `${surface} must contain the completed workflow`);
+    assert.equal(
+      snapshot.agents[0]?.state,
+      expected,
+      `${surface} must not retain the provider-settlement running mask`,
+    );
+  }
+}
+
+function assertReplayedFollowUpGap(
+  workflows: WorkflowManager,
+  runId: string,
+  publications: WorkflowSnapshot[],
+  privateFailure: string,
+): void {
+  const listed = workflows.list().find((snapshot) => snapshot.runId === runId);
+  const published = publications.filter((snapshot) => snapshot.runId === runId).at(-1);
+  for (const [surface, snapshot] of [
+    ["check", workflows.check(runId)],
+    ["list", listed],
+    ["subscriber", published],
+  ] as const) {
+    assert.ok(snapshot, `${surface} must contain the replayed workflow`);
+    const agent = snapshot.agents[0];
+    assert.equal(agent?.callIndex, 1, `${surface} binds the reused lineage to the replayed follow-up call`);
+    assert.equal(agent?.state, "running", `${surface} keeps the replayed follow-up settlement masked`);
+    assert.equal(agent?.error, undefined, `${surface} hides the staged provider failure`);
+    assert.equal(agent?.output, undefined, `${surface} hides staged replacement output`);
+    assert.equal(agent?.generations?.[0]?.callIndex, 0, `${surface} preserves the original generation identity`);
+    assert.equal(agent?.generations?.[0]?.output, "first generation", `${surface} preserves the original generation output`);
+    assert.equal(agent?.generations?.at(-1)?.callIndex, 1, `${surface} projects the replacement onto the follow-up generation`);
+    assert.equal(agent?.generations?.at(-1)?.state, "running", `${surface} masks the follow-up generation`);
+    assert.doesNotMatch(JSON.stringify(snapshot), new RegExp(privateFailure), `${surface} never exposes the private provider failure`);
+  }
+
+  const snapshot = workflows.check(runId);
+  const card = renderWorkflowCard(snapshot, theme, { expanded: true, now: Date.now() }).render(160).join("\n");
+  const dashboard = workflowDashboardSummary(snapshot, Date.now());
+  assert.doesNotMatch(card, new RegExp(privateFailure), "the live card consumes the safe snapshot");
+  assert.notEqual(dashboard.kind, "failure", "the dashboard consumes the safe running projection");
+  assert.doesNotMatch(dashboard.text, new RegExp(privateFailure), "the dashboard hides the provider failure");
 }
 
 test("rejects untrusted workflows before creating artifact storage", async () => {
@@ -718,6 +780,36 @@ test("workflow agent options preserve generic read-only/profile policy in the ba
   }
 });
 
+test("streaming workflow activity reaches check, list, and subscribers without durable journal records", async () => {
+  const f = await fixture();
+  try {
+    const publications: WorkflowSnapshot[] = [];
+    const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+    const started = await f.workflows.start(f.request(`export default async () => agent("inspect", { access: "readOnly" });`));
+    await waitFor(() => f.backend.requests.length === 1, "activity child");
+    const request = f.backend.requests[0]!;
+    const run = f.backend.runs.get(request.jobId)!;
+    const beforeJournal = (await loadWorkflowJournal(f.artifactRoot, started.snapshot.runId)).length;
+
+    run.emit({ type: "thinking_delta", text: "private thought", at: 10_000 });
+    assert.deepEqual(f.workflows.check(started.snapshot.runId).agents[0]?.activity, { kind: "reasoning", at: 10_000 });
+    assert.deepEqual(f.workflows.list()[0]?.agents[0]?.activity, { kind: "reasoning", at: 10_000 });
+    const afterFirst = publications.length;
+    run.emit({ type: "thinking_delta", text: "more private thought", at: 10_500 });
+    assert.equal(publications.length, afterFirst, "same-kind token evidence publishes at most once per second");
+    run.emit({ type: "text_delta", text: "private draft", at: 10_600 });
+    assert.equal(publications.at(-1)?.agents[0]?.activity?.kind, "responding", "semantic transitions publish immediately");
+    run.emit({ type: "tool_start", id: "read", name: "Read", args: { file_path: join(f.cwd, "src/policy.ts"), query: "secret" }, at: 10_700 });
+    assert.deepEqual(publications.at(-1)?.agents[0]?.activity, { kind: "tool", at: 10_700, tool: "Read", state: "running", target: "src/policy.ts" });
+    assert.equal((await loadWorkflowJournal(f.artifactRoot, started.snapshot.runId)).length, beforeJournal);
+
+    f.backend.completeTask("inspect", "done");
+    const final = await started.completion;
+    assert.equal(final.agents[0]?.activity, undefined, "terminal state clears live activity");
+    unsubscribe();
+  } finally { await f.cleanup(); }
+});
+
 test("records phases, results, and final workflow artifacts", async () => {
   const f = await fixture();
   const script = `
@@ -770,6 +862,7 @@ test("records phases, results, and final workflow artifacts", async () => {
     assert.equal(persisted.agents[0]?.prompt, "inspect change");
     assert.deepEqual(persisted.logs?.map((entry) => entry.message), ["Inspecting change", "Preparing final summary"]);
     assert.equal(persisted.agents[0]?.liveThinking, undefined, "live-only supervision state is not persisted");
+    assert.equal(persisted.agents[0]?.activity, undefined, "current activity is never persisted");
     const transcripts = JSON.parse(await readFile(join(final.artifactDir, "transcripts.json"), "utf8"));
     assert.equal(transcripts["0"].at(-1).kind, "assistant");
     const report = await readFile(join(final.artifactDir, "report.md"), "utf8");
@@ -1573,6 +1666,248 @@ async function initializeGitCheckout(cwd: string): Promise<void> {
   await execFileAsync("git", ["add", "tracked.txt"], { cwd });
   await execFileAsync("git", ["commit", "-qm", "fixture"], { cwd });
 }
+
+test("provider settlement masks release on fresh terminal, exhaustion, routing, replacement, and cancellation exits", async () => {
+  for (const scenario of ["terminal", "exhaustion", "routing", "replacement", "cancelled"] as const) {
+    const { clock, advance } = fakeProviderWaitClock();
+    const availability = scenario === "routing"
+      ? new ScriptedHarnessAvailability({
+          claude: availabilityFixture("claude"),
+          codex: availabilityFixture("codex", { ready: false, detail: "replacement unavailable" }),
+        })
+      : fallbackAvailability();
+    const f = await fixture(4, undefined, undefined, clock, availability);
+    const publications: WorkflowSnapshot[] = [];
+    const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+    try {
+      const options = scenario === "exhaustion"
+        ? `{ harness: "claude", access: "readOnly" }`
+        : scenario === "terminal"
+          ? `{ harness: "claude", access: "readOnly" }`
+          : `{ harness: "claude", access: "readOnly", providerFallback: { harness: "codex" } }`;
+      const started = await f.workflows.start(f.request(
+        `export default async () => agent("${scenario}", ${options});`,
+        scenario === "exhaustion"
+          ? { retry: { providerUnavailable: "wait", maxWaitMs: 120_000, maxAttempts: 1 } }
+          : {},
+      ));
+      await f.claude.waitForStart();
+      f.claude.fail(f.claude.starts[0]!, "private primary rejection", fakeQuota(clock.now() + 60_000, "claude"));
+
+      if (scenario === "exhaustion") {
+        await waitFor(
+          () => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting",
+          "fresh provider wait",
+        );
+        advance(60_000);
+        await f.claude.waitForStart(2);
+        f.claude.fail(f.claude.starts[1]!, "private exhausted rejection", fakeQuota(clock.now() + 60_000, "claude"));
+      } else if (scenario === "replacement") {
+        await f.backend.waitForStart();
+        f.backend.fail(f.backend.starts[0]!, "replacement failed", fakeQuota(clock.now() + 60_000, "codex"));
+      } else if (scenario === "cancelled") {
+        await f.workflows.cancelAgent(started.snapshot.runId, 0, "cancel provider decision gap");
+      }
+
+      const final = await started.completion;
+      assertProviderSettlementPublished(f.workflows, final, publications);
+    } finally {
+      unsubscribe();
+      await f.cleanup();
+    }
+  }
+});
+
+test("provider settlement masks release when fresh and retained continuation policy settles", async () => {
+  for (const scenario of ["continued", "cleanup", "checkout", "routing", "replacement", "followUp"] as const) {
+    const availability = scenario === "routing"
+      ? new ScriptedHarnessAvailability({
+          claude: availabilityFixture("claude"),
+          codex: availabilityFixture("codex", { ready: false, detail: "continuation target unavailable" }),
+        })
+      : fallbackAvailability();
+    const f = await fixture(4, undefined, undefined, undefined, availability);
+    const publications: WorkflowSnapshot[] = [];
+    const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+    try {
+      if (scenario !== "checkout" && scenario !== "followUp") await initializeGitCheckout(f.cwd);
+      const script = scenario === "followUp"
+        ? `export default async () => {
+            const first = await agent("retained source", {
+              harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+            });
+            return followUp(first.jobId, "retained unavailable turn");
+          };`
+        : `export default async () => agent("${scenario} continuation", {
+            harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+          });`;
+      const started = await f.workflows.start(f.request(script));
+      await f.claude.waitForStart();
+      const primary = f.claude.starts[0]!;
+      if (scenario === "followUp") {
+        f.claude.complete(primary, "retained");
+        await f.claude.waitForSend();
+      } else if (scenario === "cleanup") {
+        f.claude.failClose(primary, "process cleanup failed");
+      }
+      f.claude.emit(primary, { type: "message", text: "progress before unavailability" });
+      f.claude.fail(primary, "private progressed rejection", progressedQuota("claude"));
+
+      if (scenario === "continued" || scenario === "replacement") {
+        await f.backend.waitForStart();
+        if (scenario === "continued") f.backend.complete(f.backend.starts[0]!, "continued safely");
+        else f.backend.fail(f.backend.starts[0]!, "replacement unavailable", progressedQuota("codex"));
+      }
+
+      const final = await started.completion;
+      assertProviderSettlementPublished(f.workflows, final, publications);
+    } finally {
+      unsubscribe();
+      await f.cleanup();
+    }
+  }
+});
+
+test("provider settlement masks release when cancellation interrupts continuation proof gaps", async () => {
+  for (const scenario of ["checkout", "routing"] as const) {
+    const checkout = scenario === "checkout" ? new CancellationGatedWorkflowCheckout() : undefined;
+    const availability = scenario === "routing"
+      ? new GatedHarnessAvailability("codex", {
+          claude: availabilityFixture("claude"),
+          codex: availabilityFixture("codex"),
+        })
+      : fallbackAvailability();
+    const f = await fixture(4, undefined, undefined, undefined, availability, checkout);
+    const publications: WorkflowSnapshot[] = [];
+    const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+    try {
+      if (scenario === "routing") await initializeGitCheckout(f.cwd);
+      const started = await f.workflows.start(f.request(`export default async () => agent("cancel ${scenario} proof", {
+        harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+      });`));
+      await f.claude.waitForStart();
+      const primary = f.claude.starts[0]!;
+      f.claude.emit(primary, { type: "message", text: "progress before cancellation" });
+      f.claude.fail(primary, "private progressed rejection", progressedQuota("claude"));
+      if (checkout) await checkout.waitUntilReached();
+      else await (availability as GatedHarnessAvailability).waitUntilReached();
+
+      await f.workflows.cancelAgent(started.snapshot.runId, 0, `cancel ${scenario} gap`);
+      if (availability instanceof GatedHarnessAvailability) availability.release();
+      const final = await started.completion;
+      assertProviderSettlementPublished(f.workflows, final, publications);
+      assert.equal(final.agents[0]?.state, "cancelled");
+    } finally {
+      if (availability instanceof GatedHarnessAvailability) availability.release();
+      unsubscribe();
+      await f.cleanup();
+    }
+  }
+});
+
+test("parallel retained follow-ups keep provider settlement ownership call-scoped", async () => {
+  for (const cleanupOrder of ["terminating-first", "continuing-first"] as const) {
+    const checkout = new GatedWorkflowCheckout();
+    const f = await fixture(4, undefined, undefined, undefined, fallbackAvailability(), checkout);
+    const publications: WorkflowSnapshot[] = [];
+    const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+    try {
+      const calls = cleanupOrder === "terminating-first"
+        ? `[
+            () => followUp(first.jobId, "terminating sibling", { schema: "invalid" }),
+            () => followUp(first.jobId, "continuing sibling")
+          ]`
+        : `[
+            () => followUp(first.jobId, "continuing sibling"),
+            () => followUp(first.jobId, "terminating sibling", { schema: "invalid" })
+          ]`;
+      const started = await f.workflows.start(f.request(`export default async () => {
+        const first = await agent("retained source", {
+          harness: "claude",
+          access: "readOnly",
+          continuationFallback: { harness: "codex" }
+        });
+        return parallel(${calls});
+      };`));
+      await f.claude.waitForStart();
+      const lineage = f.claude.starts[0]!;
+      f.claude.complete(lineage, "retained source output");
+
+      await f.claude.waitForSend();
+      f.claude.emit(lineage, { type: "message", text: "PRIVATE_PROVIDER_TRANSCRIPT" });
+      const settlementPublicationStart = publications.length;
+      f.claude.fail(lineage, "PRIVATE_PROVIDER_ERROR", progressedQuota("claude"));
+
+      await withTimeout(checkout.waitUntilReached(), `${cleanupOrder} checkout gap`);
+
+      const runId = started.snapshot.runId;
+      const assertGap = (surface: string, snapshot: WorkflowSnapshot | undefined) => {
+        assert.ok(snapshot, `${surface} contains the live workflow`);
+        const agent = snapshot.agents[0];
+        assert.ok(agent, `${surface} contains the retained lineage`);
+        const continuingCall = cleanupOrder === "terminating-first" ? 2 : 1;
+        assert.equal(agent.callIndex, continuingCall, `${surface} keeps the continuing call as the lineage owner`);
+        assert.equal(agent.state, "running", `${surface} masks the exact provider settlement call`);
+        assert.doesNotMatch(JSON.stringify(agent), /PRIVATE_PROVIDER_TRANSCRIPT|PRIVATE_PROVIDER_ERROR/);
+      };
+      assertGap("check", f.workflows.check(runId));
+      assertGap("list", f.workflows.list().find((snapshot) => snapshot.runId === runId));
+      for (const [index, snapshot] of publications.slice(settlementPublicationStart).entries()) {
+        if (snapshot.runId === runId) assertGap(`subscriber snapshot ${index}`, snapshot);
+      }
+
+      checkout.release();
+      await f.backend.waitForStart();
+      f.backend.complete(f.backend.starts[0]!, "continued safely");
+      const final = await withTimeout(started.completion, `${cleanupOrder} workflow completion`);
+      assert.equal(final.status, "completed");
+      assert.equal(final.agents[0]?.state, "completed");
+      assert.doesNotMatch(JSON.stringify(final), /PRIVATE_PROVIDER_TRANSCRIPT/);
+      assertProviderSettlementPublished(f.workflows, final, publications);
+    } finally {
+      checkout.release();
+      unsubscribe();
+      await f.cleanup();
+    }
+  }
+});
+
+test("cancelling overlapping retained follow-ups clears only the continuing call mask", async () => {
+  const checkout = new GatedWorkflowCheckout();
+  const f = await fixture(4, undefined, undefined, undefined, fallbackAvailability(), checkout);
+  const publications: WorkflowSnapshot[] = [];
+  const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => {
+      const first = await agent("retained cancellation source", {
+        harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+      });
+      return parallel([
+        () => followUp(first.jobId, "continuing cancellation turn"),
+        () => followUp(first.jobId, "terminating cancellation sibling", { schema: "invalid" })
+      ]);
+    };`));
+    await f.claude.waitForStart();
+    const lineage = f.claude.starts[0]!;
+    f.claude.complete(lineage, "retained");
+    await f.claude.waitForSend();
+    f.claude.emit(lineage, { type: "message", text: "PRIVATE_CANCEL_TRANSCRIPT" });
+    f.claude.fail(lineage, "PRIVATE_CANCEL_ERROR", progressedQuota("claude"));
+    await withTimeout(checkout.waitUntilReached(), "cancellation checkout gap");
+
+    await f.workflows.cancelAgent(started.snapshot.runId, 0, "cancel exact continuing call");
+    checkout.release();
+    const final = await withTimeout(started.completion, "overlapping cancellation completion");
+    assert.equal(final.status, "completed");
+    assert.equal(final.agents[0]?.state, "cancelled");
+    assert.doesNotMatch(JSON.stringify(final), /PRIVATE_CANCEL_TRANSCRIPT/);
+    assertProviderSettlementPublished(f.workflows, final, publications);
+  } finally {
+    checkout.release();
+    unsubscribe();
+    await f.cleanup();
+  }
+});
 
 test("progressed continuation settles the failed process, hands off current checkout state, and retains the replacement", async () => {
   const f = await fallbackFixture();
@@ -2702,6 +3037,14 @@ test("replayed follow-up handoff rebinds a changed agent index and archives only
     assert.deepEqual(final.agents[0]?.attempts?.[0]?.usage, {
       input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1,
     });
+    assert.deepEqual(final.agents[0]?.generations?.map((generation) => ({
+      callIndex: generation.callIndex,
+      output: generation.output,
+    })), [
+      { callIndex: 0, output: "first generation" },
+      { callIndex: 1, output: "continued" },
+      { callIndex: 2, output: "followed" },
+    ], "replacement and retained output stay attributed to their logical calls");
     const finalJournal = await loadWorkflowJournal(f.artifactRoot, final.runId);
     const resumedFollowUpCheckpoints = finalJournal.filter((record) => (
       record.callIndex === 1 && (record.state === "progressed" || record.state === "handoff")
@@ -2721,6 +3064,84 @@ test("replayed follow-up handoff rebinds a changed agent index and archives only
   } finally {
     availability.release();
     await f.cleanup();
+  }
+});
+
+test("replayed follow-up handoffs mask replacement failure and cancellation gaps on every live surface", async () => {
+  for (const scenario of ["failure", "cancellation"] as const) {
+    const availability = new GatedHarnessAvailability("codex", {
+      claude: availabilityFixture("claude"),
+      codex: availabilityFixture("codex"),
+    });
+    const f = await fixture(4, undefined, undefined, undefined, availability);
+    let releaseGap: (() => void) | undefined;
+    try {
+      await initializeGitCheckout(f.cwd);
+      const script = `export default async () => {
+        const first = await agent("replay gap lineage", {
+          harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+        });
+        return followUp(first.jobId, "replayed progressed follow-up");
+      };`;
+      const started = await f.workflows.start(f.request(script));
+      await f.claude.waitForStart();
+      const primary = f.claude.starts[0]!;
+      f.claude.complete(primary, "first generation");
+      await f.claude.waitForSend();
+      f.claude.emit(primary, { type: "message", text: "follow-up progress" });
+      f.claude.fail(primary, "source quota", progressedQuota("claude"));
+      await availability.waitUntilReached();
+      const cancellation = f.workflows.cancel(started.snapshot.runId, "retain replayed follow-up handoff");
+      availability.release();
+      const source = await cancellation;
+
+      const journalPath = join(source.artifactDir, "journal.jsonl");
+      const records = (await readFile(journalPath, "utf8")).trim().split("\n")
+        .map((line) => JSON.parse(line) as { callIndex: number; state: string });
+      const handoffIndex = records.findIndex((record) => record.callIndex === 1 && record.state === "handoff");
+      assert.ok(handoffIndex >= 0);
+      await writeFile(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
+
+      const publications: WorkflowSnapshot[] = [];
+      const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+      const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: source.runId }));
+      let completionSettled = false;
+      void resumed.completion.then(
+        () => { completionSettled = true; },
+        () => { completionSettled = true; },
+      );
+      await f.backend.waitForStart();
+      const replacement = f.backend.starts[0]!;
+      const privateFailure = scenario === "failure" ? "private replacement rejection" : "private replacement cancellation";
+      let gapOperation: Promise<unknown> | undefined;
+
+      if (scenario === "failure") {
+        const close = f.backend.gateClose(replacement);
+        releaseGap = close.release;
+        f.backend.fail(replacement, privateFailure, progressedQuota("codex"));
+        await close.waitUntilReached();
+      } else {
+        const cancel = f.backend.gateCancellation(replacement);
+        releaseGap = cancel.release;
+        gapOperation = f.workflows.cancelAgent(resumed.snapshot.runId, 0, privateFailure);
+        await cancel.waitUntilReached();
+      }
+
+      assert.equal(completionSettled, false, "the workflow remains live while the settlement gap is inspected");
+      assertReplayedFollowUpGap(f.workflows, resumed.snapshot.runId, publications, privateFailure);
+      releaseGap();
+      releaseGap = undefined;
+      await gapOperation;
+      const final = await resumed.completion;
+      assert.equal(final.agents[0]?.callIndex, 1);
+      assert.equal(final.agents[0]?.generations?.at(-1)?.callIndex, 1);
+      assert.equal(final.agents[0]?.generations?.[0]?.output, "first generation");
+      unsubscribe();
+    } finally {
+      releaseGap?.();
+      availability.release();
+      await f.cleanup();
+    }
   }
 });
 
@@ -3730,6 +4151,114 @@ test("a live checkpoint captures provider-wait metadata; the final checkpoint do
     assert.equal(resumedFinal.status, "completed");
     assert.equal(resumedFinal.replay?.matchedCalls, 1);
   } finally {
+    await f.cleanup();
+  }
+});
+
+test("provider-wait transition clears raw attempt errors and exhaustion persists a safe terminal reason", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  const marker = /sk-(?:first|second)-secret|\/outside\/workspace/;
+  const publications: WorkflowSnapshot[] = [];
+  const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+  try {
+    const script = `export default async () => agent("quota check");`;
+    const started = await f.workflows.start(f.request(
+      script,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 1 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    const firstFailurePublication = publications.length;
+    f.backend.fail(
+      f.backend.starts[0]!,
+      "quota rejected token=sk-first-secret at /outside/workspace/first.log",
+      fakeQuota(clock.now() + 60_000),
+    );
+    for (const snapshot of [
+      f.workflows.check(started.snapshot.runId),
+      f.workflows.list().find((candidate) => candidate.runId === started.snapshot.runId)!,
+      ...publications.slice(firstFailurePublication),
+    ]) {
+      assert.doesNotMatch(JSON.stringify(snapshot), marker);
+      assert.equal(snapshot.agents[0]?.error, undefined);
+      assert.equal(snapshot.agents[0]?.output, undefined);
+      assert.equal(snapshot.agents[0]?.transcript, undefined);
+      assert.deepEqual(snapshot.agents[0]?.tools, []);
+    }
+    await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "provider wait");
+
+    const waiting = f.workflows.check(started.snapshot.runId);
+    assert.equal(waiting.agents[0]?.error, undefined, "the failed attempt is no longer the logical agent's current error");
+    assert.deepEqual(waiting.agents[0]?.providerWait, {
+      provider: "codex",
+      kind: "quota",
+      scope: undefined,
+      detail: "quota exhausted",
+      retryAt: clock.now() + 60_000,
+      attempt: 1,
+      maxAttempts: 1,
+    });
+    assert.doesNotMatch(JSON.stringify(waiting), marker);
+
+    let waitingCheckpoint: WorkflowSnapshot | undefined;
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      const checkpoint = await readCheckpoint(started.snapshot.artifactDir);
+      if (checkpoint.agents[0]?.state === "waiting") { waitingCheckpoint = checkpoint; break; }
+      await delay(20);
+    }
+    assert.ok(waitingCheckpoint, "the durable checkpoint captures the authoritative wait state");
+    assert.equal(waitingCheckpoint.agents[0]?.error, undefined);
+    assert.doesNotMatch(JSON.stringify(waitingCheckpoint), marker);
+
+    advance(60_000);
+    await waitFor(() => f.backend.requests.length === 2, "provider retry");
+    const exhaustionPublication = publications.length;
+    f.backend.fail(
+      f.backend.starts[1]!,
+      "quota rejected token=sk-second-secret at /outside/workspace/second.log",
+      fakeQuota(clock.now() + 60_000),
+    );
+    const final = await started.completion;
+    for (const snapshot of publications.slice(exhaustionPublication)) {
+      assert.doesNotMatch(JSON.stringify(snapshot), marker, "no subscriber publication exposes the rejected provider attempt");
+      assert.equal(snapshot.agents[0]?.output, undefined);
+      assert.equal(snapshot.agents[0]?.transcript, undefined);
+      assert.deepEqual(snapshot.agents[0]?.tools, []);
+    }
+    const result = final.result as { ok: boolean; error?: string };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /provider wait exhausted \(attempt 1\/1\)/i);
+    assert.equal(final.agents[0]?.state, "failed");
+    assert.equal(final.agents[0]?.error, result.error, "the terminal policy reason replaces the raw provider error");
+    assert.deepEqual(final.agents[0]?.attempts?.map((attempt) => ({
+      disposition: attempt.disposition,
+      harness: attempt.harness,
+      jobId: attempt.jobId,
+      error: attempt.error,
+    })), [{
+      disposition: "wait",
+      harness: "codex",
+      jobId: f.backend.starts[0],
+      error: undefined,
+    }], "bounded attempt provenance survives without promoting the raw error");
+    assert.doesNotMatch(JSON.stringify(final), marker);
+
+    const finalCheckpoint = await readCheckpoint(started.snapshot.artifactDir);
+    assert.equal(finalCheckpoint.agents[0]?.error, result.error);
+    assert.doesNotMatch(JSON.stringify(finalCheckpoint), marker);
+    const journal = await loadWorkflowJournal(f.artifactRoot, started.snapshot.runId);
+    assert.doesNotMatch(JSON.stringify(journal), marker);
+
+    const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: started.snapshot.runId }));
+    await waitFor(() => f.backend.requests.length === 3, "terminal pre-inference failure reruns on replay");
+    f.backend.complete(f.backend.starts[2]!, "recovered after provider window");
+    const replayed = await resumed.completion;
+    assert.equal(replayed.replay?.matchedCalls, 0, "a failed pre-inference call remains non-replayable");
+    assert.equal((replayed.result as { ok?: boolean }).ok, true);
+    assert.doesNotMatch(JSON.stringify(replayed), marker);
+  } finally {
+    unsubscribe();
     await f.cleanup();
   }
 });

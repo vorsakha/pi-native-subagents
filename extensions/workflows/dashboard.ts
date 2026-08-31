@@ -73,6 +73,7 @@ import {
   serializeResult,
   truncateWorkflowDashboardLine,
 } from "./dashboard-detail.ts";
+import { workflowAgentContext } from "./current-activity.ts";
 import {
   boundWorkflowOutline,
   buildWorkflowOutline,
@@ -1195,6 +1196,9 @@ export class WorkflowsDashboardOverlay implements Focusable {
         : "no run restart action is available here; inspect the failed agent or result";
       return [line("error", `Error · ${summary.text}`), line("text", `Recovery · ${recovery}`)];
     }
+    if (run.agents.some((agent) => agent.answering)) {
+      return [line("accent", `Now · ${summary.text}`), line("muted", "Next · peer answer is in progress; no human action required")];
+    }
     if (run.status === "paused") {
       return [line("warning", `Paused · ${summary.text}`), line("text", "Next · press p to resume; human action is required")];
     }
@@ -1241,7 +1245,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
       ];
     }
     if (agent.state === "running") {
-      return [line("accent", `Latest · ${summary.text}`), line("muted", "Next · monitor here; no human action required")];
+      return [line("accent", `Now · ${summary.text}`)];
     }
     if (agent.state === "completed") {
       const next = !agentCanRestart(agent)
@@ -1420,6 +1424,32 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const pinned = agent.waitingOn && pinnedBudget < 3
       ? this.renderCompactQuestionPreview(agent.waitingOn, width)
       : this.renderAgentStatePreview(agent, width);
+    if (agent.state === "running" && !agent.waitingOn && !agent.error) {
+      pinned.push(truncateWorkflowDashboardLine(
+        this.theme.fg("muted", `Context · ${workflowAgentContext(run, agent)}`),
+        width,
+      ));
+    }
+    if (agent.waitingOn?.context) {
+      pinned.push(truncateWorkflowDashboardLine(
+        this.theme.fg("dim", `Question context · ${boundedInline(agent.waitingOn.context, 1_000)}`),
+        width,
+      ));
+    }
+
+    // A live inspector is a status view, not a transcript view. Keep this
+    // branch ahead of every prompt, provider-output, tool, result, and optional
+    // metadata renderer so neither display toggles nor empty fallbacks can
+    // disclose data before the agent settles.
+    if (!workflowAgentIsTerminal(agent.state)) {
+      this.#scroll = 0;
+      this.#scrollKey = undefined;
+      this.#followTail = true;
+      this.#resultRows = 0;
+      this.#resultTotal = 0;
+      return fitDashboardRows([...pinned, identity], rows);
+    }
+
     const metadata: string[] = [
       this.theme.fg("dim", `${policy} · effort ${agent.effort ?? "adaptive"} · ${route} · ${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${formatAgentElapsed(agent, this.#now())}`),
       this.theme.fg("dim", `${phase ? `${boundedInline(run.name, 1_000)} · ${boundedInline(phase.name, 1_000)}` : boundedInline(run.name, 1_000)}${usage ? ` · ${usage}` : ""}`),
@@ -1474,7 +1504,6 @@ export class WorkflowsDashboardOverlay implements Focusable {
       const finalRoute = `${sanitizeInline(agent.requestedHarness ?? agent.harness ?? "?")}/${boundedInline(agent.model ?? "native default", 256)}`;
       metadata.push(this.theme.fg("dim", `Final route · ${finalRoute}`));
     }
-    if (agent.waitingOn?.context) pinned.push(this.theme.fg("dim", `Question context · ${boundedInline(agent.waitingOn.context, 1_000)}`));
     if (agent.generations?.length) metadata.push(this.theme.fg("dim", `Generations · ${agent.generations.length} (call ${agent.callIndex ?? agent.generations.at(-1)?.callIndex})`));
     if (agent.independentOf) metadata.push(this.theme.fg("muted", `Provenance · independent of ${shortId(sanitizeText(agent.independentOf))}`));
     if (agent.replayedFrom) metadata.push(this.theme.fg("muted", `Replay · ${shortId(sanitizeText(agent.replayedFrom.runId))} call ${agent.replayedFrom.callIndex}`));
@@ -1518,13 +1547,6 @@ export class WorkflowsDashboardOverlay implements Focusable {
     if (agent.prompt) {
       const prompt = boundedHeadTailText(sanitizeText(agent.prompt), MAX_PROMPT_CHARS, "prompt");
       appendBoundedSection(body, this.theme, "Prompt", renderPrefixedRows(this.theme, this.theme.fg("accent", "> "), prompt, "userMessageText", width), 48);
-    }
-    if (agent.liveThinking?.trim()) {
-      // Tool lifecycle detail already lives in the Transcript section below; keep this
-      // section to semantic live-thinking progress so it isn't duplicated here.
-      const thinking = boundedHeadTailText(sanitizeText(agent.liveThinking), MAX_ACTIVITY_CHARS, "activity");
-      const activity = renderPrefixedRows(this.theme, this.theme.fg("dim", "~ "), thinking, "muted", width);
-      appendBoundedSection(body, this.theme, "Activity", activity, 16);
     }
     if (agent.structured !== undefined) {
       const raw = serializeResult(agent.structured);
@@ -1750,6 +1772,7 @@ function workflowDashboardCollection(
 }
 
 function workflowRunStatusLabel(run: WorkflowSnapshot): string {
+  if (run.agents.some((agent) => agent.answering)) return run.status;
   const providerWait = [...run.agents].reverse().find((agent) => agent.state === "waiting" && agent.providerWait)?.providerWait;
   if (providerWait) {
     return `${run.status} · waiting for ${sanitizeInline(providerWait.provider)} ${sanitizeInline(providerWait.kind)}`;

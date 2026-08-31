@@ -9,7 +9,7 @@ import type {
   WorkflowStatus,
   WorkflowTaskOutcome,
 } from "../src/workflows/types.ts";
-import { renderWorkflowActivity, WorkflowActivityStore } from "../extensions/workflows/activity.ts";
+import { renderWorkflowActivity, workflowActivityRow, WorkflowActivityStore } from "../extensions/workflows/activity.ts";
 import { theme } from "./helpers.ts";
 
 interface WorkflowFixtureOptions {
@@ -47,6 +47,7 @@ function workflowFixture(options: WorkflowFixtureOptions): WorkflowSnapshot {
     model: "pi-model",
     effort: "medium",
     preview: options.preview,
+    activity: options.preview ? { kind: "responding", at: updatedAt } : undefined,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
   };
   return {
@@ -126,7 +127,7 @@ test("workflow activity keeps textual status and never exceeds narrow terminal w
   assert.match(wide, /availability discovery 1\/1/);
   assert.match(wide, /running/);
   assert.match(wide, /pi\/pi-model/);
-  assert.match(wide, /checking the selected route/);
+  assert.match(wide, /Drafting response/);
   assert.match(wide, /\/workflows/);
   assert.match(wide, /Ctrl\+Shift\+F/);
 
@@ -135,4 +136,44 @@ test("workflow activity keeps textual status and never exceeds narrow terminal w
       assert.ok(visibleWidth(line) <= width, `line exceeds width ${width}: ${line}`);
     }
   }
+});
+
+test("workflow editor rows show a retained peer answer ahead of other run activity", () => {
+  const run = workflowFixture({ runId: "wf_peer_answer", name: "peer answer" });
+  const active = run.agents[0]!;
+  active.state = "completed";
+  active.activity = undefined;
+  active.answering = { requestId: "peer-1", sourceAgentIndex: 1, sourceName: "reviewer" };
+  run.agents.push({
+    ...run.agents[0]!,
+    index: 1,
+    name: "provider wait",
+    state: "waiting",
+    answering: undefined,
+    providerWait: { provider: "codex", kind: "quota", detail: "limit", retryAt: 66_000, attempt: 1, maxAttempts: 3 },
+  });
+
+  const store = new WorkflowActivityStore();
+  store.observe(run);
+  const snapshot = store.snapshot(6_000);
+  assert.equal(snapshot.rows[0]?.activity, "answering peer question from reviewer");
+  assert.match(renderWorkflowActivity(snapshot, theme, 160).join("\n"), /answering peer question from reviewer/);
+  assert.doesNotMatch(renderWorkflowActivity(snapshot, theme, 160).join("\n"), /waiting for codex quota/);
+});
+
+test("workflow editor rows treat provider waiting as authoritative over stale errors", () => {
+  const run = workflowFixture({ runId: "wf_provider_wait", name: "provider wait" });
+  run.error = "legacy token=sk-run-secret at /outside/workspace/run.log";
+  const active = run.agents[0]!;
+  active.state = "waiting";
+  active.error = "legacy token=sk-agent-secret at /outside/workspace/provider.log";
+  active.providerWait = { provider: "codex", kind: "quota", detail: "limit", retryAt: 66_000, attempt: 1, maxAttempts: 3 };
+
+  const row = workflowActivityRow(run, 6_000);
+  assert.equal(row.state, "waiting");
+  assert.equal(row.attention, false);
+  assert.equal(row.activity, "builder: waiting for codex quota · retry in 1m · attempt 1/3");
+  const rendered = renderWorkflowActivity({ rows: [row], active: 1, finishing: 0, attention: 0, key: "provider-wait" }, theme, 160).join("\n");
+  assert.match(rendered, /waiting for codex quota/);
+  assert.doesNotMatch(rendered, /sk-(?:run|agent)-secret|outside\/workspace/);
 });

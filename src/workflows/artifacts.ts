@@ -334,6 +334,7 @@ export function durableWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowSna
         summary: tool.summary ? truncateUtf8(tool.summary, 1_000) : undefined,
       })),
       liveThinking: undefined,
+      activity: undefined,
       preview: agent.preview ? truncateUtf8(agent.preview, 1_000) : undefined,
       output: serializeWorkflowValue(agent.output, { maxNodes: 256, maxStringBytes: 4 * 1024, maxTotalBytes: 6 * 1024 }),
       structured: serializeWorkflowValue(agent.structured, { maxNodes: 512, maxStringBytes: 8 * 1024, maxTotalBytes: 16 * 1024 }),
@@ -999,6 +1000,7 @@ export async function loadWorkflowSummaries(
         ...parsed,
         artifactDir: directory,
         taskOutcome: parsed.taskOutcome ?? (parsed.status === "completed" ? workflowTaskOutcome(authoritativeResult) : undefined),
+        agents: parsed.agents.map((agent) => ({ ...agent, activity: undefined })),
       };
       if (snapshot.transcriptArtifact) {
         try {
