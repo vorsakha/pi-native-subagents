@@ -24,6 +24,7 @@ import {
   traceStatusMeta,
   type TraceStatusColor,
 } from "../subagents/render.ts";
+import { formatAgentActivity } from "./current-activity.ts";
 
 /** Hard budgets for workflow tool results, including their footer. */
 export const MAX_COLLAPSED_LINES = 10;
@@ -207,18 +208,9 @@ export function workflowNeedsInput(snapshot: Pick<WorkflowSnapshot, "agents">): 
   return snapshot.agents.filter((agent) => agent.waitingOn).length;
 }
 
-function activeAgentSummary(agent: WorkflowAgentRecord): DashboardSummary | undefined {
+function activeAgentSummary(agent: WorkflowAgentRecord, now: number): DashboardSummary | undefined {
   if (agent.state !== "running") return undefined;
-  if (agent.liveThinking?.trim()) {
-    return { kind: "activity", text: sanitizeInline(agent.liveThinking.slice(-320)) };
-  }
-  const tool = [...(agent.tools ?? [])].reverse().find((candidate) => candidate.status === "running");
-  if (tool) {
-    const detail = sanitizeInline(tool.summary ?? tool.name);
-    return { kind: "activity", text: `running ${detail || "tool"}` };
-  }
-  const preview = summaryPreview(agent.preview);
-  return preview ? { kind: "activity", text: preview } : undefined;
+  return { kind: "activity", text: formatAgentActivity(agent.activity, now) };
 }
 
 /** Operator-first semantic summary for one workflow agent row. */
@@ -236,15 +228,14 @@ export function workflowAgentDashboardSummary(agent: WorkflowAgentRecord, now: n
     };
   }
 
-  const active = activeAgentSummary(agent);
-  if (active) return active;
-
   if (agent.state === "waiting") {
     return { kind: "wait", text: formatProviderWait(agent, now) ?? "waiting for provider" };
   }
   if (agent.state === "queued") {
     return { kind: "wait", text: "queued for workflow dispatch" };
   }
+  const active = activeAgentSummary(agent, now);
+  if (active) return active;
   if (agent.state === "completed") {
     const result = summaryPreview(agent.output) || summaryPreview(agent.preview);
     return { kind: "result", text: result || "completed without a result preview" };
@@ -252,24 +243,29 @@ export function workflowAgentDashboardSummary(agent: WorkflowAgentRecord, now: n
   return { kind: "lifecycle", text: agent.state };
 }
 
-function latestActiveWorkflowSummary(snapshot: WorkflowSnapshot): { at: number; text: string } | undefined {
+function latestActiveWorkflowSummary(snapshot: WorkflowSnapshot, now: number): { at: number; text: string } | undefined {
   const hasExplicitWait = snapshot.agents.some((agent) => agent.state === "queued" || agent.state === "waiting");
-  let latest = hasExplicitWait
-    ? undefined
-    : snapshot.logs?.reduce<{ at: number; text: string } | undefined>((current, log) => {
-        const text = sanitizeInline(log.message);
-        if (!text || (current && current.at > log.at)) return current;
-        return { at: log.at, text };
-      }, undefined);
+  let latest: { at: number; text: string } | undefined;
 
   for (const agent of snapshot.agents) {
-    const summary = activeAgentSummary(agent);
+    const summary = activeAgentSummary(agent, now);
     if (!summary) continue;
     const candidate = {
-      at: agent.timestamps.updatedAt,
+      at: agent.activity?.at ?? -1,
       text: summary.text,
     };
     if (!latest || candidate.at > latest.at) latest = candidate;
+  }
+  if (!latest && !hasExplicitWait) {
+    latest = snapshot.logs?.reduce<{ at: number; text: string } | undefined>((current, log) => {
+      const text = sanitizeInline(log.message);
+      if (!text || (current && current.at > log.at)) return current;
+      return { at: log.at, text };
+    }, undefined);
+  }
+  if (latest && snapshot.agents.filter((agent) => agent.state === "running").length > 1) {
+    const agent = snapshot.agents.find((candidate) => candidate.activity?.at === latest?.at);
+    if (agent) latest.text = `${sanitizeInline(agent.name)}: ${latest.text}`;
   }
   return latest;
 }
@@ -300,14 +296,6 @@ export function workflowDashboardSummary(snapshot: WorkflowSnapshot, now: number
     };
   }
 
-  if (snapshot.status === "running") {
-    const activity = latestActiveWorkflowSummary(snapshot);
-    if (activity) return { kind: "activity", text: activity.text };
-  }
-
-  if (snapshot.status === "paused") {
-    return { kind: "wait", text: "paused by operator" };
-  }
   const providerWait = [...snapshot.agents].reverse().find((agent) => agent.state === "waiting" && agent.providerWait);
   if (providerWait) {
     return {
@@ -317,6 +305,14 @@ export function workflowDashboardSummary(snapshot: WorkflowSnapshot, now: number
   }
   if (snapshot.status === "pending" || snapshot.agents.some((agent) => agent.state === "queued")) {
     return { kind: "wait", text: "queued for workflow dispatch" };
+  }
+  if (snapshot.status === "running") {
+    const activity = latestActiveWorkflowSummary(snapshot, now);
+    if (activity) return { kind: "activity", text: activity.text };
+  }
+
+  if (snapshot.status === "paused") {
+    return { kind: "wait", text: "paused by operator" };
   }
 
   if (snapshot.status === "completed") {
@@ -341,10 +337,9 @@ function agentActivity(agent: WorkflowAgentRecord, now: number): string {
   const interaction = workflowAgentInteraction(agent, now);
   if (interaction) return interaction;
   if (agent.state === "waiting") return formatProviderWait(agent, now) ?? "waiting for provider";
-  if (typeof agent.preview === "string" && agent.preview) return sanitizeInline(agent.preview);
   switch (agent.state) {
     case "queued": return "waiting to start";
-    case "running": return "in progress";
+    case "running": return formatAgentActivity(agent.activity, now);
     case "completed": return "done";
     default: return agent.state;
   }

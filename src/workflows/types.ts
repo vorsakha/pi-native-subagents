@@ -1,4 +1,4 @@
-import type { AccessMode, ContextSnapshot, EffortLevel, HarnessName, ProviderFamily, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
+import type { AccessMode, AgentActivitySnapshot, ContextSnapshot, EffortLevel, HarnessName, ProviderFamily, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
 import type { RequestedHarness } from "../capability-routing.ts";
 import type { HarnessAvailabilityStatus } from "../harness-availability.ts";
 import type { InteractionRoute, InteractionState } from "../interactions.ts";
@@ -257,6 +257,8 @@ export interface WorkflowAgentRecord {
   tools?: ToolTrace[];
   /** Live-only thinking preview projected from JobManager when available. */
   liveThinking?: string;
+  /** Live-only bounded operational evidence. Never durable or replayed. */
+  activity?: AgentActivitySnapshot;
   truncated?: boolean;
   preview?: string;
   output?: unknown;

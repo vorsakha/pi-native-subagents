@@ -322,6 +322,17 @@ export interface ToolTrace {
   status: "running" | "completed" | "failed";
 }
 
+/** Bounded live operational evidence for supervision UI. Never persisted. */
+export type AgentActivitySnapshot =
+  | { kind: "reasoning" | "responding"; at: number }
+  | {
+      kind: "tool";
+      at: number;
+      tool: string;
+      state: ToolTrace["status"];
+      target?: string;
+    };
+
 export interface JobSnapshot {
   id: string;
   name: string;
@@ -357,6 +368,7 @@ export interface JobSnapshot {
   tools: ToolTrace[];
   transcript: TranscriptEntry[];
   liveThinking: string;
+  activity?: AgentActivitySnapshot;
   queuedMessages: QueuedMessage[];
   backendSessionId?: string;
   sessionFile?: string;

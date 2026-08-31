@@ -5,6 +5,7 @@ import type {
   ToolResultSnapshot,
   Usage,
 } from "./types.ts";
+import { activityFromEvent } from "./agent-activity.ts";
 
 export const MAX_OUTPUT_BYTES = 50 * 1024;
 export const MAX_TOOL_TRACES = 200;
@@ -126,6 +127,7 @@ export function reduceJob(job: JobSnapshot, event: BackendEvent, now = Date.now(
   // Copy arrays only in the event branches that mutate them. Streaming text/thinking
   // deltas are the hot path and must not duplicate a bounded 256 KiB transcript per token.
   const next: JobSnapshot = { ...job };
+  next.activity = activityFromEvent(job, event, now);
   switch (event.type) {
     case "queued":
       break;

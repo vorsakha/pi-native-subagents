@@ -47,6 +47,7 @@ function workflowFixture(options: WorkflowFixtureOptions): WorkflowSnapshot {
     model: "pi-model",
     effort: "medium",
     preview: options.preview,
+    activity: options.preview ? { kind: "responding", at: updatedAt } : undefined,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
   };
   return {
@@ -126,7 +127,7 @@ test("workflow activity keeps textual status and never exceeds narrow terminal w
   assert.match(wide, /availability discovery 1\/1/);
   assert.match(wide, /running/);
   assert.match(wide, /pi\/pi-model/);
-  assert.match(wide, /checking the selected route/);
+  assert.match(wide, /Drafting response/);
   assert.match(wide, /\/workflows/);
   assert.match(wide, /Ctrl\+Shift\+F/);
 

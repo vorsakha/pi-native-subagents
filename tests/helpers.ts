@@ -515,6 +515,7 @@ export function workflowSnapshotFixture(
         jobId: "tests-job-0002",
         prompt: "\u001b[31mRun the affected tests\u001b[0m",
         liveThinking: "\u001b]0;bad\u0007checking failures",
+        activity: { kind: "tool", at: 64_000, tool: "read", state: "running", target: "tests/failures.test.ts" },
         tools: [{ id: "bash-1", name: "bash", summary: "npm test", status: "running" }],
         output: Array.from({ length: 60 }, (_, index) => `test result ${index}`).join("\n"),
         preview: "test result 59",

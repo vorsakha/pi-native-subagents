@@ -718,6 +718,36 @@ test("workflow agent options preserve generic read-only/profile policy in the ba
   }
 });
 
+test("streaming workflow activity reaches check, list, and subscribers without durable journal records", async () => {
+  const f = await fixture();
+  try {
+    const publications: WorkflowSnapshot[] = [];
+    const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+    const started = await f.workflows.start(f.request(`export default async () => agent("inspect", { access: "readOnly" });`));
+    await waitFor(() => f.backend.requests.length === 1, "activity child");
+    const request = f.backend.requests[0]!;
+    const run = f.backend.runs.get(request.jobId)!;
+    const beforeJournal = (await loadWorkflowJournal(f.artifactRoot, started.snapshot.runId)).length;
+
+    run.emit({ type: "thinking_delta", text: "private thought", at: 10_000 });
+    assert.deepEqual(f.workflows.check(started.snapshot.runId).agents[0]?.activity, { kind: "reasoning", at: 10_000 });
+    assert.deepEqual(f.workflows.list()[0]?.agents[0]?.activity, { kind: "reasoning", at: 10_000 });
+    const afterFirst = publications.length;
+    run.emit({ type: "thinking_delta", text: "more private thought", at: 10_500 });
+    assert.equal(publications.length, afterFirst, "same-kind token evidence publishes at most once per second");
+    run.emit({ type: "text_delta", text: "private draft", at: 10_600 });
+    assert.equal(publications.at(-1)?.agents[0]?.activity?.kind, "responding", "semantic transitions publish immediately");
+    run.emit({ type: "tool_start", id: "read", name: "Read", args: { file_path: join(f.cwd, "src/policy.ts"), query: "secret" }, at: 10_700 });
+    assert.deepEqual(publications.at(-1)?.agents[0]?.activity, { kind: "tool", at: 10_700, tool: "Read", state: "running", target: "src/policy.ts" });
+    assert.equal((await loadWorkflowJournal(f.artifactRoot, started.snapshot.runId)).length, beforeJournal);
+
+    f.backend.completeTask("inspect", "done");
+    const final = await started.completion;
+    assert.equal(final.agents[0]?.activity, undefined, "terminal state clears live activity");
+    unsubscribe();
+  } finally { await f.cleanup(); }
+});
+
 test("records phases, results, and final workflow artifacts", async () => {
   const f = await fixture();
   const script = `
@@ -770,6 +800,7 @@ test("records phases, results, and final workflow artifacts", async () => {
     assert.equal(persisted.agents[0]?.prompt, "inspect change");
     assert.deepEqual(persisted.logs?.map((entry) => entry.message), ["Inspecting change", "Preparing final summary"]);
     assert.equal(persisted.agents[0]?.liveThinking, undefined, "live-only supervision state is not persisted");
+    assert.equal(persisted.agents[0]?.activity, undefined, "current activity is never persisted");
     const transcripts = JSON.parse(await readFile(join(final.artifactDir, "transcripts.json"), "utf8"));
     assert.equal(transcripts["0"].at(-1).kind, "assistant");
     const report = await readFile(join(final.artifactDir, "report.md"), "utf8");

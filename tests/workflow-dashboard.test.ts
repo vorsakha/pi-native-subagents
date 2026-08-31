@@ -186,6 +186,7 @@ test("run and agent summaries render across wide, medium, and narrow dashboard r
     const active = run.agents[1]!;
     active.name = "tests";
     active.liveThinking = "VERIFYING";
+    active.activity = { kind: "tool", at: 5_000, tool: "read", state: "running", target: "tests/verification.test.ts" };
     active.preview = "older preview";
     active.timestamps.updatedAt = 5_000;
 
@@ -193,11 +194,11 @@ test("run and agent summaries render across wide, medium, and narrow dashboard r
     t.after(() => state.overlay.dispose());
     const listLines = state.overlay.render(width);
     assertPanel(listLines, width, 30);
-    assert.ok(listLines.some((line) => line.includes("run") && line.includes("VE")), `${width}-column run row shows its summary`);
+    assert.ok(listLines.some((line) => line.includes("run") && line.includes("Reading")), `${width}-column run row shows its summary`);
     if (width === 52) state.overlay.handleInput(ENTER);
     const lines = state.overlay.render(width);
     assertPanel(lines, width, 30);
-    assert.ok(lines.some((line) => line.includes("tests") && line.includes("VERIFY")), `${width}-column agent row shows its summary`);
+    assert.ok(lines.some((line) => line.includes("tests") && line.includes("Reading")), `${width}-column agent row shows its summary`);
   }
 });
 
@@ -492,7 +493,7 @@ test("workflow results use native Markdown while transcript roles and workflow m
     stressOverlay.handleInput(PAGE_DOWN);
   }
   const allDetail = [...seen].join("\n");
-  for (const section of ["Error", "Prompt", "Activity", "Structured result", "Transcript", "Final result"]) {
+  for (const section of ["Error", "Prompt", "Structured result", "Transcript", "Final result"]) {
     assert.match(allDetail, new RegExp(section));
   }
   const compactDetail = allDetail.replace(/[\s│║]+/g, "");
@@ -507,6 +508,7 @@ test("agent detail activity does not duplicate tool detail already shown in the 
   const agent = run.agents[0]!;
   agent.state = "running";
   agent.liveThinking = "narrowing down the failing assertion";
+  agent.activity = { kind: "reasoning", at: 64_000 };
   agent.tools = [{ id: "bash-1", name: "bash", summary: "DISTINCT_TOOL_SUMMARY_MARKER", status: "completed" }];
   agent.transcript = [
     { kind: "assistant", text: "investigating" },
@@ -521,14 +523,14 @@ test("agent detail activity does not duplicate tool detail already shown in the 
   openAgentDetail(overlay, 72);
   const compactLines = overlay.render(72);
   assert.ok(!compactLines.some((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER")), "compact mode is the default and does not surface per-tool detail anywhere, including Activity");
-  assert.ok(compactLines.some((line) => line.includes("Latest") && line.includes("narrowing down the failing assertion")), "the state preview surfaces live semantic progress in compact mode");
+  assert.ok(compactLines.some((line) => line.includes("Now") && line.includes("Reasoning")), "the state preview surfaces bounded live progress in compact mode");
 
   overlay.handleInput("t");
   const lines = overlay.render(72);
   assert.ok(lines.some((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER")), "the tool lifecycle row still appears in the Transcript section in full mode, via Pi's native execution component");
-  assert.ok(lines.some((line) => line.includes("Latest") && line.includes("narrowing down the failing assertion")), "the state preview still surfaces live semantic progress");
+  assert.ok(lines.some((line) => line.includes("Now") && line.includes("Reasoning")), "the state preview still surfaces bounded live progress");
 
-  const activityLine = lines.find((line) => line.includes("Latest"));
+  const activityLine = lines.find((line) => line.includes("Now"));
   assert.ok(activityLine && !activityLine.includes("DISTINCT_TOOL_SUMMARY_MARKER"), "the state preview does not repeat the tool detail already in the transcript");
   const toolMentions = lines.filter((line) => line.includes("DISTINCT_TOOL_SUMMARY_MARKER"));
   assert.equal(toolMentions.length, 1, "tool detail is rendered exactly once, in the transcript, not duplicated in Activity");
@@ -1995,15 +1997,16 @@ test("workflow inspectors put state preview and real recovery before telemetry",
   const running = workflow("activity-priority");
   running.logs = [{ index: 0, message: "assembling deterministic evidence", at: 64_000 }];
   running.agents[1]!.liveThinking = "checking the final assertion";
+  running.agents[1]!.activity = { kind: "tool", at: 65_000, tool: "read", state: "running", target: "tests/final.test.ts" };
   running.agents[1]!.timestamps.updatedAt = 65_000;
   const active = harness([running], 30, () => {}, { fullscreen: true });
   t.after(() => active.overlay.dispose());
   let activeLines = active.overlay.render(120);
-  assert.match(activeLines.join("\n"), /Latest · checking the final assertion/);
+  assert.match(activeLines.join("\n"), /Reading tests\/final\.test\.ts/);
   assert.doesNotMatch(activeLines.join("\n"), /Usage ·/, "routine run usage is folded by default");
   active.overlay.handleInput("i");
   activeLines = active.overlay.render(120);
-  assert.ok(activeLines.findIndex((line) => line.includes("Latest ·")) < activeLines.findIndex((line) => line.includes("Usage ·")));
+  assert.ok(activeLines.findIndex((line) => line.includes("Reading tests/final.test.ts")) < activeLines.findIndex((line) => line.includes("Usage ·")));
 
   const paused = workflow("pause-priority", "paused");
   const pausedState = harness([paused], 30, () => {}, { fullscreen: true });

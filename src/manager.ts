@@ -93,6 +93,7 @@ function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: J
     usage: previous?.source.usage === snapshot.usage ? previous.value.usage : { ...snapshot.usage },
     budget: snapshot.budget ? { ...snapshot.budget } : undefined,
     context: snapshot.context ? { ...snapshot.context } : undefined,
+    activity: snapshot.activity ? { ...snapshot.activity } : undefined,
     tools: previous?.source.tools === snapshot.tools ? previous.value.tools : snapshot.tools.map((tool) => ({ ...tool })),
     transcript: previous?.source.transcript === snapshot.transcript
       ? previous.value.transcript
@@ -547,6 +548,7 @@ export class JobManager {
       truncated: false,
       tools: [],
       liveThinking: "",
+      activity: undefined,
       // The new generation's occupancy gauge is unread until its own telemetry arrives; the prior
       // generation's reading must not keep displaying as current, possibly forever if this generation
       // never reports one. Cumulative usage is untouched: it is not a generation-scoped gauge.

@@ -36,7 +36,7 @@ test("workflow outline construction includes planned phases and expands only the
   assert.deepEqual(all.nodes.map((node) => node.key), ["phase:0", "phase:1", "agent:1", "phase:2", "phase:3"]);
   const expandedAgent = all.nodes.find((node) => node.kind === "agent");
   assert.ok(expandedAgent?.kind === "agent");
-  assert.match(expandedAgent.summary.text, /checking failures/);
+  assert.match(expandedAgent.summary.text, /Reading tests\/failures\.test\.ts/);
 
   const completed = buildWorkflowOutline(run, "completed", all.selected, 65_000);
   assert.deepEqual(completed.phases.map((phase) => phase.key), ["phase:0", "phase:1", "phase:2", "phase:3"], "filters never remove phases");

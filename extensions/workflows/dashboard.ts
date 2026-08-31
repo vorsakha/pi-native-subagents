@@ -73,6 +73,7 @@ import {
   serializeResult,
   truncateWorkflowDashboardLine,
 } from "./dashboard-detail.ts";
+import { workflowAgentContext } from "./current-activity.ts";
 import {
   boundWorkflowOutline,
   buildWorkflowOutline,
@@ -1241,7 +1242,7 @@ export class WorkflowsDashboardOverlay implements Focusable {
       ];
     }
     if (agent.state === "running") {
-      return [line("accent", `Latest · ${summary.text}`), line("muted", "Next · monitor here; no human action required")];
+      return [line("accent", `Now · ${summary.text}`)];
     }
     if (agent.state === "completed") {
       const next = !agentCanRestart(agent)
@@ -1420,6 +1421,12 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const pinned = agent.waitingOn && pinnedBudget < 3
       ? this.renderCompactQuestionPreview(agent.waitingOn, width)
       : this.renderAgentStatePreview(agent, width);
+    if (agent.state === "running" && !agent.waitingOn && !agent.error) {
+      pinned.push(truncateWorkflowDashboardLine(
+        this.theme.fg("muted", `Context · ${workflowAgentContext(run, agent)}`),
+        width,
+      ));
+    }
     const metadata: string[] = [
       this.theme.fg("dim", `${policy} · effort ${agent.effort ?? "adaptive"} · ${route} · ${agent.jobId ? `job ${shortId(sanitizeText(agent.jobId))} · ` : ""}${formatAgentElapsed(agent, this.#now())}`),
       this.theme.fg("dim", `${phase ? `${boundedInline(run.name, 1_000)} · ${boundedInline(phase.name, 1_000)}` : boundedInline(run.name, 1_000)}${usage ? ` · ${usage}` : ""}`),
@@ -1518,13 +1525,6 @@ export class WorkflowsDashboardOverlay implements Focusable {
     if (agent.prompt) {
       const prompt = boundedHeadTailText(sanitizeText(agent.prompt), MAX_PROMPT_CHARS, "prompt");
       appendBoundedSection(body, this.theme, "Prompt", renderPrefixedRows(this.theme, this.theme.fg("accent", "> "), prompt, "userMessageText", width), 48);
-    }
-    if (agent.liveThinking?.trim()) {
-      // Tool lifecycle detail already lives in the Transcript section below; keep this
-      // section to semantic live-thinking progress so it isn't duplicated here.
-      const thinking = boundedHeadTailText(sanitizeText(agent.liveThinking), MAX_ACTIVITY_CHARS, "activity");
-      const activity = renderPrefixedRows(this.theme, this.theme.fg("dim", "~ "), thinking, "muted", width);
-      appendBoundedSection(body, this.theme, "Activity", activity, 16);
     }
     if (agent.structured !== undefined) {
       const raw = serializeResult(agent.structured);

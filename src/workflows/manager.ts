@@ -1841,6 +1841,7 @@ export class WorkflowManager {
       record.tools = [];
       record.transcript = undefined;
       record.liveThinking = undefined;
+      record.activity = undefined;
       record.truncated = undefined;
       record.structured = undefined;
       record.structuredTransport = undefined;
@@ -2327,6 +2328,7 @@ export class WorkflowManager {
     record.prompt = boundedText(prompt, 2 * 1024);
     record.error = undefined;
     record.structured = undefined;
+    record.activity = undefined;
     record.timestamps.updatedAt = now;
     this.#touch(entry);
 
@@ -3164,6 +3166,7 @@ export class WorkflowManager {
     target.answering = { requestId: input.requestId, sourceAgentIndex: input.sourceAgentIndex, sourceName: input.sourceName };
     target.state = "queued";
     target.error = undefined;
+    target.activity = undefined;
     target.timestamps.updatedAt = now;
     this.#touch(entry);
 
@@ -3652,6 +3655,7 @@ export class WorkflowManager {
       transcript: job.transcript.map((item) => ({ ...item })),
       tools: job.tools.slice(-8).map((tool) => ({ ...tool })),
       liveThinking: job.liveThinking,
+      activity: job.activity ? { ...job.activity } : undefined,
       truncated: job.truncated,
       error: job.error,
       usage: addWorkflowUsage(agent.retryUsage, workflowUsage(job.usage)),
@@ -3676,9 +3680,25 @@ export class WorkflowManager {
     const agent = entry?.snapshot.agents[owner.agentIndex];
     if (!entry || !agent) return;
 
-    // Streaming deltas stay authoritative in JobManager and are projected by check().
-    // Persisting and cloning the full workflow on every token is both redundant and quadratic.
-    if (event.type === "text_delta" || event.type === "thinking_delta" || event.type === "queue_changed") return;
+    // Publish bounded semantic streaming state without cloning transcripts or
+    // scheduling durable checkpoints for each provider token.
+    if (event.type === "text_delta" || event.type === "thinking_delta") {
+      const activity = job.activity;
+      if (!activity) return;
+      const previous = agent.activity;
+      const changed = !previous
+        || previous.kind !== activity.kind
+        || previous.kind === "tool" && activity.kind === "tool" && (
+          previous.tool !== activity.tool || previous.state !== activity.state || previous.target !== activity.target
+        );
+      if (!changed && activity.at - previous.at < 1_000) return;
+      agent.activity = { ...activity };
+      agent.timestamps.updatedAt = Math.max(agent.timestamps.updatedAt, activity.at);
+      entry.snapshot.timestamps.updatedAt = Math.max(entry.snapshot.timestamps.updatedAt, activity.at);
+      this.#publish(entry);
+      return;
+    }
+    if (event.type === "queue_changed") return;
 
     const now = Date.now();
     agent.state = agentState(job);
@@ -3697,6 +3717,7 @@ export class WorkflowManager {
     }
     agent.usage = addWorkflowUsage(agent.retryUsage, workflowUsage(job.usage));
     agent.context = job.context ? { ...job.context } : undefined;
+    agent.activity = isTerminal(job.status) ? undefined : job.activity ? { ...job.activity } : undefined;
     agent.timestamps.updatedAt = now;
     agent.timestamps.startedAt ??= job.startedAt;
     agent.timestamps.endedAt = job.endedAt;

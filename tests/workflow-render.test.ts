@@ -16,6 +16,7 @@ import {
   workflowPhaseProgress,
 } from "../extensions/workflows/render.ts";
 import { shortId } from "../extensions/subagents/render.ts";
+import { formatAgentActivity, workflowAgentContext } from "../extensions/workflows/current-activity.ts";
 import type { WorkflowAgentRecord, WorkflowPhase, WorkflowSnapshot } from "../src/workflows/types.ts";
 
 const ESC = "\u001b";
@@ -47,6 +48,7 @@ function workflow(overrides: Partial<WorkflowSnapshot> = {}): WorkflowSnapshot {
         index: 1, name: "tests", access: "full", independent: false, phase: 1, state: "running",
         timestamps: { createdAt, updatedAt: 3_000 }, harness: "codex", model: "codex-fixture-model",
         preview: "Running targeted tests", usage: { input: 800, output: 200, cacheRead: 0, cacheWrite: 20, cost: 0.02, turns: 1 },
+        activity: { kind: "tool", at: 5_000, tool: "read", state: "running", target: "tests/release.test.ts" },
       },
     ],
     artifactDir: "/private/workflows/run-0123456789abcdef",
@@ -95,11 +97,12 @@ test("workflow run and agent summaries preserve semantic priority and wait disti
   assert.deepEqual(workflowAgentDashboardSummary(agent({
     state: "running",
     liveThinking: "checking the release gate",
+    activity: { kind: "reasoning", at: 5_000 },
     preview: "older preview",
     tools: [{ id: "bash", name: "bash", summary: "npm test", status: "running" }],
   }), 6_000), {
     kind: "activity",
-    text: "checking the release gate",
+    text: "Reasoning · provider activity 1s ago",
   });
   assert.equal(workflowAgentDashboardSummary(agent({
     state: "waiting",
@@ -155,6 +158,42 @@ test("workflow run and agent summaries preserve semantic priority and wait disti
   });
 });
 
+test("workflow activity wording and context stay deterministic and private", () => {
+  assert.equal(formatAgentActivity(undefined, 6_000), "Working · no describable activity reported yet");
+  assert.equal(formatAgentActivity({ kind: "responding", at: 4_000 }, 6_000), "Drafting response · provider activity 2s ago");
+  assert.equal(formatAgentActivity({ kind: "tool", at: 3_000, tool: "Read", state: "completed", target: "src/private.ts" }, 6_000), "Working · last action finished 3s ago");
+  assert.equal(formatAgentActivity({ kind: "tool", at: 3_000, tool: "read", state: "failed", target: "src/private.ts" }, 6_000), "Working after read failed 3s ago");
+  assert.equal(formatAgentActivity({ kind: "tool", at: 5_000, tool: "bash", state: "running" }, 6_000), "Using bash · started 1s ago");
+
+  const run = workflow();
+  const active = run.agents[1]!;
+  active.logicalJobId = "review-lineage";
+  active.activity = { kind: "tool", at: 5_000, tool: "Read", state: "running", target: "src/policy.ts" };
+  active.liveThinking = "SECRET_THOUGHT";
+  active.preview = "SECRET_PREVIEW";
+  active.tools = [{ id: "shell", name: "bash", summary: "SECRET_COMMAND", status: "running" }];
+  run.convergence = {
+    round: 2,
+    maxRounds: 3,
+    state: "running",
+    reviewerJobId: "review-lineage",
+    pendingFindings: "SECRET_FINDING_PROMPT",
+    rounds: [],
+  };
+  assert.equal(workflowAgentContext(run, active), "reviewer · round 2/3 · phase Verification");
+  run.convergence.reviewerJobId = undefined;
+  run.convergence.implementerJobId = "review-lineage";
+  run.phases[1]!.name = "Fix findings";
+  assert.equal(workflowAgentContext(run, active), "implementer · round 2/3 · phase Fix findings");
+  run.convergence = undefined;
+  run.plannedPhaseCount = 2;
+  run.phases[1]!.name = "Implementation";
+  assert.equal(workflowAgentContext(run, active), "tests · phase 2/2 Implementation");
+  const rendered = buildWorkflowCardLines(run, theme, { expanded: false, now: 6_000 }).join("\n");
+  assert.match(rendered, /Reading src\/policy\.ts/);
+  assert.doesNotMatch(rendered, /SECRET_THOUGHT|SECRET_PREVIEW|SECRET_COMMAND|SECRET_FINDING_PROMPT/);
+});
+
 test("workflow cards enforce one budget, sanitization, and dashboard-pointer contract", () => {
   const huge = workflow({
     status: "failed",
@@ -204,6 +243,7 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
     agents: workflow().agents.map((candidate, index) => ({
       ...candidate,
       preview: `${ESC}[31magent ${index}${ESC}[0m\nlatest ${index}\u0007`,
+      activity: index === 1 ? { kind: "responding" as const, at: 3_000 } : undefined,
     })),
   });
   const lines = buildWorkflowCardLines(partial, theme, {
@@ -213,7 +253,7 @@ test("workflow cards enforce one budget, sanitization, and dashboard-pointer con
     now: 4_000,
   });
   assert.ok(lines.length <= MAX_COLLAPSED_LINES);
-  assert.ok(lines.some((line) => line.includes("latest 1")), "collapsed Latest identifies the focused agent's current activity");
+  assert.ok(lines.some((line) => line.includes("Drafting response")), "collapsed Latest identifies bounded current activity");
   assert.ok(lines.at(-1)?.includes("/workflows"));
   assert.ok(lines.every((line) => !line.includes("updating")), "active state is conveyed by the blink, not redundant copy");
   assert.ok(lines.every((line) => !CONTROL_CHARS.test(line)));
@@ -549,21 +589,21 @@ test("a progressed continuation renders as a distinct route transition", () => {
   assert.doesNotMatch(rendered, /waiting for .*quota/i);
 });
 
-test("Latest identifies the focused agent by name plus its activity, without a status glyph, and never just repeats the word running", () => {
+test("Latest identifies the focused agent by name plus bounded activity, without a status glyph", () => {
   const withPreview = workflow({
     agents: [
       agent({ index: 0, name: "reviewer", state: "completed" }),
-      agent({ index: 1, name: "reliability-security", state: "running", preview: "scanning dependency advisories" }),
+      agent({ index: 1, name: "reliability-security", state: "running", activity: { kind: "tool", at: 5_000, tool: "grep", state: "running", target: "package-lock.json" } }),
     ],
   });
   const previewLine = buildWorkflowCardLines(withPreview, theme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("Latest"))!;
-  assert.match(previewLine, /reliability-security.* · scanning dependency advisories/);
+  assert.match(previewLine, /reliability-security.* · Searching package-lock\.json · started 1s ago/);
 
   const runningNoPreview = workflow({ agents: [agent({ index: 0, name: "tests", state: "running" })] });
   const runningLine = buildWorkflowCardLines(runningNoPreview, theme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("Latest"))!;
   assert.doesNotMatch(runningLine, /[●○✓×]/, "the Latest row carries no status glyph");
   assert.doesNotMatch(runningLine, /\brunning\b/, "quiet fallback copy avoids repeating the header's already-stated running status");
-  assert.match(runningLine, /in progress/);
+  assert.match(runningLine, /no describable activity reported yet/);
 
   const queuedNoPreview = workflow({ agents: [agent({ index: 0, name: "tests", state: "queued" })] });
   const queuedLine = buildWorkflowCardLines(queuedNoPreview, theme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("Latest"))!;
@@ -577,12 +617,12 @@ test("Latest renders the resolved model and explicit effort as one dim suffix af
       state: "running",
       model: "codex-fixture-model",
       effort: "high",
-      preview: "Running targeted tests",
+      activity: { kind: "tool", at: 5_000, tool: "read", state: "running", target: "tests/release.test.ts" },
     })],
   });
   const plainLine = buildWorkflowCardLines(snapshot, theme, { expanded: false, now: 6_000 })
     .find((line) => line.startsWith("Latest"));
-  assert.equal(plainLine, "Latest   tests(codex-fixture-model·high) · Running targeted tests");
+  assert.equal(plainLine, "Latest   tests(codex-fixture-model·high) · Reading tests/release.test.ts · started 1s ago");
 
   const styledTheme = {
     ...theme,
@@ -592,7 +632,7 @@ test("Latest renders the resolved model and explicit effort as one dim suffix af
     .find((line) => line.includes("<dim>Latest"));
   assert.equal(
     styledLine,
-    "<dim>Latest  </dim> <toolTitle>tests</toolTitle><dim>(codex-fixture-model·high)</dim> <dim>·</dim> <muted>Running targeted tests</muted>",
+    "<dim>Latest  </dim> <toolTitle>tests</toolTitle><dim>(codex-fixture-model·high)</dim> <dim>·</dim> <muted>Reading tests/release.test.ts · started 1s ago</muted>",
   );
 });
 
@@ -602,12 +642,12 @@ test("Latest renders omitted effort as adaptive and truncates safely after the r
       name: "tests",
       state: "running",
       model: "codex-fixture-model",
-      preview: "Running targeted tests",
+      activity: { kind: "responding", at: 5_000 },
     })],
   });
   const plainLine = buildWorkflowCardLines(snapshot, theme, { expanded: false, now: 6_000 })
     .find((line) => line.startsWith("Latest"));
-  assert.equal(plainLine, "Latest   tests(codex-fixture-model·adaptive) · Running targeted tests");
+  assert.equal(plainLine, "Latest   tests(codex-fixture-model·adaptive) · Drafting response · provider activity 1s ago");
 
   const width = 24;
   const narrow = renderWorkflowCard(snapshot, ansiTheme, { expanded: false, now: 6_000 }).render(width);
