@@ -1155,6 +1155,7 @@ export class WorkflowManager {
         entry.snapshot.error = entry.snapshot.error ? `${entry.snapshot.error}; ${detail}` : detail;
         this.#finishPhases(entry, "failed");
       }
+      this.#clearProviderSettlements(entry);
       this.#publish(entry);
     }
     return clone(entry.snapshot);
@@ -1226,6 +1227,7 @@ export class WorkflowManager {
         this.#touch(entry);
         result = { ok: false, output: "", error: record.error, progressed: true, usage: clone(record.usage) };
       } finally {
+        this.#finishProviderSettlement(entry, callIndex, callController.signal);
         entry.callControllers.delete(callIndex);
         signal.removeEventListener("abort", bridgeCallAbort);
       }
@@ -1489,6 +1491,7 @@ export class WorkflowManager {
     });
     return sanitized;
     } finally {
+      this.#finishProviderSettlement(entry, callIndex, callController.signal);
       entry.callControllers.delete(callIndex);
       signal.removeEventListener("abort", bridgeCallAbort);
     }
@@ -1589,6 +1592,7 @@ export class WorkflowManager {
         this.#touch(entry);
         result = { ok: false, output: "", error: record.error, progressed: true, usage: clone(record.usage) };
       } finally {
+        this.#finishProviderSettlement(entry, callIndex, callController.signal);
         entry.callControllers.delete(callIndex);
         signal.removeEventListener("abort", bridgeCallAbort);
       }
@@ -1717,6 +1721,7 @@ export class WorkflowManager {
     });
     return result;
     } finally {
+      this.#finishProviderSettlement(entry, callIndex, callController.signal);
       entry.callControllers.delete(callIndex);
       signal.removeEventListener("abort", bridgeCallAbort);
     }
@@ -3615,6 +3620,50 @@ export class WorkflowManager {
     record.truncated = undefined;
     record.outputProvenance = undefined;
     record.instructionShaped = undefined;
+  }
+
+  /**
+   * A classified provider failure is hidden only while its owning logical call
+   * decides whether to wait, retry, continue, cancel, or fail. Every call scope
+   * invokes this from `finally`, so an exception or early return cannot leave a
+   * terminal agent projected as a blank running agent.
+   */
+  #clearProviderSettlements(entry: RunEntry, callIndex?: number): boolean {
+    let cleared = false;
+    for (const agent of entry.snapshot.agents) {
+      if (callIndex !== undefined && agent.callIndex !== callIndex) continue;
+      cleared = entry.settlingProviderAgents.delete(agent.index) || cleared;
+    }
+    return cleared;
+  }
+
+  #finishProviderSettlement(entry: RunEntry, callIndex: number, signal: AbortSignal): void {
+    let changed = false;
+    if (signal.aborted) {
+      for (const agent of entry.snapshot.agents) {
+        if (agent.callIndex !== callIndex
+            || ["completed", "failed", "cancelled", "aborted"].includes(agent.state)) continue;
+        agent.state = "cancelled";
+        agent.error = boundedText(signal.reason ?? "Workflow agent cancelled");
+        agent.providerWait = undefined;
+        if (agent.continuation) agent.continuation.state = "failed";
+        agent.timestamps.updatedAt = Date.now();
+        agent.timestamps.endedAt = agent.timestamps.updatedAt;
+        const generation = agent.generations?.at(-1);
+        if (generation && generation.callIndex === callIndex) {
+          generation.state = "cancelled";
+          generation.error = agent.error;
+          generation.timestamps = {
+            ...generation.timestamps,
+            updatedAt: agent.timestamps.updatedAt,
+            endedAt: agent.timestamps.endedAt,
+          };
+        }
+        changed = true;
+      }
+    }
+    if (this.#clearProviderSettlements(entry, callIndex)) changed = true;
+    if (changed) this.#touch(entry);
   }
 
   async #withMutationLock<T>(cwd: string, signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
