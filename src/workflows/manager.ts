@@ -1621,14 +1621,15 @@ export class WorkflowManager {
         await this.#appendJournal(entry, { callIndex, fingerprint, kind: "followUp", state: "failed", at: Date.now(), result: { ok: false, output: "", error, progressed: true } });
         return { ok: false, output: "", error };
       }
-      this.#applyHandoffCheckpoint(record, handoff);
-      this.#bindProviderCall(entry, record.index, callIndex);
+      this.#rebindReplayedFollowUpHandoff(record, handoff, prompt, callIndex, fingerprint);
+      this.#stageProviderSettlement(entry, record.index, callIndex);
       this.#claimReplayHandoffUsage(entry, handoff.checkpoint);
       const callController = new AbortController();
       entry.callControllers.set(callIndex, callController);
       const bridgeCallAbort = () => callController.abort(signal.reason);
       if (signal.aborted) bridgeCallAbort();
       else signal.addEventListener("abort", bridgeCallAbort, { once: true });
+      this.#touch(entry);
       let result: WorkflowAttemptResult;
       try {
         result = await this.#resumeContinuationHandoff(entry, request, record, handoff, callController.signal, callIndex, fingerprint, prompt);
@@ -1918,16 +1919,25 @@ export class WorkflowManager {
       record.state = "queued";
       record.jobId = undefined;
       record.error = undefined;
-      record.tools = [];
-      record.transcript = undefined;
-      record.liveThinking = undefined;
-      record.activity = undefined;
-      record.truncated = undefined;
-      record.structured = undefined;
+      this.#clearProviderAttemptDisplay(record);
       record.structuredTransport = undefined;
       record.nativeStructuredSchema = undefined;
       record.timestamps.updatedAt = now;
       record.timestamps.endedAt = undefined;
+      const generation = record.generations?.find((candidate) => candidate.callIndex === callIndex);
+      if (generation) {
+        generation.state = "queued";
+        generation.error = undefined;
+        generation.output = undefined;
+        generation.structured = undefined;
+        generation.structuredTransport = undefined;
+        generation.outputProvenance = undefined;
+        generation.timestamps = {
+          ...generation.timestamps,
+          updatedAt: now,
+          endedAt: undefined,
+        };
+      }
     } else {
       record = {
         index,
@@ -2639,6 +2649,32 @@ export class WorkflowManager {
     record.error = `Authoritative ${checkpoint.trigger.provider} ${checkpoint.trigger.kind} failure; continuation checkpoint retained`;
     record.timestamps.updatedAt = Date.now();
     record.timestamps.endedAt = record.timestamps.updatedAt;
+  }
+
+  #rebindReplayedFollowUpHandoff(
+    record: WorkflowAgentRecord,
+    handoff: WorkflowReplayHandoff,
+    prompt: string,
+    callIndex: number,
+    fingerprint: string,
+  ): void {
+    record.generations ??= [this.#snapshotGeneration(record)];
+    this.#applyHandoffCheckpoint(record, handoff);
+    const now = Date.now();
+    record.generations.push({
+      index: (record.generations.at(-1)?.index ?? -1) + 1,
+      callIndex,
+      prompt: boundedText(prompt, 2 * 1024),
+      state: "failed",
+      error: record.error,
+      timestamps: { createdAt: now, updatedAt: now, endedAt: now },
+    });
+    if (record.generations.length > MAX_AGENT_GENERATIONS) {
+      record.generations.splice(0, record.generations.length - MAX_AGENT_GENERATIONS);
+    }
+    record.callIndex = callIndex;
+    record.callFingerprint = fingerprint;
+    record.prompt = boundedText(prompt, 2 * 1024);
   }
 
   #recordHandoffAgent(

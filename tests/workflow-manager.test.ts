@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
-import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, GatedWorkflowCheckout, GatedWorkflowJournalAppender, ScriptedHarnessAvailability, tempDir, tick, waitFor, withTimeout } from "./helpers.ts";
+import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, GatedWorkflowCheckout, GatedWorkflowJournalAppender, ScriptedHarnessAvailability, tempDir, theme, tick, waitFor, withTimeout } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import { replayableJournalInteractions, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint, workflowInteractionFingerprint } from "../src/workflows/journal.ts";
 import {
@@ -16,6 +16,7 @@ import {
 } from "../src/workflows/manager.ts";
 import { formatWorkflowBudget, workflowBudgetHealth } from "../src/workflows/budget.ts";
 import { applyWorkflowRetention } from "../src/workflows/retention.ts";
+import { renderWorkflowCard, workflowDashboardSummary } from "../extensions/workflows/render.ts";
 import type { BackendEvent } from "../src/types.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 
@@ -165,6 +166,40 @@ function assertProviderSettlementPublished(
       `${surface} must not retain the provider-settlement running mask`,
     );
   }
+}
+
+function assertReplayedFollowUpGap(
+  workflows: WorkflowManager,
+  runId: string,
+  publications: WorkflowSnapshot[],
+  privateFailure: string,
+): void {
+  const listed = workflows.list().find((snapshot) => snapshot.runId === runId);
+  const published = publications.filter((snapshot) => snapshot.runId === runId).at(-1);
+  for (const [surface, snapshot] of [
+    ["check", workflows.check(runId)],
+    ["list", listed],
+    ["subscriber", published],
+  ] as const) {
+    assert.ok(snapshot, `${surface} must contain the replayed workflow`);
+    const agent = snapshot.agents[0];
+    assert.equal(agent?.callIndex, 1, `${surface} binds the reused lineage to the replayed follow-up call`);
+    assert.equal(agent?.state, "running", `${surface} keeps the replayed follow-up settlement masked`);
+    assert.equal(agent?.error, undefined, `${surface} hides the staged provider failure`);
+    assert.equal(agent?.output, undefined, `${surface} hides staged replacement output`);
+    assert.equal(agent?.generations?.[0]?.callIndex, 0, `${surface} preserves the original generation identity`);
+    assert.equal(agent?.generations?.[0]?.output, "first generation", `${surface} preserves the original generation output`);
+    assert.equal(agent?.generations?.at(-1)?.callIndex, 1, `${surface} projects the replacement onto the follow-up generation`);
+    assert.equal(agent?.generations?.at(-1)?.state, "running", `${surface} masks the follow-up generation`);
+    assert.doesNotMatch(JSON.stringify(snapshot), new RegExp(privateFailure), `${surface} never exposes the private provider failure`);
+  }
+
+  const snapshot = workflows.check(runId);
+  const card = renderWorkflowCard(snapshot, theme, { expanded: true, now: Date.now() }).render(160).join("\n");
+  const dashboard = workflowDashboardSummary(snapshot, Date.now());
+  assert.doesNotMatch(card, new RegExp(privateFailure), "the live card consumes the safe snapshot");
+  assert.notEqual(dashboard.kind, "failure", "the dashboard consumes the safe running projection");
+  assert.doesNotMatch(dashboard.text, new RegExp(privateFailure), "the dashboard hides the provider failure");
 }
 
 test("rejects untrusted workflows before creating artifact storage", async () => {
@@ -3002,6 +3037,14 @@ test("replayed follow-up handoff rebinds a changed agent index and archives only
     assert.deepEqual(final.agents[0]?.attempts?.[0]?.usage, {
       input: 2, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1,
     });
+    assert.deepEqual(final.agents[0]?.generations?.map((generation) => ({
+      callIndex: generation.callIndex,
+      output: generation.output,
+    })), [
+      { callIndex: 0, output: "first generation" },
+      { callIndex: 1, output: "continued" },
+      { callIndex: 2, output: "followed" },
+    ], "replacement and retained output stay attributed to their logical calls");
     const finalJournal = await loadWorkflowJournal(f.artifactRoot, final.runId);
     const resumedFollowUpCheckpoints = finalJournal.filter((record) => (
       record.callIndex === 1 && (record.state === "progressed" || record.state === "handoff")
@@ -3021,6 +3064,84 @@ test("replayed follow-up handoff rebinds a changed agent index and archives only
   } finally {
     availability.release();
     await f.cleanup();
+  }
+});
+
+test("replayed follow-up handoffs mask replacement failure and cancellation gaps on every live surface", async () => {
+  for (const scenario of ["failure", "cancellation"] as const) {
+    const availability = new GatedHarnessAvailability("codex", {
+      claude: availabilityFixture("claude"),
+      codex: availabilityFixture("codex"),
+    });
+    const f = await fixture(4, undefined, undefined, undefined, availability);
+    let releaseGap: (() => void) | undefined;
+    try {
+      await initializeGitCheckout(f.cwd);
+      const script = `export default async () => {
+        const first = await agent("replay gap lineage", {
+          harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+        });
+        return followUp(first.jobId, "replayed progressed follow-up");
+      };`;
+      const started = await f.workflows.start(f.request(script));
+      await f.claude.waitForStart();
+      const primary = f.claude.starts[0]!;
+      f.claude.complete(primary, "first generation");
+      await f.claude.waitForSend();
+      f.claude.emit(primary, { type: "message", text: "follow-up progress" });
+      f.claude.fail(primary, "source quota", progressedQuota("claude"));
+      await availability.waitUntilReached();
+      const cancellation = f.workflows.cancel(started.snapshot.runId, "retain replayed follow-up handoff");
+      availability.release();
+      const source = await cancellation;
+
+      const journalPath = join(source.artifactDir, "journal.jsonl");
+      const records = (await readFile(journalPath, "utf8")).trim().split("\n")
+        .map((line) => JSON.parse(line) as { callIndex: number; state: string });
+      const handoffIndex = records.findIndex((record) => record.callIndex === 1 && record.state === "handoff");
+      assert.ok(handoffIndex >= 0);
+      await writeFile(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
+
+      const publications: WorkflowSnapshot[] = [];
+      const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+      const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: source.runId }));
+      let completionSettled = false;
+      void resumed.completion.then(
+        () => { completionSettled = true; },
+        () => { completionSettled = true; },
+      );
+      await f.backend.waitForStart();
+      const replacement = f.backend.starts[0]!;
+      const privateFailure = scenario === "failure" ? "private replacement rejection" : "private replacement cancellation";
+      let gapOperation: Promise<unknown> | undefined;
+
+      if (scenario === "failure") {
+        const close = f.backend.gateClose(replacement);
+        releaseGap = close.release;
+        f.backend.fail(replacement, privateFailure, progressedQuota("codex"));
+        await close.waitUntilReached();
+      } else {
+        const cancel = f.backend.gateCancellation(replacement);
+        releaseGap = cancel.release;
+        gapOperation = f.workflows.cancelAgent(resumed.snapshot.runId, 0, privateFailure);
+        await cancel.waitUntilReached();
+      }
+
+      assert.equal(completionSettled, false, "the workflow remains live while the settlement gap is inspected");
+      assertReplayedFollowUpGap(f.workflows, resumed.snapshot.runId, publications, privateFailure);
+      releaseGap();
+      releaseGap = undefined;
+      await gapOperation;
+      const final = await resumed.completion;
+      assert.equal(final.agents[0]?.callIndex, 1);
+      assert.equal(final.agents[0]?.generations?.at(-1)?.callIndex, 1);
+      assert.equal(final.agents[0]?.generations?.[0]?.output, "first generation");
+      unsubscribe();
+    } finally {
+      releaseGap?.();
+      availability.release();
+      await f.cleanup();
+    }
   }
 });
 

@@ -741,6 +741,7 @@ export class ControlledBackend implements Backend {
   readonly #startWaiters = new Set<() => void>();
   readonly #sendWaiters = new Set<() => void>();
   readonly #cancellationGates = new Map<string, ControlledCancellationGate>();
+  readonly #closeGates = new Map<string, ControlledCancellationGate>();
   readonly #closeFailures = new Map<string, Error>();
   active = 0;
   maxActive = 0;
@@ -824,6 +825,13 @@ export class ControlledBackend implements Backend {
       },
       close: async () => {
         this.closes.push(request.jobId);
+        const gate = this.#closeGates.get(request.jobId);
+        if (gate) {
+          gate.reached = true;
+          gate.reach();
+          await gate.released;
+          this.#closeGates.delete(request.jobId);
+        }
         const error = this.#closeFailures.get(request.jobId);
         if (error) throw error;
       },
@@ -857,6 +865,26 @@ export class ControlledBackend implements Backend {
       release: () => release(),
     };
     this.#cancellationGates.set(jobId, gate);
+    return {
+      waitUntilReached: () => gate.reached ? Promise.resolve() : gate.reachedPromise,
+      release: gate.release,
+    };
+  }
+
+  /** Holds native session cleanup after a terminal provider event. */
+  gateClose(jobId: string): ControlledCancellationHandle {
+    assert.ok(this.runs.has(jobId), `backend never started job ${jobId}`);
+    assert.equal(this.#closeGates.has(jobId), false, `cleanup for ${jobId} is already gated`);
+    let reach!: () => void;
+    let release!: () => void;
+    const gate: ControlledCancellationGate = {
+      reached: false,
+      reachedPromise: new Promise<void>((resolve) => { reach = resolve; }),
+      reach: () => reach(),
+      released: new Promise<void>((resolve) => { release = resolve; }),
+      release: () => release(),
+    };
+    this.#closeGates.set(jobId, gate);
     return {
       waitUntilReached: () => gate.reached ? Promise.resolve() : gate.reachedPromise,
       release: gate.release,
