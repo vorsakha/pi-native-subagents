@@ -292,7 +292,7 @@ test("workflow consult() requires an explicit stable-ID allowlist and records bo
     route: { harness: "claude", model: "advisor-model" },
     queuedMs: 12,
   });
-  const f = await fixture(4, undefined, undefined, undefined, undefined, advisors);
+  const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, undefined, advisors);
   try {
     const script = `export default async () => consult(${JSON.stringify(advisorId)}, "Review containment", { phase: "Security", context: "bounded facts" });`;
     const started = await f.workflows.start(f.request(script, { advisors: [advisorId] }));
@@ -344,7 +344,7 @@ test("workflow advisor calls share the hard call budget and cumulative spend pre
     route: { harness: "claude" },
     queuedMs: 0,
   });
-  const f = await fixture(4, undefined, undefined, undefined, undefined, advisors);
+  const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, undefined, advisors);
   try {
     const started = await f.workflows.start(f.request(`
       export default async () => {
@@ -382,7 +382,7 @@ test("queued workflow advisor calls revalidate cumulative budgets before dispatc
   } satisfies Awaited<ReturnType<ControlledAdvisorGateway["consult"]>>;
   let releaseFirst!: (result: typeof expensive) => void;
   advisors.pending = new Promise((resolve) => { releaseFirst = resolve; });
-  const f = await fixture(4, undefined, undefined, undefined, undefined, advisors);
+  const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, undefined, advisors);
   try {
     const started = await f.workflows.start(f.request(`
       export default async () => parallel([
@@ -422,7 +422,7 @@ test("an advisor call reaching maxTokensPerAgent blocks later dispatch and recor
     route: { harness: "claude" },
     queuedMs: 0,
   });
-  const f = await fixture(4, undefined, undefined, undefined, undefined, advisors);
+  const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, undefined, advisors);
   try {
     const started = await f.workflows.start(f.request(`
       export default async () => {
@@ -446,7 +446,7 @@ test("workflow replay reuses journaled advisor answers and cancellation reaches 
   const advisors = new ControlledAdvisorGateway();
   const advisorId = "adv_33333333333333333333333333333333";
   advisors.add(advisorId, { lineage: 2 });
-  const f = await fixture(4, undefined, undefined, undefined, undefined, advisors);
+  const f = await fixture(4, undefined, undefined, undefined, undefined, undefined, undefined, advisors);
   const script = `export default async () => consult(${JSON.stringify(advisorId)}, "stable replay question");`;
   try {
     const first = await f.workflows.start(f.request(script, { advisors: [advisorId] }));
