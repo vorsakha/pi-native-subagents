@@ -1,14 +1,10 @@
 # Workflow authoring
 
-Read this before writing or editing a workflow script. It covers the source contract, the sandbox API, phases, fan-out shapes, `followUp()`, and how a run's lifecycle differs from its task outcome.
+Read this before editing a workflow. It covers sources, sandbox APIs, phases, fan-out, retained calls, and task outcome.
 
 ## Source and input contract
 
-The `workflow` tool accepts exactly one source:
-
-- `script` — inline JavaScript;
-- `workflowName` — a saved user/project definition;
-- `scriptPath` — a trusted project-local script.
+The `workflow` tool accepts exactly one source: inline `script`, saved `workflowName`, or trusted project-local `scriptPath`.
 
 Use zero or one input form: structured `input` or the legacy JSON-string `args`, never both. The selected value is exposed to the script as the global `args`; omitting both exposes `null`. Workflows must be trusted and use a source contained by the trusted project rules.
 
@@ -20,16 +16,14 @@ Use zero or one input form: structured `input` or the legacy JSON-string `args`,
 
 A workflow script must export a default async function. The helpers are globals, not a context object:
 
-- `args` — parsed workflow input;
-- `phase(title)` — report bounded progress;
-- `log(message)` — report bounded progress text;
-- `agent(prompt, options)` — request one generic child and return a result object;
-- `followUp(jobId, prompt, options)` — continue a completed `agent()` call's own retained native session and return the same result shape;
-- `consult(advisorId, question, options)` — consult one stable, explicitly allowlisted thread advisor;
-- `parallel(tasks, { concurrency })` — run deferred tasks with a bounded worker pool;
-- `pipeline(items, ...stages)` — process independent items through ordered stages;
-- `converge(options)` — run a bounded implement/review/fix loop over two retained sessions;
-- `convergenceReviewSchema` — the review schema `converge()` validates every verdict against.
+- `args` — parsed input;
+- `phase(title)` / `log(message)` — report bounded progress;
+- `agent(prompt, options)` — run one generic child;
+- `followUp(jobId, prompt, options)` — continue this run's retained child;
+- `consult(advisorId, question, options)` — consult an allowlisted thread advisor;
+- `parallel(tasks, { concurrency })` — run deferred tasks in a bounded pool;
+- `pipeline(items, ...stages)` — process items through stages;
+- `converge(options)` and `convergenceReviewSchema` — run and validate bounded fix loops.
 
 Do not write the function as if it receives a context object such as `async ({ phase, agent }) => ...`. Positional helper arguments are retained for compatibility, but the global API is the canonical form.
 
@@ -60,7 +54,7 @@ Always await every `agent()`, `followUp()`, and `consult()` call before returnin
 
 ## Continuing a retained agent with followUp
 
-`followUp(jobId, prompt, options?)` sends another turn to an `agent()` call this same workflow run already completed successfully, reusing its retained native session instead of starting a fresh child. This is the only supported way to return to earlier reasoning:
+`followUp(jobId, prompt, options?)` reuses a successfully completed `agent()` call's retained session. It is the only supported return to earlier reasoning:
 
 ```js
 phase("plan");

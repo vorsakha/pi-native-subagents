@@ -76,20 +76,9 @@ A workflow script must export a default async function and use the injected glob
 
 Pick the right call before you write it. Use `agent(prompt, options)` for new work. Use `followUp(jobId, prompt)` with a `jobId` from this run's completed `agent()` call to return to that child's retained session. Use `converge()` when findings should drive bounded fix rounds.
 
-A fresh workflow call may declare one opposite native fallback:
+A fresh workflow `agent()` may set `providerFallback: { harness, model? }` between opposite explicit Claude/Codex routes. After dispatch it requires `readOnly`, authoritative pre-inference proof, and zero usage. A pre-dispatch missing, unauthenticated, or incompatible primary may fall back under either access. The target must freshly be ready. It never covers `followUp()`, ordinary failure, cancellation, worktrees, or another fallback, and overrides provider waiting. Read the budget reference first.
 
-```js
-agent("task", {
-  harness: "claude",
-  access: "readOnly",
-  model: "exact-primary-model",
-  providerFallback: { harness: "codex", model: "exact-fallback-model" },
-});
-```
-
-The primary must explicitly name Claude or Codex and the fallback must name the other. After dispatch this requires `readOnly`, authoritative pre-inference proof, and zero usage; full-access rejection stays terminal. Pre-dispatch missing, unauthenticated, or incompatible readiness may fall back under either access. The target must freshly be ready. Fallback never applies to `followUp()`, ordinary failures, cancellation, worktrees, or a failed fallback, and overrides provider waiting. Read the budget reference first.
-
-A progressed native call needs a different explicit opt-in:
+Progressed failure requires a different explicit opt-in:
 
 ```js
 agent("task", {
