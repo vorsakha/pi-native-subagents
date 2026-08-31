@@ -174,10 +174,27 @@ interface RunEntry {
   callControllers: Map<number, AbortController>;
   /** Shared, run-wide `retry.maxWaitMs` allowance. Synchronously decremented by every call (sequential or concurrent) so the total time spent waiting across the whole run never exceeds the configured budget. */
   providerWaitBudgetMs: number;
-  /** Provider failures held privately until fallback, wait, or terminal policy has settled. */
-  settlingProviderAgents: Set<number>;
+  /** Immutable owner of each logical call once it has attached to an agent lineage. */
+  providerSettlementOwners: Map<number, ProviderSettlementOwner>;
+  /** Native job generations bound to the logical call that started them. */
+  providerJobOwners: Map<string, ProviderSettlementOwner>;
+  /** Provider failures held privately until their exact logical call has settled. */
+  settlingProviderCalls: Set<string>;
   /** Interaction ordinal assigned to each routed question, keyed by host request ID. */
   interactionOrdinals: Map<string, number>;
+}
+
+interface ProviderSettlementOwner {
+  readonly agentIndex: number;
+  readonly callIndex: number;
+}
+
+function providerSettlementKey(owner: ProviderSettlementOwner): string {
+  return `${owner.agentIndex}:${owner.callIndex}`;
+}
+
+function providerJobKey(job: Pick<JobSnapshot, "id" | "generation">): string {
+  return `${job.id}:${job.generation}`;
 }
 
 interface ReplaySource {
@@ -787,7 +804,9 @@ export class WorkflowManager {
       metadataReceived: false,
       providerWaits: new Map(),
       callControllers: new Map(),
-      settlingProviderAgents: new Set(),
+      providerSettlementOwners: new Map(),
+      providerJobOwners: new Map(),
+      settlingProviderCalls: new Set(),
       providerWaitBudgetMs: retry?.maxWaitMs ?? 0,
       interactionOrdinals: new Map(),
     };
@@ -837,7 +856,9 @@ export class WorkflowManager {
       metadataReceived: true,
       providerWaits: new Map(),
       callControllers: new Map(),
-      settlingProviderAgents: new Set(),
+      providerSettlementOwners: new Map(),
+      providerJobOwners: new Map(),
+      settlingProviderCalls: new Set(),
       providerWaitBudgetMs: snapshot.retry?.maxWaitMs ?? 0,
       interactionOrdinals: new Map(),
     };
@@ -1046,10 +1067,17 @@ export class WorkflowManager {
     if (!entry) throw new Error(`Unknown workflow: ${runId}`);
     const agent = entry.snapshot.agents.find((candidate) => candidate.index === agentIndex);
     if (!agent) throw new Error(`Unknown workflow agent: ${agentIndex}`);
-    const callController = agent.callIndex === undefined ? undefined : entry.callControllers.get(agent.callIndex);
-    if (callController) {
-      callController.abort(new Error(reason));
+    const activeOwners = [...entry.providerSettlementOwners.values()]
+      .filter((owner) => owner.agentIndex === agent.index && entry.callControllers.has(owner.callIndex));
+    const callControllers = activeOwners
+      .map((owner) => entry.callControllers.get(owner.callIndex))
+      .filter((controller): controller is AbortController => controller !== undefined);
+    if (callControllers.length) {
+      for (const controller of callControllers) controller.abort(new Error(reason));
       if (agent.state === "failed") {
+        if (activeOwners.some((owner) => entry.settlingProviderCalls.has(providerSettlementKey(owner)))) {
+          this.#clearProviderAttemptDisplay(agent);
+        }
         agent.state = "cancelled";
         agent.error = boundedText(reason);
         agent.timestamps.updatedAt = Date.now();
@@ -1058,12 +1086,11 @@ export class WorkflowManager {
       }
     }
     if (agent.state === "waiting") {
-      const controller = agent.callIndex === undefined ? undefined : entry.providerWaits.get(agent.callIndex);
-      if (controller) controller.abort(new Error(reason));
+      for (const owner of activeOwners) entry.providerWaits.get(owner.callIndex)?.abort(new Error(reason));
       return this.check(runId);
     }
     if (!agent.jobId) {
-      if (callController) return this.check(runId);
+      if (callControllers.length) return this.check(runId);
       throw new Error(`Workflow agent ${agent.name} has not started`);
     }
     if (["completed", "failed", "cancelled", "aborted"].includes(agent.state)) return this.check(runId);
@@ -1155,7 +1182,6 @@ export class WorkflowManager {
         entry.snapshot.error = entry.snapshot.error ? `${entry.snapshot.error}; ${detail}` : detail;
         this.#finishPhases(entry, "failed");
       }
-      this.#clearProviderSettlements(entry);
       this.#publish(entry);
     }
     return clone(entry.snapshot);
@@ -1209,6 +1235,7 @@ export class WorkflowManager {
       : undefined;
     if (handoff) {
       const record = this.#recordHandoffAgent(entry, prompt, options, callIndex, fingerprint, handoff);
+      this.#bindProviderCall(entry, record.index, callIndex);
       const callController = new AbortController();
       entry.callControllers.set(callIndex, callController);
       const bridgeCallAbort = () => callController.abort(signal.reason);
@@ -1327,7 +1354,7 @@ export class WorkflowManager {
       record ??= entry.snapshot.agents.find((candidate) => candidate.callIndex === callIndex);
       if (result.ok || !record) break;
       if (attemptSignal.aborted) {
-        entry.settlingProviderAgents.delete(record.index);
+        this.#clearProviderSettlement(entry, callIndex);
         record.state = "cancelled";
         record.error = boundedText(attemptSignal.reason ?? "Workflow agent cancelled");
         record.timestamps.updatedAt = Date.now();
@@ -1355,12 +1382,12 @@ export class WorkflowManager {
         }
         // Declaring a fallback takes precedence over the run-wide provider wait
         // policy for this call, even when the failure is not fallback-eligible.
-        entry.settlingProviderAgents.delete(record.index);
+        this.#clearProviderSettlement(entry, callIndex);
         this.#touch(entry);
         break;
       }
       if (usedFallback) {
-        entry.settlingProviderAgents.delete(record.index);
+        this.#clearProviderSettlement(entry, callIndex);
         this.#touch(entry);
         break;
       }
@@ -1392,12 +1419,12 @@ export class WorkflowManager {
         // A declared continuation route owns this call's recovery policy. It
         // never falls through to the run-wide same-provider wait policy,
         // whether the failed turn progressed or was rejected pre-inference.
-        entry.settlingProviderAgents.delete(record.index);
+        this.#clearProviderSettlement(entry, callIndex);
         this.#touch(entry);
         break;
       }
       if (!policy || policy.providerUnavailable !== "wait") {
-        entry.settlingProviderAgents.delete(record.index);
+        this.#clearProviderSettlement(entry, callIndex);
         this.#touch(entry);
         break;
       }
@@ -1408,7 +1435,7 @@ export class WorkflowManager {
       const decision = this.#planProviderWait(record, result, policy, attempt, entry.providerWaitBudgetMs);
       if (!decision.wait) {
         this.#clearProviderAttemptDisplay(record);
-        entry.settlingProviderAgents.delete(record.index);
+        this.#clearProviderSettlement(entry, callIndex);
         record.state = "failed";
         record.providerWait = undefined;
         record.error = boundedText(decision.reason);
@@ -1422,7 +1449,7 @@ export class WorkflowManager {
       const unavailable = result.unavailable!;
       entry.providerWaitBudgetMs = Math.max(0, entry.providerWaitBudgetMs - Math.max(0, decision.until - this.#providerWaitClock.now()));
       const maxAttempts = policy.maxAttempts ?? 1;
-      this.#beginProviderWait(entry, record, unavailable, decision.until, attempt + 1, maxAttempts);
+      this.#beginProviderWait(entry, record, callIndex, unavailable, decision.until, attempt + 1, maxAttempts);
       const waitController = new AbortController();
       entry.providerWaits.set(callIndex, waitController);
       const bridgeAbort = () => waitController.abort(signal.reason);
@@ -1439,7 +1466,7 @@ export class WorkflowManager {
         // both to leave a clean terminal record and because "waiting" is not
         // a valid persisted route status.
         record.state = "cancelled";
-        entry.settlingProviderAgents.delete(record.index);
+        this.#clearProviderSettlement(entry, callIndex);
         record.providerWait = undefined;
         record.error = boundedText(error);
         record.timestamps.updatedAt = Date.now();
@@ -1525,6 +1552,28 @@ export class WorkflowManager {
       state: "started",
       at: Date.now(),
     });
+    return this.#continueFollowUpCall(
+      entry,
+      request,
+      jobId,
+      prompt,
+      options,
+      signal,
+      callIndex,
+      fingerprint,
+    );
+  }
+
+  async #continueFollowUpCall(
+    entry: RunEntry,
+    request: StartWorkflowRequest,
+    jobId: string,
+    prompt: string,
+    options: Record<string, unknown>,
+    signal: AbortSignal,
+    callIndex: number,
+    fingerprint: string,
+  ): Promise<WorkflowAgentResult> {
     await this.#waitUntilResumed(entry, signal);
 
     const expected = entry.replay?.active && callIndex < (entry.snapshot.budget?.maxAgents ?? 32)
@@ -1573,6 +1622,7 @@ export class WorkflowManager {
         return { ok: false, output: "", error };
       }
       this.#applyHandoffCheckpoint(record, handoff);
+      this.#bindProviderCall(entry, record.index, callIndex);
       this.#claimReplayHandoffUsage(entry, handoff.checkpoint);
       const callController = new AbortController();
       entry.callControllers.set(callIndex, callController);
@@ -1848,7 +1898,7 @@ export class WorkflowManager {
         trigger: retry.trigger ? { ...retry.trigger } : undefined,
       } satisfies WorkflowAgentAttempt);
       if (attempts.length > 4) attempts.splice(0, attempts.length - 4);
-      entry.settlingProviderAgents.delete(record.index);
+      this.#clearProviderSettlement(entry, callIndex);
       // record.usage already includes every prior attempt (see above), so the new
       // baseline for the next attempt IS record.usage, not retryUsage + record.usage
       // — adding retryUsage again would double-count every attempt before this one.
@@ -1907,6 +1957,7 @@ export class WorkflowManager {
       entry.snapshot.agents.push(record);
       entry.snapshot.phases[phase]?.agents.push(index);
     }
+    this.#bindProviderCall(entry, record.index, callIndex);
     this.#touch(entry);
 
     if (retry) {
@@ -2145,7 +2196,7 @@ export class WorkflowManager {
       }
       record.timestamps.updatedAt = Date.now();
       record.timestamps.endedAt = record.timestamps.updatedAt;
-      if (fallbackTrigger) entry.settlingProviderAgents.add(record.index);
+      if (fallbackTrigger) this.#stageProviderSettlement(entry, record.index, callIndex);
       else this.#touch(entry);
       return { ok: false, output: "", error: record.error, fallbackTrigger };
     }
@@ -2161,6 +2212,7 @@ export class WorkflowManager {
     record.model = job.model;
     record.timestamps.updatedAt = Date.now();
     this.#jobOwners.set(job.id, { runId: entry.snapshot.runId, agentIndex: index });
+    this.#bindProviderJob(entry, job, record.index, callIndex);
     if (record.logicalJobId && record.logicalJobId !== job.id) {
       this.#jobOwners.set(record.logicalJobId, { runId: entry.snapshot.runId, agentIndex: index });
     }
@@ -2285,6 +2337,17 @@ export class WorkflowManager {
     }
     const record = entry.snapshot.agents[owner.agentIndex];
     if (!record) return { ok: false, output: "", error: `followUp() target ${jobId} is unknown` };
+    this.#bindProviderCall(entry, record.index, callIndex);
+    const retainedJobId = record.jobId ?? jobId;
+    const retained = this.#jobs.check(retainedJobId);
+    if (retained.status !== "completed") {
+      return {
+        ok: false,
+        output: "",
+        error: `Cannot continue ${retainedJobId}: job is ${retained.status}`,
+        usage: clone(record.usage),
+      };
+    }
     if (record.isolation) {
       return {
         ok: false,
@@ -2363,7 +2426,6 @@ export class WorkflowManager {
     record.timestamps.updatedAt = now;
     this.#touch(entry);
 
-    const retainedJobId = record.jobId ?? jobId;
     const attemptUsageBase = clone(record.usage);
     let queued: JobSnapshot;
     try {
@@ -2383,6 +2445,7 @@ export class WorkflowManager {
       this.#touch(entry);
       return { ok: false, output: "", error: failure, usage: clone(record.usage) };
     }
+    this.#bindProviderJob(entry, queued, record.index, callIndex);
     this.#updateAgentFromJob(queued);
 
     const abort = () => { void this.#jobs.cancel(retainedJobId, "Workflow follow-up cancelled").catch(() => undefined); };
@@ -3583,13 +3646,14 @@ export class WorkflowManager {
   #beginProviderWait(
     entry: RunEntry,
     record: WorkflowAgentRecord,
+    callIndex: number,
     unavailable: ProviderUnavailability,
     retryAt: number,
     attempt: number,
     maxAttempts: number,
   ): void {
     this.#clearProviderAttemptDisplay(record);
-    entry.settlingProviderAgents.delete(record.index);
+    this.#clearProviderSettlement(entry, callIndex);
     record.state = "waiting";
     // The failed native attempt's raw detail remains private to the job/session.
     // Once the logical call is waiting, its raw error is no longer the current
@@ -3622,47 +3686,70 @@ export class WorkflowManager {
     record.instructionShaped = undefined;
   }
 
-  /**
-   * A classified provider failure is hidden only while its owning logical call
-   * decides whether to wait, retry, continue, cancel, or fail. Every call scope
-   * invokes this from `finally`, so an exception or early return cannot leave a
-   * terminal agent projected as a blank running agent.
-   */
-  #clearProviderSettlements(entry: RunEntry, callIndex?: number): boolean {
-    let cleared = false;
-    for (const agent of entry.snapshot.agents) {
-      if (callIndex !== undefined && agent.callIndex !== callIndex) continue;
-      cleared = entry.settlingProviderAgents.delete(agent.index) || cleared;
+  #bindProviderCall(entry: RunEntry, agentIndex: number, callIndex: number): ProviderSettlementOwner {
+    const existing = entry.providerSettlementOwners.get(callIndex);
+    if (existing) {
+      if (existing.agentIndex !== agentIndex) throw new Error("Workflow call changed agent lineage during provider settlement");
+      return existing;
     }
-    return cleared;
+    const owner = { agentIndex, callIndex } as const;
+    entry.providerSettlementOwners.set(callIndex, owner);
+    return owner;
+  }
+
+  #bindProviderJob(
+    entry: RunEntry,
+    job: Pick<JobSnapshot, "id" | "generation">,
+    agentIndex: number,
+    callIndex: number,
+  ): void {
+    entry.providerJobOwners.set(providerJobKey(job), this.#bindProviderCall(entry, agentIndex, callIndex));
+  }
+
+  #stageProviderSettlement(entry: RunEntry, agentIndex: number, callIndex: number): void {
+    const owner = this.#bindProviderCall(entry, agentIndex, callIndex);
+    entry.settlingProviderCalls.add(providerSettlementKey(owner));
+  }
+
+  #clearProviderSettlement(entry: RunEntry, callIndex: number): boolean {
+    const owner = entry.providerSettlementOwners.get(callIndex);
+    return owner ? entry.settlingProviderCalls.delete(providerSettlementKey(owner)) : false;
   }
 
   #finishProviderSettlement(entry: RunEntry, callIndex: number, signal: AbortSignal): void {
+    const owner = entry.providerSettlementOwners.get(callIndex);
     let changed = false;
-    if (signal.aborted) {
-      for (const agent of entry.snapshot.agents) {
-        if (agent.callIndex !== callIndex
-            || ["completed", "failed", "cancelled", "aborted"].includes(agent.state)) continue;
-        agent.state = "cancelled";
-        agent.error = boundedText(signal.reason ?? "Workflow agent cancelled");
-        agent.providerWait = undefined;
-        if (agent.continuation) agent.continuation.state = "failed";
-        agent.timestamps.updatedAt = Date.now();
-        agent.timestamps.endedAt = agent.timestamps.updatedAt;
-        const generation = agent.generations?.at(-1);
-        if (generation && generation.callIndex === callIndex) {
+    if (signal.aborted && owner) {
+      const agent = entry.snapshot.agents[owner.agentIndex];
+      if (agent) {
+        const currentCall = agent.callIndex === owner.callIndex;
+        if (currentCall && !["completed", "failed", "cancelled", "aborted"].includes(agent.state)) {
+          this.#clearProviderAttemptDisplay(agent);
+          agent.state = "cancelled";
+          agent.error = boundedText(signal.reason ?? "Workflow agent cancelled");
+          agent.providerWait = undefined;
+          if (agent.continuation) agent.continuation.state = "failed";
+          agent.timestamps.updatedAt = Date.now();
+          agent.timestamps.endedAt = agent.timestamps.updatedAt;
+          changed = true;
+        }
+        const generation = agent.generations?.find((candidate) => candidate.callIndex === owner.callIndex);
+        if (generation && !["completed", "cancelled", "aborted"].includes(generation.state)) {
           generation.state = "cancelled";
-          generation.error = agent.error;
+          generation.error = boundedText(signal.reason ?? "Workflow agent cancelled");
+          generation.output = undefined;
+          generation.structured = undefined;
+          generation.outputProvenance = undefined;
           generation.timestamps = {
             ...generation.timestamps,
-            updatedAt: agent.timestamps.updatedAt,
-            endedAt: agent.timestamps.endedAt,
+            updatedAt: Date.now(),
+            endedAt: Date.now(),
           };
+          changed = true;
         }
-        changed = true;
       }
     }
-    if (this.#clearProviderSettlements(entry, callIndex)) changed = true;
+    if (this.#clearProviderSettlement(entry, callIndex)) changed = true;
     if (changed) this.#touch(entry);
   }
 
@@ -3767,10 +3854,24 @@ export class WorkflowManager {
   #observerSnapshot(entry: RunEntry, projectLive: boolean): WorkflowSnapshot {
     const snapshot = clone(entry.snapshot);
     snapshot.agents = snapshot.agents.map((agent) => {
-      if (!entry.settlingProviderAgents.has(agent.index)) {
+      const settlingCalls = new Set([...entry.providerSettlementOwners.values()]
+        .filter((owner) => owner.agentIndex === agent.index && entry.settlingProviderCalls.has(providerSettlementKey(owner)))
+        .map((owner) => owner.callIndex));
+      if (settlingCalls.size === 0) {
         return projectLive ? this.#projectAgent(agent) : agent;
       }
-      const generation = agent.generations?.at(-1);
+      const masksCurrentCall = agent.callIndex !== undefined && settlingCalls.has(agent.callIndex);
+      const generations = agent.generations?.map((generation) => settlingCalls.has(generation.callIndex)
+        ? {
+            ...generation,
+            state: "running" as const,
+            error: undefined,
+            output: undefined,
+            outputProvenance: undefined,
+            timestamps: { ...generation.timestamps, endedAt: undefined },
+          }
+        : generation);
+      if (!masksCurrentCall) return { ...(projectLive ? this.#projectAgent(agent) : agent), generations };
       return {
         ...agent,
         state: "running",
@@ -3788,18 +3889,7 @@ export class WorkflowManager {
         outputProvenance: undefined,
         instructionShaped: undefined,
         timestamps: { ...agent.timestamps, endedAt: undefined },
-        generations: generation
-          ? agent.generations?.map((candidate, index) => index === agent.generations!.length - 1
-            ? {
-                ...candidate,
-                state: "running",
-                error: undefined,
-                output: undefined,
-                outputProvenance: undefined,
-                timestamps: { ...candidate.timestamps, endedAt: undefined },
-              }
-            : candidate)
-          : agent.generations,
+        generations,
       };
     });
     return snapshot;
@@ -3816,7 +3906,10 @@ export class WorkflowManager {
     const agent = entry?.snapshot.agents[owner.agentIndex];
     if (!entry || !agent) return;
     const stagingProviderFailure = job.status === "failed" && job.unavailable !== undefined;
-    if (stagingProviderFailure) entry.settlingProviderAgents.add(agent.index);
+    const callOwner = entry.providerJobOwners.get(providerJobKey(job));
+    if (stagingProviderFailure && callOwner) {
+      entry.settlingProviderCalls.add(providerSettlementKey(callOwner));
+    }
 
     // Publish bounded semantic streaming state without cloning transcripts or
     // scheduling durable checkpoints for each provider token.

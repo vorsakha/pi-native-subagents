@@ -6,7 +6,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
-import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, GatedWorkflowJournalAppender, ScriptedHarnessAvailability, tempDir, tick, waitFor, withTimeout } from "./helpers.ts";
+import { AdmissionGatedWorkflowCheckout, availabilityFixture, CancellationGatedWorkflowCheckout, ControlledBackend, delay, GatedHarnessAvailability, GatedWorkflowCheckout, GatedWorkflowJournalAppender, ScriptedHarnessAvailability, tempDir, tick, waitFor, withTimeout } from "./helpers.ts";
 import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal, loadWorkflowSummaries } from "../src/workflows/artifacts.ts";
 import { replayableJournalInteractions, workflowCallFingerprint, workflowDefinitionFingerprint, workflowFollowUpFingerprint, workflowInteractionFingerprint } from "../src/workflows/journal.ts";
 import {
@@ -1767,6 +1767,110 @@ test("provider settlement masks release when cancellation interrupts continuatio
       unsubscribe();
       await f.cleanup();
     }
+  }
+});
+
+test("parallel retained follow-ups keep provider settlement ownership call-scoped", async () => {
+  for (const cleanupOrder of ["terminating-first", "continuing-first"] as const) {
+    const checkout = new GatedWorkflowCheckout();
+    const f = await fixture(4, undefined, undefined, undefined, fallbackAvailability(), checkout);
+    const publications: WorkflowSnapshot[] = [];
+    const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+    try {
+      const calls = cleanupOrder === "terminating-first"
+        ? `[
+            () => followUp(first.jobId, "terminating sibling", { schema: "invalid" }),
+            () => followUp(first.jobId, "continuing sibling")
+          ]`
+        : `[
+            () => followUp(first.jobId, "continuing sibling"),
+            () => followUp(first.jobId, "terminating sibling", { schema: "invalid" })
+          ]`;
+      const started = await f.workflows.start(f.request(`export default async () => {
+        const first = await agent("retained source", {
+          harness: "claude",
+          access: "readOnly",
+          continuationFallback: { harness: "codex" }
+        });
+        return parallel(${calls});
+      };`));
+      await f.claude.waitForStart();
+      const lineage = f.claude.starts[0]!;
+      f.claude.complete(lineage, "retained source output");
+
+      await f.claude.waitForSend();
+      f.claude.emit(lineage, { type: "message", text: "PRIVATE_PROVIDER_TRANSCRIPT" });
+      const settlementPublicationStart = publications.length;
+      f.claude.fail(lineage, "PRIVATE_PROVIDER_ERROR", progressedQuota("claude"));
+
+      await withTimeout(checkout.waitUntilReached(), `${cleanupOrder} checkout gap`);
+
+      const runId = started.snapshot.runId;
+      const assertGap = (surface: string, snapshot: WorkflowSnapshot | undefined) => {
+        assert.ok(snapshot, `${surface} contains the live workflow`);
+        const agent = snapshot.agents[0];
+        assert.ok(agent, `${surface} contains the retained lineage`);
+        const continuingCall = cleanupOrder === "terminating-first" ? 2 : 1;
+        assert.equal(agent.callIndex, continuingCall, `${surface} keeps the continuing call as the lineage owner`);
+        assert.equal(agent.state, "running", `${surface} masks the exact provider settlement call`);
+        assert.doesNotMatch(JSON.stringify(agent), /PRIVATE_PROVIDER_TRANSCRIPT|PRIVATE_PROVIDER_ERROR/);
+      };
+      assertGap("check", f.workflows.check(runId));
+      assertGap("list", f.workflows.list().find((snapshot) => snapshot.runId === runId));
+      for (const [index, snapshot] of publications.slice(settlementPublicationStart).entries()) {
+        if (snapshot.runId === runId) assertGap(`subscriber snapshot ${index}`, snapshot);
+      }
+
+      checkout.release();
+      await f.backend.waitForStart();
+      f.backend.complete(f.backend.starts[0]!, "continued safely");
+      const final = await withTimeout(started.completion, `${cleanupOrder} workflow completion`);
+      assert.equal(final.status, "completed");
+      assert.equal(final.agents[0]?.state, "completed");
+      assert.doesNotMatch(JSON.stringify(final), /PRIVATE_PROVIDER_TRANSCRIPT/);
+      assertProviderSettlementPublished(f.workflows, final, publications);
+    } finally {
+      checkout.release();
+      unsubscribe();
+      await f.cleanup();
+    }
+  }
+});
+
+test("cancelling overlapping retained follow-ups clears only the continuing call mask", async () => {
+  const checkout = new GatedWorkflowCheckout();
+  const f = await fixture(4, undefined, undefined, undefined, fallbackAvailability(), checkout);
+  const publications: WorkflowSnapshot[] = [];
+  const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
+  try {
+    const started = await f.workflows.start(f.request(`export default async () => {
+      const first = await agent("retained cancellation source", {
+        harness: "claude", access: "readOnly", continuationFallback: { harness: "codex" }
+      });
+      return parallel([
+        () => followUp(first.jobId, "continuing cancellation turn"),
+        () => followUp(first.jobId, "terminating cancellation sibling", { schema: "invalid" })
+      ]);
+    };`));
+    await f.claude.waitForStart();
+    const lineage = f.claude.starts[0]!;
+    f.claude.complete(lineage, "retained");
+    await f.claude.waitForSend();
+    f.claude.emit(lineage, { type: "message", text: "PRIVATE_CANCEL_TRANSCRIPT" });
+    f.claude.fail(lineage, "PRIVATE_CANCEL_ERROR", progressedQuota("claude"));
+    await withTimeout(checkout.waitUntilReached(), "cancellation checkout gap");
+
+    await f.workflows.cancelAgent(started.snapshot.runId, 0, "cancel exact continuing call");
+    checkout.release();
+    const final = await withTimeout(started.completion, "overlapping cancellation completion");
+    assert.equal(final.status, "completed");
+    assert.equal(final.agents[0]?.state, "cancelled");
+    assert.doesNotMatch(JSON.stringify(final), /PRIVATE_CANCEL_TRANSCRIPT/);
+    assertProviderSettlementPublished(f.workflows, final, publications);
+  } finally {
+    checkout.release();
+    unsubscribe();
+    await f.cleanup();
   }
 });
 

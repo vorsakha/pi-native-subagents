@@ -336,6 +336,41 @@ export class StaticWorkflowCheckout implements WorkflowCheckoutOperations {
   }
 }
 
+/** Stable checkout proof whose capture is held until a test releases or cancels it. */
+export class GatedWorkflowCheckout extends StaticWorkflowCheckout {
+  #reached = false;
+  #reachedResolve!: () => void;
+  readonly #reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
+  #release!: () => void;
+  readonly #releasePromise = new Promise<void>((resolve) => { this.#release = resolve; });
+
+  override async capture(cwd: string, signal: AbortSignal): Promise<WorkflowCheckoutProof> {
+    this.#reached = true;
+    this.#reachedResolve();
+    await new Promise<void>((resolve, reject) => {
+      const abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      signal.addEventListener("abort", abort, { once: true });
+      void this.#releasePromise.then(() => {
+        signal.removeEventListener("abort", abort);
+        resolve();
+      });
+    });
+    return super.capture(cwd, signal);
+  }
+
+  waitUntilReached(): Promise<void> {
+    return this.#reached ? Promise.resolve() : this.#reachedPromise;
+  }
+
+  release(): void {
+    this.#release();
+  }
+}
+
 /** Stable checkout proof whose scheduler-admission assertion is test-controlled. */
 export class AdmissionGatedWorkflowCheckout extends StaticWorkflowCheckout {
   #assertions = 0;
