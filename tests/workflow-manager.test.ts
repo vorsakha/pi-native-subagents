@@ -3765,6 +3765,92 @@ test("a live checkpoint captures provider-wait metadata; the final checkpoint do
   }
 });
 
+test("provider-wait transition clears raw attempt errors and exhaustion persists a safe terminal reason", async () => {
+  const { clock, advance } = fakeProviderWaitClock();
+  const f = await fixture(4, undefined, undefined, clock);
+  const marker = /sk-(?:first|second)-secret|\/outside\/workspace/;
+  try {
+    const script = `export default async () => agent("quota check");`;
+    const started = await f.workflows.start(f.request(
+      script,
+      { retry: { providerUnavailable: "wait", maxWaitMs: 60 * 60_000, maxAttempts: 1 } },
+    ));
+    await waitFor(() => f.backend.requests.length === 1, "first attempt");
+    f.backend.fail(
+      f.backend.starts[0]!,
+      "quota rejected token=sk-first-secret at /outside/workspace/first.log",
+      fakeQuota(clock.now() + 60_000),
+    );
+    await waitFor(() => f.workflows.check(started.snapshot.runId).agents[0]?.state === "waiting", "provider wait");
+
+    const waiting = f.workflows.check(started.snapshot.runId);
+    assert.equal(waiting.agents[0]?.error, undefined, "the failed attempt is no longer the logical agent's current error");
+    assert.deepEqual(waiting.agents[0]?.providerWait, {
+      provider: "codex",
+      kind: "quota",
+      scope: undefined,
+      detail: "quota exhausted",
+      retryAt: clock.now() + 60_000,
+      attempt: 1,
+      maxAttempts: 1,
+    });
+    assert.doesNotMatch(JSON.stringify(waiting), marker);
+
+    let waitingCheckpoint: WorkflowSnapshot | undefined;
+    const deadline = Date.now() + 2_000;
+    while (Date.now() < deadline) {
+      const checkpoint = await readCheckpoint(started.snapshot.artifactDir);
+      if (checkpoint.agents[0]?.state === "waiting") { waitingCheckpoint = checkpoint; break; }
+      await delay(20);
+    }
+    assert.ok(waitingCheckpoint, "the durable checkpoint captures the authoritative wait state");
+    assert.equal(waitingCheckpoint.agents[0]?.error, undefined);
+    assert.doesNotMatch(JSON.stringify(waitingCheckpoint), marker);
+
+    advance(60_000);
+    await waitFor(() => f.backend.requests.length === 2, "provider retry");
+    f.backend.fail(
+      f.backend.starts[1]!,
+      "quota rejected token=sk-second-secret at /outside/workspace/second.log",
+      fakeQuota(clock.now() + 60_000),
+    );
+    const final = await started.completion;
+    const result = final.result as { ok: boolean; error?: string };
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? "", /provider wait exhausted \(attempt 1\/1\)/i);
+    assert.equal(final.agents[0]?.state, "failed");
+    assert.equal(final.agents[0]?.error, result.error, "the terminal policy reason replaces the raw provider error");
+    assert.deepEqual(final.agents[0]?.attempts?.map((attempt) => ({
+      disposition: attempt.disposition,
+      harness: attempt.harness,
+      jobId: attempt.jobId,
+      error: attempt.error,
+    })), [{
+      disposition: "wait",
+      harness: "codex",
+      jobId: f.backend.starts[0],
+      error: undefined,
+    }], "bounded attempt provenance survives without promoting the raw error");
+    assert.doesNotMatch(JSON.stringify(final), marker);
+
+    const finalCheckpoint = await readCheckpoint(started.snapshot.artifactDir);
+    assert.equal(finalCheckpoint.agents[0]?.error, result.error);
+    assert.doesNotMatch(JSON.stringify(finalCheckpoint), marker);
+    const journal = await loadWorkflowJournal(f.artifactRoot, started.snapshot.runId);
+    assert.doesNotMatch(JSON.stringify(journal), marker);
+
+    const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: started.snapshot.runId }));
+    await waitFor(() => f.backend.requests.length === 3, "terminal pre-inference failure reruns on replay");
+    f.backend.complete(f.backend.starts[2]!, "recovered after provider window");
+    const replayed = await resumed.completion;
+    assert.equal(replayed.replay?.matchedCalls, 0, "a failed pre-inference call remains non-replayable");
+    assert.equal((replayed.result as { ok?: boolean }).ok, true);
+    assert.doesNotMatch(JSON.stringify(replayed), marker);
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("followUp reuses the same jobId/native session across phases for a planner review and an implementer fix cycle", async () => {
   const f = await fixture();
   try {

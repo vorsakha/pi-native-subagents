@@ -218,10 +218,7 @@ export function workflowAgentDashboardSummary(agent: WorkflowAgentRecord, now: n
   if (agent.waitingOn) {
     return { kind: "input", text: formatWorkflowInteraction(agent.waitingOn, now) };
   }
-  if (agent.error || agent.state === "failed") {
-    return { kind: "failure", text: summaryPreview(agent.error) || "Agent failed" };
-  }
-  if (agent.answering) {
+  if (agent.state === "waiting" && agent.answering) {
     return {
       kind: "activity",
       text: `answering peer question from ${sanitizeInline(agent.answering.sourceName)}`,
@@ -230,6 +227,15 @@ export function workflowAgentDashboardSummary(agent: WorkflowAgentRecord, now: n
 
   if (agent.state === "waiting") {
     return { kind: "wait", text: formatProviderWait(agent, now) ?? "waiting for provider" };
+  }
+  if (agent.error || agent.state === "failed") {
+    return { kind: "failure", text: summaryPreview(agent.error) || "Agent failed" };
+  }
+  if (agent.answering) {
+    return {
+      kind: "activity",
+      text: `answering peer question from ${sanitizeInline(agent.answering.sourceName)}`,
+    };
   }
   if (agent.state === "queued") {
     return { kind: "wait", text: "queued for workflow dispatch" };
@@ -287,6 +293,16 @@ export function workflowDashboardSummary(snapshot: WorkflowSnapshot, now: number
     };
   }
 
+  const answering = [...snapshot.agents].reverse().find((agent) => agent.answering);
+  const providerWait = [...snapshot.agents].reverse().find((agent) => agent.state === "waiting" && agent.providerWait);
+  if (answering && providerWait) return workflowAgentDashboardSummary(answering, now);
+  if (providerWait) {
+    return {
+      kind: "wait",
+      text: `${sanitizeInline(providerWait.name)}: ${formatProviderWait(providerWait, now)}`,
+    };
+  }
+
   const failedAgent = [...snapshot.agents].reverse().find((agent) => agent.state === "failed");
   const failedPhase = [...snapshot.phases].reverse().find((phase) => phase.status === "failed");
   const activeFailure = snapshot.status === "pending" || snapshot.status === "running" || snapshot.status === "paused";
@@ -301,17 +317,7 @@ export function workflowDashboardSummary(snapshot: WorkflowSnapshot, now: number
       text: summaryPreview(snapshot.error ?? failedAgent?.error ?? failedPhase?.error) || fallback,
     };
   }
-
-  const answering = [...snapshot.agents].reverse().find((agent) => agent.answering);
   if (answering) return workflowAgentDashboardSummary(answering, now);
-
-  const providerWait = [...snapshot.agents].reverse().find((agent) => agent.state === "waiting" && agent.providerWait);
-  if (providerWait) {
-    return {
-      kind: "wait",
-      text: `${sanitizeInline(providerWait.name)}: ${formatProviderWait(providerWait, now)}`,
-    };
-  }
   if (snapshot.status === "pending" || snapshot.agents.some((agent) => agent.state === "queued")) {
     return { kind: "wait", text: "queued for workflow dispatch" };
   }

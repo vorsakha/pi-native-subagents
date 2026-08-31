@@ -144,9 +144,18 @@ test("workflow run and agent summaries preserve semantic priority and wait disti
     index: 1,
     name: "tests",
     state: "waiting",
+    error: "legacy token=sk-render-secret at /outside/workspace/provider.log",
     providerWait: { provider: "codex", kind: "quota", detail: "limit", retryAt: 66_000, attempt: 1, maxAttempts: 3 },
   });
-  assert.equal(workflowDashboardSummary(providerWait, 6_000).text, "tests: waiting for codex quota · retry in 1m · attempt 1/3");
+  providerWait.error = "legacy token=sk-run-secret at /outside/workspace/run.log";
+  assert.deepEqual(workflowAgentDashboardSummary(providerWait.agents[1]!, 6_000), {
+    kind: "wait",
+    text: "waiting for codex quota · retry in 1m · attempt 1/3",
+  });
+  assert.deepEqual(workflowDashboardSummary(providerWait, 6_000), {
+    kind: "wait",
+    text: "tests: waiting for codex quota · retry in 1m · attempt 1/3",
+  });
 
   providerWait.agents.unshift(agent({
     index: 2,

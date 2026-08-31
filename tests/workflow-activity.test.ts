@@ -9,7 +9,7 @@ import type {
   WorkflowStatus,
   WorkflowTaskOutcome,
 } from "../src/workflows/types.ts";
-import { renderWorkflowActivity, WorkflowActivityStore } from "../extensions/workflows/activity.ts";
+import { renderWorkflowActivity, workflowActivityRow, WorkflowActivityStore } from "../extensions/workflows/activity.ts";
 import { theme } from "./helpers.ts";
 
 interface WorkflowFixtureOptions {
@@ -159,4 +159,21 @@ test("workflow editor rows show a retained peer answer ahead of other run activi
   assert.equal(snapshot.rows[0]?.activity, "answering peer question from reviewer");
   assert.match(renderWorkflowActivity(snapshot, theme, 160).join("\n"), /answering peer question from reviewer/);
   assert.doesNotMatch(renderWorkflowActivity(snapshot, theme, 160).join("\n"), /waiting for codex quota/);
+});
+
+test("workflow editor rows treat provider waiting as authoritative over stale errors", () => {
+  const run = workflowFixture({ runId: "wf_provider_wait", name: "provider wait" });
+  run.error = "legacy token=sk-run-secret at /outside/workspace/run.log";
+  const active = run.agents[0]!;
+  active.state = "waiting";
+  active.error = "legacy token=sk-agent-secret at /outside/workspace/provider.log";
+  active.providerWait = { provider: "codex", kind: "quota", detail: "limit", retryAt: 66_000, attempt: 1, maxAttempts: 3 };
+
+  const row = workflowActivityRow(run, 6_000);
+  assert.equal(row.state, "waiting");
+  assert.equal(row.attention, false);
+  assert.equal(row.activity, "builder: waiting for codex quota · retry in 1m · attempt 1/3");
+  const rendered = renderWorkflowActivity({ rows: [row], active: 1, finishing: 0, attention: 0, key: "provider-wait" }, theme, 160).join("\n");
+  assert.match(rendered, /waiting for codex quota/);
+  assert.doesNotMatch(rendered, /sk-(?:run|agent)-secret|outside\/workspace/);
 });

@@ -1390,6 +1390,12 @@ export class WorkflowManager {
       // never see a stale or double-spent balance.
       const decision = this.#planProviderWait(record, result, policy, attempt, entry.providerWaitBudgetMs);
       if (!decision.wait) {
+        record.state = "failed";
+        record.providerWait = undefined;
+        record.error = boundedText(decision.reason);
+        record.timestamps.updatedAt = Date.now();
+        record.timestamps.endedAt ??= record.timestamps.updatedAt;
+        this.#touch(entry);
         result = { ok: false, output: result.output, jobId: result.jobId, error: decision.reason, usage: result.usage };
         break;
       }
@@ -3558,6 +3564,10 @@ export class WorkflowManager {
     maxAttempts: number,
   ): void {
     record.state = "waiting";
+    // The failed native attempt's raw detail remains private to the job/session.
+    // Once the logical call is waiting, its raw error is no longer the current
+    // agent error and must not escape through live workflow snapshots.
+    record.error = undefined;
     record.providerWait = {
       provider: unavailable.provider,
       kind: unavailable.kind,

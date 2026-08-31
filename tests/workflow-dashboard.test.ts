@@ -965,6 +965,8 @@ test("short workflow agent inspectors pin active state or terminal recovery deta
   const waitingRun = workflow("short-provider-wait");
   const waiting = waitingRun.agents[1]!;
   waiting.state = "waiting";
+  waitingRun.error = "legacy token=sk-run-secret at /outside/workspace/run.log";
+  waiting.error = "legacy token=sk-agent-secret at /outside/workspace/provider.log";
   waiting.providerWait = {
     provider: "codex",
     kind: "quota",
@@ -977,11 +979,14 @@ test("short workflow agent inspectors pin active state or terminal recovery deta
   waiting.transcript = [{ kind: "assistant", text: "WAIT_TRANSCRIPT" }];
   const provider = harness([waitingRun], 8, () => {}, { fullscreen: true });
   t.after(() => provider.overlay.dispose());
+  const runText = provider.overlay.render(72).join("\n");
+  assert.match(runText, /waiting for/);
+  assert.doesNotMatch(runText, /sk-(?:run|agent)-secret|outside\/workspace/);
   openAgentDetail(provider.overlay, 52, 1);
   const providerText = provider.overlay.render(52).join("\n");
   assert.match(providerText, /Provider wait ·/);
   assert.match(providerText, /Retry · 1m · attempt 1\/3 · automatic/);
-  assert.doesNotMatch(providerText, /test result 59|WAIT_TRANSCRIPT|transcript|result yet/i, "provider waits retain only safe wait metadata until the agent settles");
+  assert.doesNotMatch(providerText, /test result 59|WAIT_TRANSCRIPT|transcript|result yet|sk-(?:run|agent)-secret|outside\/workspace/i, "provider waits retain only safe wait metadata until the agent settles");
 
   const questionRun = workflow("short-question");
   questionRun.agents[1]!.waitingOn = {
