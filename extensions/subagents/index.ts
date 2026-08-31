@@ -1262,7 +1262,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     promptSnippet: "Spawn a native Pi, Claude Code, or Codex subagent in the background",
     promptGuidelines: [
       "Give each isolated agent a complete task with all relevant paths, requirements, constraints, and expected verification.",
-      "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
+      "Omit profile by default; use a profile only when the human explicitly requests that named profile. Profile metadata never authorizes Fast by itself.",
       "Use access=readOnly for inspection; use independent=true only for a different native provider, or independentOf=<jobId> to review with a different provider than the producer.",
       "Use requires only for capabilities confirmed by subagent_capabilities; pair it with harness=auto to let the capable harness be chosen.",
       "Omit model to use the native harness default; a different model on the same provider is not independent.",
@@ -1539,7 +1539,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       const route = args.model ? `${harness}/${args.model}` : harness;
       const effort = args.effort ? ` · effort:${args.effort}` : "";
       const profile = args.profile ? ` · profile:${args.profile}` : "";
-      return renderToolCallLine(theme, "Run", args.name ?? "agent", `[${route}${effort}${profile}] ${truncatePreview(args.task)}`);
+      const speed = args.speed === "fast" ? " · speed:fast · Codex credits apply" : "";
+      return renderToolCallLine(theme, "Run", args.name ?? "agent", `[${route}${effort}${profile}${speed}] ${truncatePreview(args.task)}`);
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);

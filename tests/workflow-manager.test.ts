@@ -339,26 +339,31 @@ test("workflow agent speed is explicit, fixed, and rejected before unsupported o
     f.backend.completeTask("fast-work", "done");
     const completed = await fast.completion;
     assert.equal(completed.agents[0]?.speed, "fast");
+    assert.equal(completed.agents[0]?.effectiveSpeed, undefined, "successful priority dispatch is not an observed Fast receipt");
+    const persistedFast = (await loadWorkflowSummaries(f.artifactRoot)).find((run) => run.runId === completed.runId);
+    assert.equal(persistedFast?.agents[0]?.speed, "fast");
+    assert.equal(persistedFast?.agents[0]?.effectiveSpeed, undefined);
     const replayed = await f.workflows.start(f.request(fastScript, { resumeFromRunId: completed.runId }));
     const replayedFinal = await replayed.completion;
     assert.equal(replayedFinal.agents[0]?.speed, "fast");
+    assert.equal(replayedFinal.agents[0]?.effectiveSpeed, undefined);
     assert.equal(replayedFinal.agents[0]?.outputProvenance, "replay");
     assert.equal(f.backend.requests.length, 1, "exact Fast replay spends no new turn or credits");
 
     const profiled = await f.workflows.start(f.request(`
       export default async () => agent("profile-fast", { profile: "fast-reviewer", access: "readOnly" });
     `));
-    await waitFor(() => f.backend.requests.length === 2, "Fast profile dispatch");
-    assert.equal(f.backend.requests[1]?.policy.speed, "fast");
+    await waitFor(() => f.backend.requests.length === 2, "profiled standard dispatch");
+    assert.equal(f.backend.requests[1]?.policy.speed, "standard", "profile metadata alone cannot authorize Fast");
     f.backend.completeTask("profile-fast", "done");
-    assert.equal((await profiled.completion).agents[0]?.speed, "fast");
+    assert.equal((await profiled.completion).agents[0]?.speed, "standard");
 
     const overridden = await f.workflows.start(f.request(`
-      export default async () => agent("profile-standard", { profile: "fast-reviewer", speed: "standard", access: "readOnly" });
+      export default async () => agent("profile-authorized-fast", { profile: "fast-reviewer", speed: "fast", access: "readOnly" });
     `));
-    await waitFor(() => f.backend.requests.length === 3, "standard profile override dispatch");
-    assert.equal(f.backend.requests[2]?.policy.speed, "standard");
-    f.backend.completeTask("profile-standard", "done");
+    await waitFor(() => f.backend.requests.length === 3, "explicit Fast profile dispatch");
+    assert.equal(f.backend.requests[2]?.policy.speed, "fast");
+    f.backend.completeTask("profile-authorized-fast", "done");
     await overridden.completion;
 
     const unsupported = await f.workflows.start(f.request(`

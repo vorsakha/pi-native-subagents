@@ -55,7 +55,7 @@ const failed = files.filter((_, index) => processed[index] === null);
 
 Always await every `agent()`/`followUp()` call before returning from the default function. A forgotten promise fails the workflow rather than silently losing the child result.
 
-`agent("task", { harness: "codex", speed: "fast" })` explicitly opts one Codex lineage into Fast mode. Omit `speed` for standard policy. Fast is unsupported by Pi and Claude, does not choose a route for `harness: "auto"`, and cannot combine with provider or continuation fallback.
+`agent("task", { harness: "codex", speed: "fast" })` explicitly opts one Codex lineage into Fast mode. Omit `speed` for standard policy. A selected profile never supplies this opt-in. Fast is unsupported by Pi and Claude, does not choose a route for `harness: "auto"`, and cannot combine with provider or continuation fallback.
 
 ## Continuing a retained agent with followUp
 

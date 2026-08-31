@@ -156,10 +156,8 @@ export function formatSpeedBilling(input: { speed?: JobSnapshot["speed"]; effect
   const requested = input.speed ?? "standard";
   const effective = input.effectiveSpeed;
   if (requested !== "fast" && effective !== "fast") return "";
-  const mismatch = effective && effective !== requested
-    ? ` · ${effective === "fast" ? `requested ${requested}` : `effective ${effective}`}`
-    : "";
-  return `speed fast · Codex credits apply · monetary cost unreported${mismatch}`;
+  const observed = effective ? `observed ${effective}` : "effective speed unknown";
+  return `requested ${requested} · Codex credits apply · monetary cost unreported · ${observed}`;
 }
 
 export type TraceStatusColor = "accent" | "success" | "warning" | "error" | "muted" | "dim";

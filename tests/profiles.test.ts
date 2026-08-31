@@ -22,7 +22,7 @@ test("profiles load from global and trusted project directories with project pre
     assert.equal(loaded.profiles.size, 1);
     assert.equal(loaded.profiles.get("audit")?.origin, "project");
     assert.equal(loaded.profiles.get("audit")?.systemPrompt, "project instructions");
-    assert.equal(loaded.profiles.get("audit")?.speed, "fast");
+    assert.equal(loaded.profiles.get("audit")?.speed, "fast", "the loader retains speed policy without treating it as request authorization");
     assert.equal(loaded.warnings.length, 4);
     assert.ok(loaded.warnings.some((warning) => /Invalid speed/.test(warning.message)));
     assert.ok(loaded.warnings.some((warning) => /Invalid access/.test(warning.message)));

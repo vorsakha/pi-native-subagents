@@ -5,7 +5,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { ClaudeBackend, CLAUDE_SUBAGENT_ASK_TOOL, forbiddenInitTools } from "../src/backends/claude.ts";
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
-import { CodexAppServerBackend, classifyCodexUnavailability, codexExitDiagnostic, normalizeCodexSpeed } from "../src/backends/codex.ts";
+import { CodexAppServerBackend, classifyCodexUnavailability, codexExitDiagnostic } from "../src/backends/codex.ts";
 import { MAX_OUTPUT_BYTES } from "../src/reducer.ts";
 import type { BackendEvent, BackendRun, HarnessName, BackendRequest } from "../src/types.ts";
 import {
@@ -1495,7 +1495,7 @@ test("Codex reuses its native thread for queued and post-settlement follow-ups",
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
 });
 
-test("Codex sends priority on every fast retained turn and reports native effective speed", async () => {
+test("Codex sends priority on every fast retained turn without manufacturing effective speed", async () => {
   const fake = await fixture(CODEX_FIXTURE);
   const events: BackendEvent[] = [];
   const paramFile = join(fake.dir, "turn-params.jsonl");
@@ -1518,17 +1518,9 @@ test("Codex sends priority on every fast retained turn and reports native effect
     }
     const turns = (await readFile(paramFile, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
     assert.deepEqual(turns.map((params) => params.serviceTier), ["priority", "priority"]);
-    assert.ok(contextEvents(events).some((event) => event.context.effectiveSpeed === "standard"));
-    assert.equal(contextEvents(events).at(-1)?.context.effectiveSpeed, "fast");
+    assert.deepEqual(contextEvents(events), [], "request acceptance, thread defaults, and next-turn settings are not served-tier receipts");
     await run.close();
   } finally { await rm(fake.dir, { recursive: true, force: true }); }
-});
-
-test("Codex effective speed normalization ignores unknown provider values", () => {
-  assert.equal(normalizeCodexSpeed("default"), "standard");
-  assert.equal(normalizeCodexSpeed("priority"), "fast");
-  assert.equal(normalizeCodexSpeed("fast"), "fast");
-  assert.equal(normalizeCodexSpeed("experimental"), undefined);
 });
 
 test("Codex surfaces a native priority-policy rejection without retrying or downgrading", async () => {

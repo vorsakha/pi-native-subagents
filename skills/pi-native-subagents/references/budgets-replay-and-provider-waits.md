@@ -1,33 +1,33 @@
 # Budgets, replay, and provider waits
 
-Read this before setting spend limits, replay, waiting, or fallback. These options change dispatch and accounting.
+Read this before setting budgets, replay, waits, or fallback.
 
 ## Direct-job budgets
 
-Direct limits are optional and cumulative across the retained session and its follow-ups. Omit them for an open budget.
+Direct limits are optional and cumulative across a retained lineage. Omit them for an open budget.
 
-Reaching a direct spend boundary never cancels the active turn or changes its result. The active turn finishes, usage may overshoot, and later retained follow-ups are rejected. A follow-up submitted during an active generation waits for settlement and a cumulative-budget recheck; steering the active generation stays immediate.
+A reached direct limit never cancels or changes the active turn. It may overshoot, then blocks later follow-ups. A follow-up queued mid-generation waits for settlement and a cumulative recheck; steering stays immediate.
 
 Fresh input plus output consumes `maxTokens`; cache reads do not. Never infer a spend limit from a profile, route, model, or environment.
 
 ## Workflow budgets
 
-- `maxAgents` and `maxConcurrency` limit work shape. `maxTokens` limits aggregate fresh input plus output; cached reads remain visible but do not consume that budget. `maxTokensPerAgent` applies the same ceiling to one child. `maxCost` and `maxTurns` are aggregate, and `maxTurns` is not a per-agent allowance.
-- Workflow budgets are optional. An omitted or empty budget leaves spend open while the hard ceilings — 32 calls, four workers, global concurrency four, watchdogs, provider/context limits, bounded persistence, cancellation, and shutdown — remain in force.
-- Spend limits are soft dispatch boundaries. The runtime warns once per metric, lets running calls finish, accepts overshoot, preserves their results, and blocks later fresh dispatches. Queued workflow jobs recheck when a global slot opens. Replayable completions bypass fresh-dispatch checks; `maxTokensPerAgent` follows the same rule.
+- `maxAgents` and `maxConcurrency` limit work shape. `maxTokens` counts aggregate fresh input plus output, not cache reads. `maxTokensPerAgent` applies that ceiling per child. `maxCost` and `maxTurns` are aggregate.
+- Omitted workflow budgets leave spend open. Hard ceilings remain: 32 calls, four workers, global concurrency four, watchdogs, provider/context limits, bounded persistence, cancellation, and shutdown.
+- Spend limits are soft dispatch boundaries. The runtime warns once per metric, lets running calls finish and overshoot, then blocks fresh dispatches. Queued jobs recheck on admission. Replayable completions bypass fresh checks; `maxTokensPerAgent` does too.
 - `>=` is reached. Aggregate usage spans children. Exact replay is free; handoff admission adds carried source spend to checkpointed and journal-only current usage.
 
 ## Cost reporting is provider-dependent
 
-Pi and Claude report token, turn, and cost metrics. Codex reports tokens and turns but not cost, so a Codex route with `maxCost` is rejected before dispatch — both directly and in a workflow. The runtime validates the final live route, including the provider opposite an `independentOf` producer, instead of comparing the limit with a synthetic zero. Never treat Codex's absent cost metric as zero.
+Pi and Claude report tokens, turns, and cost. Codex omits cost, so its routes reject `maxCost` before dispatch. Validation uses the final live route, including the provider opposite an `independentOf` producer. Never treat absent cost as zero.
 
-Codex Fast mode is the explicit `speed: "fast"` policy. It may consume credits faster, but the adapter reports neither exact credits nor authoritative monetary cost. Cards therefore say `Codex credits apply · monetary cost unreported`; no credit estimate or budget is synthesized.
+Codex Fast requires `speed: "fast"` on the direct request or workflow `agent()` call. Profiles may permit or constrain it, but never opt in. The adapter reports no exact credits or monetary cost. Cards say `Codex credits apply · monetary cost unreported`; no estimate or budget is synthesized.
 
 ## Replay with resumeFromRunId
 
-`resumeFromRunId` replays every independently matching completed call, including later calls from a parallel batch when an earlier lane failed. Failed, incomplete, duplicated, or fingerprint-mismatched ordinals rerun live.
+`resumeFromRunId` replays each matching completion, including later parallel calls after an earlier lane failed. Failed, incomplete, duplicated, or mismatched ordinals rerun live.
 
-- Keep source, input, project, and routing context identical; only increase replay budgets when the runtime permits it.
+- Keep source, input, project, and route identical; increase replay budgets only when permitted.
 - A terminal retained source can be looked up by run ID across Pi sessions; the source summary and journal are read under the retention lock before replay starts.
 - New journal records add available route evidence: requested and resolved harness, normalized auto-candidate checks, executable version, model, and capability fingerprint. Older journals still load without it. A matched completion reuses its result and evidence; invalidation or mismatch dispatches fresh and may resolve `harness: "auto"` again.
 - Requested speed is replay identity. Explicit `standard` matches a legacy omitted value; `fast` does not. Exact Fast replay dispatches nothing and consumes no new credits. Effective speed is telemetry and never changes continuation identity.

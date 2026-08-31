@@ -6,10 +6,10 @@ import { HarnessAutoUnavailableError, HarnessUnavailableError, type HarnessAvail
 import type { JobManager, PeerInteractionRequest, PeerInteractionResult } from "../manager.ts";
 import { isTerminal } from "../manager.ts";
 import { renderPeerQuestionPrompt, type PendingInteraction } from "../interactions.ts";
-import { normalizeModel } from "../policy.ts";
+import { normalizeModel, selectSpeed } from "../policy.ts";
 import { reachedSpendWarning, spendBudgetMetrics, validateSpendBudget } from "../budget.ts";
 import { waitDecision, type ProviderUnavailability } from "../provider-unavailability.ts";
-import type { AccessMode, AgentSpeed, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SpawnRequest, StructuredOutputSupport, Usage } from "../types.ts";
+import type { AccessMode, BackendEvent, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SpawnRequest, StructuredOutputSupport, Usage } from "../types.ts";
 import {
   appendWorkflowJournal,
   checkpointWorkflow,
@@ -81,7 +81,6 @@ import type {
 
 const EFFORTS = new Set<EffortLevel>(["low", "medium", "high", "xhigh", "max"]);
 const ACCESS = new Set<AccessMode>(["readOnly", "full"]);
-const SPEEDS = new Set<AgentSpeed>(["standard", "fast"]);
 const CHECKPOINT_DELAY_MS = 150;
 const MAX_WORKFLOW_LOGS = 128;
 export const MAX_WORKFLOW_PHASES = 64;
@@ -1859,9 +1858,9 @@ export class WorkflowManager {
     if (effort && !EFFORTS.has(effort)) return { ok: false, output: "", error: `Unknown effort: ${effort}` };
     const profileName = typeof options.profile === "string" ? options.profile.trim() : undefined;
     const selectedProfile = profileName ? this.#resolveProfile?.(profileName) : undefined;
-    const speedValue = retry?.record.speed ?? options.speed ?? selectedProfile?.speed ?? "standard";
-    const speed = String(speedValue) as AgentSpeed;
-    if (!SPEEDS.has(speed)) return { ok: false, output: "", error: `Unknown speed: ${speed}` };
+    let speed;
+    try { speed = selectSpeed({ speed: retry?.record.speed ?? options.speed }, selectedProfile); }
+    catch (error) { return { ok: false, output: "", error: boundedText(error) }; }
     if (speed === "fast" && (fallbackDeclaration.fallback || continuationDeclaration.fallback)) {
       return { ok: false, output: "", error: "Fast speed cannot be combined with providerFallback or continuationFallback" };
     }

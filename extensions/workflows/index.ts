@@ -438,7 +438,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       "Use exactly one source (script, workflowName, or scriptPath) and zero or one input form (input or legacy args), never both; omitting both exposes null.",
       "agent(prompt) is generic and defaults to full access after project trust; set access=readOnly for inspection.",
       "Use independent=true only for a different native provider; use independentOf=<jobId> to review with a provider different from the producer.",
-      "Omit profile by default; use a profile only when the human explicitly requests that named profile.",
+      "Omit profile by default; use a profile only when the human explicitly requests that named profile. Profile metadata never authorizes Fast by itself.",
       "Set speed='fast' only on an explicit Codex agent() route. It uses Codex credits, reports no authoritative monetary cost, and cannot be combined with providerFallback or continuationFallback. Omit it for standard policy.",
       "Scripts cannot access files, network, environment variables, subprocesses, imports, or credentials; only agent, followUp, parallel, pipeline, phase, log, and JSON args are available.",
       "Use background=true for independent long work; completion is delivered automatically as a follow-up.",

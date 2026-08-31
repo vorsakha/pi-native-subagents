@@ -814,3 +814,26 @@ test("manager rejects unknown explicit profiles, untrusted execution, and empty 
   assert.throws(() => manager.spawn({ ...request(1), trusted: false }), /untrusted/);
   assert.throws(() => manager.spawn({ ...request(1), task: " " }), /empty/);
 });
+
+test("manager never dispatches Fast from profile metadata alone", async () => {
+  const backend = new ControlledBackend();
+  const urgent: ProfileDefinition = {
+    name: "urgent",
+    description: "",
+    harness: "codex",
+    speed: "fast",
+    systemPrompt: "urgent review",
+    filePath: "urgent.md",
+    origin: "global",
+  };
+  const manager = new JobManager({ backends: [backend], profiles: new Map([[urgent.name, urgent]]) });
+  const profiled = manager.spawn({ ...request(1), profile: urgent.name });
+  const authorized = manager.spawn({ ...request(2), profile: urgent.name, speed: "fast" });
+  await tick();
+  assert.equal(profiled.speed, "standard");
+  assert.equal(authorized.speed, "fast");
+  assert.deepEqual(backend.policies.map((policy) => policy.speed), ["standard", "fast"]);
+  backend.complete(profiled.id);
+  backend.complete(authorized.id);
+  await manager.shutdown();
+});

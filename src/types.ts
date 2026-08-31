@@ -35,7 +35,7 @@ export interface ContextSnapshot {
   window?: number;
   /** Model identity reported by the native runtime for the current turn; never the configured policy model. */
   servingModel?: string;
-  /** Native service tier reported for the current turn; never inferred from requested policy. */
+  /** Authoritative served tier reported for the current turn; never inferred from request or settings. */
   effectiveSpeed?: AgentSpeed;
 }
 
@@ -219,6 +219,7 @@ export interface ProfileDefinition {
   access?: AccessMode;
   harness?: HarnessName;
   effort?: EffortLevel;
+  /** Optional speed ceiling or permission. Never authorizes Fast without request.speed. */
   speed?: AgentSpeed;
   independent?: boolean;
   lockedHarness?: HarnessName;

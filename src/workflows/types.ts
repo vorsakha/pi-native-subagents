@@ -253,7 +253,7 @@ export interface WorkflowAgentRecord {
   effort?: EffortLevel;
   /** Resolved requested speed, fixed across the logical lineage. */
   speed?: AgentSpeed;
-  /** Latest provider-reported active tier. */
+  /** Latest authoritative provider receipt for the tier that served a turn. */
   effectiveSpeed?: AgentSpeed;
   /** Authoritative originating agent() objective, fixed across bounded history truncation. */
   objective?: string;

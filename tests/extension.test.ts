@@ -145,6 +145,10 @@ test("the subagent extension surface", async (t) => {
     assert.ok(spawnProperties.harness);
     assert.ok(spawnProperties.model);
     assert.deepEqual(spawnProperties.speed.enum, ["standard", "fast"]);
+    const fastCall = spawnTool.renderCall({ task: "urgent review", harness: "codex", speed: "fast" }, theme).render(120).join("\n");
+    assert.match(fastCall, /speed:fast · Codex credits apply/, "the direct trace warns before Fast dispatch");
+    const foregroundFastCall = pi.tools.get("subagent").renderCall({ task: "urgent review", harness: "codex", speed: "fast" }, theme).render(120).join("\n");
+    assert.match(foregroundFastCall, /speed:fast · Codex credits apply/, "the foreground direct trace warns before Fast dispatch");
     assert.equal(spawnProperties.backend, undefined, "backend compatibility is intentionally absent");
     assert.equal(spawnProperties.modelTier, undefined, "tier compatibility is intentionally absent");
     assert.ok(pi.messageRenderers.has("native-workflow-result"));

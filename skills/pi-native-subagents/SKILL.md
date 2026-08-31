@@ -36,12 +36,12 @@ Usage rules:
 
 - Use `access: "readOnly"` for inspection, review, and planning. Request `full` only when mutation is required and the project is trusted. Read-only children are sandboxed by construction, not by instruction.
 - Omit `model` unless a concrete harness-local override is needed. A model name is not a cross-harness tier, and `harness: "auto"` rejects harness-local model overrides.
-- Omit `speed` for standard policy. Use `speed: "fast"` only on an explicit Codex route when the human opts in. Fast is fixed for the retained lineage, uses Codex credits, and has no reported monetary cost. It never follows from model or effort.
+- Omit `speed` for standard policy. Use `speed: "fast"` only on an explicit Codex route when the human opts in. Fast stays fixed, uses Codex credits, and has no reported monetary cost. Never infer it from model, effort, or profile metadata.
 - `harness: "auto"` selects an initial ready route; it is not failover. Explicit routes fail closed except for the workflow opt-ins below. Availability checks are read-only and never install, log in, or reconfigure providers.
 - Use `requires` only with IDs returned by `subagent_capabilities`; pair it with `harness: "auto"` when any capable harness is acceptable.
 - Use `independent: true` only when the child must use a different native provider from the parent. A different model on the same provider is not independent.
 - Use `independentOf: "<producer-job-id>"` when a reviewer must differ from the provider that produced the reviewed work. The target must be an existing job.
-- Omit `profile` unless the human explicitly names one. Profiles may impose access, harness, or routing ceilings.
+- Omit `profile` unless the human names one. Profiles may constrain speed, but never authorize Fast without request-level `speed: "fast"`.
 - At most four jobs run concurrently across direct and workflow work.
 - `maxTokens`, `maxCost`, and `maxTurns` are optional; omit all three for an open spend budget. They bind the retained session cumulatively across every follow-up, never just the current turn, and reaching one blocks later follow-ups instead of cancelling active work. Codex reports no cost, so a Codex route with `maxCost` is rejected before dispatch.
 

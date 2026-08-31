@@ -3,11 +3,12 @@ import { PARENT_THREAD_TOOL_NAME } from "./parent-thread-context.ts";
 import { SUBAGENT_ASK_TOOL_NAME } from "./interactions.ts";
 import type { AccessMode, AgentSpeed, HarnessName, BackendPolicy, ProfileDefinition, ProviderFamily, SpawnRequest } from "./types.ts";
 
-const SPEEDS = new Set<AgentSpeed>(["standard", "fast"]);
-
-export function selectSpeed(request: SpawnRequest, profile?: ProfileDefinition): AgentSpeed {
-  const speed = request.speed ?? profile?.speed ?? "standard";
-  if (!SPEEDS.has(speed)) throw new Error(`Unknown speed: ${String(speed)}`);
+export function selectSpeed(request: { speed?: unknown }, profile?: ProfileDefinition): AgentSpeed {
+  const speed = request.speed ?? "standard";
+  if (speed !== "standard" && speed !== "fast") throw new Error(`Unknown speed: ${String(speed)}`);
+  if (speed === "fast" && profile?.speed === "standard") {
+    throw new Error(`Profile ${profile.name} constrains speed to standard`);
+  }
   return speed;
 }
 
