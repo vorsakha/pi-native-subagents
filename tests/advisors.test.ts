@@ -977,6 +977,36 @@ test("Windows cross-volume relative paths fail advisor cwd containment", () => {
   assert.equal(relativePathEscapesRoot("..\\outside", "win32"), true);
 });
 
+test("advisor storage initializes lazily when the trusted private root is absent", async () => {
+  const base = await tempDir("advisor-missing-root");
+  try {
+    const trustedRoot = join(base, "agent-dir");
+    const store = new FileAdvisorStore(join(trustedRoot, "native-subagents", "advisors"), trustedRoot);
+
+    assert.deepEqual(await store.load(threadId), []);
+
+    const backend = new ControlledBackend("codex");
+    const jobs = new JobManager({ backends: [backend] });
+    const registry = new AdvisorRegistry({
+      jobs,
+      store,
+      router: new ScriptedAdvisorRouter("codex"),
+      threadId,
+      projectRoot: process.cwd(),
+    });
+    await registry.initialize();
+    await registry.shutdown();
+    await jobs.shutdown();
+    await assert.rejects(stat(trustedRoot), { code: "ENOENT" });
+
+    await mkdir(trustedRoot);
+    await store.save(threadId, []);
+    assert.deepEqual(await store.load(threadId), []);
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
 test("advisor private persistence rejects symlinked roots and state files", async () => {
   const base = await tempDir("advisor-symlink-store");
   const redirected = await tempDir("advisor-symlink-target");

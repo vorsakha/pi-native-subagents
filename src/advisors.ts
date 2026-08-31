@@ -156,7 +156,8 @@ export interface AdvisorStore {
 
 /** Extension-private, mode-0600 storage keyed by a hash of the parent thread ID. */
 export class FileAdvisorStore implements AdvisorStore {
-  readonly #trustedRoot: string;
+  readonly #requestedTrustedRoot: string;
+  #trustedRoot?: string;
   readonly #segments: string[];
   readonly #descriptorRoot?: string;
   readonly #portableNamespace: string;
@@ -172,7 +173,8 @@ export class FileAdvisorStore implements AdvisorStore {
     if (!relation || relativePathEscapesRoot(relation) || resolve(requestedTrustedRoot, relation) !== requestedRoot) {
       throw new Error("Advisor state root must be a strict descendant of its trusted private root");
     }
-    this.#trustedRoot = realpathSync(requestedTrustedRoot);
+    this.#requestedTrustedRoot = requestedTrustedRoot;
+    if (existsSync(requestedTrustedRoot)) this.#trustedRoot = realpathSync(requestedTrustedRoot);
     this.#segments = relation.split(sep).filter(Boolean);
     this.#descriptorRoot = options.descriptorAnchoring === false ? undefined : availableDescriptorRoot();
     this.#portableNamespace = createHash("sha256").update(this.#segments.join("/")).digest("hex").slice(0, 16);
@@ -182,7 +184,7 @@ export class FileAdvisorStore implements AdvisorStore {
     let directory: PrivateDirectory | undefined;
     let handle: Awaited<ReturnType<typeof open>> | undefined;
     try {
-      directory = await openPrivateDirectory(this.#trustedRoot, this.#storageSegments(), false, this.#descriptorRoot);
+      directory = await this.#openPrivateDirectory(false);
       const path = join(directory.path, this.#filename(threadId));
       handle = await open(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
       await verifyOpenPrivateFile(directory, path, handle);
@@ -227,7 +229,7 @@ export class FileAdvisorStore implements AdvisorStore {
     if (Buffer.byteLength(contents) > MAX_ADVISOR_STORE_BYTES) {
       throw new Error(`Advisor state exceeds ${MAX_ADVISOR_STORE_BYTES} bytes`);
     }
-    const directory = await openPrivateDirectory(this.#trustedRoot, this.#storageSegments(), true, this.#descriptorRoot);
+    const directory = await this.#openPrivateDirectory(true);
     try {
       await atomicPrivateWrite(directory, this.#filename(threadId), contents);
     } finally {
@@ -242,6 +244,11 @@ export class FileAdvisorStore implements AdvisorStore {
 
   #storageSegments(): string[] {
     return this.#descriptorRoot ? this.#segments : [];
+  }
+
+  async #openPrivateDirectory(create: boolean): Promise<PrivateDirectory> {
+    this.#trustedRoot ??= await realpath(this.#requestedTrustedRoot);
+    return openPrivateDirectory(this.#trustedRoot, this.#storageSegments(), create, this.#descriptorRoot);
   }
 }
 
@@ -958,6 +965,7 @@ export class AdvisorRegistry {
     const write = this.#persistChain.catch(() => undefined).then(async () => {
       const next = new Map([...this.#persistedRecords].map(([id, record]) => [id, cloneStored(record)]));
       update(next);
+      if (next.size === 0 && this.#persistedRecords.size === 0) return;
       await this.#store.save(this.#threadId, [...next.values()].map(cloneStored));
       this.#persistedRecords.clear();
       for (const [id, record] of next) this.#persistedRecords.set(id, cloneStored(record));
