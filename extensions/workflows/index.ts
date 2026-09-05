@@ -314,7 +314,6 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   let sessionContext: ExtensionContext | undefined;
   let generation = 0;
   let shuttingDown = false;
-  let finalSnapshots: WorkflowSnapshot[] = [];
   const liveBlinks = new Set<LiveWorkflowBlink>();
 
   const getManager = () => {
@@ -615,7 +614,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     shortcut,
     shortcutHint,
     list() {
-      return manager?.list() ?? finalSnapshots;
+      return manager?.list() ?? [];
     },
     check(runId) {
       if (shuttingDown || !manager) return undefined;
@@ -625,7 +624,6 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     sessionStart(ctx, jobs) {
       const sessionGeneration = ++generation;
       shuttingDown = false;
-      finalSnapshots = [];
       clearBlinks();
       sessionContext = ctx;
       unsubscribe?.();
@@ -675,19 +673,24 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       generation++;
       clearBlinks();
       const closing = manager;
+      let finalSnapshots: WorkflowSnapshot[] = [];
       let shutdownError: unknown;
       try { await closing?.shutdown(); }
       catch (error) { shutdownError = error; }
-      finalSnapshots = closing?.list() ?? [];
-      if (sessionContext?.hasUI) sessionContext.ui.setStatus("native-workflows", undefined);
+      try { finalSnapshots = closing?.list() ?? []; }
+      catch (error) { shutdownError ??= error; }
+      try {
+        if (sessionContext?.hasUI) sessionContext.ui.setStatus("native-workflows", undefined);
+      } catch (error) { shutdownError ??= error; }
       if (shutdownError) throw shutdownError;
       return finalSnapshots;
     },
     sessionClosed() {
-      unsubscribe?.();
+      const dispose = unsubscribe;
       unsubscribe = undefined;
       manager = undefined;
       sessionContext = undefined;
+      dispose?.();
     },
   };
 }

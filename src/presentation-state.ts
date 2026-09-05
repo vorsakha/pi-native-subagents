@@ -265,8 +265,15 @@ export interface NativeSubagentsProjectionOptionsV1 {
   lifecycle: NativeSubagentsStateV1["session"]["lifecycle"];
 }
 
+type SummaryField = "waitingSummary" | "resultSummary" | "errorSummary";
+type SummarizableRecord = {
+  waitingSummary?: string;
+  resultSummary?: string;
+  errorSummary?: string;
+};
+
 interface ProjectionContext {
-  summaryEffects: Map<string, Set<string>>;
+  summaryEffects: WeakMap<SummarizableRecord, Set<SummaryField>>;
   workflowSources: WeakMap<NativeWorkflowStateV1, { agents: number; phases: number }>;
 }
 
@@ -295,7 +302,9 @@ function boundedText(value: string, limit: number, fallback: string): { text: st
     if (text.length + character.length > limit) break;
     text += character;
   }
-  return { text: text || fallback, truncated: text.length < normalized.length };
+  const truncated = text.length < normalized.length;
+  text = text.trimEnd();
+  return { text: text || fallback, truncated };
 }
 
 function boundedId(value: string): string {
@@ -306,18 +315,28 @@ function boundedName(value: string): string {
   return boundedText(value, MAX_NATIVE_SUBAGENTS_STATE_V1_NAME_CHARS, "unnamed").text;
 }
 
-function markSummaryEffect(context: ProjectionContext, recordKey: string, field: string): boolean {
-  const fields = context.summaryEffects.get(recordKey) ?? new Set<string>();
+function markSummaryEffect(
+  context: ProjectionContext,
+  record: SummarizableRecord,
+  field: SummaryField,
+): boolean {
+  const fields = context.summaryEffects.get(record) ?? new Set<SummaryField>();
   if (fields.has(field)) return false;
   fields.add(field);
-  context.summaryEffects.set(recordKey, fields);
+  context.summaryEffects.set(record, fields);
   return true;
 }
 
-function boundedSummary(value: string, context: ProjectionContext, recordKey: string, field: string): string {
+function addSummary(
+  record: SummarizableRecord,
+  field: SummaryField,
+  value: string | undefined,
+  context: ProjectionContext,
+): void {
+  if (value === undefined) return;
   const result = boundedText(value, MAX_NATIVE_SUBAGENTS_STATE_V1_SUMMARY_CHARS, "No details available.");
-  if (result.truncated) markSummaryEffect(context, recordKey, field);
-  return result.text;
+  record[field] = result.text;
+  if (result.truncated) markSummaryEffect(context, record, field);
 }
 
 function compareText(left: string, right: string): number {
@@ -340,22 +359,60 @@ function isTerminalAgent(status: WorkflowAgentRecord["state"]): boolean {
   return status === "completed" || status === "failed" || status === "cancelled" || status === "aborted";
 }
 
+interface RetentionPriority {
+  terminal: boolean;
+  timestamp: number;
+  stableId: string;
+  stableIndex?: number;
+}
+
+function compareRetentionPriority(left: RetentionPriority, right: RetentionPriority): number {
+  return Number(left.terminal) - Number(right.terminal)
+    || right.timestamp - left.timestamp
+    || compareText(left.stableId, right.stableId)
+    || (left.stableIndex ?? 0) - (right.stableIndex ?? 0);
+}
+
+function jobPriority(job: JobSnapshot | NativeSubagentJobStateV1): RetentionPriority {
+  return {
+    terminal: isTerminalJob(job.status),
+    timestamp: "timestamps" in job
+      ? job.timestamps.endedAt ?? job.timestamps.startedAt ?? job.timestamps.createdAt
+      : latestJobTimestamp(job),
+    stableId: `job:${job.id}`,
+  };
+}
+
+function workflowPriority(workflow: WorkflowSnapshot | NativeWorkflowStateV1): RetentionPriority {
+  return {
+    terminal: isTerminalWorkflow(workflow.status),
+    timestamp: workflow.timestamps.updatedAt,
+    stableId: `workflow:${"runId" in workflow ? workflow.runId : workflow.id}:run`,
+  };
+}
+
+function agentPriority(
+  workflowId: string,
+  agent: WorkflowAgentRecord | NativeWorkflowAgentStateV1,
+): RetentionPriority {
+  return {
+    terminal: isTerminalAgent("state" in agent ? agent.state : agent.status),
+    timestamp: agent.timestamps.updatedAt,
+    stableId: `workflow:${workflowId}:agent`,
+    stableIndex: agent.index,
+  };
+}
+
 function compareJobs(left: JobSnapshot, right: JobSnapshot): number {
-  return Number(isTerminalJob(left.status)) - Number(isTerminalJob(right.status))
-    || latestJobTimestamp(right) - latestJobTimestamp(left)
-    || compareText(left.id, right.id);
+  return compareRetentionPriority(jobPriority(left), jobPriority(right));
 }
 
 function compareWorkflows(left: WorkflowSnapshot, right: WorkflowSnapshot): number {
-  return Number(isTerminalWorkflow(left.status)) - Number(isTerminalWorkflow(right.status))
-    || right.timestamps.updatedAt - left.timestamps.updatedAt
-    || compareText(left.runId, right.runId);
+  return compareRetentionPriority(workflowPriority(left), workflowPriority(right));
 }
 
 function compareAgents(left: WorkflowAgentRecord, right: WorkflowAgentRecord): number {
-  return Number(isTerminalAgent(left.state)) - Number(isTerminalAgent(right.state))
-    || right.timestamps.updatedAt - left.timestamps.updatedAt
-    || left.index - right.index;
+  return compareRetentionPriority(agentPriority("", left), agentPriority("", right));
 }
 
 function projectTimestamps(value: WorkflowTimestamps): NativeWorkflowStateV1["timestamps"] {
@@ -437,7 +494,15 @@ function waitingJobSummary(job: JobSnapshot): string | undefined {
 
 function waitingAgentSummary(agent: WorkflowAgentRecord): string | undefined {
   if (agent.providerWait) {
-    return `Waiting to retry ${agent.providerWait.provider} at ${agent.providerWait.retryAt}; attempt ${agent.providerWait.attempt} of ${agent.providerWait.maxAttempts}.`;
+    const { provider, retryAt, attempt, maxAttempts } = agent.providerWait;
+    const validProvider = provider === "claude" || provider === "codex" || provider === "other";
+    const validRetryAt = Number.isSafeInteger(retryAt) && retryAt >= 0;
+    const validAttempt = Number.isSafeInteger(attempt) && attempt >= 1;
+    const validMaxAttempts = Number.isSafeInteger(maxAttempts) && maxAttempts >= attempt;
+    if (!validProvider || !validRetryAt || !validAttempt || !validMaxAttempts) {
+      return "Waiting to retry a provider.";
+    }
+    return `Waiting to retry ${provider} at ${retryAt}; attempt ${attempt} of ${maxAttempts}.`;
   }
   if (agent.waitingOn) {
     return agent.waitingOn.target === "peer" ? "Waiting for a peer agent." : "Waiting for host input.";
@@ -448,12 +513,11 @@ function waitingAgentSummary(agent: WorkflowAgentRecord): string | undefined {
 }
 
 function projectJob(job: JobSnapshot, context: ProjectionContext): NativeSubagentJobStateV1 {
-  const recordKey = `job:${boundedId(job.id)}`;
   const waiting = waitingJobSummary(job);
   const result = jobResultSummary(job.status);
   const error = safeErrorSummary("job", job.status, job.unavailable?.kind === "quota");
   const usage = optionalUsage(job.usage);
-  return {
+  const projected: NativeSubagentJobStateV1 = {
     id: boundedId(job.id),
     name: boundedName(job.name),
     kind: job.workflow ? "workflow-agent" : job.peer ? "session-peer" : "direct",
@@ -482,10 +546,11 @@ function projectJob(job: JobSnapshot, context: ProjectionContext): NativeSubagen
       ...(job.independentOf === undefined ? {} : { independentOfJobId: boundedId(job.independentOf) }),
     },
     ...(usage === undefined ? {} : { usage }),
-    ...(waiting === undefined ? {} : { waitingSummary: boundedSummary(waiting, context, recordKey, "waitingSummary") }),
-    ...(result === undefined ? {} : { resultSummary: boundedSummary(result, context, recordKey, "resultSummary") }),
-    ...(error === undefined ? {} : { errorSummary: boundedSummary(error, context, recordKey, "errorSummary") }),
   };
+  addSummary(projected, "waitingSummary", waiting, context);
+  addSummary(projected, "resultSummary", result, context);
+  addSummary(projected, "errorSummary", error, context);
+  return projected;
 }
 
 function projectPhase(
@@ -505,7 +570,6 @@ function projectPhase(
 }
 
 function projectAgent(workflowId: string, agent: WorkflowAgentRecord, context: ProjectionContext): NativeWorkflowAgentStateV1 {
-  const recordKey = `workflow:${workflowId}:agent:${agent.index}`;
   const validHarness = agent.harness === "pi" || agent.harness === "claude" || agent.harness === "codex"
     ? agent.harness
     : undefined;
@@ -513,7 +577,7 @@ function projectAgent(workflowId: string, agent: WorkflowAgentRecord, context: P
   const result = agentResultSummary(agent.state);
   const error = safeErrorSummary("agent", agent.state, agent.continuation?.trigger.kind === "quota");
   const usage = optionalUsage(agent.usage);
-  return {
+  const projected: NativeWorkflowAgentStateV1 = {
     index: agent.index,
     ...(agent.jobId === undefined ? {} : { jobId: boundedId(agent.jobId) }),
     ...(agent.logicalJobId === undefined ? {} : { logicalJobId: boundedId(agent.logicalJobId) }),
@@ -546,15 +610,15 @@ function projectAgent(workflowId: string, agent: WorkflowAgentRecord, context: P
       }),
     },
     ...(usage === undefined ? {} : { usage }),
-    ...(waiting === undefined ? {} : { waitingSummary: boundedSummary(waiting, context, recordKey, "waitingSummary") }),
-    ...(result === undefined ? {} : { resultSummary: boundedSummary(result, context, recordKey, "resultSummary") }),
-    ...(error === undefined ? {} : { errorSummary: boundedSummary(error, context, recordKey, "errorSummary") }),
   };
+  addSummary(projected, "waitingSummary", waiting, context);
+  addSummary(projected, "resultSummary", result, context);
+  addSummary(projected, "errorSummary", error, context);
+  return projected;
 }
 
 function projectWorkflow(workflow: WorkflowSnapshot, context: ProjectionContext): NativeWorkflowStateV1 {
   const workflowId = boundedId(workflow.runId);
-  const recordKey = `workflow:${workflowId}`;
   const sortedAgents = [...workflow.agents].sort(compareAgents);
   const retainedAgents = sortedAgents.slice(0, MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOW_AGENTS);
   const retainedAgentIndexes = new Set(retainedAgents.map((agent) => agent.index));
@@ -588,10 +652,10 @@ function projectWorkflow(workflow: WorkflowSnapshot, context: ProjectionContext)
       }),
     },
     ...(usage === undefined ? {} : { usage }),
-    ...(waiting === undefined ? {} : { waitingSummary: boundedSummary(waiting, context, recordKey, "waitingSummary") }),
-    ...(result === undefined ? {} : { resultSummary: boundedSummary(result, context, recordKey, "resultSummary") }),
-    ...(error === undefined ? {} : { errorSummary: boundedSummary(error, context, recordKey, "errorSummary") }),
   };
+  addSummary(projected, "waitingSummary", waiting, context);
+  addSummary(projected, "resultSummary", result, context);
+  addSummary(projected, "errorSummary", error, context);
   context.workflowSources.set(projected, { agents: workflow.agents.length, phases: workflow.phases.length });
   return projected;
 }
@@ -600,39 +664,34 @@ function serializedBytes(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
-type PriorityRecord = {
-  terminal: boolean;
-  timestamp: number;
-  key: string;
-};
-
-type SummaryRecord = PriorityRecord & {
-  record: { waitingSummary?: string; resultSummary?: string; errorSummary?: string };
+type SummaryRecord = {
+  priority: RetentionPriority;
+  record: SummarizableRecord;
 };
 
 function summaryRecords(state: NativeSubagentsStateV1): SummaryRecord[] {
   const records: SummaryRecord[] = [];
   for (const job of state.jobs) {
     records.push({
-      terminal: isTerminalJob(job.status),
-      timestamp: job.timestamps.endedAt ?? job.timestamps.startedAt ?? job.timestamps.createdAt,
-      key: `job:${job.id}`,
+      priority: jobPriority(job),
       record: job,
     });
   }
   for (const workflow of state.workflows) {
-    records.push({ terminal: isTerminalWorkflow(workflow.status), timestamp: workflow.timestamps.updatedAt, key: `workflow:${workflow.id}`, record: workflow });
+    records.push({ priority: workflowPriority(workflow), record: workflow });
     for (const agent of workflow.agents) {
-      records.push({ terminal: isTerminalAgent(agent.status), timestamp: agent.timestamps.updatedAt, key: `workflow:${workflow.id}:agent:${agent.index}`, record: agent });
+      records.push({ priority: agentPriority(workflow.id, agent), record: agent });
     }
   }
   return records;
 }
 
-function lowestPriority(left: PriorityRecord, right: PriorityRecord): number {
-  return Number(right.terminal) - Number(left.terminal)
-    || left.timestamp - right.timestamp
-    || compareText(right.key, left.key);
+function lowestPriority(left: RetentionPriority, right: RetentionPriority): number {
+  return compareRetentionPriority(right, left);
+}
+
+function summaryEffectCount(context: ProjectionContext, record: SummarizableRecord): number {
+  return context.summaryEffects.get(record)?.size ?? 0;
 }
 
 function summaryPropertyBytes(key: string, value: string): number {
@@ -645,13 +704,16 @@ function removeTerminalSummaries(
   initialBytes: number,
 ): number {
   let bytes = initialBytes;
-  for (const candidate of summaryRecords(state).filter((record) => record.terminal).sort(lowestPriority)) {
+  const candidates = summaryRecords(state)
+    .filter((candidate) => candidate.priority.terminal)
+    .sort((left, right) => lowestPriority(left.priority, right.priority));
+  for (const candidate of candidates) {
     for (const key of ["waitingSummary", "resultSummary", "errorSummary"] as const) {
       const value = candidate.record[key];
       if (value === undefined) continue;
       bytes -= summaryPropertyBytes(key, value);
       delete candidate.record[key];
-      if (markSummaryEffect(context, candidate.key, key)) {
+      if (markSummaryEffect(context, candidate.record, key)) {
         const before = String(state.truncation.summariesTruncated).length;
         state.truncation.summariesTruncated++;
         bytes += String(state.truncation.summariesTruncated).length - before;
@@ -662,20 +724,22 @@ function removeTerminalSummaries(
   return bytes;
 }
 
-type OmissionCandidate = PriorityRecord & { remove(): boolean };
+type OmissionCandidate = {
+  priority: RetentionPriority;
+  remove(): boolean;
+};
 
-function omissionCandidates(state: NativeSubagentsStateV1): OmissionCandidate[] {
+function omissionCandidates(state: NativeSubagentsStateV1, context: ProjectionContext): OmissionCandidate[] {
   const candidates: OmissionCandidate[] = [];
   for (const job of [...state.jobs]) {
     candidates.push({
-      terminal: isTerminalJob(job.status),
-      timestamp: job.timestamps.endedAt ?? job.timestamps.startedAt ?? job.timestamps.createdAt,
-      key: `job:${job.id}`,
+      priority: jobPriority(job),
       remove: () => {
         const index = state.jobs.indexOf(job);
         if (index < 0) return false;
         state.jobs.splice(index, 1);
         state.truncation.jobsOmitted++;
+        state.truncation.summariesTruncated -= summaryEffectCount(context, job);
         return true;
       },
     });
@@ -683,9 +747,7 @@ function omissionCandidates(state: NativeSubagentsStateV1): OmissionCandidate[] 
   for (const workflow of [...state.workflows]) {
     for (const agent of [...workflow.agents]) {
       candidates.push({
-        terminal: isTerminalAgent(agent.status),
-        timestamp: agent.timestamps.updatedAt,
-        key: `workflow:${workflow.id}:0-agent:${agent.index}`,
+        priority: agentPriority(workflow.id, agent),
         remove: () => {
           if (!state.workflows.includes(workflow)) return false;
           const index = workflow.agents.indexOf(agent);
@@ -695,15 +757,19 @@ function omissionCandidates(state: NativeSubagentsStateV1): OmissionCandidate[] 
             phase.agentIndexes = phase.agentIndexes.filter((agentIndex) => agentIndex !== agent.index);
           }
           state.truncation.workflowAgentsOmitted++;
+          state.truncation.summariesTruncated -= summaryEffectCount(context, agent);
           return true;
         },
       });
     }
     for (const phase of [...workflow.phases]) {
       candidates.push({
-        terminal: isTerminalWorkflow(phase.status),
-        timestamp: phase.timestamps.updatedAt,
-        key: `workflow:${workflow.id}:1-phase:${phase.index}`,
+        priority: {
+          terminal: isTerminalWorkflow(phase.status),
+          timestamp: phase.timestamps.updatedAt,
+          stableId: `workflow:${workflow.id}:phase`,
+          stableIndex: phase.index,
+        },
         remove: () => {
           if (!state.workflows.includes(workflow)) return false;
           const index = workflow.phases.indexOf(phase);
@@ -716,30 +782,87 @@ function omissionCandidates(state: NativeSubagentsStateV1): OmissionCandidate[] 
       });
     }
     candidates.push({
-      terminal: isTerminalWorkflow(workflow.status),
-      timestamp: workflow.timestamps.updatedAt,
-      key: `workflow:${workflow.id}:2-run`,
+      priority: workflowPriority(workflow),
       remove: () => {
         const index = state.workflows.indexOf(workflow);
         if (index < 0) return false;
+        const source = context.workflowSources.get(workflow);
+        state.truncation.workflowAgentsOmitted -= (source?.agents ?? workflow.agents.length) - workflow.agents.length;
+        state.truncation.phasesOmitted -= (source?.phases ?? workflow.phases.length) - workflow.phases.length;
+        state.truncation.summariesTruncated -= summaryEffectCount(context, workflow)
+          + workflow.agents.reduce((total, agent) => total + summaryEffectCount(context, agent), 0);
         state.workflows.splice(index, 1);
         state.truncation.workflowsOmitted++;
         return true;
       },
     });
   }
-  return candidates.sort(lowestPriority);
+  return candidates.sort((left, right) => lowestPriority(left.priority, right.priority));
 }
 
-function enforcePayloadLimit(state: NativeSubagentsStateV1, context: ProjectionContext): void {
-  let bytes = serializedBytes(state);
-  if (bytes <= MAX_NATIVE_SUBAGENTS_STATE_V1_BYTES) return;
-  bytes = removeTerminalSummaries(state, context, bytes);
-  if (bytes <= MAX_NATIVE_SUBAGENTS_STATE_V1_BYTES) return;
-  for (const candidate of omissionCandidates(state)) {
-    if (!candidate.remove()) continue;
-    if (serializedBytes(state) <= MAX_NATIVE_SUBAGENTS_STATE_V1_BYTES) return;
+function clonePressureState(
+  state: NativeSubagentsStateV1,
+  context: ProjectionContext,
+): { state: NativeSubagentsStateV1; context: ProjectionContext } {
+  const clone = structuredClone(state);
+  const cloneContext: ProjectionContext = {
+    summaryEffects: new WeakMap(),
+    workflowSources: new WeakMap(),
+  };
+  const copySummaryEffects = (source: SummarizableRecord, target: SummarizableRecord) => {
+    const effects = context.summaryEffects.get(source);
+    if (effects) cloneContext.summaryEffects.set(target, new Set(effects));
+  };
+  for (let index = 0; index < state.jobs.length; index++) {
+    copySummaryEffects(state.jobs[index]!, clone.jobs[index]!);
   }
+  for (let workflowIndex = 0; workflowIndex < state.workflows.length; workflowIndex++) {
+    const source = state.workflows[workflowIndex]!;
+    const target = clone.workflows[workflowIndex]!;
+    copySummaryEffects(source, target);
+    const sourceCounts = context.workflowSources.get(source);
+    if (sourceCounts) cloneContext.workflowSources.set(target, sourceCounts);
+    for (let agentIndex = 0; agentIndex < source.agents.length; agentIndex++) {
+      copySummaryEffects(source.agents[agentIndex]!, target.agents[agentIndex]!);
+    }
+  }
+  return { state: clone, context: cloneContext };
+}
+
+function applyOmissionPrefix(
+  state: NativeSubagentsStateV1,
+  context: ProjectionContext,
+  count: number,
+): void {
+  const candidates = omissionCandidates(state, context);
+  for (let index = 0; index < count; index++) candidates[index]?.remove();
+}
+
+function enforcePayloadLimit(state: NativeSubagentsStateV1, context: ProjectionContext): number {
+  let bytes = serializedBytes(state);
+  if (bytes <= MAX_NATIVE_SUBAGENTS_STATE_V1_BYTES) return bytes;
+  removeTerminalSummaries(state, context, bytes);
+  bytes = serializedBytes(state);
+  if (bytes <= MAX_NATIVE_SUBAGENTS_STATE_V1_BYTES) return bytes;
+
+  const candidateCount = omissionCandidates(state, context).length;
+  // Advancing this prefix only removes projected records or becomes a no-op
+  // after removing their parent workflow, so exact serialized size cannot grow.
+  let lower = 1;
+  let upper = candidateCount;
+  while (lower < upper) {
+    const middle = Math.floor((lower + upper) / 2);
+    const trial = clonePressureState(state, context);
+    applyOmissionPrefix(trial.state, trial.context, middle);
+    if (serializedBytes(trial.state) <= MAX_NATIVE_SUBAGENTS_STATE_V1_BYTES) upper = middle;
+    else lower = middle + 1;
+  }
+  applyOmissionPrefix(state, context, lower);
+  bytes = serializedBytes(state);
+  if (bytes > MAX_NATIVE_SUBAGENTS_STATE_V1_BYTES) {
+    throw new RangeError("Native subagents state V1 could not be reduced to its byte limit");
+  }
+  return bytes;
 }
 
 export function projectNativeSubagentsStateV1(
@@ -747,7 +870,7 @@ export function projectNativeSubagentsStateV1(
   workflows: readonly WorkflowSnapshot[],
   options: NativeSubagentsProjectionOptionsV1,
 ): NativeSubagentsStateV1 {
-  const context: ProjectionContext = { summaryEffects: new Map(), workflowSources: new WeakMap() };
+  const context: ProjectionContext = { summaryEffects: new WeakMap(), workflowSources: new WeakMap() };
   const sortedJobs = [...jobs].sort(compareJobs);
   const sortedWorkflows = [...workflows].sort(compareWorkflows);
   const retainedWorkflows = sortedWorkflows.slice(0, MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOWS);
@@ -780,22 +903,10 @@ export function projectNativeSubagentsStateV1(
     jobs: sortedJobs.slice(0, MAX_NATIVE_SUBAGENTS_STATE_V1_JOBS).map((job) => projectJob(job, context)),
     workflows: retainedWorkflows.map((workflow) => projectWorkflow(workflow, context)),
   };
-  state.truncation.summariesTruncated = [...context.summaryEffects.values()]
-    .reduce((total, fields) => total + fields.size, 0);
-  enforcePayloadLimit(state, context);
-  const retainedKeys = new Set(summaryRecords(state).map((record) => record.key));
-  state.truncation.summariesTruncated = [...context.summaryEffects]
-    .filter(([recordKey]) => retainedKeys.has(recordKey))
-    .reduce((total, [, fields]) => total + fields.size, 0);
-  state.truncation.jobsOmitted = jobs.length - state.jobs.length;
-  state.truncation.workflowsOmitted = workflows.length - state.workflows.length;
-  state.truncation.workflowAgentsOmitted = state.workflows.reduce((total, workflow) => {
-    return total + (context.workflowSources.get(workflow)?.agents ?? workflow.agents.length) - workflow.agents.length;
-  }, 0);
-  state.truncation.phasesOmitted = state.workflows.reduce((total, workflow) => {
-    return total + (context.workflowSources.get(workflow)?.phases ?? workflow.phases.length) - workflow.phases.length;
-  }, 0);
-  assertNativeSubagentsStateV1(state);
+  state.truncation.summariesTruncated = summaryRecords(state)
+    .reduce((total, { record }) => total + summaryEffectCount(context, record), 0);
+  const serializedSize = enforcePayloadLimit(state, context);
+  assertNativeSubagentsStateV1WithSize(state, serializedSize);
   return state;
 }
 
@@ -815,6 +926,13 @@ export function assertNativeSubagentsStateV1(value: unknown): asserts value is N
   } catch (error) {
     throw new TypeError(`Native subagents state V1 is not serializable: ${error instanceof Error ? error.name : "unknown error"}`);
   }
+  assertNativeSubagentsStateV1WithSize(value, bytes);
+}
+
+function assertNativeSubagentsStateV1WithSize(
+  value: unknown,
+  bytes: number,
+): asserts value is NativeSubagentsStateV1 {
   if (bytes > MAX_NATIVE_SUBAGENTS_STATE_V1_BYTES) {
     throw new RangeError(`Native subagents state V1 exceeds ${MAX_NATIVE_SUBAGENTS_STATE_V1_BYTES} UTF-8 bytes`);
   }

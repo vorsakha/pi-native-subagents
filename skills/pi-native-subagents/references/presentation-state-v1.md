@@ -30,7 +30,7 @@ The envelope contains:
 - all five truncation counters;
 - complete bounded `jobs` and `workflows` arrays.
 
-Startup follows manager initialization and workflow restoration. Shutdown carries the managers' final authoritative snapshots and marks the session closed without synthesizing terminal record states. A reload creates a new instance ID and restarts sequence at 1. Compare sequences only within one instance. No-op comparison ignores only sequence, emission time, and cause. A listener failure cannot change job, workflow, or shutdown behavior.
+Startup follows manager initialization and workflow restoration. Shutdown carries the managers' final authoritative snapshots and marks the session closed without synthesizing terminal record states. If either manager's final state cannot be read, the producer does not fabricate a closed snapshot; teardown still releases both managers, listeners, and the extension install claim. A reload creates a new instance ID and restarts sequence at 1. Compare sequences only within one instance. No-op comparison ignores only sequence, emission time, and cause. A listener failure cannot change job, workflow, or shutdown behavior.
 
 ## Limits and priority
 
@@ -49,6 +49,8 @@ All numeric values are finite and nonnegative, with the exported safe-integer ma
 Jobs retain their ID, name, kind, exact manager status, generation, lifecycle timestamps, route, workflow and independence relationships, optional cumulative usage, and optional waiting, result, and error summaries. Waiting for a slot, host input, or a peer stays in `waitingSummary`; it never changes the top-level job status.
 
 Workflows retain their ID, name, exact workflow status, task outcome, timestamps, current phase, phases, agents, replay and replacement lineage, optional aggregate usage, and summaries. `relationships.replayedFrom.runId` comes from the manager's workflow replay source. `relationships.replacementOf` keeps the source run and agent index. Phases retain index, name, exact status, timestamps, and bounded agent-index links. Agents retain index, name, exact state including `waiting`, timestamps, route, phase and job links, replay/replacement lineage, optional cumulative usage, and summaries. Restored workflows do not require matching live top-level jobs.
+
+Provider-wait summaries expose only a known provider value, a nonnegative retry time, and positive attempt counts. Invalid restored metadata produces the fixed summary `Waiting to retry a provider.`
 
 The projection excludes tasks, prompts, objectives, questions and answers, transcripts, reasoning, queued messages, tools, raw output, structured or workflow results, agent previews, arbitrary JSON, stacks, parser dumps, provider bodies, paths, artifacts, environment and credentials, and manager internals. Result summaries use only allowlisted status and task-outcome metadata. They never inspect excluded execution text. Treat names and summaries as untrusted text and render summaries only as text.
 

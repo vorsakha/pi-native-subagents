@@ -29,6 +29,7 @@ import type { JobSnapshot } from "../src/types.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 import {
   ControlledBackend,
+  FailingWorkflowRegistration,
   ImmediateBackend,
   context,
   fakePi,
@@ -70,6 +71,10 @@ test("V1 presentation strings reject unsafe input while projection sanitizes man
   assert.equal(projected.jobs[0]!.name, "worker safe");
   assert.equal(projected.jobs[0]!.route.model, "model safe");
 
+  const boundary = project([jobSnapshot({ name: `${"x".repeat(159)} suffix` })], []);
+  assert.equal(boundary.jobs[0]!.name, "x".repeat(159));
+  assert.equal(validateNativeSubagentsStateV1(boundary), true, "truncation cannot leave schema-invalid trailing whitespace");
+
   const valid = project([jobSnapshot({ id: "job-safe", status: "queued" })], []);
   const cases: Array<{ label: string; mutate(state: NativeSubagentsStateV1): void }> = [
     { label: "ESC identifier", mutate: (state) => { state.jobs[0]!.id = "job-\u001b[31mred"; } },
@@ -84,6 +89,44 @@ test("V1 presentation strings reject unsafe input while projection sanitizes man
     entry.mutate(candidate);
     assert.equal(Check(NativeSubagentsStateV1Schema, candidate), false, entry.label);
     assert.equal(validateNativeSubagentsStateV1(candidate), false, entry.label);
+  }
+});
+
+test("V1 provider-wait summaries allow only known providers and valid retry metadata", () => {
+  const waiting = workflowSnapshotFixture("provider-wait", "running");
+  const agent = waiting.agents[1]!;
+  agent.state = "waiting";
+  agent.providerWait = {
+    provider: "claude",
+    kind: "quota",
+    detail: PRIVATE,
+    retryAt: 10_000,
+    attempt: 2,
+    maxAttempts: 4,
+  };
+  assert.equal(
+    project([], [waiting]).workflows[0]!.agents[0]!.waitingSummary,
+    "Waiting to retry claude at 10000; attempt 2 of 4.",
+  );
+
+  const invalidValues: Array<{ field: string; value: unknown }> = [
+    { field: "provider", value: "PrivateTokenABC123" },
+    { field: "retryAt", value: Number.NaN },
+    { field: "retryAt", value: -1 },
+    { field: "retryAt", value: Number.POSITIVE_INFINITY },
+    { field: "attempt", value: "2" },
+    { field: "attempt", value: -1 },
+    { field: "maxAttempts", value: Number.NaN },
+    { field: "maxAttempts", value: 1 },
+  ];
+  for (const { field, value } of invalidValues) {
+    const restored = structuredClone(waiting);
+    Object.assign(restored.agents[1]!.providerWait!, { [field]: value });
+    const state = project([], [restored]);
+    const publicAgent = state.workflows[0]!.agents.find((candidate) => candidate.index === 1)!;
+    assert.equal(publicAgent.waitingSummary, "Waiting to retry a provider.", field);
+    assert.equal(validateNativeSubagentsStateV1(state), true, field);
+    assert.equal(JSON.stringify(state).includes("PrivateTokenABC123"), false, field);
   }
 });
 
@@ -402,6 +445,74 @@ test("V1 limits and deterministic truncation remove low-priority summaries and r
   assert.ok(state.workflows.every((workflow) => workflow.phases.length <= MAX_NATIVE_SUBAGENTS_STATE_V1_PHASES));
 });
 
+test("V1 byte pressure preserves numeric agent priority within a bounded runtime", () => {
+  const longId = (prefix: string, fill: string) => `${prefix}-${fill.repeat(220)}`;
+  const workflows = Array.from({ length: MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOWS }, (_, workflowIndex) => {
+    const workflow = workflowSnapshotFixture(`pressure-${String(workflowIndex).padStart(2, "0")}`, "running");
+    workflow.timestamps = { createdAt: 1_000, updatedAt: 2_000, startedAt: 1_000 };
+    const template = workflow.agents[0]!;
+    workflow.agents = Array.from({ length: MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOW_AGENTS }, (_, agentIndex) => ({
+      ...structuredClone(template),
+      index: agentIndex,
+      name: "n".repeat(MAX_NATIVE_SUBAGENTS_STATE_V1_NAME_CHARS),
+      state: "failed" as const,
+      timestamps: { createdAt: 1_000, updatedAt: 2_000, startedAt: 1_000, endedAt: 2_000 },
+      jobId: longId(`job-${workflowIndex}-${agentIndex}`, "j"),
+      logicalJobId: longId(`logical-${workflowIndex}-${agentIndex}`, "l"),
+      model: "m".repeat(MAX_NATIVE_SUBAGENTS_STATE_V1_NAME_CHARS),
+      independentOf: longId(`independent-${workflowIndex}-${agentIndex}`, "i"),
+      replayedFrom: { runId: longId(`replay-${workflowIndex}-${agentIndex}`, "r"), callIndex: agentIndex },
+      replacedBy: { replacementRunId: longId(`replacement-${workflowIndex}-${agentIndex}`, "b"), reason: PRIVATE, at: 2_000 },
+      continuation: {
+        state: "running" as const,
+        fromHarness: "claude" as const,
+        toHarness: "codex" as const,
+        failedJobId: longId(`failed-${workflowIndex}-${agentIndex}`, "f"),
+        replacementJobId: longId(`next-${workflowIndex}-${agentIndex}`, "q"),
+        checkpointAt: 2_000,
+        checkoutDigest: PRIVATE,
+        trigger: { source: "continuation" as const, provider: "claude" as const, kind: "quota" as const, detail: PRIVATE },
+        warning: PRIVATE,
+      },
+    }));
+    const phase = workflow.phases[0]!;
+    workflow.phases = Array.from({ length: MAX_NATIVE_SUBAGENTS_STATE_V1_PHASES }, (_, phaseIndex) => ({
+      ...structuredClone(phase),
+      index: phaseIndex,
+      name: "p",
+      status: "running" as const,
+      agents: [],
+      timestamps: { createdAt: 0, updatedAt: 0 },
+    }));
+    return workflow;
+  });
+
+  const startedAt = performance.now();
+  const state = project([], workflows);
+  const elapsedMs = performance.now() - startedAt;
+  assert.equal(validateNativeSubagentsStateV1(state), true);
+  assert.ok(Buffer.byteLength(JSON.stringify(state), "utf8") <= MAX_NATIVE_SUBAGENTS_STATE_V1_BYTES);
+  assert.equal(state.workflows.length, MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOWS);
+  assert.ok(state.truncation.workflowAgentsOmitted > 0, "the fixture must exercise record omission");
+  assert.equal(
+    state.truncation.workflowAgentsOmitted,
+    workflows.length * MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOW_AGENTS
+      - state.workflows.reduce((total, workflow) => total + workflow.agents.length, 0),
+  );
+  assert.ok(state.workflows.some(
+    (workflow) => workflow.agents.length > 0
+      && workflow.agents.length < MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOW_AGENTS,
+  ));
+  for (const workflow of state.workflows) {
+    assert.deepEqual(
+      workflow.agents.map(({ index }) => index),
+      Array.from({ length: workflow.agents.length }, (_, index) => index),
+      `${workflow.id} retains the lowest numeric indexes`,
+    );
+  }
+  assert.ok(elapsedMs < 10_000, `bounded pressure projection took ${elapsedMs.toFixed(1)}ms`);
+});
+
 test("publisher rebuilds authoritative lists, suppresses only true public no-ops, validates, sequences, and isolates failures", async () => {
   let jobs: JobSnapshot[] = [];
   let jobLists = 0;
@@ -469,7 +580,7 @@ test("publisher rebuilds authoritative lists, suppresses only true public no-ops
   assert.notEqual(fingerprintNativeSubagentsStateV1(metadataOnly), fingerprintNativeSubagentsStateV1(states[4]!));
 
   const hostileError = new Error("provider details");
-  hostileError.name = "X".repeat(5_000);
+  hostileError.name = "PrivateTokenABC123";
   const hostileDiagnostics: string[] = [];
   createNativeSubagentsStatePublisher({
     sessionId: "hostile-session",
@@ -479,6 +590,7 @@ test("publisher rebuilds authoritative lists, suppresses only true public no-ops
     reportError: (message) => hostileDiagnostics.push(message),
   }).start();
   assert.equal(hostileDiagnostics[0], "Native subagents state projection failed (Error).");
+  assert.equal(hostileDiagnostics[0]!.includes("PrivateTokenABC123"), false);
   assert.ok(hostileDiagnostics[0]!.length < 100);
 });
 
@@ -496,7 +608,6 @@ test("extension lifecycle publishes restored startup, workflow-only terminal upd
     throw new Error("consumer failed");
   });
   eventBus.on(NATIVE_SUBAGENTS_STATE_EVENT_V1, (value) => {
-    assert.equal(validateNativeSubagentsStateV1(value), true);
     states.push(value as NativeSubagentsStateV1);
   });
 
@@ -607,4 +718,62 @@ test("extension lifecycle publishes restored startup, workflow-only terminal upd
   assert.equal(producerFirstStates[0]!.cause, "startup");
   assert.equal(producerFirstStates[0]!.sequence, 1);
   await producerFirst.handlers.get("session_shutdown")?.();
+  for (const state of [...states, ...producerFirstStates]) {
+    assert.equal(validateNativeSubagentsStateV1(state), true);
+  }
+});
+
+test("shutdown releases every resource when workflow shutdown and final reads fail", async (t) => {
+  const root = await tempDir("presentation-shutdown-failure");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const registry = {};
+  const workflows = new FailingWorkflowRegistration();
+  const backend = new ControlledBackend("pi");
+  const first = fakePi();
+  const published: unknown[] = [];
+  first.eventBus.on(NATIVE_SUBAGENTS_STATE_EVENT_V1, (value) => { published.push(value); });
+  registerNativeSubagents(first.api, {
+    registry,
+    legacyRoot: false,
+    backends: [backend],
+    workflowArtifactRoot: join(root, "unused-runs"),
+    globalProfilesDir: join(root, "profiles"),
+    providerStatus: readyProviderStatusReader(),
+    workflowRegistrationFactory: workflows.factory,
+  });
+  const session = context({ sessionId: "failing-shutdown", cwd: root });
+  first.handlers.get("session_start")?.({}, session.ctx);
+  const spawned = await first.tools.get("subagent_spawn").execute(
+    "shutdown-job",
+    { task: "remain active until shutdown" },
+    undefined,
+    undefined,
+    session.ctx,
+  );
+  await backend.waitForStart();
+
+  await assert.rejects(
+    first.handlers.get("session_shutdown")?.(),
+    (error) => error === workflows.shutdownError,
+  );
+  assert.deepEqual(backend.cancels, [{ jobId: spawned.details.job.id, reason: "Session shutdown" }]);
+  assert.equal(workflows.sessionShutdowns, 1);
+  assert.equal(workflows.sessionCloses, 1, "workflow close is attempted even after final reads fail");
+  assert.ok(published.every(validateNativeSubagentsStateV1));
+  assert.equal(
+    published.some((value) => (value as NativeSubagentsStateV1).cause === "shutdown"),
+    false,
+    "a failed final read cannot fabricate an authoritative closed snapshot",
+  );
+
+  const replacement = fakePi();
+  assert.doesNotThrow(() => registerNativeSubagents(replacement.api, {
+    registry,
+    legacyRoot: false,
+    backends: [new ImmediateBackend("pi")],
+    workflowArtifactRoot: join(root, "replacement-runs"),
+    globalProfilesDir: join(root, "replacement-profiles"),
+    providerStatus: readyProviderStatusReader(),
+  }), "a throwing workflow close cannot retain the install claim");
+  await replacement.handlers.get("session_shutdown")?.();
 });

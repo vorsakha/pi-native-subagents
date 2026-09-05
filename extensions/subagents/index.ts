@@ -87,7 +87,13 @@ import type { AccessMode, AgentSpeed, Backend, HarnessName, EffortLevel, JobSnap
 import type { SpendBudget } from "../../src/budget.ts";
 import { formatSpendBudget } from "../../src/budget.ts";
 import { renderWorkflowActivity, WorkflowActivityStore, type WorkflowActivitySnapshot } from "../workflows/activity.ts";
-import { configuredWorkflowsShortcut, formatWorkflowsShortcutHint, registerWorkflows } from "../workflows/index.ts";
+import {
+  configuredWorkflowsShortcut,
+  formatWorkflowsShortcutHint,
+  registerWorkflows,
+  type RegisterWorkflowOptions,
+  type WorkflowRegistration,
+} from "../workflows/index.ts";
 import type { WorkflowSnapshot } from "../../src/workflows/types.ts";
 import { createNativeSubagentsStatePublisher, type NativeSubagentsStatePublisher } from "./state-publisher.ts";
 
@@ -230,6 +236,8 @@ export interface RegistrationOptions {
   providerStatus?: ProviderStatusReader;
   /** Injectable for tests; production reads the real process environment. */
   env?: NodeJS.ProcessEnv;
+  /** Injectable for lifecycle fault tests. */
+  workflowRegistrationFactory?: (pi: ExtensionAPI, options: RegisterWorkflowOptions) => WorkflowRegistration;
 }
 
 interface LiveCardBlink {
@@ -580,7 +588,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     );
     return renderJobListCard(jobs, theme, { expanded, now: Date.now() });
   };
-  const workflows = registerWorkflows(pi, {
+  const workflows = (options.workflowRegistrationFactory ?? registerWorkflows)(pi, {
     artifactRoot: options.workflowArtifactRoot,
     savedWorkflowRoot: options.savedWorkflowRoot,
     shortcut: workflowsShortcut,
@@ -1062,7 +1070,6 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     currentHarnessActivations = undefined;
     const closingManager = manager;
     const closingPublisher = statePublisher;
-    closingPublisher?.suspend();
     sessionContext = undefined;
     clearCardBlinks();
     deferredResults.clear();
@@ -1087,22 +1094,50 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     displayedHarnessAvailability = undefined;
     displayedActivity = undefined;
     let finalWorkflows: WorkflowSnapshot[] = [];
+    let finalJobs: JobSnapshot[] = [];
+    let finalWorkflowsRead = false;
+    let finalJobsRead = closingManager === undefined;
     let shutdownError: unknown;
-    try { finalWorkflows = await workflows.sessionShutdown(); }
-    catch (error) {
-      finalWorkflows = workflows.list();
-      shutdownError = error;
+    const rememberShutdownError = (error: unknown) => { shutdownError ??= error; };
+    try {
+      try { closingPublisher?.suspend(); }
+      catch (error) { rememberShutdownError(error); }
+      try {
+        finalWorkflows = await workflows.sessionShutdown();
+        finalWorkflowsRead = true;
+      }
+      catch (error) {
+        rememberShutdownError(error);
+        try {
+          finalWorkflows = workflows.list();
+          finalWorkflowsRead = true;
+        }
+        catch (readError) { rememberShutdownError(readError); }
+      }
+      try { await closingManager?.shutdown(); }
+      catch (error) { rememberShutdownError(error); }
+      try {
+        finalJobs = closingManager?.list() ?? [];
+        finalJobsRead = true;
+      }
+      catch (error) { rememberShutdownError(error); }
+      try {
+        if (finalJobsRead && finalWorkflowsRead) closingPublisher?.stop(finalJobs, finalWorkflows);
+      }
+      catch (error) { rememberShutdownError(error); }
+    } finally {
+      finalJobs = [];
+      finalWorkflows = [];
+      try { unsubscribeManager?.(); }
+      catch (error) { rememberShutdownError(error); }
+      unsubscribeManager = undefined;
+      try { workflows.sessionClosed(); }
+      catch (error) { rememberShutdownError(error); }
+      if (manager === closingManager) manager = undefined;
+      if (statePublisher === closingPublisher) statePublisher = undefined;
+      try { releaseInstall(); }
+      catch (error) { rememberShutdownError(error); }
     }
-    try { await closingManager?.shutdown(); }
-    catch (error) { shutdownError ??= error; }
-    const finalJobs = closingManager?.list() ?? [];
-    closingPublisher?.stop(finalJobs, finalWorkflows);
-    unsubscribeManager?.();
-    unsubscribeManager = undefined;
-    workflows.sessionClosed();
-    if (manager === closingManager) manager = undefined;
-    if (statePublisher === closingPublisher) statePublisher = undefined;
-    releaseInstall();
     if (shutdownError) throw shutdownError;
   });
 

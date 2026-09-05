@@ -4,7 +4,6 @@ import {
   NATIVE_SUBAGENTS_PRODUCER_VERSION,
   NATIVE_SUBAGENTS_STATE_EVENT_V1,
   projectNativeSubagentsStateV1,
-  validateNativeSubagentsStateV1,
   type NativeSubagentsStateV1,
 } from "../../src/presentation-state.ts";
 import type { JobSnapshot } from "../../src/types.ts";
@@ -17,11 +16,10 @@ export interface NativeSubagentsStatePublisher {
   stop(finalJobs: readonly JobSnapshot[], finalWorkflows: readonly WorkflowSnapshot[]): void;
 }
 
-const DIAGNOSTIC_KIND = /^[A-Za-z][A-Za-z0-9]{0,63}$/;
-
 function diagnosticKind(error: unknown): string {
-  if (!(error instanceof Error) || !DIAGNOSTIC_KIND.test(error.name)) return "Error";
-  return error.name;
+  if (error instanceof TypeError) return "TypeError";
+  if (error instanceof RangeError) return "RangeError";
+  return "Error";
 }
 
 function deepFreeze(value: unknown): void {
@@ -53,7 +51,7 @@ export function createNativeSubagentsStatePublisher(options: {
   let lastFingerprint: string | undefined;
   let lastDiagnostic: string | undefined;
 
-  const diagnose = (stage: "projection" | "validation" | "emission", error: unknown): void => {
+  const diagnose = (stage: "projection" | "emission", error: unknown): void => {
     const kind = diagnosticKind(error);
     const message = `Native subagents state ${stage} failed (${kind}).`;
     if (message === lastDiagnostic) return;
@@ -84,10 +82,6 @@ export function createNativeSubagentsStatePublisher(options: {
     }
     const fingerprint = fingerprintNativeSubagentsStateV1(state);
     if (fingerprint === lastFingerprint) return;
-    if (!validateNativeSubagentsStateV1(state)) {
-      diagnose("validation", new TypeError("invalid V1 payload"));
-      return;
-    }
     try {
       deepFreeze(state);
       options.emit(NATIVE_SUBAGENTS_STATE_EVENT_V1, state);
