@@ -19,6 +19,7 @@ Paths are relative to this file. Read the reference **before** you write the cal
 | let a child use `subagent_ask`, or answer with `subagent_answer` | `references/routed-questions.md` |
 | set `speed`, spend limits, replay, provider fallback, or retry | `references/budgets-replay-and-provider-waits.md` |
 | use `isolation: "worktree"`, or run `/workflows reclaim` | `references/worktrees-and-retention.md` |
+| subscribe to or consume `native-subagents:state:v1` | `references/presentation-state-v1.md` |
 | run `/subagents providers` or `/subagents providers refresh`, supervise or recover a selected job/workflow/agent, report on running work, or interpret usage and model numbers | `references/supervision-and-telemetry.md` |
 
 ## Choose the smallest orchestration surface

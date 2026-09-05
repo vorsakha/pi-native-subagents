@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import { createEventBus, type EventBus, type Theme } from "@earendil-works/pi-coding-agent";
 import type { DiscoveredCapability } from "../src/capabilities.ts";
 import type {
   Backend,
@@ -979,6 +979,8 @@ function askThroughBackend(requests: BackendRequest[], jobId: string, input: Ask
 export interface FakePiOptions {
   /** Registers a `getAllTools` implementation. Omitted entirely when not supplied. */
   allTools?: Array<Record<string, unknown>>;
+  /** Reuses a host event bus across extension reloads. */
+  eventBus?: EventBus;
 }
 
 /**
@@ -986,6 +988,7 @@ export interface FakePiOptions {
  * Duplicate tool or command names throw, so double registration is caught.
  */
 export function fakePi(options: FakePiOptions = {}) {
+  const eventBus = options.eventBus ?? createEventBus();
   const handlers = new Map<string, (...args: any[]) => any>();
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
@@ -1000,6 +1003,7 @@ export function fakePi(options: FakePiOptions = {}) {
   }>();
   const entries: Array<{ id: string; customType: string; data: unknown }> = [];
   const api: Record<string, unknown> = {
+    events: eventBus,
     on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
     registerTool(tool: any) {
       if (tools.has(tool.name)) throw new Error(`duplicate tool: ${tool.name}`);
@@ -1037,6 +1041,7 @@ export function fakePi(options: FakePiOptions = {}) {
     entryRenderers,
     messages,
     entries,
+    eventBus,
     waitForMessage(customType?: string) {
       const found = messages.find((entry) => !customType || entry.message.customType === customType);
       if (found) return Promise.resolve(found);
