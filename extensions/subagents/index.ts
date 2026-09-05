@@ -87,8 +87,17 @@ import type { AccessMode, AgentSpeed, Backend, HarnessName, EffortLevel, JobSnap
 import type { SpendBudget } from "../../src/budget.ts";
 import { formatSpendBudget } from "../../src/budget.ts";
 import { renderWorkflowActivity, WorkflowActivityStore, type WorkflowActivitySnapshot } from "../workflows/activity.ts";
-import { configuredWorkflowsShortcut, formatWorkflowsShortcutHint, registerWorkflows } from "../workflows/index.ts";
+import {
+  configuredWorkflowsShortcut,
+  formatWorkflowsShortcutHint,
+  registerWorkflows,
+  type RegisterWorkflowOptions,
+  type WorkflowRegistration,
+} from "../workflows/index.ts";
 import type { WorkflowSnapshot } from "../../src/workflows/types.ts";
+import { createNativeSubagentsStatePublisher, type NativeSubagentsStatePublisher } from "./state-publisher.ts";
+
+export * from "../../src/presentation-state.ts";
 
 /** Production session-peer source backed by Pi's real SessionManager. Never mutates the source session. */
 export function createRealSessionPeerSource(): SessionPeerSource {
@@ -227,6 +236,8 @@ export interface RegistrationOptions {
   providerStatus?: ProviderStatusReader;
   /** Injectable for tests; production reads the real process environment. */
   env?: NodeJS.ProcessEnv;
+  /** Injectable for lifecycle fault tests. */
+  workflowRegistrationFactory?: (pi: ExtensionAPI, options: RegisterWorkflowOptions) => WorkflowRegistration;
 }
 
 interface LiveCardBlink {
@@ -320,6 +331,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   let activeHarness = configuredHarness;
   let manager: JobManager | undefined;
   let unsubscribeManager: (() => void) | undefined;
+  let statePublisher: NativeSubagentsStatePublisher | undefined;
+  let sessionClosing = false;
   let sessionContext: { isIdle(): boolean } | undefined;
   let sessionUi: ExtensionUIContext | undefined;
   let displayedHarness: HarnessName | undefined;
@@ -575,7 +588,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     );
     return renderJobListCard(jobs, theme, { expanded, now: Date.now() });
   };
-  const workflows = registerWorkflows(pi, {
+  const workflows = (options.workflowRegistrationFactory ?? registerWorkflows)(pi, {
     artifactRoot: options.workflowArtifactRoot,
     savedWorkflowRoot: options.savedWorkflowRoot,
     shortcut: workflowsShortcut,
@@ -586,9 +599,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     setInterval: options.setInterval,
     clearInterval: options.clearInterval,
     onSnapshot: (snapshot) => {
+      statePublisher?.changed();
       workflowActivity.observe(snapshot);
       observeFollowThroughWorkflow(snapshot);
       if (sessionUi && manager) updateSessionUi(sessionUi, manager, activeHarness);
+    },
+    onInitialized: () => {
+      statePublisher?.start();
     },
     onResultDelivered: (runId) => {
       clearFollowThroughWatchesForWorkflow(runId);
@@ -950,6 +967,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       globalProfilesDir,
       ctx.isProjectTrusted() ? resolve(ctx.cwd, CONFIG_DIR_NAME, "subagents") : undefined,
     );
+    sessionClosing = false;
     manager = createManager();
     // A new session may open a different project or follow a configuration change.
     capabilities.invalidate();
@@ -984,8 +1002,25 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       if (isTerminal(data.job.status)) humanResultsPublished.add(key);
     }
     const sessionManager = manager;
+    let sessionPublisher: NativeSubagentsStatePublisher;
+    sessionPublisher = createNativeSubagentsStatePublisher({
+      sessionId: ctx.sessionManager.getSessionId(),
+      listJobs: () => sessionManager.list(),
+      listWorkflows: () => workflows.list(),
+      emit: (channel, state) => {
+        if (manager !== sessionManager || statePublisher !== sessionPublisher) return;
+        pi.events.emit(channel, state);
+      },
+      reportError: (message) => {
+        if (manager !== sessionManager || statePublisher !== sessionPublisher) return;
+        try { ctx.ui.notify(message, "warning"); } catch { /* UI may be unavailable during teardown. */ }
+      },
+    });
+    statePublisher = sessionPublisher;
     unsubscribeManager = sessionManager.subscribe((job, event) => {
       if (manager !== sessionManager) return;
+      sessionPublisher.changed();
+      if (sessionClosing) return;
       rememberCardSnapshot(job);
       refreshCardBlinks();
       pruneFollowThroughWatches();
@@ -1026,14 +1061,15 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   });
 
   pi.on("session_shutdown", async () => {
+    sessionClosing = true;
     followThroughSessionGeneration++;
     followThroughFlushQueued = false;
     availabilityGeneration++;
     startupAvailabilityController?.abort(new Error("Session shutdown"));
     startupAvailabilityController = undefined;
     currentHarnessActivations = undefined;
-    unsubscribeManager?.();
-    unsubscribeManager = undefined;
+    const closingManager = manager;
+    const closingPublisher = statePublisher;
     sessionContext = undefined;
     clearCardBlinks();
     deferredResults.clear();
@@ -1057,14 +1093,52 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     displayedHarness = undefined;
     displayedHarnessAvailability = undefined;
     displayedActivity = undefined;
+    let finalWorkflows: WorkflowSnapshot[] = [];
+    let finalJobs: JobSnapshot[] = [];
+    let finalWorkflowsRead = false;
+    let finalJobsRead = closingManager === undefined;
+    let shutdownError: unknown;
+    const rememberShutdownError = (error: unknown) => { shutdownError ??= error; };
     try {
-      await workflows.sessionShutdown();
-      await manager?.shutdown();
+      try { closingPublisher?.suspend(); }
+      catch (error) { rememberShutdownError(error); }
+      try {
+        finalWorkflows = await workflows.sessionShutdown();
+        finalWorkflowsRead = true;
+      }
+      catch (error) {
+        rememberShutdownError(error);
+        try {
+          finalWorkflows = workflows.list();
+          finalWorkflowsRead = true;
+        }
+        catch (readError) { rememberShutdownError(readError); }
+      }
+      try { await closingManager?.shutdown(); }
+      catch (error) { rememberShutdownError(error); }
+      try {
+        finalJobs = closingManager?.list() ?? [];
+        finalJobsRead = true;
+      }
+      catch (error) { rememberShutdownError(error); }
+      try {
+        if (finalJobsRead && finalWorkflowsRead) closingPublisher?.stop(finalJobs, finalWorkflows);
+      }
+      catch (error) { rememberShutdownError(error); }
+    } finally {
+      finalJobs = [];
+      finalWorkflows = [];
+      try { unsubscribeManager?.(); }
+      catch (error) { rememberShutdownError(error); }
+      unsubscribeManager = undefined;
+      try { workflows.sessionClosed(); }
+      catch (error) { rememberShutdownError(error); }
+      if (manager === closingManager) manager = undefined;
+      if (statePublisher === closingPublisher) statePublisher = undefined;
+      try { releaseInstall(); }
+      catch (error) { rememberShutdownError(error); }
     }
-    finally {
-      manager = undefined;
-      releaseInstall();
-    }
+    if (shutdownError) throw shutdownError;
   });
 
   /** Text inventory shared by `/subagents capabilities` and `subagent_capabilities`. */

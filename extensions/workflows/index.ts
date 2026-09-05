@@ -65,7 +65,11 @@ export function formatWorkflowsShortcutHint(shortcut: string): string {
 
 export interface WorkflowRegistration {
   sessionStart(ctx: ExtensionContext, jobs: JobManager): void;
-  sessionShutdown(): Promise<void>;
+  sessionShutdown(): Promise<WorkflowSnapshot[]>;
+  /** Release manager references after the outer producer emits its final snapshot. */
+  sessionClosed(): void;
+  /** Complete authoritative snapshots for the active session. */
+  list(): WorkflowSnapshot[];
   /** Read-only compact lookup for extension-owned workflow observations. */
   check(runId: string): WorkflowSnapshot | undefined;
   /** Effective keyboard shortcut registered for the `/workflows` surface. */
@@ -87,6 +91,8 @@ export interface RegisterWorkflowOptions {
   resolveProfile?: (name: string) => ProfileDefinition | undefined;
   /** Session supervision bridge; workflow cards and results remain independent. */
   onSnapshot?: (snapshot: WorkflowSnapshot) => void;
+  /** Called once durable restoration settles, including when restoration fails. */
+  onInitialized?: () => void;
   /** Called after the existing foreground/background result delivery path succeeds. */
   onResultDelivered?: (runId: string) => void;
 }
@@ -607,6 +613,9 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
   return {
     shortcut,
     shortcutHint,
+    list() {
+      return manager?.list() ?? [];
+    },
     check(runId) {
       if (shuttingDown || !manager) return undefined;
       try { return compactSnapshot(manager.check(runId)); }
@@ -641,28 +650,47 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
         refreshBlinks();
         options.onSnapshot?.(snapshot);
       });
-      void sessionManager.initialize().then(() => {
-        if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
-        updateStatus();
-        for (const snapshot of sessionManager.list()) {
-          if (!workflowIsTerminal(snapshot.status)) options.onSnapshot?.(snapshot);
-        }
-      }).catch((error) => {
-        if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
-        if (ctx.hasUI) ctx.ui.notify(`Workflow history unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
-      });
+      void sessionManager.initialize()
+        .then(() => {
+          if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
+          updateStatus();
+          for (const snapshot of sessionManager.list()) {
+            if (!workflowIsTerminal(snapshot.status)) options.onSnapshot?.(snapshot);
+          }
+        })
+        .catch((error) => {
+          if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
+          if (ctx.hasUI) ctx.ui.notify(`Workflow history unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+        })
+        .finally(() => {
+          if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
+          try { options.onInitialized?.(); }
+          catch { /* initialization observers cannot change workflow lifecycle */ }
+        });
     },
     async sessionShutdown() {
       shuttingDown = true;
       generation++;
       clearBlinks();
-      unsubscribe?.();
-      unsubscribe = undefined;
       const closing = manager;
+      let finalSnapshots: WorkflowSnapshot[] = [];
+      let shutdownError: unknown;
+      try { await closing?.shutdown(); }
+      catch (error) { shutdownError = error; }
+      try { finalSnapshots = closing?.list() ?? []; }
+      catch (error) { shutdownError ??= error; }
+      try {
+        if (sessionContext?.hasUI) sessionContext.ui.setStatus("native-workflows", undefined);
+      } catch (error) { shutdownError ??= error; }
+      if (shutdownError) throw shutdownError;
+      return finalSnapshots;
+    },
+    sessionClosed() {
+      const dispose = unsubscribe;
+      unsubscribe = undefined;
       manager = undefined;
-      await closing?.shutdown();
-      if (sessionContext?.hasUI) sessionContext.ui.setStatus("native-workflows", undefined);
       sessionContext = undefined;
+      dispose?.();
     },
   };
 }

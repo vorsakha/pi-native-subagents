@@ -5,7 +5,13 @@ import assert from "node:assert/strict";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import {
+  createEventBus,
+  type EventBus,
+  type ExtensionAPI,
+  type ExtensionContext,
+  type Theme,
+} from "@earendil-works/pi-coding-agent";
 import type { DiscoveredCapability } from "../src/capabilities.ts";
 import type {
   Backend,
@@ -21,12 +27,13 @@ import type {
 } from "../src/types.ts";
 import type { ProviderUnavailability } from "../src/provider-unavailability.ts";
 import { normalizeTarget, type InteractionAskResult, type PendingInteraction } from "../src/interactions.ts";
-import type { InteractionDeadlineClock } from "../src/manager.ts";
+import type { InteractionDeadlineClock, JobManager } from "../src/manager.ts";
 import type { WorkflowCheckoutProof } from "../src/workflows/checkout.ts";
 import type { WorkflowCheckoutOperations } from "../src/workflows/manager.ts";
 import type { ProviderStatus, ProviderStatusReader, ProviderStatusRequest } from "../src/provider-status.ts";
 import type { ManagedProcess } from "../src/process-tree.ts";
 import type { WorkflowJournalRecord, WorkflowSnapshot } from "../src/workflows/types.ts";
+import type { RegisterWorkflowOptions, WorkflowRegistration } from "../extensions/workflows/index.ts";
 import { appendWorkflowJournal } from "../src/workflows/artifacts.ts";
 import {
   harnessAvailability,
@@ -979,6 +986,8 @@ function askThroughBackend(requests: BackendRequest[], jobId: string, input: Ask
 export interface FakePiOptions {
   /** Registers a `getAllTools` implementation. Omitted entirely when not supplied. */
   allTools?: Array<Record<string, unknown>>;
+  /** Reuses a host event bus across extension reloads. */
+  eventBus?: EventBus;
 }
 
 /**
@@ -986,6 +995,7 @@ export interface FakePiOptions {
  * Duplicate tool or command names throw, so double registration is caught.
  */
 export function fakePi(options: FakePiOptions = {}) {
+  const eventBus = options.eventBus ?? createEventBus();
   const handlers = new Map<string, (...args: any[]) => any>();
   const tools = new Map<string, any>();
   const commands = new Map<string, any>();
@@ -1000,6 +1010,7 @@ export function fakePi(options: FakePiOptions = {}) {
   }>();
   const entries: Array<{ id: string; customType: string; data: unknown }> = [];
   const api: Record<string, unknown> = {
+    events: eventBus,
     on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
     registerTool(tool: any) {
       if (tools.has(tool.name)) throw new Error(`duplicate tool: ${tool.name}`);
@@ -1037,6 +1048,7 @@ export function fakePi(options: FakePiOptions = {}) {
     entryRenderers,
     messages,
     entries,
+    eventBus,
     waitForMessage(customType?: string) {
       const found = messages.find((entry) => !customType || entry.message.customType === customType);
       if (found) return Promise.resolve(found);
@@ -1052,6 +1064,41 @@ export function fakePi(options: FakePiOptions = {}) {
       });
     },
   };
+}
+
+/** Workflow registration whose shutdown, final observation, and close all fail independently. */
+export class FailingWorkflowRegistration {
+  readonly shutdownError = new Error("workflow shutdown failed");
+  readonly listError = new Error("workflow final list failed");
+  readonly closeError = new Error("workflow close failed");
+  sessionStarts = 0;
+  sessionShutdowns = 0;
+  sessionCloses = 0;
+
+  readonly factory = (
+    _pi: ExtensionAPI,
+    options: RegisterWorkflowOptions,
+  ): WorkflowRegistration => ({
+    shortcut: "ctrl+alt+w",
+    shortcutHint: "Ctrl+Alt+W",
+    sessionStart: (_ctx: ExtensionContext, _jobs: JobManager) => {
+      this.sessionStarts++;
+      options.onInitialized?.();
+    },
+    sessionShutdown: async () => {
+      this.sessionShutdowns++;
+      throw this.shutdownError;
+    },
+    sessionClosed: () => {
+      this.sessionCloses++;
+      throw this.closeError;
+    },
+    list: () => {
+      if (this.sessionShutdowns > 0) throw this.listError;
+      return [];
+    },
+    check: () => undefined,
+  });
 }
 
 export interface ContextOptions {

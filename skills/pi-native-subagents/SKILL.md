@@ -19,6 +19,7 @@ Paths are relative to this file. Read the reference **before** you write the cal
 | let a child use `subagent_ask`, or answer with `subagent_answer` | `references/routed-questions.md` |
 | set `speed`, spend limits, replay, provider fallback, or retry | `references/budgets-replay-and-provider-waits.md` |
 | use `isolation: "worktree"`, or run `/workflows reclaim` | `references/worktrees-and-retention.md` |
+| subscribe to or consume `native-subagents:state:v1` | `references/presentation-state-v1.md` |
 | run `/subagents providers` or `/subagents providers refresh`, supervise or recover a selected job/workflow/agent, report on running work, or interpret usage and model numbers | `references/supervision-and-telemetry.md` |
 
 ## Choose the smallest orchestration surface
@@ -194,8 +195,9 @@ These are enforced by the runtime. Do not design around them.
 - Requirement rejected: rediscover capabilities with `subagent_capabilities`, use the returned ID, and keep the access ceiling consistent.
 - A clean mid-turn Codex app-server exit is a lifecycle failure, not proof a required capability is unsupported. Retry before dropping the requirement.
 - A harness rejected for login or readiness: the error names the normalized state (missing executable, login required, incompatible, temporarily unhealthy, or status unknown). Check `/subagents providers` for the active set and each harness's actionable reason, then switch routes or use `harness: "auto"` rather than guessing at the account state. The extension never logs in or installs a CLI for you.
-- A workflow or child fails: inspect the returned `ok`, `error`, route, and job ID; use `/workflows` for durable workflow state. Do not hide a failed route behind a success-only summary.
-- `/workflows` pins live-only `Now` and workflow `Context`. It uses bounded event evidence, never thoughts, response text, raw commands/results, credentials, or absolute paths. An active provider wait exposes only structured provider, window, retry, and attempt data; raw attempt errors stay private. Questions, failures, peer answers, provider waits, and queueing outrank routine activity. Replay never restores `Now`. Use `?` for navigation and `i` for telemetry.
+- A workflow or child fails: inspect `ok`, `error`, route, and job ID; use `/workflows` for durable state. Keep failed routes in the final summary.
+- `/workflows` pins live-only `Now` and workflow `Context` from bounded event evidence, never thoughts, response text, raw commands/results, credentials, or paths. Provider waits expose only structured provider, window, retry, and attempt data. Questions, failures, peer answers, waits, and queueing outrank routine activity. Replay never restores `Now`. Use `?` for navigation and `i` for telemetry.
+- No closed state event after shutdown: keep the last valid snapshot. A failed final read skips publication; teardown still releases runtime resources.
 - A provider-quota, replay, worktree, or routed-question error: the matching reference above lists the exact message and its recovery.
 
 ## Safe routing defaults
