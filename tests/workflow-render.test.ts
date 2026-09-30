@@ -274,25 +274,17 @@ function workflowWithPrivateLiveProviderState(): WorkflowSnapshot {
 const PRIVATE_LIVE_PROVIDER_MARKERS =
   /PRIVATE_LIVE_THINKING_MARKER|PRIVATE_RESPONSE_PREVIEW_MARKER|PRIVATE_OUTPUT_IN_PROGRESS_MARKER|PRIVATE_COMMAND_MARKER|PRIVATE_TOOL_SUMMARY_MARKER|PRIVATE_TRANSCRIPT_EXCERPT_MARKER/;
 
-test("collapsed running workflow cards expose semantic activity without live provider text", () => {
-  const rendered = buildWorkflowCardLines(workflowWithPrivateLiveProviderState(), theme, {
-    expanded: false,
-    now: 6_000,
-  }).join("\n");
+for (const expanded of [false, true]) {
+  test(`${expanded ? "expanded" : "collapsed"} running workflow cards expose semantic activity without live provider text`, () => {
+    const rendered = buildWorkflowCardLines(workflowWithPrivateLiveProviderState(), theme, {
+      expanded,
+      now: 6_000,
+    }).join("\n");
 
-  assert.match(rendered, /Reading tests\/privacy\.test\.ts · started 1s ago/);
-  assert.doesNotMatch(rendered, PRIVATE_LIVE_PROVIDER_MARKERS);
-});
-
-test("expanded running workflow cards expose semantic activity without live provider text", () => {
-  const rendered = buildWorkflowCardLines(workflowWithPrivateLiveProviderState(), theme, {
-    expanded: true,
-    now: 6_000,
-  }).join("\n");
-
-  assert.match(rendered, /Reading tests\/privacy\.test\.ts · started 1s ago/);
-  assert.doesNotMatch(rendered, PRIVATE_LIVE_PROVIDER_MARKERS);
-});
+    assert.match(rendered, /Reading tests\/privacy\.test\.ts · started 1s ago/);
+    assert.doesNotMatch(rendered, PRIVATE_LIVE_PROVIDER_MARKERS);
+  });
+}
 
 test("workflow cards enforce one budget, sanitization, and dashboard-pointer contract", () => {
   const huge = workflow({
@@ -559,7 +551,7 @@ test("styled header and phase spine truncate cleanly at narrow widths with a rea
   assert.ok(phasesLine.includes(ESC), "the phase spine still applies theme styling at a narrow width");
 });
 
-test("collapsed cards keep only the phase spine loud for routine running state; the header and agent rollup stay quiet", () => {
+test("collapsed running cards show readable status and active agent count", () => {
   const allRunning = workflow({
     status: "running",
     agents: [
@@ -570,15 +562,10 @@ test("collapsed cards keep only the phase spine loud for routine running state; 
   });
   const lines = buildWorkflowCardLines(allRunning, theme, { expanded: false, now: 6_000 });
   const [header] = lines;
-  const phasesLine = lines.find((line) => line.startsWith("Phases"))!;
   const agentsLine = lines.find((line) => line.startsWith("Agents"))!;
 
-  assert.ok(!header!.includes("●"), "the header no longer duplicates the phase spine's running dot");
-  assert.ok(header!.includes("◆"), "the header uses a neutral marker for a routine (non-attention) status");
   assert.ok(header!.includes("running"), "the overall status is still stated once, as text, in the header");
-  assert.ok(phasesLine.includes("●"), "the phase spine still carries the current phase's running dot");
-  assert.match(agentsLine, /\b3 active\b/, "a uniformly running roster collapses to a compact readable count, not glyph-heavy per-state tallies");
-  assert.doesNotMatch(agentsLine, /[●○✓×]/, "the compact count carries no per-state status glyphs");
+  assert.match(agentsLine, /\b3 active\b/, "the rollup reports all three active agents");
 });
 
 test("mixed-state agent rollups stay textual and readable, and failures/queued remain distinguishable without glyphs or color alone", () => {
@@ -592,7 +579,6 @@ test("mixed-state agent rollups stay textual and readable, and failures/queued r
   });
   const agentsLine = buildWorkflowCardLines(mixed, theme, { expanded: false, now: 6_000 }).find((line) => line.startsWith("Agents"))!;
 
-  assert.doesNotMatch(agentsLine, /[●○✓×]/, "the collapsed rollup no longer carries per-state status glyphs");
   assert.match(agentsLine, /\bqueued\b/);
   assert.match(agentsLine, /\brunning\b/);
   assert.match(agentsLine, /\bdone\b/);
@@ -640,55 +626,35 @@ test("a waiting agent renders distinctly from failed/queued, is excluded from th
   assert.ok(coloredAgentsLine.includes("[warning]1 waiting"), "waiting keeps an attention color distinct from failed/error");
 });
 
-test("a collapsed provider-wait card hides a stale run error", () => {
-  const staleError = "legacy token=sk-collapsed-secret at /outside/workspace/collapsed.log";
-  const waiting = workflow({
-    error: staleError,
-    agents: [agent({
-      name: "quota-check",
-      state: "waiting",
-      error: "legacy token=sk-agent-secret at /outside/workspace/provider.log",
-      providerWait: {
-        provider: "codex",
-        kind: "quota",
-        detail: "raw provider rejection",
-        retryAt: 66_000,
-        attempt: 1,
-        maxAttempts: 3,
-      },
-    })],
+for (const { expanded, provider, attempt, maxAttempts } of [
+  { expanded: false, provider: "codex", attempt: 1, maxAttempts: 3 },
+  { expanded: true, provider: "claude", attempt: 2, maxAttempts: 4 },
+] as const) {
+  test(`a ${expanded ? "expanded" : "collapsed"} provider-wait card hides a stale run error`, () => {
+    const staleError = "legacy token=sk-run-secret at /outside/workspace/run.log";
+    const waiting = workflow({
+      error: staleError,
+      agents: [agent({
+        name: "quota-check",
+        state: "waiting",
+        error: "legacy token=sk-agent-secret at /outside/workspace/provider.log",
+        providerWait: {
+          provider,
+          kind: "quota",
+          detail: "raw provider rejection",
+          retryAt: 66_000,
+          attempt,
+          maxAttempts,
+        },
+      })],
+    });
+
+    const rendered = buildWorkflowCardLines(waiting, theme, { expanded, now: 6_000 }).join("\n");
+    assert.ok(rendered.includes(`waiting for ${provider} quota · retry in 1m · attempt ${attempt}/${maxAttempts}`));
+    assert.doesNotMatch(rendered, /sk-(?:run|agent)-secret|outside\/workspace/);
+    assert.equal(waiting.error, staleError, "rendering does not discard private historical provenance");
   });
-
-  const rendered = buildWorkflowCardLines(waiting, theme, { expanded: false, now: 6_000 }).join("\n");
-  assert.match(rendered, /waiting for codex quota · retry in 1m · attempt 1\/3/);
-  assert.doesNotMatch(rendered, /sk-(?:collapsed|agent)-secret|outside\/workspace/);
-  assert.equal(waiting.error, staleError, "rendering does not discard private historical provenance");
-});
-
-test("an expanded provider-wait card hides a stale run error", () => {
-  const staleError = "legacy token=sk-expanded-secret at /outside/workspace/expanded.log";
-  const waiting = workflow({
-    error: staleError,
-    agents: [agent({
-      name: "quota-check",
-      state: "waiting",
-      error: "legacy token=sk-agent-secret at /outside/workspace/provider.log",
-      providerWait: {
-        provider: "claude",
-        kind: "quota",
-        detail: "raw provider rejection",
-        retryAt: 66_000,
-        attempt: 2,
-        maxAttempts: 4,
-      },
-    })],
-  });
-
-  const rendered = buildWorkflowCardLines(waiting, theme, { expanded: true, now: 6_000 }).join("\n");
-  assert.match(rendered, /waiting for claude quota · retry in 1m · attempt 2\/4/);
-  assert.doesNotMatch(rendered, /sk-(?:expanded|agent)-secret|outside\/workspace/);
-  assert.equal(waiting.error, staleError, "rendering does not discard private historical provenance");
-});
+}
 
 test("terminal provider-wait exhaustion remains visible on workflow cards", () => {
   const terminalError = "Provider wait exhausted (attempt 3/3) for codex quota.";

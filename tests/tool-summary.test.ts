@@ -40,12 +40,9 @@ test("pairToolEntries resolves a self-settled phase-less entry as its own result
   assert.equal(pairs.get("bash-1")?.result, entry);
 });
 
-test("a call interrupted by an intervening event still resolves to exactly one paired call", () => {
+test("start and end events resolve to one failed tool call", () => {
   const start = tool({ toolId: "bash-1", phase: "start", name: "bash" });
   const end = tool({ toolId: "bash-1", phase: "end", name: "bash", result: { content: [], isError: true }, error: true });
-  // The entries a caller pairs are only the tool events; a non-tool entry in
-  // between (assistant/user/thinking) never reaches pairToolEntries, mirroring
-  // how both dashboard surfaces filter their transcript before pairing.
   const states = toolCallStates([start, end]);
   assert.equal(states.length, 1, "start and end merge into exactly one call, not a running call plus a separate failed one");
   assert.equal(states[0]?.status, "failed");
