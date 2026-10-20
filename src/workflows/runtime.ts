@@ -387,17 +387,21 @@ export async function inspectWorkflowExecution(database: string) {
       const document = await harness.snapshot(WorkflowDoc, conversationId, BACKGROUND_CONTEXT);
       const task = document?.taskId ? await harness.getTask(document.taskId, BACKGROUND_CONTEXT) : undefined;
       const unsafeCalls: number[] = [];
+      const interruptionErrors: Record<number, string> = {};
       for (const intent of document?.nativeIntents ?? []) {
         const native = await harness.getTask(intent.taskId, BACKGROUND_CONTEXT);
         if (native && (native.state.status !== "terminal" || native.state.outcome.status === "failed"
             && /interrupted.*may have partially run/i.test(native.state.outcome.error.message))) {
           unsafeCalls.push(intent.callIndex);
+          if (native.state.status === "terminal" && native.state.outcome.status === "failed") {
+            interruptionErrors[intent.callIndex] = native.state.outcome.error.message;
+          }
         }
       }
-      return { pending: task !== undefined && task.state.status !== "terminal", unsafeCalls };
+      return { pending: task !== undefined && task.state.status !== "terminal", unsafeCalls, interruptionErrors };
     });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { pending: false, unsafeCalls: [] };
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { pending: false, unsafeCalls: [], interruptionErrors: {} as Record<number, string> };
     throw error;
   }
 }

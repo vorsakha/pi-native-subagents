@@ -14,11 +14,25 @@ const request = {
   defaultHarness: "codex" as const,
   script: `export const meta = { phases: ["before", "after"] };
     export default async () => {
+      const guards = [];
+      for (const operation of [
+        () => globalThis.Date.now(),
+        () => new globalThis.Date(),
+        () => globalThis.Math.random(),
+        () => Function("return globalThis.Math.random()")(),
+        () => (async function () {}).constructor("return Date.now()")(),
+      ]) {
+        try { await operation(); throw new Error("Deterministic guard escaped"); }
+        catch (error) {
+          if (!error.message.includes("not available in deterministic workflows")) throw error;
+          guards.push(error.message);
+        }
+      }
       phase("before");
       const done = await agent("done", { access: "readOnly" });
       const interrupted = await agent("interrupted", { access: "readOnly" });
       phase("after");
-      const after = await agent("after", { access: "readOnly" });
+      const after = await agent("after " + JSON.stringify({ interrupted, guards }), { access: "readOnly" });
       return { done, interrupted, after };
     };`,
 };
@@ -38,12 +52,13 @@ try {
     const started = await workflows.start({ ...request, resumeFromRunId: runId });
     if (started.snapshot.runId !== runId) throw new Error("Recovery replaced the run instead of recovering its Durable task");
     await backend.waitForStart(1);
-    if (backend.requests[0]?.task !== "after") throw new Error("Recovery redispatched completed or interrupted native work");
+    if (!backend.requests[0]?.task.startsWith("after {")) throw new Error("Recovery redispatched completed or interrupted native work");
     await appendFile(join(directory, "calls"), "after\n");
     backend.complete(backend.starts[0]!, "after");
     const final = await started.completion;
     const replay = await workflows.start({ ...request, resumeFromRunId: runId });
     const replayed = await replay.completion;
+    if (JSON.stringify(replayed.result) !== JSON.stringify(final.result)) throw new Error("Finished replay changed public values");
     if (backend.requests.length !== 1 || replayed.status !== "completed") throw new Error("Finished replay redispatched interrupted native work");
     process.stdout.write(JSON.stringify({ status: final.status, result: final.result, agents: final.agents.map((agent) => agent.state), usage: aggregateWorkflowUsage(final) }) + "\n");
   }

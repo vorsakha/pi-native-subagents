@@ -1,5 +1,17 @@
-import { parse, type Node } from "acorn";
+import { parse, type Node, type Pattern } from "acorn";
 import { workflowPrelude } from "./prelude.ts";
+
+function bindingNames(pattern: Pattern): string[] {
+  switch (pattern.type) {
+    case "Identifier": return [pattern.name];
+    case "RestElement": return bindingNames(pattern.argument);
+    case "AssignmentPattern": return bindingNames(pattern.left);
+    case "ArrayPattern": return pattern.elements.flatMap((item) => item ? bindingNames(item) : []);
+    case "ObjectPattern": return pattern.properties.flatMap((item) =>
+      bindingNames(item.type === "RestElement" ? item.argument : item.value));
+    default: return [];
+  }
+}
 
 /** Parse module syntax without evaluating host JavaScript or permitting module loading. */
 export function workflowCode(source: string, argsJson: string, maxAgentCalls: number): string {
@@ -40,7 +52,7 @@ export function workflowCode(source: string, argsJson: string, maxAgentCalls: nu
         edits.push({ start: statement.start, end: statement.declaration.start, text: "" });
         if (statement.declaration.type === "VariableDeclaration") {
           for (const declaration of statement.declaration.declarations) {
-            if (declaration.id.type === "Identifier" && declaration.id.name === "meta") metaName = "meta";
+            if (bindingNames(declaration.id).includes("meta")) metaName = "meta";
           }
         }
       } else {
@@ -60,7 +72,7 @@ export function workflowCode(source: string, argsJson: string, maxAgentCalls: nu
   const moduleBody = `${body}\n;return { default: ${defaultName}, hasMeta: ${metaName !== undefined}, meta: ${metaName ?? "undefined"} };`;
   return `${workflowPrelude(argsJson, maxAgentCalls)}
     const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-    const workflowModule = await new AsyncFunction("Date", "Math", ${JSON.stringify('"use strict";\n' + moduleBody)})(Date, Math);
+    const workflowModule = await new AsyncFunction(${JSON.stringify('"use strict";\n' + moduleBody)})();
     if (workflowModule.hasMeta) await bridge({ operation: "meta", value: workflowModule.meta ?? null });
     if (typeof workflowModule.default !== "function") throw new TypeError("Workflow must export a default async function");
     let result;

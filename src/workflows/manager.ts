@@ -215,7 +215,7 @@ function progressedJournalCalls(records: WorkflowJournalRecord[]): Set<number> {
     record.kind !== "peerQuestion" && (record.state === "progressed"
       || record.state === "handoff"
       || record.result?.progressed === true
-      || record.result?.unsafeToReplay === true
+      || record.unsafeToReplay === true
       || record.continuationProgress !== undefined
       || record.continuation !== undefined
       || record.route?.continuation !== undefined)
@@ -936,9 +936,10 @@ export class WorkflowManager {
           version: 1, sequence: records.length,
           kind: record.kind, callIndex: record.callIndex, fingerprint: record.fingerprint,
           state: "failed", at: Date.now(), agentIndex: agent?.index,
+          unsafeToReplay: true,
           result: {
-            ok: false, output: "", unsafeToReplay: true,
-            error: "Native call was interrupted and may have partially run; inspect partial effects before manual recovery",
+            ok: false, output: "",
+            error: execution.interruptionErrors[record.callIndex] ?? "Tool workflow_agent was interrupted and may have partially run",
           },
           route: journalRoute(agent),
         };
@@ -1289,6 +1290,7 @@ export class WorkflowManager {
         result: clone(expected.result),
         route: expected.route ? { ...expected.route } : undefined,
         replayedFrom: { runId: entry.replay.sourceRunId, callIndex: expected.callIndex },
+        unsafeToReplay: expected.unsafeToReplay,
       });
       this.#touch(entry);
       return clone(expected.result);
@@ -1670,6 +1672,7 @@ export class WorkflowManager {
         result: replayedResult,
         route: expected.route ? { ...expected.route } : undefined,
         replayedFrom: { runId: entry.replay.sourceRunId, callIndex: expected.callIndex },
+        unsafeToReplay: expected.unsafeToReplay,
       });
       this.#touch(entry);
       return replayedResult;
@@ -2667,7 +2670,7 @@ export class WorkflowManager {
     record.structured = structured;
     record.structuredTransport = replay.result.transport;
     record.error = replay.result.error;
-    if (replay.result.unsafeToReplay) record.unsafeToReplay = true;
+    if (replay.unsafeToReplay) record.unsafeToReplay = true;
     if (replay.result.progressed === true || replay.route?.continuation !== undefined) {
       record.progressedCheckpoint = true;
     }
@@ -2969,7 +2972,7 @@ export class WorkflowManager {
       structured: replay.result.structured === undefined ? undefined : clone(replay.result.structured),
       structuredTransport: replay.result.transport,
       error: replay.result.error,
-      unsafeToReplay: replay.result.unsafeToReplay,
+      unsafeToReplay: replay.unsafeToReplay,
       progressedCheckpoint: replay.result.progressed === true || replay.route?.continuation !== undefined ? true : undefined,
       // Replay restores route/attempt provenance but spends no usage again.
       usage: workflowUsage(),

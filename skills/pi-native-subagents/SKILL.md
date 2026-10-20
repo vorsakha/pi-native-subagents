@@ -67,9 +67,7 @@ await subagent_wait({ jobId: review.jobId, timeoutMs: 600_000 });
 
 ## Workflow shape
 
-Read `references/workflow-authoring.md` before writing a script. Read `references/durable-recovery.md` before recovering, replaying, or restarting a run. Durable recovers interrupted tasks in place; settled-run replay and suffix restart use retained application proofs. Interrupted native intents never redispatch automatically, and provider sessions are not reattached. Old VM runs are not resumable.
-
-The essentials:
+Read `references/workflow-authoring.md` before writing a script. Read `references/durable-recovery.md` before recovering, replaying, or restarting a run. Durable recovers interrupted tasks in place; settled-run replay and suffix restart use retained application proofs. Interrupted native intents replay the same public failure and never redispatch automatically, and provider sessions are not reattached. Old VM runs are not resumable.
 
 The `workflow` tool accepts exactly one source — `script` (inline JavaScript), `workflowName` (a saved definition), or `scriptPath` (a trusted project-local script) — and zero or one input form, either structured `input` or the legacy JSON-string `args`, never both. The selected value reaches the script as the global `args`; omitting both exposes `null`.
 

@@ -322,8 +322,6 @@ export interface WorkflowLogRecord {
 
 export interface WorkflowJournalResult {
   ok: boolean;
-  /** Durable interrupted a native intent; no side-effect replay is authorized. */
-  unsafeToReplay?: true;
   output: string;
   jobId?: string;
   error?: string;
@@ -443,6 +441,8 @@ export interface WorkflowJournalRecord {
   interaction?: WorkflowInteractionJournalDetail;
   /** A persisted peer answer that requires a later accepted record before replay. */
   interactionPending?: true;
+  /** Internal interruption proof, excluded from script-visible results. */
+  unsafeToReplay?: true;
   result?: WorkflowJournalResult;
   route?: WorkflowJournalRoute;
   replayedFrom?: WorkflowReplayReference;
@@ -472,6 +472,7 @@ export interface WorkflowReplayCall {
   kind: "agent" | "followUp";
   /** The lineage this call belongs to; required to reconstruct a followUp() replay. */
   agentIndex?: number;
+  unsafeToReplay?: true;
   result: WorkflowJournalResult;
   route?: WorkflowJournalRoute;
   /** Accepted checkpoint chain copied into a replay journal before its terminal record. */

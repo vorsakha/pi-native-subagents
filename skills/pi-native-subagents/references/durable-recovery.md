@@ -6,7 +6,7 @@ Read this before recovering an interrupted workflow or replaying a settled run.
 
 Workflows use pinned Durable/code-mode 1.3.0 with a QuickJS worker and one private SQLite database per run. Durable owns tasks, call results, execution replay, and interrupted-task recovery. The existing native job manager owns Pi, Claude, and Codex execution and the shared four-turn scheduler. No coordinator model turn is added.
 
-`runtime.sqlite` contains execution state plus bounded application history for inspection, finished-run replay, and suffix restart. JSON summaries, transcripts, results, and reports are inspection exports. Task-scoped code-mode journals retire at settlement; application history remains until run retention removes it. Keep databases and their sidecars private and out of Git. Only one process may schedule or write a run's database; passive inspection never enables scheduling.
+`runtime.sqlite` contains execution state plus bounded application history for inspection, finished-run replay, and suffix restart. JSON summaries, transcripts, results, and reports are inspection exports. Task-scoped code-mode journals retire at settlement; application history remains until run retention removes it. Keep databases and their sidecars private and out of Git. Only one process may schedule or write a run's database; passive inspection uses a non-reconciling session and leaves task records unchanged. Ownership is published atomically under the interprocess lock; interrupted publication residue is recoverable without replacing a live lease.
 
 ## Recover an interrupted host
 
@@ -20,7 +20,7 @@ The script may handle that failed result and continue with later calls. Native a
 
 For a settled task, `resumeFromRunId` starts a replacement run. The application matches completed calls against bounded persisted proofs, including independently completed parallel lanes. Failed or incomplete work may run again only when no interrupted native intent or progressed-work proof forbids it. Compatible budget increases remain supported for finished replay. Interrupted recovery requires the original budget.
 
-Restarting an eligible selected agent also starts a replacement run, reuses its valid prefix, and invalidates its suffix. It cannot discard progressed or interrupted native work. The dashboard hides restart for those agents; use the recorded handoff where eligible, or inspect partial effects and recover manually. Replaying an interruption preserves its failure and never makes that native intent safe to dispatch.
+Restarting an eligible selected agent also starts a replacement run, reuses its valid prefix, and invalidates its suffix. It cannot discard progressed or interrupted native work. The dashboard hides restart for those agents; use the recorded handoff where eligible, or inspect partial effects and recover manually. Replaying an interruption preserves the same public failure value, including its error text. Unsafe-replay proof stays private to history and inspection, outside the script result. It never makes that native intent safe to dispatch.
 
 Old Node VM/checkpoint runs are not migrated or resumable. Start a fresh run after inspecting their partial effects.
 

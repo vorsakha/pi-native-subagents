@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { join } from "node:path";
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
+import { claimWorkflowDatabase } from "../src/workflows/state.ts";
 import { tempDir, withTimeout, workflowRuntimeOptions } from "./helpers.ts";
 import { runWorkflowSandbox } from "../src/workflows/sandbox.ts";
 
@@ -88,6 +90,23 @@ test("one live owner schedules a private database while passive inspection dispa
   try {
     await active;
     await assert.rejects(runWorkflowSandbox({ ...options, signal: new AbortController().signal }), /live owner/);
+    const db = new DatabaseSync(database, { readOnly: true });
+    const before = db.prepare("SELECT * FROM tasks ORDER BY id").all();
+    const reader = spawn(process.execPath, ["--input-type=module", "-e", `
+      import { inspectWorkflowExecution } from ${JSON.stringify(new URL("../src/workflows/runtime.ts", import.meta.url).href)};
+      import { readWorkflowState } from ${JSON.stringify(new URL("../src/workflows/state.ts", import.meta.url).href)};
+      await readWorkflowState(${JSON.stringify(database)});
+      const state = await inspectWorkflowExecution(${JSON.stringify(database)});
+      if (!state.pending) throw new Error("Missing active workflow");
+    `], { stdio: ["ignore", "ignore", "pipe"] });
+    let errors = "";
+    reader.stderr.on("data", (chunk) => { errors += String(chunk); });
+    try {
+      const [code] = await withTimeout(once(reader, "exit"), "Passive reader");
+      assert.equal(code, 0, errors);
+      assert.deepEqual(db.prepare("SELECT * FROM tasks ORDER BY id").all(), before,
+        "cross-process inspection must leave committed task records unchanged");
+    } finally { reader.kill("SIGKILL"); db.close(); }
     const { inspectWorkflowExecution } = await import("../src/workflows/runtime.ts");
     assert.equal((await inspectWorkflowExecution(database)).pending, true);
     assert.equal(dispatches, 1, "passive inspection must not enable another scheduler");
@@ -108,4 +127,65 @@ test("script console output stays private when reporting a workflow failure", as
     assert.doesNotMatch(error.message, /PRIVATE_SCRIPT_OUTPUT/);
     return true;
   });
+});
+
+
+test("unawaited helper and direct native calls cannot commit success", async () => {
+  const cwd = await tempDir("durable-unawaited");
+  for (const call of [
+    'agent("forgotten")',
+    'tools.workflow_agent({ operation: "agent", prompt: "forgotten", options: {}, callIndex: 0 })',
+  ]) {
+    let dispatched = 0;
+    let cancelled = 0;
+    await assert.rejects(runWorkflowSandbox(workflowRuntimeOptions(cwd,
+      `export default async () => { void ${call}; return "success"; }`, {
+        onAgent: async (_prompt, _options, signal) => {
+          dispatched++;
+          return new Promise((resolve) => {
+            const abort = () => { cancelled++; resolve({ ok: false, output: "", error: "cancelled" }); };
+            signal.addEventListener("abort", abort, { once: true });
+            if (signal.aborted) abort();
+          });
+        },
+      })), /await every|returned before/i);
+    assert.equal(cancelled, dispatched, "every dispatched call settles cancellation before close returns");
+  }
+});
+
+test("owner publication recovers residue and never replaces a live lease", async () => {
+  const cwd = await tempDir("durable-owner-publication");
+  const database = join(cwd, "runtime.sqlite");
+  const owner = join(cwd, "runtime.owner");
+  const pending = `${owner}.pending`;
+  await writeFile(owner, "");
+  await writeFile(pending, '{"pid":');
+  const release = await claimWorkflowDatabase(database);
+  const published = await readFile(owner, "utf8");
+  assert.equal(JSON.parse(published).pid, process.pid);
+  await assert.rejects(readFile(pending), { code: "ENOENT" });
+  await assert.rejects(claimWorkflowDatabase(database), /live owner/);
+  assert.equal(await readFile(owner, "utf8"), published);
+  await release();
+  const reacquired = await claimWorkflowDatabase(database);
+  await reacquired();
+});
+
+test("destructured module exports retain metadata at the host boundary", async () => {
+  const cwd = await tempDir("durable-meta-bindings");
+  for (const declaration of [
+    'const { meta } = { meta: { name: "binding" } }',
+    'const [{ nested: { meta = { name: "binding" } } }] = [{ nested: {} }]',
+    'const [unused, ...meta] = [0, "binding"]',
+    'const { unused, ...meta } = { unused: 0, name: "binding" }',
+  ]) {
+    let observed: unknown;
+    const result = await runWorkflowSandbox(workflowRuntimeOptions(cwd,
+      `export ${declaration}; export default async () => meta;`, {
+        onMeta: (meta) => { observed = meta; },
+      }));
+    assert.deepEqual(result.meta, observed);
+    assert.deepEqual(result.result, observed);
+    assert.ok(observed, "metadata must reach the host");
+  }
 });

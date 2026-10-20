@@ -298,8 +298,16 @@ test("forbids nondeterministic time and random APIs used by replayable workflows
         () => Date.now(),
         () => new Date(),
         () => Math.random(),
+        () => globalThis.Date.now(),
+        () => new globalThis.Date(),
+        () => globalThis.Math.random(),
+        () => Function("return Date.now()")(),
+        () => Function("return globalThis.Math.random()")(),
+        () => new Date.prototype.constructor(),
+        () => Object.getPrototypeOf(new Date(0)).constructor.now(),
+        () => (async function () {}).constructor("return globalThis.Date.now()")(),
       ]) {
-        try { operation(); failures.push("allowed"); }
+        try { await operation(); failures.push("allowed"); }
         catch (error) { failures.push(error.message); }
       }
       return { failures, explicitDate: new Date(0).toISOString(), parsed: Date.parse("1970-01-01T00:00:00.000Z") };
@@ -312,6 +320,14 @@ test("forbids nondeterministic time and random APIs used by replayable workflows
         "Date.now() is not available in deterministic workflows",
         "new Date() is not available in deterministic workflows; pass an explicit value",
         "Math.random() is not available in deterministic workflows",
+        "Date.now() is not available in deterministic workflows",
+        "new Date() is not available in deterministic workflows; pass an explicit value",
+        "Math.random() is not available in deterministic workflows",
+        "Date.now() is not available in deterministic workflows",
+        "Math.random() is not available in deterministic workflows",
+        "new Date() is not available in deterministic workflows; pass an explicit value",
+        "Date.now() is not available in deterministic workflows",
+        "Date.now() is not available in deterministic workflows",
       ],
       explicitDate: "1970-01-01T00:00:00.000Z",
       parsed: 0,

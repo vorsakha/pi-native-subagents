@@ -632,7 +632,7 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || typeof record.result.output !== "string" || record.result.output.length > JOURNAL_RECORD_BYTES
       || record.result.jobId !== undefined && (typeof record.result.jobId !== "string" || !record.result.jobId || record.result.jobId.length > 200)
       || record.result.error !== undefined && typeof record.result.error !== "string"
-      || record.result.unsafeToReplay !== undefined && record.result.unsafeToReplay !== true
+      || record.unsafeToReplay !== undefined && record.unsafeToReplay !== true
       || record.result.progressed !== undefined && record.result.progressed !== true
       || record.result.transport !== undefined && record.result.transport !== "native" && record.result.transport !== "portable") return false;
   return record.state === "completed" ? record.result.ok : !record.result.ok;

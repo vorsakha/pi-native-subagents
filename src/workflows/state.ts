@@ -1,8 +1,8 @@
-import { chmod, lstat, open, readFile, rm } from "node:fs/promises";
+import type { Context, JsonValue } from "@earendil-works/chord";
+import { chmod, lstat, open, readFile, rename, rm } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { createModels } from "workflow-pi-ai/models";
-import { createRegistry, defineDoc, Harness, type ConversationId } from "@earendil-works/pi-durable";
+import { createSession, defineDoc, ROOT_CONVERSATION_ID, type Session, type TaskRecord, type TaskId, type ConversationId } from "@earendil-works/pi-durable";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
 import { withWorkflowRetentionLock } from "./retention.ts";
 
@@ -25,7 +25,9 @@ export class WorkflowDatabaseBusyError extends Error {
 }
 
 interface Owner {
-  harness: Harness;
+  harness: Pick<Session, "snapshot" | "commit"> & {
+    getTask(id: TaskId, context: Context): Promise<Pick<TaskRecord<JsonValue, JsonValue, unknown>, "state"> | undefined>;
+  };
   conversationId: ConversationId;
 }
 
@@ -75,16 +77,34 @@ async function withState<T>(database: string, readOnly: boolean, action: (owner:
   if (owner) return action(await owner);
   // Passive readers never resume the scheduler. Only one writer may open this run's database.
   const release = readOnly ? async () => {} : await claimWorkflowDatabase(database);
-  let harness: Harness | undefined;
+  let session: Session | undefined;
   try {
     await requireDatabase(database, readOnly);
-    harness = await Harness.open(await openNodeSqliteStorage(database), {
-      models: createModels(), registry: createRegistry(),
-    }, BACKGROUND_CONTEXT);
-    const root = await harness.root(BACKGROUND_CONTEXT);
-    return await action({ harness, conversationId: root.id });
+    const storage = await openNodeSqliteStorage(database);
+    session = createSession(storage);
+    if (!readOnly && !await storage.conversation(ROOT_CONVERSATION_ID, BACKGROUND_CONTEXT)) {
+      // New artifacts need the reserved root; only the exclusive owner may bootstrap it.
+      await session.close(BACKGROUND_CONTEXT);
+      session = undefined;
+      const { Harness, createRegistry } = await import("@earendil-works/pi-durable");
+      const { createModels } = await import("workflow-pi-ai/models");
+      const harness = await Harness.open(await openNodeSqliteStorage(database), {
+        models: createModels(), registry: createRegistry(),
+      }, BACKGROUND_CONTEXT);
+      session = harness;
+      const root = await harness.root(BACKGROUND_CONTEXT);
+      return await action({ harness, conversationId: root.id });
+    }
+    return await action({
+      harness: {
+        snapshot: session.snapshot.bind(session),
+        commit: session.commit.bind(session),
+        getTask: storage.task.bind(storage),
+      },
+      conversationId: ROOT_CONVERSATION_ID,
+    });
   } finally {
-    await harness?.close(BACKGROUND_CONTEXT);
+    await session?.close(BACKGROUND_CONTEXT);
     if (!readOnly) await chmod(database, 0o600).catch(() => undefined);
     await release();
   }
@@ -105,17 +125,24 @@ export async function claimWorkflowDatabase(database: string): Promise<() => Pro
   const lockRoot = join(dirname(database), ".ownership");
   await withWorkflowRetentionLock(lockRoot, async () => {
     try {
-      const owner: unknown = JSON.parse(await readFile(lock, "utf8"));
-      if (!owner || typeof owner !== "object" || !("pid" in owner) || typeof owner.pid !== "number") {
-        throw new Error("Invalid workflow database owner");
+      let owner: unknown;
+      try { owner = JSON.parse(await readFile(lock, "utf8")); }
+      catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+        await rm(lock);
       }
-      try {
-        process.kill(owner.pid, 0);
-        throw new WorkflowDatabaseBusyError();
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      if (!owner || typeof owner !== "object" || !("pid" in owner) || typeof owner.pid !== "number"
+          || !Number.isSafeInteger(owner.pid) || owner.pid <= 0) {
+        if (owner !== undefined) await rm(lock);
+      } else {
+        try {
+          process.kill(owner.pid, 0);
+          throw new WorkflowDatabaseBusyError();
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+        }
+        await rm(lock);
       }
-      await rm(lock);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     }
@@ -126,9 +153,20 @@ export async function claimWorkflowDatabase(database: string): Promise<() => Pro
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
-    const owner = await open(lock, "wx", 0o600);
-    try { await owner.writeFile(JSON.stringify({ pid: process.pid })); }
-    finally { await owner.close(); }
+    // The retention lock excludes every publisher. Remove interrupted staging files here.
+    const temporary = `${lock}.pending`;
+    await rm(temporary, { force: true });
+    const owner = await open(temporary, "wx", 0o600);
+    try {
+      await owner.writeFile(JSON.stringify({ pid: process.pid }));
+      await owner.sync();
+      await owner.close();
+      await rename(temporary, lock);
+    } catch (error) {
+      await owner.close().catch(() => undefined);
+      await rm(temporary, { force: true });
+      throw error;
+    }
   });
   return () => withWorkflowRetentionLock(lockRoot, () => rm(lock, { force: true }));
 }

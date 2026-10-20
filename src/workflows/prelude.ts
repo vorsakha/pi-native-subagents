@@ -58,21 +58,6 @@ export function workflowPrelude(argsJson: string, maxAgentCalls: number): string
         (error) => { pendingAgents--; resolve(JSON.stringify({ ok: false, output: "", error: String(error.message || error) })); },
       );
     };
-      const NativeDate = globalThis.Date;
-      const Math = Object.create(globalThis.Math);
-      class WorkflowDate extends NativeDate {
-        constructor(...values) {
-          if (values.length === 0) throw new Error("new Date() is not available in deterministic workflows; pass an explicit value");
-          super(...values);
-        }
-        static now() { throw new Error("Date.now() is not available in deterministic workflows"); }
-      }
-      const Date = WorkflowDate;
-      Object.defineProperty(Math, "random", {
-        value() { throw new Error("Math.random() is not available in deterministic workflows"); },
-        writable: false,
-        configurable: false,
-      });
       const asFailure = (error) => ({
         ok: false,
         output: "",

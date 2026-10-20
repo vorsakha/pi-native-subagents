@@ -669,6 +669,7 @@ test("workflow-owned jobs recheck spend at the global pre-launch boundary", asyn
       () => agent("global queued", { access: "readOnly" })
     ], 2);`, { budget: { maxConcurrency: 2, maxTokens: 5 } }));
     await waitFor(() => f.jobs.list().length === 2, "one active and one globally queued workflow child");
+    await f.backend.waitForStart(1);
     assert.equal(f.backend.requests.length, 1);
     f.backend.completeTask("global first", "done", { input: 5, output: 1 });
     const final = await started.completion;
