@@ -1,6 +1,6 @@
 # Routed questions (subagent_ask / subagent_answer)
 
-Read this before telling a child it may ask a question, and before answering one as the parent. A blocked child may have exactly one outstanding bounded question open at a time and waits for its correlated answer before asking another. This is a host-routed request/response — never a way to delegate, discover jobs, or change policy.
+Read this before telling a child it may ask a question, and before answering one as the parent. A blocked child may have exactly one outstanding bounded question open at a time and waits for its correlated answer before asking another. Host-routed questions cannot delegate, discover jobs, or change policy.
 
 ## Child side — `subagent_ask({ target?, question, context? })`
 
@@ -63,7 +63,7 @@ coalesced into one follow-up turn. Repeated lifecycle events cannot redeliver it
 - Cancelling the caller or shutting down rejects the parked callback. Dismissal or expiry removes queued answer work and cancels a started answer, making the target unavailable to `followUp()`. The workflow awaits cancellation before restoring the target or journaling, retains cancellation usage, and rechecks after native completion and provisional-answer persistence. Replay requires a separate accepted record written after caller settlement; dismissal or any acceptance/invalidation write failure leaves no replayable answer.
 - A peer answer is a real model turn on the target lineage: it is charged to that agent's usage, rechecks that agent's cumulative retained-session budget, counts toward workflow token/cost/turn budgets, and appears as another bounded generation (`peerAnswer`) under the same agent card — never a new agent. Successful, failed, and cancelled answer journals include all target-lineage usage, including a continued lineage's failed primary and answer-turn spend. A failed or cancelled peer answer marks only its own generation failed; the lineage result the script already consumed is preserved. Its progress does not create an agent-call checkpoint or block an otherwise safe suffix restart.
 - A peer-answer turn inherits the target lineage's fixed speed. It cannot change or downgrade Fast policy.
-- `resumeFromRunId` replays a recorded peer answer only when the asking lineage and generation, the target lineage and its call fingerprint, and the question all match; the recorded answer is returned without dispatching or re-charging the target. Anything else reruns live, or fails with an actionable error when the replayed target has no retained session. Parent answers are never replayed: the live parent thread may have changed.
+- Finished-run `resumeFromRunId` replays a recorded peer answer only when the asking lineage and generation, the target lineage and its call fingerprint, and the question all match; the recorded answer is returned without dispatching or re-charging the target. Anything else reruns live, or fails with an actionable error when the replayed target has no retained session. Parent answers are never replayed: the live parent thread may have changed.
 
 ## Recovery
 

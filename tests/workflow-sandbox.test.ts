@@ -163,7 +163,7 @@ test("aborts a running workflow and aborts in-flight agent work", async () => {
   } finally { await cleanup(stuck.cwd); }
 });
 
-test("terminates the child when a host progress callback fails", async () => {
+test("terminates the sandbox when a host progress callback fails", async () => {
   const f = await fixture(`
     export const meta = { name: "callback-failure" };
     export default async () => new Promise(() => {});
@@ -175,22 +175,16 @@ test("terminates the child when a host progress callback fails", async () => {
   } finally { await cleanup(f.cwd); }
 });
 
-test("has no overall deadline and runs until explicitly aborted", async () => {
+test("rejects a stalled script that cannot make further progress", async () => {
   const f = await fixture(`export default async () => new Promise(() => {})`);
   try {
-    const running = runWorkflowSandbox(f.options);
-    const state = await Promise.race([
-      running.then(() => "settled", () => "settled"),
-      new Promise<string>((resolve) => setTimeout(() => resolve("running"), 75)),
-    ]);
-    assert.equal(state, "running");
-    f.controller.abort();
-    await assert.rejects(running, (error: Error) => error.name === "AbortError");
+    await assert.rejects(runWorkflowSandbox(f.options), /pending|stalled|settle/i);
   } finally { await cleanup(f.cwd); }
 });
 
 test("rejects workflows that return before all agent calls are awaited", async () => {
   let aborted = false;
+  let dispatched = false;
   const f = await fixture(`
     export default async () => {
       void agent("forgotten", {});
@@ -198,6 +192,7 @@ test("rejects workflows that return before all agent calls are awaited", async (
     }
   `, {
     onAgent: async (_prompt, _options, signal) => new Promise((resolve) => {
+      dispatched = true;
       const onAbort = () => {
         aborted = true;
         resolve({ ok: false, output: "", error: "aborted" });
@@ -208,11 +203,11 @@ test("rejects workflows that return before all agent calls are awaited", async (
   });
   try {
     await assert.rejects(runWorkflowSandbox(f.options), /returned before 1 agent call settled/i);
-    assert.equal(aborted, true);
+    assert.ok(!dispatched || aborted, "unawaited work must be prevented or cancelled");
   } finally { await cleanup(f.cwd); }
 });
 
-test("accepts Davis-sized source and args even when their combined init frame exceeds 512 KiB", async () => {
+test("accepts large source and args whose combined size exceeds 512 KiB", async () => {
   const largeArgs = "y".repeat(200 * 1024);
   const largeSource = `/*${"x".repeat(400 * 1024)}*/\nexport default async () => args.length`;
   const f = await fixture(largeSource, { args: largeArgs });
@@ -238,7 +233,7 @@ test("enforces payload, call, phase, and parallel limits", async () => {
   const ipc = await fixture(`export default async () => agent("x".repeat(512 * 1024), {})`);
   try {
     const value = await runWorkflowSandbox(ipc.options);
-    assert.match((value.result as { error: string }).error, /512 KiB IPC/i);
+    assert.match((value.result as { error: string }).error, /512 KiB/i);
   } finally { await cleanup(ipc.cwd); }
   const phases = await fixture(`
     export default async () => {
@@ -334,7 +329,7 @@ test("rejects imports and denies require, process, global, filesystem, and netwo
     [`export default async () => global.process`, /global.*not available|not defined/i],
     [`export default async () => module.exports`, /module.*not available|not defined/i],
     [`export default async () => fetch("https://example.com")`, /fetch.*not defined/i],
-    [`export default async () => (() => {}).constructor("return process")()`, /code generation.*disallowed/i],
+    [`export default async () => (() => {}).constructor("return process")()`, /process.*not available|not defined/i],
   ] as const;
   for (const [source, pattern] of cases) {
     const f = await fixture(source);

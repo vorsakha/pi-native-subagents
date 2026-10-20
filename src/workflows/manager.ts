@@ -1,5 +1,5 @@
 import { realpath } from "node:fs/promises";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { isRequestedHarness, routeCapabilities, type CapabilityRouting, type RequestedHarness } from "../capability-routing.ts";
 import type { CapabilityRouter } from "../capability-service.ts";
 import { HarnessAutoUnavailableError, HarnessUnavailableError, type HarnessAvailabilityProbe, type HarnessAvailabilityStatus } from "../harness-availability.ts";
@@ -35,6 +35,8 @@ import {
 } from "./journal.ts";
 import { resolveWorkflowStructured, workflowSchema } from "./schema.ts";
 import { runWorkflowSandbox, serializeWorkflowArgs, type WorkflowAgentResult } from "./sandbox.ts";
+import { WorkflowDatabaseBusyError } from "./state.ts";
+import { inspectWorkflowExecution } from "./runtime.ts";
 import { workflowTaskOutcome } from "./outcome.ts";
 import { assertWorkflowCheckout, captureWorkflowCheckout, type WorkflowCheckoutProof } from "./checkout.ts";
 import { finishWorkflowWorktree, prepareWorkflowWorktree, reclaimWorkflowWorktree, type WorkflowWorktreeHandle, type WorkflowWorktreeReclamation } from "./worktree.ts";
@@ -159,6 +161,7 @@ interface RunEntry {
   journalChain: Promise<void>;
   journalSequence: number;
   nextCallIndex: number;
+  recovering?: boolean;
   replay?: ReplayRuntime;
   request?: StartWorkflowRequest;
   pauseWaiters: Set<() => void>;
@@ -203,6 +206,7 @@ interface ReplaySource {
   handoffs: WorkflowReplayHandoff[];
   interactions: WorkflowReplayInteraction[];
   progressedCalls: Set<number>;
+  interrupted?: boolean;
   usage: WorkflowUsage;
 }
 
@@ -211,6 +215,7 @@ function progressedJournalCalls(records: WorkflowJournalRecord[]): Set<number> {
     record.kind !== "peerQuestion" && (record.state === "progressed"
       || record.state === "handoff"
       || record.result?.progressed === true
+      || record.result?.unsafeToReplay === true
       || record.continuationProgress !== undefined
       || record.continuation !== undefined
       || record.route?.continuation !== undefined)
@@ -724,12 +729,29 @@ export class WorkflowManager {
       if (!sameDefinition) {
         throw new Error("Workflow definition or execution context does not match the replay source (including budget)");
       }
+      if (request.restartFromCallIndex === undefined && source.interrupted) {
+        if (source.snapshot.definitionFingerprint !== definitionFingerprint) {
+          throw new Error("Interrupted Durable recovery requires the original execution context and budget");
+        }
+        const entry = this.#restoreRun(clone(source.snapshot));
+        entry.controller = new AbortController();
+        entry.request = clone(request);
+        entry.recovering = true;
+        entry.journalSequence = (await loadWorkflowJournal(this.#artifactRoot, source.snapshot.runId)).length;
+        entry.snapshot.status = "running";
+        entry.snapshot.error = undefined;
+        entry.snapshot.timestamps.endedAt = undefined;
+        entry.snapshot.timestamps.pausedAt = undefined;
+        entry.completion = this.#execute(entry, request);
+        this.#publish(entry);
+        return { snapshot: clone(entry.snapshot), completion: entry.completion };
+      }
       const restartAt = request.restartFromCallIndex;
       if (restartAt !== undefined && (!Number.isSafeInteger(restartAt) || restartAt < 0 || restartAt >= 32)) {
         throw new Error("restartFromCallIndex must be an agent call ordinal from 0 to 31");
       }
       if (restartAt !== undefined && [...source.progressedCalls].some((callIndex) => callIndex >= restartAt)) {
-        throw new Error("Cannot restart a workflow suffix that contains a progressed continuation checkpoint; recover from its durable handoff instead");
+        throw new Error("Cannot restart a workflow suffix that contains a progressed continuation checkpoint or interrupted native work; inspect partial effects and use its durable handoff or manual recovery");
       }
       const calls = restartAt === undefined ? source.calls : source.calls.filter((call) => call.callIndex < restartAt);
       replay = {
@@ -765,7 +787,7 @@ export class WorkflowManager {
       definitionFingerprint,
       replayBaseFingerprint,
       replacementOf: request.replacementOf ? clone(request.replacementOf) : undefined,
-      journalArtifact: "journal.jsonl",
+      journalArtifact: "runtime.sqlite",
       approval,
       budget,
       retry,
@@ -899,6 +921,32 @@ export class WorkflowManager {
       records = loaded?.records ?? [];
     }
     if (!snapshot) return undefined;
+    const execution = await inspectWorkflowExecution(join(snapshot.artifactDir, "runtime.sqlite"));
+    if (terminalWorkflow(snapshot.status)) {
+      const settled = new Set(records
+        .filter((record) => record.kind !== "peerQuestion" && ["completed", "failed"].includes(record.state))
+        .map((record) => record.callIndex));
+      for (const record of [...records]) {
+        if (record.kind === "peerQuestion" || record.state !== "started" || settled.has(record.callIndex)
+            || !execution.unsafeCalls.includes(record.callIndex)) continue;
+        const agent = snapshot.agents.find((candidate) => candidate.callIndex === record.callIndex
+          || candidate.generations?.some((generation) => generation.callIndex === record.callIndex));
+        if (agent) agent.unsafeToReplay = true;
+        const interrupted: WorkflowJournalRecord = {
+          version: 1, sequence: records.length,
+          kind: record.kind, callIndex: record.callIndex, fingerprint: record.fingerprint,
+          state: "failed", at: Date.now(), agentIndex: agent?.index,
+          result: {
+            ok: false, output: "", unsafeToReplay: true,
+            error: "Native call was interrupted and may have partially run; inspect partial effects before manual recovery",
+          },
+          route: journalRoute(agent),
+        };
+        await this.#journalAppender(this.#artifactRoot, runId, interrupted);
+        records.push(interrupted);
+        settled.add(record.callIndex);
+      }
+    }
     if (!terminalWorkflow(snapshot.status)) {
       return {
         snapshot,
@@ -929,6 +977,7 @@ export class WorkflowManager {
       calls,
       handoffs: replayableJournalHandoffs(records),
       interactions: replayableJournalInteractions(records),
+      interrupted: execution.pending,
       progressedCalls: progressedJournalCalls(records),
       usage: durableReplaySourceUsage(snapshot, records),
     };
@@ -1039,7 +1088,7 @@ export class WorkflowManager {
     if (!entry.request) throw new Error("Workflow definition is unavailable in this session; rerun the workflow tool with resumeFromRunId");
     const journal = await loadWorkflowJournal(this.#artifactRoot, runId);
     if ([...progressedJournalCalls(journal)].some((callIndex) => callIndex >= agent.callIndex!)) {
-      throw new Error("Cannot restart a workflow suffix that contains a progressed continuation checkpoint; recover from its durable handoff instead");
+      throw new Error("Cannot restart a workflow suffix that contains a progressed continuation checkpoint or interrupted native work; inspect partial effects and use its durable handoff or manual recovery");
     }
     if (!terminalWorkflow(entry.snapshot.status)) await this.cancel(runId, `Restarting workflow from agent ${agent.name}`);
     const reason = replacementReason(agent);
@@ -1138,8 +1187,10 @@ export class WorkflowManager {
   }
 
   async #execute(entry: RunEntry, request: StartWorkflowRequest): Promise<WorkflowSnapshot> {
+    let ownershipDenied = false;
     try {
       const sandbox = await runWorkflowSandbox({
+        database: join(entry.snapshot.artifactDir, "runtime.sqlite"),
         source: request.script,
         args: request.args ?? null,
         cwd: request.cwd,
@@ -1160,33 +1211,40 @@ export class WorkflowManager {
       this.#finishPhases(entry, "completed");
       await writeWorkflowResult(this.#artifactRoot, entry.snapshot.runId, sandbox.result);
     } catch (error) {
+      if (error instanceof WorkflowDatabaseBusyError) {
+        ownershipDenied = true;
+        this.#runs.delete(entry.snapshot.runId);
+        throw error;
+      }
       const aborted = entry.controller.signal.aborted || (error instanceof Error && error.name === "AbortError");
       entry.snapshot.status = aborted ? "aborted" : "failed";
       entry.snapshot.error = boundedText(entry.snapshot.error || error);
       await this.#cancelMemberJobs(entry, entry.snapshot.error);
       this.#finishPhases(entry, entry.snapshot.status);
     } finally {
-      this.#releasePause(entry);
-      await this.#releaseMemberRuns(entry);
-      const now = Date.now();
-      entry.snapshot.timestamps.updatedAt = now;
-      entry.snapshot.timestamps.pausedAt = undefined;
-      entry.snapshot.timestamps.endedAt = now;
-      try {
-        await entry.journalChain;
-        entry.snapshot.reportArtifact = "report.md";
-        await writeWorkflowReport(this.#artifactRoot, entry.snapshot);
-        await this.#flushCheckpoint(entry);
-      } catch (error) {
-        // Artifact failure is a workflow failure, not a rejected lifecycle
-        // promise. Foreground cards and background follow-ups must still get
-        // exactly one structured terminal result.
-        entry.snapshot.status = "failed";
-        const detail = `Artifact persistence failed: ${boundedText(error)}`;
-        entry.snapshot.error = entry.snapshot.error ? `${entry.snapshot.error}; ${detail}` : detail;
-        this.#finishPhases(entry, "failed");
+      if (!ownershipDenied) {
+        this.#releasePause(entry);
+        await this.#releaseMemberRuns(entry);
+        const now = Date.now();
+        entry.snapshot.timestamps.updatedAt = now;
+        entry.snapshot.timestamps.pausedAt = undefined;
+        entry.snapshot.timestamps.endedAt = now;
+        try {
+          await entry.journalChain;
+          entry.snapshot.reportArtifact = "report.md";
+          await writeWorkflowReport(this.#artifactRoot, entry.snapshot);
+          await this.#flushCheckpoint(entry);
+        } catch (error) {
+          // Artifact failure is a workflow failure, not a rejected lifecycle
+          // promise. Foreground cards and background follow-ups must still get
+          // exactly one structured terminal result.
+          entry.snapshot.status = "failed";
+          const detail = `Artifact persistence failed: ${boundedText(error)}`;
+          entry.snapshot.error = entry.snapshot.error ? `${entry.snapshot.error}; ${detail}` : detail;
+          this.#finishPhases(entry, "failed");
+        }
+        this.#publish(entry);
       }
-      this.#publish(entry);
     }
     return clone(entry.snapshot);
   }
@@ -1199,6 +1257,7 @@ export class WorkflowManager {
     signal: AbortSignal,
     callIndex: number,
   ): Promise<WorkflowAgentResult> {
+    if (entry.recovering && callIndex > entry.nextCallIndex) entry.nextCallIndex = callIndex;
     if (callIndex !== entry.nextCallIndex || callIndex < 0 || callIndex >= 32) {
       throw new Error(`Workflow agent call ordinal is invalid or out of sequence: ${callIndex}`);
     }
@@ -1544,6 +1603,7 @@ export class WorkflowManager {
     signal: AbortSignal,
     callIndex: number,
   ): Promise<WorkflowAgentResult> {
+    if (entry.recovering && callIndex > entry.nextCallIndex) entry.nextCallIndex = callIndex;
     if (callIndex !== entry.nextCallIndex || callIndex < 0 || callIndex >= 32) {
       throw new Error(`Workflow agent call ordinal is invalid or out of sequence: ${callIndex}`);
     }
@@ -2190,6 +2250,14 @@ export class WorkflowManager {
         record.structuredTransport = structuredTransport;
         this.#touch(entry);
       }
+      const admission = spawnRequest.dispatchAdmission;
+      spawnRequest.dispatchAdmission = async (admissionSignal) => {
+        // Durable may skip a completed native tool after a crash. Persist its
+        // inspection/accounting projection before native effects can begin.
+        await this.#flushCheckpoint(entry);
+        if (admissionSignal.aborted) throw abortError(admissionSignal.reason);
+        return admission?.(admissionSignal);
+      };
       this.#jobs.assertSpendBudgetSupported(spawnRequest, entry.snapshot.budget);
       await retry?.beforeSpawn?.();
       if (signal.aborted) throw abortError(signal.reason);
@@ -2599,6 +2667,7 @@ export class WorkflowManager {
     record.structured = structured;
     record.structuredTransport = replay.result.transport;
     record.error = replay.result.error;
+    if (replay.result.unsafeToReplay) record.unsafeToReplay = true;
     if (replay.result.progressed === true || replay.route?.continuation !== undefined) {
       record.progressedCheckpoint = true;
     }
@@ -2900,6 +2969,7 @@ export class WorkflowManager {
       structured: replay.result.structured === undefined ? undefined : clone(replay.result.structured),
       structuredTransport: replay.result.transport,
       error: replay.result.error,
+      unsafeToReplay: replay.result.unsafeToReplay,
       progressedCheckpoint: replay.result.progressed === true || replay.route?.continuation !== undefined ? true : undefined,
       // Replay restores route/attempt provenance but spends no usage again.
       usage: workflowUsage(),
@@ -3868,7 +3938,12 @@ export class WorkflowManager {
       sequence: entry.journalSequence++,
       ...value,
     };
-    const write = entry.journalChain.then(() => this.#journalAppender(this.#artifactRoot, entry.snapshot.runId, record));
+    const write = entry.journalChain.then(() => {
+      const persist = entry.persistChain.then(() =>
+        this.#journalAppender(this.#artifactRoot, entry.snapshot.runId, record, clone(entry.snapshot)));
+      entry.persistChain = persist.catch(() => undefined);
+      return persist;
+    });
     entry.journalChain = write.catch(() => undefined);
     try { await write; }
     catch (error) {
@@ -4313,8 +4388,9 @@ export class WorkflowManager {
   async #flushCheckpoint(entry: RunEntry): Promise<void> {
     if (entry.checkpointTimer) clearTimeout(entry.checkpointTimer);
     entry.checkpointTimer = undefined;
-    await entry.persistChain.catch(() => undefined);
-    await checkpointWorkflow(this.#artifactRoot, clone(entry.snapshot));
+    const persist = entry.persistChain.then(() => checkpointWorkflow(this.#artifactRoot, clone(entry.snapshot)));
+    entry.persistChain = persist.catch(() => undefined);
+    await persist;
   }
 
   #publish(entry: RunEntry): void {

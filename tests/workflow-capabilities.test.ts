@@ -1,3 +1,4 @@
+import { readWorkflowHistory, writeWorkflowHistory, writeWorkflowFixture } from "./helpers.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -114,11 +115,11 @@ test("replayed follow-up continuation retains and revalidates the original capab
     const source = await sourceRun.completion;
     assert.equal(codex.requests.length, 0, "the live continuation keeps the capability requirement");
 
-    const journalPath = join(source.artifactDir, "journal.jsonl");
-    const records = (await readFile(journalPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as { callIndex: number; state: string });
+    const journalPath = join(source.artifactDir, "runtime.sqlite");
+    const records = (await readWorkflowHistory(journalPath)).trim().split("\n").map((line) => JSON.parse(line) as { callIndex: number; state: string });
     const handoffIndex = records.findIndex((record) => record.callIndex === 1 && record.state === "handoff");
     assert.ok(handoffIndex >= 0);
-    await writeFile(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
+    await writeWorkflowHistory(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
 
     const replayed = await workflows.start({
       sessionId: "session-1", name: "capability continuation", script, cwd, trusted: true, defaultHarness: "codex", resumeFromRunId: source.runId,

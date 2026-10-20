@@ -236,6 +236,8 @@ export interface WorkflowAgentRecord {
   logicalJobId?: string;
   /** Durable proof that manual replay of this agent suffix could repeat progressed effects. */
   progressedCheckpoint?: true;
+  /** An interrupted native intent may have side effects without observable progress. */
+  unsafeToReplay?: true;
   state: WorkflowAgentState;
   timestamps: WorkflowTimestamps;
   harness?: string;
@@ -320,6 +322,8 @@ export interface WorkflowLogRecord {
 
 export interface WorkflowJournalResult {
   ok: boolean;
+  /** Durable interrupted a native intent; no side-effect replay is authorized. */
+  unsafeToReplay?: true;
   output: string;
   jobId?: string;
   error?: string;

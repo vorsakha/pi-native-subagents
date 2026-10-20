@@ -1,5 +1,4 @@
 import { randomBytes } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
 import {
   chmod,
   lstat,
@@ -15,6 +14,7 @@ import type { ToolResultSnapshot, TranscriptEntry } from "../types.ts";
 import { formatWorkflowBudget } from "./budget.ts";
 import { isWorkflowConvergence, MAX_CONVERGENCE_ROUNDS } from "./convergence.ts";
 import { workflowTaskOutcome } from "./outcome.ts";
+import { readWorkflowState, updateWorkflowState } from "./state.ts";
 import type { WorkflowJournalRecord, WorkflowSnapshot } from "./types.ts";
 import type { WorkflowWorktreeResult } from "./worktree.ts";
 
@@ -37,7 +37,6 @@ export function isTranscriptTruncationEntry(entry: TranscriptEntry): boolean {
 const JOURNAL_RECORD_BYTES = 1 * 1_024 * 1_024;
 const JOURNAL_FILE_BYTES = 72 * 1_024 * 1_024;
 const MAX_JOURNAL_RECORDS = 256;
-const journalWrites = new Map<string, Promise<void>>();
 
 export interface WorkflowSerializationLimits {
   maxDepth: number;
@@ -633,57 +632,42 @@ function isWorkflowJournalRecord(value: unknown): value is WorkflowJournalRecord
       || typeof record.result.output !== "string" || record.result.output.length > JOURNAL_RECORD_BYTES
       || record.result.jobId !== undefined && (typeof record.result.jobId !== "string" || !record.result.jobId || record.result.jobId.length > 200)
       || record.result.error !== undefined && typeof record.result.error !== "string"
+      || record.result.unsafeToReplay !== undefined && record.result.unsafeToReplay !== true
       || record.result.progressed !== undefined && record.result.progressed !== true
       || record.result.transport !== undefined && record.result.transport !== "native" && record.result.transport !== "portable") return false;
   return record.state === "completed" ? record.result.ok : !record.result.ok;
 }
 
-async function appendJournalLine(path: string, record: WorkflowJournalRecord): Promise<void> {
-  const contents = `${JSON.stringify(record)}\n`;
-  if (Buffer.byteLength(contents) > JOURNAL_RECORD_BYTES) throw new Error("Workflow journal record exceeds the 1 MiB limit");
-  const flags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_CREAT | (fsConstants.O_NOFOLLOW ?? 0);
-  const handle = await open(path, flags, 0o600);
-  try {
-    const info = await handle.stat();
-    if (!info.isFile()) throw new Error("Workflow journal is not a regular file");
-    if (info.size + Buffer.byteLength(contents) > JOURNAL_FILE_BYTES) throw new Error("Workflow journal exceeds the 72 MiB limit");
-    await handle.writeFile(contents, "utf8");
-    await handle.sync();
-    await handle.chmod(0o600);
-  } finally {
-    await handle.close();
-  }
-}
-
-export async function appendWorkflowJournal(root: string, runId: string, record: WorkflowJournalRecord): Promise<void> {
+export async function appendWorkflowJournal(
+  root: string,
+  runId: string,
+  record: WorkflowJournalRecord,
+  projection?: WorkflowSnapshot,
+): Promise<void> {
   if (!isWorkflowJournalRecord(record)) throw new Error("Invalid workflow journal record");
   const directory = await requireRunDirectory(root, runId);
-  const path = join(directory, "journal.jsonl");
-  const previous = journalWrites.get(path) ?? Promise.resolve();
-  const write = previous.catch(() => undefined).then(() => appendJournalLine(path, record));
-  journalWrites.set(path, write);
-  try { await write; }
-  finally { if (journalWrites.get(path) === write) journalWrites.delete(path); }
+  const contents = JSON.stringify(record);
+  if (Buffer.byteLength(contents) > JOURNAL_RECORD_BYTES) throw new Error("Workflow journal record exceeds the 1 MiB limit");
+  await updateWorkflowState(join(directory, "runtime.sqlite"), (state) => {
+    if (state.history.length >= MAX_JOURNAL_RECORDS) throw new Error("Workflow journal record limit exceeded");
+    if (record.sequence !== state.history.length) throw new Error("Workflow journal sequence is not contiguous");
+    if (state.history.reduce((bytes, line) => bytes + Buffer.byteLength(line), Buffer.byteLength(contents)) > JOURNAL_FILE_BYTES) {
+      throw new Error("Workflow journal exceeds the 72 MiB limit");
+    }
+    state.history.push(contents);
+    if (projection) {
+      state.snapshot = JSON.stringify(durableWorkflowSnapshot(projection));
+      state.transcripts = JSON.stringify(transcriptArtifact(projection));
+    }
+  });
 }
 
-/** Load the durable prefix only. A partial tail from a crash is ignored; a
- * malformed or out-of-sequence complete line stops replay before corruption. */
+/** Application replay proofs are committed atomically; Durable owns execution replay separately. */
 export async function loadWorkflowJournal(root: string, runId: string): Promise<WorkflowJournalRecord[]> {
   const directory = await requireRunDirectory(root, runId);
-  const path = join(directory, "journal.jsonl");
-  let info;
-  try { info = await lstat(path); }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
-    throw error;
-  }
-  if (info.isSymbolicLink() || !info.isFile()) throw new Error(`Workflow journal is not a regular file: ${runId}`);
-  if (info.size > JOURNAL_FILE_BYTES) throw new Error("Workflow journal exceeds the 72 MiB limit");
-  const contents = await readFile(path, "utf8");
-  const complete = contents.endsWith("\n") ? contents : contents.slice(0, contents.lastIndexOf("\n") + 1);
+  const state = await readWorkflowState(join(directory, "runtime.sqlite"));
   const records: WorkflowJournalRecord[] = [];
-  for (const line of complete.split("\n")) {
-    if (!line) continue;
+  for (const line of state?.history ?? []) {
     if (records.length >= MAX_JOURNAL_RECORDS || Buffer.byteLength(line) > JOURNAL_RECORD_BYTES) break;
     let parsed: unknown;
     try { parsed = JSON.parse(line); } catch { break; }
@@ -718,7 +702,10 @@ export async function createWorkflowArtifacts(
   try {
     await atomicWrite(join(artifactDir, "script.js"), input.script);
     await atomicWriteJson(join(artifactDir, "args.json"), input.args, input.limits);
-    await atomicWrite(join(artifactDir, "journal.jsonl"), "");
+    await updateWorkflowState(join(artifactDir, "runtime.sqlite"), (state) => {
+      state.snapshot = JSON.stringify(workflow);
+      state.transcripts = JSON.stringify(transcriptArtifact(workflow));
+    });
     await atomicWriteJson(join(artifactDir, "transcripts.json"), transcriptArtifact(workflow), { maxTotalBytes: 2 * 1024 * 1024 });
     await atomicWriteJson(join(artifactDir, "workflow.json"), workflow, input.limits);
     await atomicWriteJson(join(artifactDir, "result.json"), workflow.result ?? null, input.limits);
@@ -740,6 +727,10 @@ export async function checkpointWorkflow(
   // Never let a caller's tiny serialization override collapse the whole
   // summary into a truncation marker; structural validity outranks verbosity.
   const durable = durableWorkflowSnapshot(normalized);
+  await updateWorkflowState(join(directory, "runtime.sqlite"), (state) => {
+    state.snapshot = JSON.stringify(durable);
+    state.transcripts = JSON.stringify(transcriptArtifact(normalized));
+  });
   await atomicWriteJson(join(directory, "workflow.json"), durable, {
     ...limits,
     maxTotalBytes: Math.max(512 * 1024, limits.maxTotalBytes ?? 0),
@@ -949,7 +940,7 @@ function abortStaleWorkflow(snapshot: WorkflowSnapshot, now: number, staleAfterM
   // staleAfterMs=0 is the explicit no-resume mode: every restored running
   // checkpoint is from a previous manager, even with equal/future timestamps.
   if (staleAfterMs > 0 && now - snapshot.timestamps.updatedAt <= staleAfterMs) return snapshot;
-  const error = snapshot.error ?? "Workflow was aborted because its running checkpoint became stale.";
+  const error = snapshot.error ?? "Workflow host checkpoint became stale. Re-run the same workflow with resumeFromRunId to recover its Durable task; interrupted native calls will not be redispatched.";
   const declared = snapshot.plannedPhaseCount !== undefined;
   const currentPosition = declared ? currentPhasePosition(snapshot) : undefined;
   return {
@@ -1001,7 +992,8 @@ export async function loadWorkflowSummaries(
     if (!entry.isDirectory() || !RUN_ID_PATTERN.test(entry.name)) continue;
     const directory = runDirectory(normalizedRoot, entry.name);
     try {
-      const parsed: unknown = JSON.parse(await readFile(join(directory, "workflow.json"), "utf8"));
+      const state = await readWorkflowState(join(directory, "runtime.sqlite"));
+      const parsed: unknown = JSON.parse(state?.snapshot ?? "null");
       if (!isWorkflowSnapshot(parsed) || parsed.runId !== entry.name) continue;
       if (options.sessionId !== undefined && parsed.sessionId !== options.sessionId) continue;
       let authoritativeResult: unknown = parsed.result;
@@ -1018,7 +1010,7 @@ export async function loadWorkflowSummaries(
       snapshot = withDefaultAgentSpeeds(snapshot);
       if (snapshot.transcriptArtifact) {
         try {
-          const rawTranscripts = JSON.parse(await readFile(join(directory, snapshot.transcriptArtifact), "utf8")) as Record<string, unknown>;
+          const rawTranscripts = JSON.parse(state?.transcripts ?? await readFile(join(directory, snapshot.transcriptArtifact), "utf8")) as Record<string, unknown>;
           snapshot = {
             ...snapshot,
             agents: snapshot.agents.map((agent) => ({
@@ -1031,6 +1023,7 @@ export async function loadWorkflowSummaries(
       const aborted = abortStaleWorkflow(snapshot, now, staleAfterMs);
       if (aborted !== snapshot) {
         snapshot = aborted;
+        await updateWorkflowState(join(directory, "runtime.sqlite"), (state) => { state.snapshot = JSON.stringify(durableWorkflowSnapshot(snapshot)); });
         await atomicWriteJson(join(directory, "workflow.json"), durableWorkflowSnapshot(snapshot), {
           ...options.limits,
           maxTotalBytes: Math.max(512 * 1024, options.limits?.maxTotalBytes ?? 0),
@@ -1062,7 +1055,8 @@ export async function listWorkflowRunIds(root: string): Promise<string[]> {
 export async function readWorkflowRunSummary(root: string, runId: string): Promise<WorkflowSnapshot | undefined> {
   try {
     const directory = runDirectory(root, runId);
-    const parsed: unknown = JSON.parse(await readFile(join(directory, "workflow.json"), "utf8"));
+    const state = await readWorkflowState(join(directory, "runtime.sqlite"));
+    const parsed: unknown = JSON.parse(state?.snapshot ?? "null");
     if (!isWorkflowSnapshot(parsed) || parsed.runId !== runId) return undefined;
     return withDefaultAgentSpeeds({ ...parsed, artifactDir: directory });
   } catch { return undefined; }
@@ -1082,7 +1076,8 @@ export async function updateWorkflowRunIsolation(
   isolation: WorkflowWorktreeResult,
 ): Promise<void> {
   const directory = await requireRunDirectory(root, runId);
-  const parsed: unknown = JSON.parse(await readFile(join(directory, "workflow.json"), "utf8"));
+  const state = await readWorkflowState(join(directory, "runtime.sqlite"));
+  const parsed: unknown = JSON.parse(state?.snapshot ?? "null");
   if (!isWorkflowSnapshot(parsed) || parsed.runId !== runId) throw new Error(`Workflow run summary is invalid: ${runId}`);
   if (!parsed.agents[agentIndex]) throw new Error(`Unknown workflow agent: ${agentIndex}`);
   const next: WorkflowSnapshot = {
@@ -1090,5 +1085,5 @@ export async function updateWorkflowRunIsolation(
     artifactDir: directory,
     agents: parsed.agents.map((agent, index) => index === agentIndex ? { ...agent, isolation } : agent),
   };
-  await atomicWriteJson(join(directory, "workflow.json"), durableWorkflowSnapshot(next), { maxTotalBytes: 512 * 1024 });
+  await checkpointWorkflow(root, next);
 }

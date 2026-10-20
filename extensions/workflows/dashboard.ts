@@ -167,6 +167,7 @@ function agentCanRestart(agent: WorkflowAgentRecord | undefined): agent is Workf
   return !!agent
     && agent.callIndex !== undefined
     && agent.progressedCheckpoint !== true
+    && agent.unsafeToReplay !== true
     && agent.continuation === undefined
     && !agent.attempts?.some((attempt) => attempt.disposition === "continuation");
 }

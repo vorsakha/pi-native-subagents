@@ -1,6 +1,6 @@
 # Bounded convergence with converge()
 
-Read this before calling `converge()`. It runs the iterative implement → review → fix lifecycle inside one workflow run instead of stopping at the first review: one mutating implementer and one read-only reviewer are started with `agent()`, then both retained sessions are continued across rounds with `followUp()`.
+Read this before calling `converge()`. It runs implement → review → fix inside one Durable workflow run: one mutating implementer and one read-only reviewer are started with `agent()`, then both retained sessions are continued across rounds with `followUp()`.
 
 ```js
 export default async function () {

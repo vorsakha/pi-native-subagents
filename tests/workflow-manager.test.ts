@@ -1,3 +1,4 @@
+import { readWorkflowHistory, writeWorkflowHistory, writeWorkflowFixture } from "./helpers.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
@@ -923,7 +924,7 @@ test("records phases, results, and final workflow artifacts", async () => {
     assert.deepEqual(final.result, { accepted: true, report: "looks good", subject: "change" });
     assert.deepEqual(final.logs?.map((entry) => entry.message), ["Inspecting change", "Preparing final summary"]);
     assert.deepEqual((await readdir(final.artifactDir)).sort(), [
-      "args.json", "journal.jsonl", "report.md", "result.json", "script.js", "transcripts.json", "workflow.json",
+      ".ownership", ".ownership.runtime", "args.json", "report.md", "result.json", "runtime.sqlite", "script.js", "transcripts.json", "workflow.json",
     ]);
     assert.equal(await readFile(join(final.artifactDir, "script.js"), "utf8"), script);
     assert.deepEqual(JSON.parse(await readFile(join(final.artifactDir, "args.json"), "utf8")), { subject: "change" });
@@ -1558,7 +1559,7 @@ test("replays the completed journal prefix and reruns the first incomplete call"
           cwd: f.cwd,
           defaultHarness: "codex",
         }),
-        journalArtifact: "journal.jsonl",
+        journalArtifact: "runtime.sqlite",
       },
     });
     await appendWorkflowJournal(f.artifactRoot, source.runId, {
@@ -1618,7 +1619,7 @@ test("replay preserves completed parallel lanes after an earlier-index failure",
         sessionId: "session-1", name: "parallel replay", description: "", background: false, status: "aborted",
         timestamps: { createdAt: now, updatedAt: now, startedAt: now, endedAt: now }, currentPhase: null, phases: [], agents: [],
         definitionFingerprint: workflowDefinitionFingerprint({ script, argsJson: "null", cwd: f.cwd, defaultHarness: "codex" }),
-        journalArtifact: "journal.jsonl",
+        journalArtifact: "runtime.sqlite",
       },
     });
     for (const [callIndex, prompt] of prompts.entries()) {
@@ -2058,8 +2059,8 @@ test("progressed continuation settles the failed process, hands off current chec
     assert.equal(replayFinal.agents[0]?.continuation?.replacementJobId, replacement.jobId);
     assert.deepEqual(aggregateWorkflowUsage(replayFinal), { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 });
 
-    const replayJournalPath = join(replayFinal.artifactDir, "journal.jsonl");
-    const replayRecords = (await readFile(replayJournalPath, "utf8")).trim().split("\n")
+    const replayJournalPath = join(replayFinal.artifactDir, "runtime.sqlite");
+    const replayRecords = (await readWorkflowHistory(replayJournalPath)).trim().split("\n")
       .map((line) => JSON.parse(line) as {
         sequence: number;
         state: string;
@@ -2074,7 +2075,7 @@ test("progressed continuation settles the failed process, hands off current chec
     const interruptedProof = replayRecords
       .filter((record) => record.callIndex === 0 && ["started", "progressed", "handoff"].includes(record.state))
       .map((record, sequence) => ({ ...record, sequence }));
-    await writeFile(replayJournalPath, `${interruptedProof.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    await writeWorkflowHistory(replayJournalPath, `${interruptedProof.map((record) => JSON.stringify(record)).join("\n")}\n`);
     const interruptedReplay = await f.workflows.start(f.request(script, { resumeFromRunId: replayFinal.runId }));
     const interruptedFinal = await withTimeout(interruptedReplay.completion, "interrupted copied proof replay");
     assert.equal((interruptedFinal.result as { ok: boolean }).ok, false);
@@ -2084,7 +2085,7 @@ test("progressed continuation settles the failed process, hands off current chec
     const terminalOnly = replayRecords
       .filter((record) => record.state !== "progressed" && record.state !== "handoff")
       .map((record, sequence) => ({ ...record, sequence }));
-    await writeFile(replayJournalPath, `${terminalOnly.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    await writeWorkflowHistory(replayJournalPath, `${terminalOnly.map((record) => JSON.stringify(record)).join("\n")}\n`);
     const replayOfReplay = await f.workflows.start(f.request(script, { resumeFromRunId: replayFinal.runId }));
     const replayOfReplayFinal = await withTimeout(replayOfReplay.completion, "validated replay of replay");
     assert.equal((replayOfReplayFinal.result as { ok: boolean }).ok, true, "terminal-only replay validates its referenced source checkpoint chain");
@@ -2094,7 +2095,7 @@ test("progressed continuation settles the failed process, hands off current chec
     const continuationTerminal = mismatched.find((record) => record.state === "completed" && record.route?.continuation);
     assert.ok(continuationTerminal?.replayedFrom);
     continuationTerminal.replayedFrom.callIndex = 31;
-    await writeFile(replayJournalPath, `${mismatched.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    await writeWorkflowHistory(replayJournalPath, `${mismatched.map((record) => JSON.stringify(record)).join("\n")}\n`);
     const refused = await f.workflows.start(f.request(script, { resumeFromRunId: replayFinal.runId }));
     const refusedFinal = await withTimeout(refused.completion, "refused mismatched replay");
     assert.equal((refusedFinal.result as { ok: boolean }).ok, false);
@@ -2640,12 +2641,12 @@ test("replay after a crash between progressed proof and handoff never reruns the
     f.claude.fail(primary, "quota", progressedQuota("claude"));
     const failed = await started.completion;
 
-    const journalPath = join(failed.artifactDir, "journal.jsonl");
-    const records = (await readFile(journalPath, "utf8")).trim().split("\n")
+    const journalPath = join(failed.artifactDir, "runtime.sqlite");
+    const records = (await readWorkflowHistory(journalPath)).trim().split("\n")
       .map((line) => JSON.parse(line) as { state: string });
     const crashWindow = records.filter((record) => record.state === "started" || record.state === "progressed");
     assert.deepEqual(crashWindow.map((record) => record.state), ["started", "progressed"]);
-    await writeFile(journalPath, `${crashWindow.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    await writeWorkflowHistory(journalPath, `${crashWindow.map((record) => JSON.stringify(record)).join("\n")}\n`);
 
     const primaryDispatches = f.claude.requests.length;
     const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: failed.runId }));
@@ -2959,8 +2960,8 @@ test("cancelled fresh handoff replay rebinds a changed agent index before termin
     assert.equal(cancelled.status, "aborted");
     assert.equal(f.backend.requests.length, 0, "cancellation wins before replacement dispatch");
 
-    const journalPath = join(cancelled.artifactDir, "journal.jsonl");
-    const records = (await readFile(journalPath, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as {
+    const journalPath = join(cancelled.artifactDir, "runtime.sqlite");
+    const records = (await readWorkflowHistory(journalPath)).trim().split("\n").map((line) => JSON.parse(line) as {
       callIndex: number;
       state: string;
       agentIndex?: number;
@@ -2975,7 +2976,7 @@ test("cancelled fresh handoff replay rebinds a changed agent index before termin
       if (record.continuationProgress) record.continuationProgress.agentIndex = 1;
       if (record.continuation) record.continuation.agentIndex = 1;
     }
-    await writeFile(journalPath, `${interrupted.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    await writeWorkflowHistory(journalPath, `${interrupted.map((record) => JSON.stringify(record)).join("\n")}\n`);
 
     availability.gateNext();
     const cancelledReplay = await f.workflows.start(f.request(script, { resumeFromRunId: cancelled.runId }));
@@ -3077,8 +3078,8 @@ test("replayed follow-up handoff rebinds a changed agent index and archives only
     availability.release();
     const source = await cancellation;
 
-    const journalPath = join(source.artifactDir, "journal.jsonl");
-    const records = (await readFile(journalPath, "utf8")).trim().split("\n")
+    const journalPath = join(source.artifactDir, "runtime.sqlite");
+    const records = (await readWorkflowHistory(journalPath)).trim().split("\n")
       .map((line) => JSON.parse(line) as {
         callIndex: number;
         state: string;
@@ -3095,7 +3096,7 @@ test("replayed follow-up handoff rebinds a changed agent index and archives only
       if (record.continuationProgress) record.continuationProgress.agentIndex = 1;
       if (record.continuation) record.continuation.agentIndex = 1;
     }
-    await writeFile(journalPath, `${interrupted.map((record) => JSON.stringify(record)).join("\n")}\n`);
+    await writeWorkflowHistory(journalPath, `${interrupted.map((record) => JSON.stringify(record)).join("\n")}\n`);
 
     const resumed = await f.workflows.start(f.request(script, { resumeFromRunId: source.runId }));
     await f.backend.waitForStart();
@@ -3168,12 +3169,12 @@ test("replayed follow-up handoffs mask replacement failure and cancellation gaps
       availability.release();
       const source = await cancellation;
 
-      const journalPath = join(source.artifactDir, "journal.jsonl");
-      const records = (await readFile(journalPath, "utf8")).trim().split("\n")
+      const journalPath = join(source.artifactDir, "runtime.sqlite");
+      const records = (await readWorkflowHistory(journalPath)).trim().split("\n")
         .map((line) => JSON.parse(line) as { callIndex: number; state: string });
       const handoffIndex = records.findIndex((record) => record.callIndex === 1 && record.state === "handoff");
       assert.ok(handoffIndex >= 0);
-      await writeFile(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
+      await writeWorkflowHistory(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
 
       const publications: WorkflowSnapshot[] = [];
       const unsubscribe = f.workflows.subscribe((snapshot) => publications.push(snapshot));
@@ -3246,12 +3247,12 @@ test("interrupted continuation handoffs keep every original workflow budget ceil
     const cancellation = f.workflows.cancel(started.snapshot.runId, "retain interrupted handoff");
     availability.release();
     const source = await cancellation;
-    const journalPath = join(source.artifactDir, "journal.jsonl");
-    const records = (await readFile(journalPath, "utf8")).trim().split("\n")
+    const journalPath = join(source.artifactDir, "runtime.sqlite");
+    const records = (await readWorkflowHistory(journalPath)).trim().split("\n")
       .map((line) => JSON.parse(line) as { state: string });
     const handoffIndex = records.findIndex((record) => record.state === "handoff");
     assert.ok(handoffIndex >= 0);
-    await writeFile(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
+    await writeWorkflowHistory(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
 
     const widened = [
       undefined,
@@ -3310,14 +3311,14 @@ test("handoff replay combines replay-carried, checkpointed, and journal-only usa
       availability.release();
       const source = await withTimeout(cancellation, "source cancellation");
 
-      const journalPath = join(source.artifactDir, "journal.jsonl");
-      const records = (await readFile(journalPath, "utf8")).trim().split("\n")
+      const journalPath = join(source.artifactDir, "runtime.sqlite");
+      const records = (await readWorkflowHistory(journalPath)).trim().split("\n")
         .map((line) => JSON.parse(line) as { callIndex: number; state: string });
       const handoffIndex = records.findIndex((record) => record.callIndex === 1 && record.state === "handoff");
       assert.ok(handoffIndex >= 0);
       const interrupted = records.filter((record) => record.callIndex !== 1 || record.state !== "failed");
       assert.ok(interrupted.some((record) => record.callIndex === 0 && record.state === "completed"));
-      await writeFile(journalPath, `${interrupted.map((record) => JSON.stringify(record)).join("\n")}\n`);
+      await writeWorkflowHistory(journalPath, `${interrupted.map((record) => JSON.stringify(record)).join("\n")}\n`);
 
       const summaryPath = join(source.artifactDir, "workflow.json");
       const staleSummary = JSON.parse(await readFile(summaryPath, "utf8")) as WorkflowSnapshot;
@@ -3330,7 +3331,7 @@ test("handoff replay combines replay-carried, checkpointed, and journal-only usa
         matchedCalls: 0,
         carriedUsage: { ...zeroUsage, ...scenario.carried },
       };
-      await writeFile(summaryPath, `${JSON.stringify(staleSummary)}\n`);
+      await writeWorkflowFixture(summaryPath, `${JSON.stringify(staleSummary)}\n`);
 
       const replacementDispatches = f.backend.requests.length;
       const diskWorkflows = new WorkflowManager({
@@ -5017,7 +5018,7 @@ async function createFollowUpReplaySource(f: Awaited<ReturnType<typeof fixture>>
       phases: [],
       agents: [],
       definitionFingerprint: workflowDefinitionFingerprint({ script, argsJson: "null", cwd: f.cwd, defaultHarness: "codex" }),
-      journalArtifact: "journal.jsonl",
+      journalArtifact: "runtime.sqlite",
     },
   });
   await appendWorkflowJournal(f.artifactRoot, source.runId, {
@@ -5160,7 +5161,7 @@ test("replayed follow-up reattaches by stable jobId even when the source run's p
         phases: [],
         agents: [],
         definitionFingerprint: workflowDefinitionFingerprint({ script, argsJson: "null", cwd: f.cwd, defaultHarness: "codex" }),
-        journalArtifact: "journal.jsonl",
+        journalArtifact: "runtime.sqlite",
       },
     });
     // Original run dispatched callIndex 0 ("a") and 1 ("b") in parallel, but "b"

@@ -44,7 +44,7 @@ The plan accepts 1–64 unique normalized names of at most 160 characters. Match
 
 ## parallel versus pipeline
 
-`parallel` receives functions, not started promises. The runner owns order, concurrency, call numbers, cancellation, and replay. Concurrency is 1 to 4 and defaults to 4. Use it when the next step needs all results; check every result's `ok`.
+`parallel` receives functions, not started promises. Durable owns execution and recovery; helpers bound concurrency and call numbers. Concurrency is 1 to 4 and defaults to 4. Use it when the next step needs all results; check every result's `ok`.
 
 `pipeline(items, ...stages)` accepts at most 4096 items and up to four lanes. **A thrown stage makes that item's result `null`; it does not fail the run.** Branch on `null`:
 
@@ -90,7 +90,7 @@ A fresh explicit Claude/Codex `agent()` may set one opposite native route. `prov
 
 ## Sandbox limits and determinism
 
-- The sandbox exposes only orchestration: no imports, I/O, environment, processes, credentials, or nested delegation.
+- QuickJS exposes orchestration only: no imports, I/O, environment, processes, credentials, or nested delegation. All host calls share a 600-call ceiling.
 - Workflows are deterministic: `Date.now()`, zero-argument `new Date()`, and `Math.random()` all throw.
 - Workflow data is bounded and JSON-serializable; one agent request is capped at 512 KiB.
 - A run may make at most 32 agent calls (`agent()` and `followUp()` share the budget) and use at most four concurrent workers. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
@@ -98,7 +98,7 @@ A fresh explicit Claude/Codex `agent()` may set one opposite native route. `prov
 
 ## Lifecycle versus task outcome
 
-Workflow lifecycle and task outcome are separate. Sandbox completion sets lifecycle `completed`. A top-level plain object with `ok: true` has outcome `successful`; `ok: false` has outcome `unsuccessful`; every other result is `unspecified`. Script and runtime errors still fail the run, while cancellation, shutdown, and stale restoration abort it. Completed child journal calls stay replayable even when the containing workflow outcome is unsuccessful.
+Workflow lifecycle and task outcome are separate. Sandbox completion sets lifecycle `completed`. A top-level plain object with `ok: true` has outcome `successful`; `ok: false` has outcome `unsuccessful`; every other result is `unspecified`. Script errors and stalled promises fail the run; cancellation, shutdown, and stale restoration abort it. Completed calls remain replayable even when the task outcome is unsuccessful.
 
 ## Authoring failures
 

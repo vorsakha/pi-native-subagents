@@ -1,205 +1,65 @@
-"use strict";
-
-const vm = require("node:vm");
-
-const KIB = 1024;
-const MIB = 1024 * KIB;
-const MAX_SOURCE_BYTES = 512 * KIB;
-const MAX_ARGS_BYTES = 256 * KIB;
-const MAX_RESULT_BYTES = MIB;
-const MAX_IPC_BYTES = 512 * KIB;
-const MAX_AGENT_CALLS = 32;
-const MAX_PHASE_EVENTS = 128;
-const MAX_LOG_EVENTS = 256;
-const MAX_CONVERGENCE_EVENTS = 64;
-const MAX_PHASE_CAPACITY_REQUESTS = 64;
-const MAX_PHASE_CAPACITY_TITLES = 2;
+// Executed only inside QuickJS. Native execution and all admission bounds remain host-owned.
 const MAX_CONVERGENCE_ROUNDS = 16;
 const MAX_CONVERGENCE_FINDINGS = 32;
-const MAX_LOG_MESSAGE_BYTES = 4 * KIB;
-const MAX_CONVERGENCE_PROGRESS_BYTES = 64 * KIB;
 const MAX_PIPELINE_ITEMS = 4096;
 const MAX_PIPELINE_CONCURRENCY = 4;
-const RESULT_CHUNK_BYTES = 256 * KIB;
 
-const token = process.argv[2];
-if (typeof token !== "string" || !/^[a-f0-9]{64}$/.test(token) || typeof process.send !== "function") {
-  process.exitCode = 1;
-  return;
-}
-
-let initialized = false;
-let finished = false;
-let nextAgentId = 1;
-let agentCalls = 0;
-let agentCallBudget = MAX_AGENT_CALLS;
-let phaseEvents = 0;
-let logEvents = 0;
-let convergenceEvents = 0;
-let nextPhaseCapacityId = 1;
-const pendingAgents = new Map();
-const pendingPhaseCapacity = new Map();
-
-function byteLength(value) {
-  return Buffer.byteLength(value, "utf8");
-}
-
-function frameSize(message) {
-  try { return byteLength(JSON.stringify(message)); }
-  catch { return MAX_IPC_BYTES + 1; }
-}
-
-function errorMessage(error) {
-  if (error && typeof error.message === "string") return error.message;
-  return String(error);
-}
-
-function send(message) {
-  const authenticated = { token, ...message };
-  if (frameSize(authenticated) > MAX_IPC_BYTES || !process.connected) return false;
-  try { return process.send(authenticated); }
-  catch { return false; }
-}
-
-function failure(message) {
-  return JSON.stringify({ ok: false, output: "", error: message });
-}
-
-function formatWorkflowError(error) {
-  const message = errorMessage(error);
-  if (/Cannot destructure property ['"](?:phase|log|agent|followUp|parallel|converge)['"]/.test(message)) {
-    return `${message}. Workflow helpers are globals: use phase(), log(), agent(), followUp(), parallel(), and converge().`;
-  }
-  return message;
-}
-
-function finishError(error) {
-  if (finished) return;
-  finished = true;
-  const message = formatWorkflowError(error).slice(0, 32 * KIB);
-  send({ type: "error", message });
-  for (const resolve of pendingAgents.values()) resolve(failure("Workflow sandbox stopped"));
-  pendingAgents.clear();
-  for (const resolve of pendingPhaseCapacity.values()) resolve(JSON.stringify({ ok: false, reason: "Workflow sandbox stopped" }));
-  pendingPhaseCapacity.clear();
-  if (process.connected) process.disconnect();
-}
-
-function bridge(operation, payloadJson, resolve) {
-  if (finished) {
-    if (typeof resolve === "function") resolve(failure("Workflow sandbox stopped"));
-    return;
-  }
-  if (operation === "phase") {
-    if (++phaseEvents > MAX_PHASE_EVENTS) return `Workflow phase event limit exceeded (${MAX_PHASE_EVENTS})`;
-    if (typeof payloadJson !== "string" || byteLength(payloadJson) > MAX_IPC_BYTES) return "Phase message exceeds the 512 KiB IPC limit";
-    let payload;
-    try { payload = JSON.parse(payloadJson); }
-    catch { return "Phase message is not valid JSON"; }
-    if (typeof payload.title !== "string") return "phase requires a string title";
-    if (!send({ type: "phase", title: payload.title })) return "Phase message exceeds the 512 KiB IPC limit";
-    return undefined;
-  }
-  if (operation === "log") {
-    if (++logEvents > MAX_LOG_EVENTS) return `Workflow log event limit exceeded (${MAX_LOG_EVENTS})`;
-    if (typeof payloadJson !== "string" || byteLength(payloadJson) > MAX_LOG_MESSAGE_BYTES) return "Log message exceeds the 4 KiB limit";
-    let payload;
-    try { payload = JSON.parse(payloadJson); }
-    catch { return "Log message is not valid JSON"; }
-    if (typeof payload.message !== "string") return "log requires a string message";
-    if (!send({ type: "log", message: payload.message })) return "Unable to emit workflow log message";
-    return undefined;
-  }
-  if (operation === "limits") {
-    // Remaining sandbox capacity, so converge() can stop at a bounded
-    // limit-reached outcome instead of dispatching a call that must fail.
-    return JSON.stringify({
-      agentCalls: Math.max(0, agentCallBudget - agentCalls),
-    });
-  }
-  if (operation === "phaseCapacity") {
-    if (typeof resolve !== "function") return;
-    let payload;
-    try { payload = JSON.parse(payloadJson); }
-    catch { resolve(JSON.stringify({ ok: false, reason: "the phase preflight request is invalid" })); return; }
-    if (!payload || !Array.isArray(payload.titles) || payload.titles.length < 1 ||
-        payload.titles.length > MAX_PHASE_CAPACITY_TITLES || !payload.titles.every((item) => typeof item === "string")) {
-      resolve(JSON.stringify({ ok: false, reason: "the phase preflight request is invalid" }));
-      return;
-    }
-    if (nextPhaseCapacityId > MAX_PHASE_CAPACITY_REQUESTS) {
-      resolve(JSON.stringify({ ok: false, reason: "the workflow phase preflight limit was reached" }));
-      return;
-    }
-    const id = nextPhaseCapacityId++;
-    if (!send({ type: "phase-capacity", id, titles: payload.titles })) {
-      resolve(JSON.stringify({ ok: false, reason: "Unable to preflight workflow phase capacity" }));
-      return;
-    }
-    pendingPhaseCapacity.set(id, resolve);
-    return;
-  }
-  if (operation === "convergence") {
-    if (++convergenceEvents > MAX_CONVERGENCE_EVENTS) return `Workflow convergence event limit exceeded (${MAX_CONVERGENCE_EVENTS})`;
-    if (typeof payloadJson !== "string" || byteLength(payloadJson) > MAX_CONVERGENCE_PROGRESS_BYTES) return "Convergence progress exceeds the 64 KiB limit";
-    let payload;
-    try { payload = JSON.parse(payloadJson); }
-    catch { return "Convergence progress is not valid JSON"; }
-    if (!send({ type: "convergence", progress: payload })) return "Unable to emit workflow convergence progress";
-    return undefined;
-  }
-  if ((operation !== "agent" && operation !== "followUp") || typeof resolve !== "function") return;
-  if (agentCalls >= MAX_AGENT_CALLS) {
-    resolve(failure(`Agent call limit exceeded (${MAX_AGENT_CALLS})`));
-    return;
-  }
-  if (typeof payloadJson !== "string" || byteLength(payloadJson) > MAX_IPC_BYTES) {
-    resolve(failure("Agent request exceeds the 512 KiB IPC limit"));
-    return;
-  }
-  let payload;
-  try { payload = JSON.parse(payloadJson); }
-  catch (error) { resolve(failure(`Agent request is not JSON-serializable: ${errorMessage(error)}`)); return; }
-  if (typeof payload.prompt !== "string" || !payload.options || typeof payload.options !== "object" || Array.isArray(payload.options)) {
-    resolve(failure("agent requires a string prompt and an options object"));
-    return;
-  }
-  if (operation === "followUp" && (typeof payload.jobId !== "string" || !payload.jobId.trim())) {
-    resolve(failure("followUp requires a job ID, a string prompt, and an options object"));
-    return;
-  }
-  const id = nextAgentId++;
-  agentCalls++;
-  const request = operation === "followUp"
-    ? { type: "followUp", id, jobId: payload.jobId, prompt: payload.prompt, options: payload.options }
-    : { type: "agent", id, prompt: payload.prompt, options: payload.options };
-  if (frameSize({ token, ...request }) > MAX_IPC_BYTES || !send(request)) {
-    resolve(failure("Agent request exceeds the 512 KiB IPC limit"));
-    return;
-  }
-  pendingAgents.set(id, resolve);
-}
-Object.setPrototypeOf(bridge, null);
-
-function installApi(context, argsJson) {
-  Object.defineProperty(context, "__workflowBridge", {
-    value: bridge,
-    writable: false,
-    configurable: true,
-    enumerable: false,
-  });
-  Object.defineProperty(context, "__workflowArgsJson", {
-    value: argsJson,
-    writable: false,
-    configurable: true,
-    enumerable: false,
-  });
-  const setup = new vm.Script(`
-    (() => {
-      "use strict";
-      const callHost = globalThis.__workflowBridge;
-      const workflowArgs = JSON.parse(globalThis.__workflowArgsJson);
-      const NativeDate = Date;
+export function workflowPrelude(argsJson: string, maxAgentCalls: number): string {
+  return `
+    const workflowArgs = JSON.parse(${JSON.stringify(argsJson)});
+    const bridge = (input) => input.operation === "agent" || input.operation === "followUp"
+      ? tools.workflow_agent(input)
+      : tools.workflow_event(input);
+    let agentCalls = 0;
+    let pendingAgents = 0;
+    let phaseEvents = 0;
+    let logEvents = 0;
+    let convergenceEvents = 0;
+    let phaseCapacityRequests = 0;
+    let eventChain = Promise.resolve();
+    let eventFailure;
+    const agentCallBudget = ${maxAgentCalls};
+    const byteLength = (value) => unescape(encodeURIComponent(value)).length;
+    const enqueue = (operation, payload) => {
+      eventChain = eventChain.then(() => bridge({ operation, ...payload }));
+      eventChain.catch((error) => { eventFailure = error; });
+    };
+    const flush = async () => { await eventChain; if (eventFailure) throw eventFailure; };
+    const callHost = (operation, payloadJson, resolve) => {
+      if (operation === "limits") return JSON.stringify({ agentCalls: Math.max(0, agentCallBudget - agentCalls) });
+      const payload = JSON.parse(payloadJson);
+      const bytes = byteLength(payloadJson);
+      if (operation === "phase" || operation === "log" || operation === "convergence") {
+        if (operation === "phase" && ++phaseEvents > 128) return "Workflow phase event limit exceeded (128)";
+        if (operation === "log" && ++logEvents > 256) return "Workflow log event limit exceeded (256)";
+        if (operation === "convergence" && ++convergenceEvents > 64) return "Workflow convergence event limit exceeded (64)";
+        if (operation === "log" && bytes > 4096) return "Log message exceeds the 4 KiB limit";
+        if (bytes > (operation === "convergence" ? 65536 : 524288)) return "Workflow event exceeds its size limit";
+        enqueue(operation, operation === "convergence" ? { progress: payload } : payload);
+        return;
+      }
+      if (operation === "phaseCapacity") {
+        if (++phaseCapacityRequests > 64) {
+          resolve(JSON.stringify({ ok: false, reason: "the workflow phase preflight limit was reached" }));
+          return;
+        }
+        void flush().then(() => bridge({ operation, ...payload })).then(
+          (result) => resolve(JSON.stringify(result)),
+          (error) => resolve(JSON.stringify({ ok: false, reason: String(error) })),
+        );
+        return;
+      }
+      if (agentCalls >= 32) { resolve(JSON.stringify({ ok: false, output: "", error: "Agent call limit exceeded (32)" })); return; }
+      if (bytes > 524288) { resolve(JSON.stringify({ ok: false, output: "", error: "Agent request exceeds the 512 KiB limit" })); return; }
+      const callIndex = agentCalls++;
+      pendingAgents++;
+      void flush().then(() => bridge({ operation, ...payload, callIndex })).then(
+        (result) => { pendingAgents--; resolve(JSON.stringify(result)); },
+        (error) => { pendingAgents--; resolve(JSON.stringify({ ok: false, output: "", error: String(error.message || error) })); },
+      );
+    };
+      const NativeDate = globalThis.Date;
+      const Math = Object.create(globalThis.Math);
       class WorkflowDate extends NativeDate {
         constructor(...values) {
           if (values.length === 0) throw new Error("new Date() is not available in deterministic workflows; pass an explicit value");
@@ -207,13 +67,12 @@ function installApi(context, argsJson) {
         }
         static now() { throw new Error("Date.now() is not available in deterministic workflows"); }
       }
+      const Date = WorkflowDate;
       Object.defineProperty(Math, "random", {
         value() { throw new Error("Math.random() is not available in deterministic workflows"); },
         writable: false,
         configurable: false,
       });
-      delete globalThis.__workflowBridge;
-      delete globalThis.__workflowArgsJson;
       const asFailure = (error) => ({
         ok: false,
         output: "",
@@ -674,7 +533,6 @@ function installApi(context, argsJson) {
       };
       Object.defineProperties(globalThis, {
         args: { value: workflowArgs, writable: false, configurable: false },
-        Date: { value: WorkflowDate, writable: false, configurable: false },
         phase: { value: phaseApi, writable: false, configurable: false },
         log: { value: logApi, writable: false, configurable: false },
         agent: { value: agentApi, writable: false, configurable: false },
@@ -691,120 +549,6 @@ function installApi(context, argsJson) {
           set() { throw new Error(name + " is not available in workflow sandbox"); },
         });
       }
-      // Structured stack traces can otherwise expose function objects belonging
-      // to callers outside the VM realm through V8 CallSite#getFunction().
-      Object.defineProperties(Error, {
-        prepareStackTrace: { value: undefined, writable: false, configurable: false },
-        captureStackTrace: { value: undefined, writable: false, configurable: false },
-      });
-    })();
-  `, { filename: "workflow-sandbox-api.js" });
-  setup.runInContext(context);
-}
 
-async function execute(source, argsJson) {
-  const sandbox = Object.create(null);
-  const context = vm.createContext(sandbox, {
-    name: "workflow-sandbox",
-    codeGeneration: { strings: false, wasm: false },
-  });
-  installApi(context, argsJson);
-  const module = new vm.SourceTextModule(source, {
-    context,
-    identifier: "workflow.js",
-    initializeImportMeta(meta) { Object.freeze(meta); },
-  });
-  await module.link(() => { throw new Error("Workflow imports are not allowed"); });
-  await module.evaluate();
-  const hasMeta = Object.prototype.hasOwnProperty.call(module.namespace, "meta");
-  const meta = hasMeta ? module.namespace.meta : undefined;
-  if (hasMeta) {
-    let metaJson;
-    try { metaJson = JSON.stringify(meta); }
-    catch (error) { throw new TypeError(`Workflow meta must be JSON-serializable: ${errorMessage(error)}`); }
-    if (metaJson !== undefined && byteLength(metaJson) > 16 * KIB) throw new RangeError("Workflow meta exceeds the 16 KiB limit");
-    if (!send({ type: "meta", meta: metaJson === undefined ? null : JSON.parse(metaJson) })) throw new Error("Unable to send workflow meta");
-  }
-  const defaultExport = module.namespace.default;
-  if (typeof defaultExport !== "function") throw new TypeError("Workflow must export a default async function");
-  const result = await Reflect.apply(defaultExport, undefined, [
-    sandbox.args,
-    sandbox.phase,
-    sandbox.agent,
-    sandbox.parallel,
-    sandbox.pipeline,
-    sandbox.log,
-    sandbox.followUp,
-  ]);
-  if (pendingAgents.size > 0) {
-    throw new Error(`Workflow returned before ${pendingAgents.size} agent call${pendingAgents.size === 1 ? "" : "s"} settled; await every agent() call`);
-  }
-  let payload;
-  try {
-    payload = JSON.stringify({
-      hasMeta,
-      metaUndefined: hasMeta && meta === undefined,
-      resultUndefined: result === undefined,
-      ...(meta === undefined ? {} : { meta }),
-      ...(result === undefined ? {} : { result }),
-    });
-  } catch (error) {
-    throw new TypeError(`Workflow result must be JSON-serializable: ${errorMessage(error)}`);
-  }
-  if (payload === undefined) throw new TypeError("Workflow result must be JSON-serializable");
-  const bytes = byteLength(payload);
-  if (bytes > MAX_RESULT_BYTES) throw new RangeError("Workflow result exceeds the 1 MiB limit");
-  const buffer = Buffer.from(payload, "utf8");
-  const chunks = [];
-  for (let offset = 0; offset < buffer.length; offset += RESULT_CHUNK_BYTES) {
-    chunks.push(buffer.subarray(offset, offset + RESULT_CHUNK_BYTES).toString("base64"));
-  }
-  if (chunks.length === 0) chunks.push("");
-  if (!send({ type: "result-start", chunks: chunks.length, bytes })) throw new Error("Unable to send workflow result");
-  for (let index = 0; index < chunks.length; index++) {
-    if (!send({ type: "result-chunk", index, data: chunks[index] })) throw new Error("Unable to send workflow result chunk");
-  }
-  if (!send({ type: "result-end" })) throw new Error("Unable to finish workflow result");
-  finished = true;
-  if (process.connected) process.disconnect();
+  `;
 }
-
-process.on("message", (message) => {
-  if (!message || typeof message !== "object" || message.token !== token) return;
-  if (message.type !== "init" && frameSize(message) > MAX_IPC_BYTES) return;
-  if (message.type === "agent-result") {
-    const resolve = pendingAgents.get(message.id);
-    if (!resolve) return;
-    pendingAgents.delete(message.id);
-    let response;
-    try { response = JSON.stringify(message.result); }
-    catch (error) { response = failure(`Agent result is not JSON-serializable: ${errorMessage(error)}`); }
-    if (response === undefined) response = failure("Agent returned undefined");
-    resolve(response);
-    return;
-  }
-  if (message.type === "phase-capacity-result") {
-    const resolve = pendingPhaseCapacity.get(message.id);
-    if (!resolve) return;
-    pendingPhaseCapacity.delete(message.id);
-    let response;
-    try { response = JSON.stringify(message.result); }
-    catch { response = JSON.stringify({ ok: false, reason: "the phase capacity response is invalid" }); }
-    resolve(response);
-    return;
-  }
-  if (message.type === "cancel") {
-    finishError("Workflow sandbox cancelled");
-    return;
-  }
-  if (message.type !== "init" || initialized) return;
-  initialized = true;
-  if (typeof message.source !== "string" || byteLength(message.source) > MAX_SOURCE_BYTES ||
-      typeof message.argsJson !== "string" || byteLength(message.argsJson) > MAX_ARGS_BYTES ||
-      !Number.isSafeInteger(message.maxAgentCalls) || message.maxAgentCalls < 1 || message.maxAgentCalls > MAX_AGENT_CALLS) {
-    finishError("Invalid or oversized workflow initialization");
-    return;
-  }
-  agentCallBudget = message.maxAgentCalls;
-  void execute(message.source, message.argsJson).catch(finishError);
-});

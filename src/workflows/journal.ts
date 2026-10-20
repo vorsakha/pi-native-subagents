@@ -340,7 +340,7 @@ export function replayableJournalCalls(
       } else {
         completed.set(record.callIndex, record);
         const proof = localProof ?? replayProof ?? lineageProof;
-        if (record.result.progressed === true) durableProgressEvidence.set(record.callIndex, record);
+        if ((record.result.progressed === true || record.result.unsafeToReplay === true)) durableProgressEvidence.set(record.callIndex, record);
         if (proof) {
           continuationProofs.set(record.callIndex, proof);
           acceptedLineageProofs.push(proof);
@@ -349,9 +349,9 @@ export function replayableJournalCalls(
       }
     }
     else if (record.state === "failed" && record.result?.ok === false
-        && (progressed.has(record.callIndex) || handoffs.has(record.callIndex) || record.result.progressed === true)) {
+        && (progressed.has(record.callIndex) || handoffs.has(record.callIndex) || (record.result.progressed === true || record.result.unsafeToReplay === true))) {
       completed.set(record.callIndex, record);
-      if (record.result.progressed === true || progressed.has(record.callIndex) || handoffs.has(record.callIndex)) {
+      if ((record.result.progressed === true || record.result.unsafeToReplay === true) || progressed.has(record.callIndex) || handoffs.has(record.callIndex)) {
         durableProgressEvidence.set(record.callIndex, record);
       }
     }

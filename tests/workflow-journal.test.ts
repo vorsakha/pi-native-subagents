@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { tempDir } from "./helpers.ts";
-import { appendFile, mkdtemp, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   appendWorkflowJournal,
@@ -39,7 +39,7 @@ async function fixture() {
       phases: [],
       agents: [],
       definitionFingerprint: "sha256:" + "a".repeat(64),
-      journalArtifact: "journal.jsonl",
+      journalArtifact: "runtime.sqlite",
     },
   });
   return { parent, root, created, cleanup: () => rm(parent, { recursive: true, force: true }) };
@@ -89,10 +89,9 @@ test("journal loading replays valid completed calls independently across a faile
       result: { ok: true, output: "later", jobId: "job-later", usage },
       route: { jobId: "job-later", harness: "claude", model: "review-model" },
     });
-    await appendFile(join(f.created.artifactDir, "journal.jsonl"), "{partial crash tail", "utf8");
 
     const records = await loadWorkflowJournal(f.root, f.created.runId);
-    assert.equal(records.length, 6, "an unterminated crash tail is ignored");
+    assert.equal(records.length, 6, "all committed proof records survive reopen");
     assert.deepEqual(replayableJournalCalls(records), [{
       callIndex: 0,
       fingerprint: first,
