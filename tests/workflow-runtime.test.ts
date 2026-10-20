@@ -11,48 +11,51 @@ import { runWorkflowSandbox } from "../src/workflows/sandbox.ts";
 
 // This exercises the real Durable scheduler, SQLite, QuickJS, WorkflowManager, and JobManager.
 // Native execution uses ControlledBackend; no provider process reattachment is claimed.
-test("SIGKILL recovery keeps completed results and never redispatches an interrupted native call", { timeout: 20_000 }, async () => {
-  const directory = await tempDir("durable-crash");
-  const fixture = join(import.meta.dirname, "fixtures", "workflow-crash.ts");
-  const first = spawn(process.execPath, [fixture, "run", directory], { stdio: ["ignore", "pipe", "pipe"] });
-  let errors = "";
-  first.stderr.on("data", (chunk) => { errors += String(chunk); });
-  const exited = once(first, "exit");
-  try {
-    await withTimeout(new Promise<void>((resolve, reject) => {
-      let output = "";
-      first.stdout.on("data", (chunk) => { output += String(chunk); if (output.includes("READY\n")) resolve(); });
-      first.once("exit", () => reject(new Error(errors || "Crash worker exited before native dispatch")));
-    }), "Durable crash checkpoint", 10_000);
-    first.kill("SIGKILL");
-    await exited;
-    const recovered = spawn(process.execPath, [fixture, "recover", directory], { stdio: ["ignore", "pipe", "pipe"] });
-    let output = "";
-    let recoveryErrors = "";
-    recovered.stdout.on("data", (chunk) => { output += String(chunk); });
-    recovered.stderr.on("data", (chunk) => { recoveryErrors += String(chunk); });
+for (const operation of ["agent", "followUp"] as const) {
+  test(`SIGKILL recovery keeps completed results and never redispatches an interrupted ${operation} call`, { timeout: 20_000 }, async () => {
+    const directory = await tempDir("durable-crash");
+    const fixture = join(import.meta.dirname, "fixtures", "workflow-crash.ts");
+    const first = spawn(process.execPath, [fixture, "run", directory, operation], { stdio: ["ignore", "pipe", "pipe"] });
+    let errors = "";
+    first.stderr.on("data", (chunk) => { errors += String(chunk); });
+    const exited = once(first, "exit");
     try {
-      const [code] = await withTimeout(once(recovered, "exit"), "Durable recovery", 10_000);
-      assert.equal(code, 0, recoveryErrors);
-      const result = JSON.parse(output.trim()) as {
-        status: string;
-        agents: string[];
-        usage: { input: number; output: number; turns: number };
-        result: { done: { ok: boolean }; interrupted: { ok: boolean; error: string }; after: { ok: boolean } };
-      };
-      assert.equal(result.status, "completed");
-      assert.equal(result.agents.length, 3, "recovery retains both earlier agent records and the new call");
-      assert.equal(result.usage.input, 7, "completed native spend survives a crash before the debounce checkpoint");
-      assert.equal(result.usage.output, 3);
-      assert.equal(result.usage.turns, 1);
-      assert.equal(result.result.done.ok, true);
-      assert.equal(result.result.interrupted.ok, false);
-      assert.match(result.result.interrupted.error, /interrupted.*may have partially run/i);
-      assert.equal(result.result.after.ok, true);
-      assert.deepEqual((await readFile(join(directory, "calls"), "utf8")).trim().split("\n"), ["done", "interrupted", "after"]);
-    } finally { recovered.kill("SIGKILL"); }
-  } finally { first.kill("SIGKILL"); }
-});
+      await withTimeout(new Promise<void>((resolve, reject) => {
+        let output = "";
+        first.stdout.on("data", (chunk) => { output += String(chunk); if (output.includes("READY\n")) resolve(); });
+        first.once("exit", () => reject(new Error(errors || "Crash worker exited before native dispatch")));
+      }), "Durable crash checkpoint", 10_000);
+      first.kill("SIGKILL");
+      await exited;
+      const recovered = spawn(process.execPath, [fixture, "recover", directory, operation], { stdio: ["ignore", "pipe", "pipe"] });
+      let output = "";
+      let recoveryErrors = "";
+      recovered.stdout.on("data", (chunk) => { output += String(chunk); });
+      recovered.stderr.on("data", (chunk) => { recoveryErrors += String(chunk); });
+      try {
+        const [code] = await withTimeout(once(recovered, "exit"), "Durable recovery", 10_000);
+        assert.equal(code, 0, recoveryErrors);
+        const result = JSON.parse(output.trim()) as {
+          status: string;
+          agents: string[];
+          usage: { input: number; output: number; turns: number };
+          result: { done: { ok: boolean }; interrupted: { ok: boolean; error: string }; after: { ok: boolean } };
+        };
+        assert.equal(result.status, "completed");
+        assert.equal(result.agents.length, operation === "followUp" ? 2 : 3, "recovery retains every agent lineage");
+        assert.equal(result.usage.input, 7, "completed native spend survives a crash before the debounce checkpoint");
+        assert.equal(result.usage.output, 3);
+        assert.equal(result.usage.turns, 1);
+        assert.equal(result.result.done.ok, true);
+        assert.equal(result.result.interrupted.ok, false);
+        assert.equal("jobId" in result.result.interrupted, false, "the public interruption carries no native session identity");
+        assert.match(result.result.interrupted.error, /interrupted.*may have partially run/i);
+        assert.equal(result.result.after.ok, true);
+        assert.deepEqual((await readFile(join(directory, "calls"), "utf8")).trim().split("\n"), ["done", "interrupted", "after"]);
+      } finally { recovered.kill("SIGKILL"); }
+    } finally { first.kill("SIGKILL"); }
+  });
+}
 
 test("host admission bounds direct sandbox tool calls that bypass the workflow helpers", async () => {
   const cwd = await tempDir("durable-admission");

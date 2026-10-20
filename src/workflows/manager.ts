@@ -1660,7 +1660,10 @@ export class WorkflowManager {
       }
       entry.snapshot.replay!.matchedCalls++;
       const replayedResult = clone(expected.result);
-      replayedResult.jobId = record.logicalJobId ?? jobId;
+      // Interrupted Durable failures expose no jobId; their lineage stays on the agent record.
+      if (replayedResult.jobId !== undefined) {
+        replayedResult.jobId = record.logicalJobId ?? jobId;
+      }
       await this.#appendReplayedContinuationProof(entry, callIndex, fingerprint, "followUp", record.index, expected);
       await this.#appendJournal(entry, {
         callIndex,
