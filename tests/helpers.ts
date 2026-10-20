@@ -2,9 +2,9 @@
 // fake backends, and the Pi extension-host doubles. Test files should import from
 // here rather than re-declaring a backend or host stub.
 import assert from "node:assert/strict";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import {
   createEventBus,
   type EventBus,
@@ -90,7 +90,7 @@ export class GatedWorkflowJournalAppender {
   readonly #reachedPromise = new Promise<void>((resolve) => { this.#resolveReached = resolve; });
   readonly #releasePromise = new Promise<void>((resolve) => { this.#resolveRelease = resolve; });
 
-  readonly append = async (root: string, runId: string, record: WorkflowJournalRecord): Promise<void> => {
+  readonly append = async (root: string, runId: string, record: WorkflowJournalRecord, projection?: WorkflowSnapshot): Promise<void> => {
     if (this.#failAcceptance && record.kind === "peerQuestion" && record.state === "accepted") {
       this.#failAcceptance = false;
       throw new Error("controlled peer-answer acceptance persistence failure");
@@ -99,7 +99,7 @@ export class GatedWorkflowJournalAppender {
       this.#failInvalidation = false;
       throw new Error("controlled peer-answer invalidation persistence failure");
     }
-    await appendWorkflowJournal(root, runId, record);
+    await appendWorkflowJournal(root, runId, record, projection);
     if (!this.#armed || this.#reached || record.kind !== "peerQuestion" || record.state !== this.#gateState) return;
     this.#reached = true;
     this.#resolveReached();
@@ -1192,5 +1192,40 @@ export function interactionSnapshot(overrides: Partial<PendingInteraction> = {})
     state: "pending",
     ...overrides,
     target: overrides.target ?? { kind: "orchestrator" },
+  };
+}
+
+/** Inject persisted application proofs without depending on SQLite's private table layout. */
+export async function readWorkflowHistory(database: string): Promise<string> {
+  const { readWorkflowState } = await import("../src/workflows/state.ts");
+  const state = await readWorkflowState(database);
+  return (state?.history ?? []).join("\n") + "\n";
+}
+
+export async function writeWorkflowHistory(database: string, contents: string): Promise<void> {
+  const { updateWorkflowState } = await import("../src/workflows/state.ts");
+  await updateWorkflowState(database, (state) => { state.history = contents.trim().split("\n"); });
+}
+
+export async function writeWorkflowFixture(path: string, contents: string, options?: { mode?: number } | "utf8"): Promise<void> {
+  if (basename(path) === "workflow.json") {
+    const { updateWorkflowState } = await import("../src/workflows/state.ts");
+    await updateWorkflowState(join(dirname(path), "runtime.sqlite"), (state) => { state.snapshot = contents; });
+  }
+  await writeFile(path, contents, options);
+}
+
+export function workflowRuntimeOptions(
+  cwd: string,
+  source: string,
+  overrides: Partial<import("../src/workflows/sandbox.ts").WorkflowSandboxOptions> = {},
+): import("../src/workflows/sandbox.ts").WorkflowSandboxOptions {
+  return {
+    source, cwd, args: null, signal: new AbortController().signal,
+    onAgent: async () => ({ ok: true, output: "done" }),
+    onFollowUp: async () => { throw new Error("Unexpected follow-up"); },
+    onMeta() {}, onPhase() {}, onLog() {}, onConvergence() {},
+    onPhaseCapacity: () => ({ ok: true }),
+    ...overrides,
   };
 }

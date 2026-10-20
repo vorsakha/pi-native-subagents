@@ -35,7 +35,7 @@ Four non-failure states are reported separately and must not be summarized as fa
 - Never derive `Now` from thought text, response previews, transcript entries, tool summaries, raw commands, queries, results, credentials, or absolute machine paths. It is not journaled or replayed, clears between generations and attempts, and disappears at terminal settlement. Updates come from manager events without polling or provider turns.
 - Failed or cancelled direct sessions pin their error and offer no follow-up, restart, or takeover. Workflow-owned rows send recovery to `/workflows`.
 - Failed workflow runs pin their error and have no run restart action. Use `r` only on an agent that `/workflows` can restart in a replacement run.
-- Failed, cancelled, or aborted agents show `r` only when restart cannot discard progressed agent or follow-up work. Exact replay restores that proof. Peer-answer progress does not block safe suffix restart. Progressed failures and continued agents require the handoff or manual recovery.
+- Failed agents show `r` only when restart cannot discard progressed or interrupted native work. Replay preserves that refusal. Peer-answer progress does not block safe suffix restart. Progressed failures and continued agents require the handoff or manual recovery.
 - A completed entity shows one concise result preview. Use `f` for a retained direct session when more work is needed. Completed workflow runs and agents require no action; `r` on an eligible workflow agent starts a replacement run rather than continuing the completed session.
 
 ## Telemetry concepts stay distinct

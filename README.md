@@ -133,9 +133,11 @@ flowchart TB
     D -. cannot delegate .-> I
 ```
 
-Children must stay inside a trusted project. Read-only jobs use the native runtime's sandbox instead of relying on prompt instructions. Children cannot start more agents or approve permission changes. Workflow scripts run in a separate restricted process.
+Children must stay inside a trusted project. Read-only jobs use the native runtime's sandbox instead of relying on prompt instructions. Children cannot start more agents or approve permission changes. Workflow scripts run in a QuickJS worker, with Durable task state in a private per-run SQLite database.
 
 Transcripts, artifacts, credentials, and machine-local state stay outside Git. Report security problems through GitHub's private vulnerability reporting. See [SECURITY.md](SECURITY.md).
+
+Interrupted workflows can recover with `resumeFromRunId` and the original source/input. Completed calls are reused; interrupted native calls require inspection before manual recovery. Finished-run replay and eligible agent restart remain available.
 
 ## Agent instructions
 

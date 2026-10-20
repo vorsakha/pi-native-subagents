@@ -1,3 +1,4 @@
+import { writeWorkflowFixture } from "./helpers.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { tempDir } from "./helpers.ts";
@@ -76,7 +77,7 @@ test("creates private workflow artifacts and redacts environment/auth values", a
   assert.match(created.runId, /^wf_[a-f0-9]+$/);
   assert.equal(created.artifactDir, join(root, created.runId));
   assert.deepEqual((await readdir(created.artifactDir)).sort(), [
-    "args.json", "journal.jsonl", "result.json", "script.js", "transcripts.json", "workflow.json",
+    ".ownership", ".ownership.runtime", "args.json", "result.json", "runtime.sqlite", "script.js", "transcripts.json", "workflow.json",
   ]);
   const persisted = await readFile(join(created.artifactDir, "args.json"), "utf8");
   assert.match(persisted, /safe/);
@@ -86,7 +87,8 @@ test("creates private workflow artifacts and redacts environment/auth values", a
     assert.equal((await stat(root)).mode & 0o777, 0o700);
     assert.equal((await stat(created.artifactDir)).mode & 0o777, 0o700);
     for (const name of await readdir(created.artifactDir)) {
-      assert.equal((await stat(join(created.artifactDir, name))).mode & 0o777, 0o600);
+      const entry = await stat(join(created.artifactDir, name));
+      assert.equal(entry.mode & 0o777, entry.isDirectory() ? 0o700 : 0o600);
     }
   }
 });
@@ -131,7 +133,7 @@ test("loads session summaries, ignores corrupt files, and durably aborts stale r
   });
   const corruptDir = join(root, "wf_corrupt");
   await import("node:fs/promises").then(({ mkdir }) => mkdir(corruptDir, { recursive: true }));
-  await writeFile(join(corruptDir, "workflow.json"), "{ definitely not json", { mode: 0o600 });
+  await writeWorkflowFixture(join(corruptDir, "workflow.json"), "{ definitely not json", { mode: 0o600 });
 
   const summaries = await loadWorkflowSummaries(root, {
     sessionId: "session-a",
@@ -310,7 +312,7 @@ test("persists declared phase totals and rejects inconsistent declared snapshots
 
   const persisted = JSON.parse(await readFile(join(created.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
   persisted.plannedPhaseCount = 2;
-  await writeFile(join(created.artifactDir, "workflow.json"), JSON.stringify(persisted), { mode: 0o600 });
+  await writeWorkflowFixture(join(created.artifactDir, "workflow.json"), JSON.stringify(persisted), { mode: 0o600 });
   assert.deepEqual(await loadWorkflowSummaries(root, { sessionId: "planned-session" }), [], "a count/phase mismatch is not restored");
 });
 
@@ -403,7 +405,7 @@ test("convergence state is bounded on the way to disk, restores unchanged, and s
   const legacyRaw = JSON.parse(await readFile(legacyPath, "utf8")) as WorkflowSnapshot;
   delete legacyRaw.agents[0]!.speed;
   delete legacyRaw.agents[0]!.effectiveSpeed;
-  await writeFile(legacyPath, JSON.stringify(legacyRaw), { mode: 0o600 });
+  await writeWorkflowFixture(legacyPath, JSON.stringify(legacyRaw), { mode: 0o600 });
   const [legacy] = await loadWorkflowSummaries(f.root, { sessionId: "session-2" });
   assert.equal(legacy?.convergence, undefined, "a snapshot written without convergence stays loadable");
   assert.equal(legacy?.agents[0]?.speed, "standard", "legacy snapshots reconstruct the standard requested default");
@@ -434,7 +436,7 @@ test("convergence state is bounded on the way to disk, restores unchanged, and s
     { ...validConvergence, rounds: [{ round: 1, verdict: "request_changes", actionableCount: 0, fingerprint: "fp-1" }], verdict: "request_changes" },
   ];
   for (const convergenceRecord of invalidRecords) {
-    await writeFile(corrupted, JSON.stringify({ ...raw, convergence: convergenceRecord }), "utf8");
+    await writeWorkflowFixture(corrupted, JSON.stringify({ ...raw, convergence: convergenceRecord }), "utf8");
     const remaining = await loadWorkflowSummaries(f.root, { sessionId: "session-2" });
     assert.deepEqual(remaining, [], `an incoherent convergence record is rejected: ${JSON.stringify(convergenceRecord)}`);
   }

@@ -236,6 +236,8 @@ export interface WorkflowAgentRecord {
   logicalJobId?: string;
   /** Durable proof that manual replay of this agent suffix could repeat progressed effects. */
   progressedCheckpoint?: true;
+  /** An interrupted native intent may have side effects without observable progress. */
+  unsafeToReplay?: true;
   state: WorkflowAgentState;
   timestamps: WorkflowTimestamps;
   harness?: string;
@@ -439,6 +441,8 @@ export interface WorkflowJournalRecord {
   interaction?: WorkflowInteractionJournalDetail;
   /** A persisted peer answer that requires a later accepted record before replay. */
   interactionPending?: true;
+  /** Internal interruption proof, excluded from script-visible results. */
+  unsafeToReplay?: true;
   result?: WorkflowJournalResult;
   route?: WorkflowJournalRoute;
   replayedFrom?: WorkflowReplayReference;
@@ -468,6 +472,7 @@ export interface WorkflowReplayCall {
   kind: "agent" | "followUp";
   /** The lineage this call belongs to; required to reconstruct a followUp() replay. */
   agentIndex?: number;
+  unsafeToReplay?: true;
   result: WorkflowJournalResult;
   route?: WorkflowJournalRoute;
   /** Accepted checkpoint chain copied into a replay journal before its terminal record. */

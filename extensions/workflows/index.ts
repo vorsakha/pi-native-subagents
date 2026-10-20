@@ -433,7 +433,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
     name: "workflow",
     renderShell: "self",
     label: "Workflow",
-    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Export a default async function and use the injected globals phase(), log(), agent(), followUp(), parallel(), pipeline(), and converge(); parallel receives deferred task functions, not already-started promises. Use exactly one source (script, workflowName, or scriptPath) and at most one input form (input or legacy args); omitting both exposes null. isolation='worktree' runs a mutating agent in a clean Git worktree and preserves changed work with a patch. Runs are limited to 32 agent calls and four concurrent agents; resumeFromRunId replays matching completed calls from an exact interrupted run, including independent later parallel lanes.",
+    description: "Run sandboxed JavaScript orchestration over generic task-driven subagents. Export a default async function and use the injected globals phase(), log(), agent(), followUp(), parallel(), pipeline(), and converge(); parallel receives deferred task functions, not already-started promises. Use exactly one source (script, workflowName, or scriptPath) and at most one input form (input or legacy args); omitting both exposes null. isolation='worktree' runs a mutating agent in a clean Git worktree and preserves changed work with a patch. Runs are limited to 32 agent calls and four concurrent agents; resumeFromRunId recovers an interrupted Durable task in place or replays matching completed calls from a settled run. Interrupted native calls are never redispatched.",
     promptSnippet: "Run a sandboxed multi-agent workflow with phases and bounded parallelism",
     promptGuidelines: [
       "Use workflow for multi-phase fan-out/fan-in work rather than manually chaining many subagent calls; use direct spawning for a small simple fan-out.",
@@ -453,7 +453,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       "Read-only workflow agents can run concurrently; mutating agents sharing the checkout are serialized unless each uses isolation='worktree'.",
       "maxTurns is aggregate native-provider turns across all workflow agents; size it for the full fan-out rather than per-agent turns.",
       "Use log for concise progress updates that are useful without opening an agent transcript.",
-      "Set resumeFromRunId only to replay an interrupted run with the exact same script, input, project, and routing context.",
+      "Set resumeFromRunId with the same script, input, project, and routing context. Interrupted Durable tasks recover in place with the original budget; settled runs replay completed calls. Inspect interrupted native effects before manual recovery.",
       "Use approval=plan for read-only planning or approval=onMutate to require a host confirmation before mutation.",
       "Use workflowName for a saved user/project workflow or scriptPath for a trusted project-local script; provide exactly one script source.",
       "Use agent schema for validated JSON output when downstream phases need structure; schema cannot change access policy.",
@@ -469,7 +469,7 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       scriptPath: Type.Optional(Type.String({ minLength: 1, maxLength: 2_000 })),
       args: Type.Optional(Type.String({ maxLength: 256 * 1024, description: "Legacy JSON string passed to the script as args" })),
       input: Type.Optional(Type.Unknown({ description: "Structured JSON value exposed to the script as args; do not combine with legacy args" })),
-      resumeFromRunId: Type.Optional(Type.String({ pattern: "^wf_[a-f0-9]+$", description: "Terminal run whose matching completed calls should be replayed" })),
+      resumeFromRunId: Type.Optional(Type.String({ pattern: "^wf_[a-f0-9]+$", description: "Run to recover in place when interrupted, or replay when settled" })),
       approval: Type.Optional(Type.Union([Type.Literal("auto"), Type.Literal("plan"), Type.Literal("onMutate")])),
       budget: Type.Optional(Type.Object({
         maxAgents: Type.Optional(Type.Integer({ minimum: 1, maximum: 32, description: "Maximum child agent calls in this workflow" })),

@@ -67,7 +67,7 @@ await subagent_wait({ jobId: review.jobId, timeoutMs: 600_000 });
 
 ## Workflow shape
 
-Read `references/workflow-authoring.md` before writing a script. The essentials:
+Read `references/workflow-authoring.md` before writing a script. Read `references/durable-recovery.md` before recovering, replaying, or restarting a run. Durable recovers interrupted tasks in place; settled-run replay and suffix restart use retained application proofs. Interrupted native intents replay the same public failure and never redispatch automatically, and provider sessions are not reattached. Old VM runs are not resumable.
 
 The `workflow` tool accepts exactly one source — `script` (inline JavaScript), `workflowName` (a saved definition), or `scriptPath` (a trusted project-local script) — and zero or one input form, either structured `input` or the legacy JSON-string `args`, never both. The selected value reaches the script as the global `args`; omitting both exposes `null`.
 
@@ -199,9 +199,3 @@ These are enforced by the runtime. Do not design around them.
 - `/workflows` pins live-only `Now` and workflow `Context` from bounded event evidence, never thoughts, response text, raw commands/results, credentials, or paths. Provider waits expose only structured provider, window, retry, and attempt data. Questions, failures, peer answers, waits, and queueing outrank routine activity. Replay never restores `Now`. Use `?` for navigation and `i` for telemetry.
 - No closed state event after shutdown: keep the last valid snapshot. A failed final read skips publication; teardown still releases runtime resources.
 - A provider-quota, replay, worktree, or routed-question error: the matching reference above lists the exact message and its recovery.
-
-## Safe routing defaults
-
-- Keep reviewers read-only unless mutation is explicitly required.
-- Make harness, model, effort, speed, access, independence, and verification requirements explicit when the human asks for them.
-- Unless the caller explicitly asks for a one-shot review, give an implementation/review workflow at least one bounded fix round.

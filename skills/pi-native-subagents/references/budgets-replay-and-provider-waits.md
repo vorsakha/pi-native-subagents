@@ -15,7 +15,7 @@ Fresh input plus output consumes `maxTokens`; cache reads do not. Never infer a 
 - `maxAgents` and `maxConcurrency` limit work shape. `maxTokens` counts aggregate fresh input plus output, not cache reads. `maxTokensPerAgent` applies that ceiling per child. `maxCost` and `maxTurns` are aggregate.
 - Omitted workflow budgets leave spend open. Hard ceilings remain: 32 calls, four workers, global concurrency four, watchdogs, provider/context limits, bounded persistence, cancellation, and shutdown.
 - Spend limits are soft dispatch boundaries. The runtime warns once per metric, lets running calls finish and overshoot, then blocks fresh dispatches. Queued jobs recheck on admission. Replayable completions bypass fresh checks; `maxTokensPerAgent` does too.
-- `>=` is reached. Aggregate usage spans children. Exact replay is free; handoff admission adds carried source spend to checkpointed and journal-only current usage.
+- `>=` is reached. Aggregate usage spans children. Finished replay is free; handoff admission adds carried source spend to checkpointed and journal-only current usage.
 
 ## Cost reporting is provider-dependent
 
@@ -25,11 +25,11 @@ Codex Fast requires `speed: "fast"` on the direct request or workflow `agent()` 
 
 ## Replay with resumeFromRunId
 
-`resumeFromRunId` replays each matching completion, including later parallel calls after an earlier lane failed. Failed, incomplete, duplicated, or mismatched ordinals rerun live.
+`resumeFromRunId` recovers a pending Durable task in place with its original budget. Completed calls do not dispatch; interrupted native intents fail without redispatch. For settled tasks, application proofs replay matching completions, including later parallel lanes. An interrupted intent or progressed proof forbids fresh replay.
 
 - Keep source, input, project, and route identical; increase replay budgets only when permitted.
 - A terminal retained source can be looked up by run ID across Pi sessions; the source summary and journal are read under the retention lock before replay starts.
-- New journal records add available route evidence: requested and resolved harness, normalized auto-candidate checks, executable version, model, and capability fingerprint. Older journals still load without it. A matched completion reuses its result and evidence; invalidation or mismatch dispatches fresh and may resolve `harness: "auto"` again.
+- New journal records add available route evidence: requested and resolved harness, normalized auto-candidate checks, executable version, model, and capability fingerprint. A matched completion reuses its result and evidence; invalidation or mismatch dispatches fresh and may resolve `harness: "auto"` again.
 - Requested speed is replay identity. Explicit `standard` matches a legacy omitted value; `fast` does not. Exact Fast replay dispatches nothing and consumes no new credits. Effective speed is telemetry and never changes continuation identity.
 - `retry` is not part of the replay definition fingerprint, so changing it does not invalidate a prior run for `resumeFromRunId`.
 

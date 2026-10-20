@@ -25,7 +25,7 @@ Reclaiming a run's last protected worktree is what makes that run eligible for t
 
 ## Run retention
 
-Workflow run artifacts are bounded to the newest 64 eligible runs on disk, the same cap as in-session run history.
+Workflow artifacts, including each private Durable database, are bounded to the newest 64 eligible runs, matching in-session history.
 
 A run is only reclaimed once it is terminal (or a `running`/`paused` checkpoint has gone stale for 24 hours) **and** every isolated worktree it used has reached `removed`. An empty (or absent) `worktrees/` directory is unprotected either way: normal finalization of an unchanged worktree removes only that agent's own checkout, not the parent `worktrees/` directory, so the directory commonly survives on disk after every worktree it held is `removed`.
 
