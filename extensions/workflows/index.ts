@@ -627,43 +627,52 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       clearBlinks();
       sessionContext = ctx;
       unsubscribe?.();
+      const activeSessionId = ctx.sessionManager.getSessionId();
+      const isCurrentSession = () => {
+        if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return false;
+        try { return ctx.sessionManager.getSessionId() === activeSessionId; }
+        catch { return false; /* Pi may invalidate the context before cleanup runs. */ }
+      };
       const sessionManager = new WorkflowManager({
         jobs,
         artifactRoot,
-        sessionId: ctx.sessionManager.getSessionId(),
+        sessionId: activeSessionId,
         router: options.router,
         availability: options.availability,
         resolveProfile: options.resolveProfile,
         approveMutation: async ({ workflow, agent, prompt, signal }) => {
-          if (!ctx.hasUI || typeof ctx.ui.confirm !== "function") return false;
-          return ctx.ui.confirm(
+          if (!isCurrentSession() || signal.aborted || !ctx.hasUI || typeof ctx.ui.confirm !== "function") return false;
+          const approved = await ctx.ui.confirm(
             `Allow workflow mutation?`,
             `${workflow} · ${agent}\n\n${prompt}`,
             { timeout: 60_000, signal },
           );
+          return isCurrentSession() && !signal.aborted && approved;
         },
       });
       manager = sessionManager;
       unsubscribe = sessionManager.subscribe((snapshot) => {
-        if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
+        if (!isCurrentSession()) return;
         updateStatus(snapshot);
         refreshBlinks();
         options.onSnapshot?.(snapshot);
       });
       void sessionManager.initialize()
         .then(() => {
-          if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
+          if (!isCurrentSession()) return;
           updateStatus();
           for (const snapshot of sessionManager.list()) {
             if (!workflowIsTerminal(snapshot.status)) options.onSnapshot?.(snapshot);
           }
         })
         .catch((error) => {
-          if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
-          if (ctx.hasUI) ctx.ui.notify(`Workflow history unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+          if (!isCurrentSession()) return;
+          try {
+            if (ctx.hasUI) ctx.ui.notify(`Workflow history unavailable: ${error instanceof Error ? error.message : String(error)}`, "warning");
+          } catch { /* Error reporting must not reject the background restoration task. */ }
         })
         .finally(() => {
-          if (shuttingDown || generation !== sessionGeneration || manager !== sessionManager) return;
+          if (!isCurrentSession()) return;
           try { options.onInitialized?.(); }
           catch { /* initialization observers cannot change workflow lifecycle */ }
         });
@@ -672,6 +681,11 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       shuttingDown = true;
       generation++;
       clearBlinks();
+      const ctx = sessionContext;
+      sessionContext = undefined;
+      try {
+        if (ctx?.hasUI) ctx.ui.setStatus("native-workflows", undefined);
+      } catch { /* UI may already be unavailable during teardown. */ }
       const closing = manager;
       let finalSnapshots: WorkflowSnapshot[] = [];
       let shutdownError: unknown;
@@ -679,9 +693,6 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
       catch (error) { shutdownError = error; }
       try { finalSnapshots = closing?.list() ?? []; }
       catch (error) { shutdownError ??= error; }
-      try {
-        if (sessionContext?.hasUI) sessionContext.ui.setStatus("native-workflows", undefined);
-      } catch (error) { shutdownError ??= error; }
       if (shutdownError) throw shutdownError;
       return finalSnapshots;
     },

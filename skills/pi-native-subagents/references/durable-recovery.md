@@ -10,6 +10,8 @@ Workflows use pinned Durable/code-mode 1.3.0 with a QuickJS worker and one priva
 
 ## Recover an interrupted host
 
+Restoration belongs to the Pi session that started it. Replacing or reloading that session discards its late restoration callbacks, including UI notifications and mutation approvals. Inspect the replacement session's `/workflows` history before choosing recovery.
+
 A restored stale projection is shown as aborted. Repeat the `workflow` call with its original source, input, project, route, approval, and budget, adding `resumeFromRunId`. If its Durable task is still pending, the runtime recovers that task under the same run ID.
 
 Completed calls return their persisted results without native dispatch. A native call interrupted after intent returns an interruption failure and is never automatically redispatched, even if no progress was observed. Inspect partial effects before choosing manual recovery. Native commands, hooks, plugins, MCP calls, and file mutations are not exactly-once. Recovery does not reattach provider processes or restore their retained sessions. A later `followUp()` can therefore fail because the native session no longer exists.

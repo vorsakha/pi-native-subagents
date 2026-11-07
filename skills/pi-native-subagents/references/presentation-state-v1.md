@@ -32,6 +32,8 @@ The envelope contains:
 
 Startup follows manager initialization and workflow restoration. Shutdown carries the managers' final authoritative snapshots and marks the session closed without synthesizing terminal record states. If either manager's final state cannot be read, the producer does not fabricate a closed snapshot; teardown still releases both managers, listeners, and the extension install claim. A reload creates a new instance ID and restarts sequence at 1. Compare sequences only within one instance. No-op comparison ignores only sequence, emission time, and cause. A listener failure cannot change job, workflow, or shutdown behavior.
 
+Restoration that settles after its Pi context is invalidated cannot publish startup or update state. Consumers wait for the replacement instance's startup event and keep the last valid snapshot until then.
+
 ## Limits and priority
 
 `NATIVE_SUBAGENTS_STATE_V1_LIMITS` publishes these V1 bounds:

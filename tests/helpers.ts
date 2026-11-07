@@ -1146,6 +1146,19 @@ export function context(options: ContextOptions = {}) {
   return { ctx: ctx as any, notifications, statuses, widgets };
 }
 
+/** Models Pi's guarded contexts becoming unusable when their runtime is replaced. */
+export function replaceableContext(options: ContextOptions = {}) {
+  const session = context(options);
+  let active = true;
+  const ctx = new Proxy<ExtensionContext>(session.ctx, {
+    get(target, property, receiver) {
+      if (!active) throw new Error("This extension ctx is stale after session replacement or reload.");
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  return { ...session, ctx, invalidate() { active = false; } };
+}
+
 /* ── snapshot builders ───────────────────────────────────────────────────── */
 
 export function usage(overrides: Partial<JobSnapshot["usage"]> = {}): JobSnapshot["usage"] {
