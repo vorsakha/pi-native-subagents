@@ -5,7 +5,9 @@ import { createActivityWatchdog } from "../src/activity-watchdog.ts";
 
 test("activity watchdog resets on progress and disarms cleanly", async () => {
   let expirations = 0;
-  const watchdog = createActivityWatchdog(200, () => { expirations++; });
+  const watchdog = createActivityWatchdog(200, () => {
+    expirations++;
+  });
 
   watchdog.arm();
   await delay(30);
@@ -24,7 +26,9 @@ test("activity watchdog resets on progress and disarms cleanly", async () => {
 
 test("a suspended watchdog holds the countdown for a parked interaction and resumes from now", async () => {
   let expirations = 0;
-  const watchdog = createActivityWatchdog(150, () => { expirations++; });
+  const watchdog = createActivityWatchdog(150, () => {
+    expirations++;
+  });
 
   watchdog.arm();
   watchdog.suspend();

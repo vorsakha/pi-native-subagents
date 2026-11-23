@@ -22,12 +22,20 @@ export function createActivityWatchdog(timeoutMs: number, onInactive: () => void
   let armed = false;
   let suspended = 0;
   const clearTimer = () => {
-    if (timer) clearTimeout(timer);
+    if (timer) {
+      clearTimeout(timer);
+    }
+
     timer = undefined;
   };
+
   const schedule = () => {
     clearTimer();
-    if (suspended > 0) return;
+
+    if (suspended > 0) {
+      return;
+    }
+
     timer = setTimeout(() => {
       timer = undefined;
       armed = false;
@@ -35,13 +43,16 @@ export function createActivityWatchdog(timeoutMs: number, onInactive: () => void
     }, timeoutMs);
     timer.unref();
   };
+
   return {
     arm() {
       armed = true;
       schedule();
     },
     touch() {
-      if (armed) schedule();
+      if (armed) {
+        schedule();
+      }
     },
     clear() {
       armed = false;
@@ -53,9 +64,15 @@ export function createActivityWatchdog(timeoutMs: number, onInactive: () => void
       clearTimer();
     },
     resume() {
-      if (suspended === 0) return;
+      if (suspended === 0) {
+        return;
+      }
+
       suspended--;
-      if (suspended === 0 && armed) schedule();
+
+      if (suspended === 0 && armed) {
+        schedule();
+      }
     },
   };
 }

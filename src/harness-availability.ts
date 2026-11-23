@@ -19,12 +19,7 @@ const DEFAULT_AVAILABILITY_TIMEOUT_MS = 25_000;
  *   without a model turn is an explicit non-goal.
  */
 export type HarnessAvailabilityStatus =
-  | "ready"
-  | "missing"
-  | "unauthenticated"
-  | "incompatible"
-  | "unhealthy"
-  | "unknown";
+  "ready" | "missing" | "unauthenticated" | "incompatible" | "unhealthy" | "unknown";
 
 export interface HarnessAvailability {
   harness: HarnessName;
@@ -95,17 +90,30 @@ export function explicitBlocked(status: HarnessAvailabilityStatus): boolean {
  * this mapping is pure and side-effect-free.
  */
 export function harnessAvailabilityStatus(status: ProviderStatus): HarnessAvailabilityStatus {
-  if (status.ready) return "ready";
+  if (status.ready) {
+    return "ready";
+  }
+
   // A probe that ran the CLI but threw is transiently unhealthy; a probe that
   // could not find the CLI at all is missing.
-  if (status.probeFailed) return status.installed ? "unhealthy" : "missing";
-  if (!status.installed) return "missing";
-  if (status.compatible === false) return "incompatible";
+  if (status.probeFailed) {
+    return status.installed ? "unhealthy" : "missing";
+  }
+
+  if (!status.installed) {
+    return "missing";
+  }
+
+  if (status.compatible === false) {
+    return "incompatible";
+  }
+
   if (!status.authenticated) {
     // Pi has no interactive account to check: an installed-but-unready Pi is a
     // deferred-readiness signal, never a "log in" instruction.
     return status.harness === "pi" ? "unknown" : "unauthenticated";
   }
+
   // Installed and authenticated but still not ready means the login itself is
   // incompatible (wrong auth method or plan for a launched subagent).
   return "incompatible";
@@ -114,6 +122,7 @@ export function harnessAvailabilityStatus(status: ProviderStatus): HarnessAvaila
 /** Normalized availability for a single provider status. Reason is email-masked and bounded. */
 export function harnessAvailability(status: ProviderStatus): HarnessAvailability {
   const normalized = harnessAvailabilityStatus(status);
+
   return {
     harness: status.harness,
     status: normalized,
@@ -127,6 +136,7 @@ export function harnessAvailability(status: ProviderStatus): HarnessAvailability
 
 function availabilityReason(status: ProviderStatus, normalized: HarnessAvailabilityStatus): string {
   const base = status.detail?.trim() || DEFAULT_REASONS[normalized] || "not ready";
+
   return maskEmbeddedEmails(base.replace(/\s+/g, " ").trim()).slice(0, 300);
 }
 
@@ -153,8 +163,12 @@ export function activeHarnesses(activations: HarnessActivation[]): HarnessName[]
  * any new probe, folding in the user's enable state. Callers that already hold a
  * status list reuse it here rather than re-probing.
  */
-export function harnessActivations(statuses: ProviderStatus[], disabled: Iterable<HarnessName> = []): HarnessActivation[] {
+export function harnessActivations(
+  statuses: ProviderStatus[],
+  disabled: Iterable<HarnessName> = [],
+): HarnessActivation[] {
   const off = new Set(disabled);
+
   return statuses.map((status) => harnessActivation(harnessAvailability(status), !off.has(status.harness)));
 }
 
@@ -171,7 +185,10 @@ export function formatHarnessAvailabilityLine(activation: HarnessActivation): st
   const version = availability.version ? ` · version ${availability.version}` : "";
   const reason = !activation.enabled
     ? " — the harness is turned off in this session"
-    : availability.reason ? ` — ${availability.reason}. ${availabilityGuidance(availability.status)}` : "";
+    : availability.reason
+      ? ` — ${availability.reason}. ${availabilityGuidance(availability.status)}`
+      : "";
+
   return `${activation.harness.padEnd(6)} ${marker.padEnd(8)} ${state}${version}${reason}`;
 }
 
@@ -179,6 +196,7 @@ export function formatHarnessAvailabilityLine(activation: HarnessActivation): st
 export function formatHarnessAvailabilityReport(activations: HarnessActivation[], now: number): string {
   const oldest = activations.reduce((value, activation) => Math.min(value, activation.availability.checkedAt), now);
   const active = activeHarnesses(activations);
+
   return [
     "Native harness availability (read-only discovery; no model request was made):",
     ...activations.map(formatHarnessAvailabilityLine),
@@ -189,7 +207,11 @@ export function formatHarnessAvailabilityReport(activations: HarnessActivation[]
 
 function formatAvailabilityAge(ageMs: number): string {
   const seconds = Math.round(ageMs / 1000);
-  if (seconds < 1) return "just now";
+
+  if (seconds < 1) {
+    return "just now";
+  }
+
   return seconds < 90 ? `${seconds}s ago` : `${Math.round(seconds / 60)}m ago`;
 }
 
@@ -202,6 +224,7 @@ export class HarnessUnavailableError extends Error {
   readonly harness: HarnessName;
   readonly status: HarnessAvailabilityStatus;
   readonly availability: HarnessAvailability;
+
   constructor(availability: HarnessAvailability) {
     super(describeUnavailable(availability));
     this.name = "HarnessUnavailableError";
@@ -226,18 +249,25 @@ export class HarnessAutoUnavailableError extends Error {
 export function describeUnavailable(availability: HarnessAvailability): string {
   const label = availabilityLabel(availability.status);
   const reason = availability.reason ? `: ${availability.reason}` : "";
+
   return `${availability.harness} is not ready (${label})${reason}. ${availabilityGuidance(availability.status)}`;
 }
 
 /** Safe remediation text. Discovery reports actions but never performs them. */
 export function availabilityGuidance(status: HarnessAvailabilityStatus): string {
   switch (status) {
-    case "ready": return "No action is required.";
-    case "missing": return "Install the native CLI and ensure its executable is on PATH, then retry.";
-    case "unauthenticated": return "Authenticate with the native CLI, then retry.";
-    case "incompatible": return "Use a supported native login or CLI version, then retry.";
-    case "unhealthy": return "Retry the status check and inspect the native CLI directly if the failure persists.";
-    case "unknown": return "Run /subagents providers refresh and retry when readiness can be confirmed.";
+    case "ready":
+      return "No action is required.";
+    case "missing":
+      return "Install the native CLI and ensure its executable is on PATH, then retry.";
+    case "unauthenticated":
+      return "Authenticate with the native CLI, then retry.";
+    case "incompatible":
+      return "Use a supported native login or CLI version, then retry.";
+    case "unhealthy":
+      return "Retry the status check and inspect the native CLI directly if the failure persists.";
+    case "unknown":
+      return "Run /subagents providers refresh and retry when readiness can be confirmed.";
   }
 }
 
@@ -267,11 +297,15 @@ export class HarnessAvailabilityService {
   readonly #harnesses: HarnessName[];
   readonly #timeoutMs: number;
   readonly #now: () => number;
-  constructor(status: ProviderStatusReader, options: {
-    harnesses?: HarnessName[];
-    timeoutMs?: number;
-    now?: () => number;
-  } = {}) {
+
+  constructor(
+    status: ProviderStatusReader,
+    options: {
+      harnesses?: HarnessName[];
+      timeoutMs?: number;
+      now?: () => number;
+    } = {},
+  ) {
     this.#status = status;
     this.#harnesses = [...new Set(options.harnesses ?? ["pi", "claude", "codex"])] as HarnessName[];
     this.#timeoutMs = Math.max(1, options.timeoutMs ?? DEFAULT_AVAILABILITY_TIMEOUT_MS);
@@ -283,14 +317,24 @@ export class HarnessAvailabilityService {
   }
 
   /** Normalized availability for one harness, revalidated live when `refresh` is set. */
-  async availability(harness: HarnessName, request: { cwd: string; refresh?: boolean; signal?: AbortSignal }): Promise<HarnessAvailability> {
+  async availability(
+    harness: HarnessName,
+    request: { cwd: string; refresh?: boolean; signal?: AbortSignal },
+  ): Promise<HarnessAvailability> {
     try {
       const statuses = await this.#boundedStatuses([harness], request);
       const status = statuses.find((candidate) => candidate.harness === harness);
-      if (!status) throw new Error(`availability probe returned no status for ${harness}`);
+
+      if (!status) {
+        throw new Error(`availability probe returned no status for ${harness}`);
+      }
+
       return harnessAvailability(status);
     } catch (error) {
-      if (request.signal?.aborted) throw request.signal.reason ?? error;
+      if (request.signal?.aborted) {
+        throw request.signal.reason ?? error;
+      }
+
       return this.#unknown(harness, error);
     }
   }
@@ -298,14 +342,22 @@ export class HarnessAvailabilityService {
   /** Bounded, read-only startup scan across supported harnesses. */
   async discover(request: HarnessAvailabilityRequest): Promise<HarnessAvailability[]> {
     const harnesses = request.harnesses ?? this.#harnesses;
+
     try {
       const statuses = await this.#boundedStatuses(harnesses, request);
+
       return harnesses.map((harness) => {
         const status = statuses.find((candidate) => candidate.harness === harness);
-        return status ? harnessAvailability(status) : this.#unknown(harness, `availability probe returned no status for ${harness}`);
+
+        return status
+          ? harnessAvailability(status)
+          : this.#unknown(harness, `availability probe returned no status for ${harness}`);
       });
     } catch (error) {
-      if (request.signal?.aborted) throw request.signal.reason ?? error;
+      if (request.signal?.aborted) {
+        throw request.signal.reason ?? error;
+      }
+
       return harnesses.map((harness) => this.#unknown(harness, error));
     }
   }
@@ -318,6 +370,7 @@ export class HarnessAvailabilityService {
   async activations(request: HarnessAvailabilityRequest): Promise<HarnessActivation[]> {
     const disabled = new Set(request.disabled ?? []);
     const availabilities = await this.discover(request);
+
     return availabilities.map((availability) => harnessActivation(availability, !disabled.has(availability.harness)));
   }
 
@@ -329,7 +382,10 @@ export class HarnessAvailabilityService {
     harnesses: HarnessName[],
     request: { cwd: string; refresh?: boolean; signal?: AbortSignal },
   ): Promise<ProviderStatus[]> {
-    if (request.signal?.aborted) throw request.signal.reason ?? new Error("Availability probe aborted");
+    if (request.signal?.aborted) {
+      throw request.signal.reason ?? new Error("Availability probe aborted");
+    }
+
     const controller = new AbortController();
     const abort = () => controller.abort(request.signal?.reason ?? new Error("Availability probe aborted"));
     request.signal?.addEventListener("abort", abort, { once: true });
@@ -345,6 +401,7 @@ export class HarnessAvailabilityService {
         reject(error);
       }, this.#timeoutMs);
     });
+
     try {
       return await Promise.race([
         this.#status.statuses({
@@ -356,7 +413,10 @@ export class HarnessAvailabilityService {
         timeout,
       ]);
     } finally {
-      if (timer !== undefined) clearTimeout(timer);
+      if (timer !== undefined) {
+        clearTimeout(timer);
+      }
+
       request.signal?.removeEventListener("abort", abort);
       controller.abort();
     }
@@ -378,5 +438,8 @@ export class HarnessAvailabilityService {
 export interface HarnessAvailabilityProbe {
   /** Supported adapter names, exposed without running discovery. */
   readonly harnesses: HarnessName[];
-  availability(harness: HarnessName, request: { cwd: string; refresh?: boolean; signal?: AbortSignal }): Promise<HarnessAvailability>;
+  availability(
+    harness: HarnessName,
+    request: { cwd: string; refresh?: boolean; signal?: AbortSignal },
+  ): Promise<HarnessAvailability>;
 }

@@ -32,15 +32,23 @@ export interface InteractionBridge {
 }
 
 function tokenMatches(expected: string, received: unknown): boolean {
-  if (typeof received !== "string") return false;
+  if (typeof received !== "string") {
+    return false;
+  }
+
   const left = Buffer.from(expected, "utf8");
   const right = Buffer.from(received, "utf8");
-  if (left.length !== right.length) return false;
+
+  if (left.length !== right.length) {
+    return false;
+  }
+
   return timingSafeEqual(left, right);
 }
 
 function socketPath(dir: string, jobId: string): string {
   const name = `ask-${jobId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 12) || "job"}.sock`;
+
   return process.platform === "win32"
     ? `\\\\.\\pipe\\pi-native-subagents-${jobId.replace(/[^a-zA-Z0-9]/g, "").slice(0, 24)}-${randomBytes(6).toString("hex")}`
     : join(dir, name);
@@ -50,10 +58,7 @@ function socketPath(dir: string, jobId: string): string {
  * Opens the bridge for one authorized job. The returned address/token pair is
  * handed to that child only; every other connection or frame is refused.
  */
-export async function openInteractionBridge(
-  jobId: string,
-  handler: InteractionHandler,
-): Promise<InteractionBridge> {
+export async function openInteractionBridge(jobId: string, handler: InteractionHandler): Promise<InteractionBridge> {
   const dir = process.platform === "win32" ? "" : await mkdtemp(join(tmpdir(), "pi-subagent-ask-"));
   const address = socketPath(dir, jobId);
   const token = randomBytes(BRIDGE_TOKEN_BYTES).toString("hex");
@@ -61,28 +66,43 @@ export async function openInteractionBridge(
 
   const handleFrame = async (socket: Socket, record: string): Promise<void> => {
     const message = parseJsonRecord(record);
+
     // An unauthenticated or malformed frame gets no protocol detail back: it is
     // not a caller this bridge has any reason to help.
     if (!message || !tokenMatches(token, message.token)) {
       socket.destroy();
+
       return;
     }
+
     const id = typeof message.id === "string" ? message.id : "";
     const reply = (payload: Record<string, unknown>) => {
-      if (socket.destroyed) return;
+      if (socket.destroyed) {
+        return;
+      }
+
       socket.write(`${JSON.stringify({ id, ...payload })}\n`);
     };
+
     if (message.type !== "ask") {
       reply({ ok: false, error: `Unsupported interaction bridge operation: ${String(message.type ?? "unknown")}` });
+
       return;
     }
+
     try {
       const result = await handler.ask({
         question: normalizeQuestion(message.question),
         context: normalizeContext(message.context),
         target: normalizeTarget(message.target),
       });
-      reply({ ok: true, answer: result.answer, requestId: result.requestId, route: result.route, answeredBy: result.answeredBy });
+      reply({
+        ok: true,
+        answer: result.answer,
+        requestId: result.requestId,
+        route: result.route,
+        answeredBy: result.answeredBy,
+      });
     } catch (error) {
       reply({ ok: false, error: error instanceof Error ? error.message : String(error) });
     }
@@ -95,9 +115,18 @@ export async function openInteractionBridge(
     const framer = new JsonlFramer(MAX_BRIDGE_FRAME_BYTES);
     socket.on("data", (chunk: Buffer) => {
       let records: string[];
-      try { records = framer.push(chunk); }
-      catch { socket.destroy(); return; }
-      for (const record of records) void handleFrame(socket, record);
+
+      try {
+        records = framer.push(chunk);
+      } catch {
+        socket.destroy();
+
+        return;
+      }
+
+      for (const record of records) {
+        void handleFrame(socket, record);
+      }
     });
   });
 
@@ -113,10 +142,16 @@ export async function openInteractionBridge(
     address,
     token,
     async close() {
-      for (const socket of [...sockets]) socket.destroy();
+      for (const socket of [...sockets]) {
+        socket.destroy();
+      }
+
       sockets.clear();
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      if (dir) await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+
+      if (dir) {
+        await rm(dir, { recursive: true, force: true }).catch(() => undefined);
+      }
     },
   };
 }
@@ -131,49 +166,77 @@ export interface InteractionBridgeAnswer {
  * Child-side single-shot call. Each question opens its own connection so a
  * stalled or half-closed socket can never leak across turns.
  */
-export function askThroughInteractionBridge(
-  options: { address: string; token: string; question: string; context?: string; target: unknown },
-): Promise<InteractionBridgeAnswer> {
+export function askThroughInteractionBridge(options: {
+  address: string;
+  token: string;
+  question: string;
+  context?: string;
+  target: unknown;
+}): Promise<InteractionBridgeAnswer> {
   return new Promise<InteractionBridgeAnswer>((resolve, reject) => {
     const framer = new JsonlFramer(MAX_BRIDGE_FRAME_BYTES);
     let settled = false;
     const socket = createConnection(options.address);
     const finish = (fn: () => void) => {
-      if (settled) return;
+      if (settled) {
+        return;
+      }
+
       settled = true;
       socket.destroy();
       fn();
     };
-    socket.on("error", (error: Error) => finish(() => reject(new InteractionError(`Interaction bridge is unavailable: ${error.message}`))));
+
+    socket.on("error", (error: Error) =>
+      finish(() => reject(new InteractionError(`Interaction bridge is unavailable: ${error.message}`))),
+    );
     socket.on("close", () => finish(() => reject(new InteractionError("Interaction bridge closed before answering"))));
     socket.on("data", (chunk: Buffer) => {
       let records: string[];
-      try { records = framer.push(chunk); }
-      catch (error) { finish(() => reject(error instanceof Error ? error : new Error(String(error)))); return; }
+
+      try {
+        records = framer.push(chunk);
+      } catch (error) {
+        finish(() => reject(error instanceof Error ? error : new Error(String(error))));
+
+        return;
+      }
+
       for (const record of records) {
         const message = parseJsonRecord(record);
-        if (!message) continue;
+
+        if (!message) {
+          continue;
+        }
+
         if (message.ok === true && typeof message.answer === "string") {
-          finish(() => resolve({
-            answer: message.answer as string,
-            requestId: typeof message.requestId === "string" ? message.requestId : undefined,
-            answeredBy: typeof message.answeredBy === "string" ? message.answeredBy : undefined,
-          }));
+          finish(() =>
+            resolve({
+              answer: message.answer as string,
+              requestId: typeof message.requestId === "string" ? message.requestId : undefined,
+              answeredBy: typeof message.answeredBy === "string" ? message.answeredBy : undefined,
+            }),
+          );
+
           return;
         }
+
         finish(() => reject(new InteractionError(String(message.error ?? "The host rejected this question"))));
+
         return;
       }
     });
     socket.on("connect", () => {
-      socket.write(`${JSON.stringify({
-        token: options.token,
-        id: "ask",
-        type: "ask",
-        question: options.question,
-        context: options.context,
-        target: options.target,
-      })}\n`);
+      socket.write(
+        `${JSON.stringify({
+          token: options.token,
+          id: "ask",
+          type: "ask",
+          question: options.question,
+          context: options.context,
+          target: options.target,
+        })}\n`,
+      );
     });
   });
 }

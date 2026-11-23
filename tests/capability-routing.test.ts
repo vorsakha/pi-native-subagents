@@ -2,10 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { isRequestedHarness, routeCapabilities } from "../src/capability-routing.ts";
 import type { CapabilityRouteRequest, CapabilityRouteResult, CapabilityRouter } from "../src/capability-service.ts";
-import {
-  HarnessAvailabilityService,
-  HarnessUnavailableError,
-} from "../src/harness-availability.ts";
+import { HarnessAvailabilityService, HarnessUnavailableError } from "../src/harness-availability.ts";
 import { ProviderStatusService } from "../src/provider-status.ts";
 import { ScriptedHarnessAvailability } from "./helpers.ts";
 
@@ -17,6 +14,7 @@ function baseRequest(overrides: Partial<CapabilityRoutingBaseRequest> = {}): Cap
     ...overrides,
   };
 }
+
 interface CapabilityRoutingBaseRequest {
   task: string;
   cwd: string;
@@ -32,9 +30,14 @@ interface CapabilityRoutingBaseRequest {
 class RecordingRouter implements CapabilityRouter {
   readonly calls: CapabilityRouteRequest[] = [];
   #result: CapabilityRouteResult;
-  constructor(result: CapabilityRouteResult) { this.#result = result; }
+
+  constructor(result: CapabilityRouteResult) {
+    this.#result = result;
+  }
+
   async route(request: CapabilityRouteRequest): Promise<CapabilityRouteResult> {
     this.calls.push(request);
+
     return this.#result;
   }
 }
@@ -43,15 +46,31 @@ function fakeResult(harness: "pi" | "claude" | "codex", matched: string[], auto?
   return {
     harness,
     auto: auto ?? false,
-    catalog: { harness, cwd: "/proj", access: "full", discoveredAt: 1, revision: "sha256:fixture", capabilities: [], sources: [], warnings: [], health: "healthy", degraded: false },
+    catalog: {
+      harness,
+      cwd: "/proj",
+      access: "full",
+      discoveredAt: 1,
+      revision: "sha256:fixture",
+      capabilities: [],
+      sources: [],
+      warnings: [],
+      health: "healthy",
+      degraded: false,
+    },
     resolution: { satisfied: [], missing: [], blocked: [] },
     route: { harness, matched, revision: "sha256:fixture", discoveredAt: 1, auto },
   };
 }
 
 test("isRequestedHarness accepts pi/claude/codex/auto and rejects anything else", () => {
-  for (const value of ["pi", "claude", "codex", "auto"]) assert.equal(isRequestedHarness(value), true);
-  for (const value of ["gpt", "", undefined, null, 1]) assert.equal(isRequestedHarness(value), false);
+  for (const value of ["pi", "claude", "codex", "auto"]) {
+    assert.equal(isRequestedHarness(value), true);
+  }
+
+  for (const value of ["gpt", "", undefined, null, 1]) {
+    assert.equal(isRequestedHarness(value), false);
+  }
 });
 
 test("a request with neither requires nor harness:auto passes through untouched and never calls the router", async () => {
@@ -83,7 +102,9 @@ test("requires without a router configured fails closed", async () => {
 
 test("an explicit harness with requires resolves the harness through selectHarness and forwards it, not auto", async () => {
   const router = new RecordingRouter(fakeResult("codex", ["codex:tool:lint"]));
-  const routing = await routeCapabilities(router, { request: baseRequest({ harness: "codex", model: "review-model", requires: ["codex:tool:lint"] }) });
+  const routing = await routeCapabilities(router, {
+    request: baseRequest({ harness: "codex", model: "review-model", requires: ["codex:tool:lint"] }),
+  });
   assert.equal(router.calls.length, 1);
   assert.equal(router.calls[0]!.harness, "codex");
   assert.equal(router.calls[0]!.model, "review-model");
@@ -129,7 +150,12 @@ test("harness:auto with independentOfProvider (durable replay) restricts candida
 test("an unresolved independentOf target does not arbitrarily narrow auto candidates before JobManager validates it", async () => {
   const router = new RecordingRouter(fakeResult("claude", ["claude:tool:lint"], true));
   await routeCapabilities(router, {
-    request: baseRequest({ harness: "auto", requires: ["tool:lint"], independentOf: "missing-job", parentProvider: "codex" }),
+    request: baseRequest({
+      harness: "auto",
+      requires: ["tool:lint"],
+      independentOf: "missing-job",
+      parentProvider: "codex",
+    }),
   });
   assert.equal(router.calls[0]!.candidates, undefined);
 });
@@ -142,8 +168,13 @@ test("harness:auto without independence leaves candidates unrestricted (undefine
 
 test("harness:auto honors locked profiles and intersects them with profile independence", async () => {
   const locked = {
-    name: "codex-only", description: "locked", access: "readOnly" as const,
-    lockedHarness: "codex" as const, systemPrompt: "", filePath: "/profile.md", origin: "global" as const,
+    name: "codex-only",
+    description: "locked",
+    access: "readOnly" as const,
+    lockedHarness: "codex" as const,
+    systemPrompt: "",
+    filePath: "/profile.md",
+    origin: "global" as const,
   };
   const router = new RecordingRouter(fakeResult("codex", ["codex:tool:lint"], true));
   await routeCapabilities(router, {
@@ -163,7 +194,9 @@ test("harness:auto honors locked profiles and intersects them with profile indep
 
 test("an explicit harness whose live probe fails closed rejects with a structured error and never reaches the router", async () => {
   const router = new RecordingRouter(fakeResult("claude", ["claude:skill:review"]));
-  const availability = new ScriptedHarnessAvailability({ claude: { authenticated: false, ready: false, detail: "Claude Code is not logged in" } });
+  const availability = new ScriptedHarnessAvailability({
+    claude: { authenticated: false, ready: false, detail: "Claude Code is not logged in" },
+  });
   await assert.rejects(
     routeCapabilities(router, {
       request: baseRequest({ harness: "claude", requires: ["claude:skill:review"] }),
@@ -173,6 +206,7 @@ test("an explicit harness whose live probe fails closed rejects with a structure
       assert.ok(error instanceof HarnessUnavailableError);
       assert.equal(error.harness, "claude");
       assert.equal(error.status, "unauthenticated");
+
       return true;
     },
   );
@@ -184,9 +218,8 @@ test("ProviderStatusService readiness is re-read after startup and blocks a stal
   let calls = 0;
   const providerStatus = new ProviderStatusService({
     now: () => 1_000 + calls,
-    readClaudeAuth: async () => JSON.stringify(calls++ === 0
-      ? { loggedIn: true, authMethod: "claude.ai" }
-      : { loggedIn: false }),
+    readClaudeAuth: async () =>
+      JSON.stringify(calls++ === 0 ? { loggedIn: true, authMethod: "claude.ai" } : { loggedIn: false }),
   });
   const availability = new HarnessAvailabilityService(providerStatus, { harnesses: ["claude"] });
   assert.equal((await availability.discover({ cwd: "/proj" }))[0]?.status, "ready");
@@ -245,8 +278,15 @@ test("harness:auto considers only currently-ready harnesses and passes just thos
     request: baseRequest({ harness: "auto", requires: ["tool:lint"] }),
     availability,
   });
-  assert.deepEqual(router.calls[0]!.candidates, ["claude"], "missing pi and unauthenticated codex are excluded from auto");
-  assert.ok(availability.asked.every((ask) => ask.refresh), "every auto candidate is revalidated live");
+  assert.deepEqual(
+    router.calls[0]!.candidates,
+    ["claude"],
+    "missing pi and unauthenticated codex are excluded from auto",
+  );
+  assert.ok(
+    availability.asked.every((ask) => ask.refresh),
+    "every auto candidate is revalidated live",
+  );
 });
 
 test("harness:auto with no ready harness fails closed with each candidate's normalized reason instead of routing", async () => {

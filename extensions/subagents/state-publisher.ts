@@ -17,14 +17,26 @@ export interface NativeSubagentsStatePublisher {
 }
 
 function diagnosticKind(error: unknown): string {
-  if (error instanceof TypeError) return "TypeError";
-  if (error instanceof RangeError) return "RangeError";
+  if (error instanceof TypeError) {
+    return "TypeError";
+  }
+
+  if (error instanceof RangeError) {
+    return "RangeError";
+  }
+
   return "Error";
 }
 
 function deepFreeze(value: unknown): void {
-  if (!value || typeof value !== "object" || Object.isFrozen(value)) return;
-  for (const child of Object.values(value)) deepFreeze(child);
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) {
+    return;
+  }
+
+  for (const child of Object.values(value)) {
+    deepFreeze(child);
+  }
+
   Object.freeze(value);
 }
 
@@ -54,9 +66,18 @@ export function createNativeSubagentsStatePublisher(options: {
   const diagnose = (stage: "projection" | "emission", error: unknown): void => {
     const kind = diagnosticKind(error);
     const message = `Native subagents state ${stage} failed (${kind}).`;
-    if (message === lastDiagnostic) return;
+
+    if (message === lastDiagnostic) {
+      return;
+    }
+
     lastDiagnostic = message;
-    try { options.reportError(message); } catch { /* diagnostics cannot affect manager lifecycle */ }
+
+    try {
+      options.reportError(message);
+    } catch {
+      /* diagnostics cannot affect manager lifecycle */
+    }
   };
 
   const publish = (
@@ -66,6 +87,7 @@ export function createNativeSubagentsStatePublisher(options: {
     workflows: readonly WorkflowSnapshot[],
   ): void => {
     let state: NativeSubagentsStateV1;
+
     try {
       state = projectNativeSubagentsStateV1(jobs, workflows, {
         producerVersion,
@@ -78,40 +100,60 @@ export function createNativeSubagentsStatePublisher(options: {
       });
     } catch (error) {
       diagnose("projection", error);
+
       return;
     }
+
     const fingerprint = fingerprintNativeSubagentsStateV1(state);
-    if (fingerprint === lastFingerprint) return;
+
+    if (fingerprint === lastFingerprint) {
+      return;
+    }
+
     try {
       deepFreeze(state);
       options.emit(NATIVE_SUBAGENTS_STATE_EVENT_V1, state);
     } catch (error) {
       diagnose("emission", error);
+
       return;
     }
+
     sequence++;
     lastFingerprint = fingerprint;
     lastDiagnostic = undefined;
   };
 
   const schedule = (): void => {
-    if (mode !== "active" || queued) return;
+    if (mode !== "active" || queued) {
+      return;
+    }
+
     queued = true;
     const scheduledGeneration = generation;
     enqueue(() => {
-      if (!queued || mode !== "active" || generation !== scheduledGeneration) return;
+      if (!queued || mode !== "active" || generation !== scheduledGeneration) {
+        return;
+      }
+
       queued = false;
       publishActive();
     });
   };
 
   const publishActive = (): void => {
-    if (mode !== "active") return;
-    if (publishing) {
-      schedule();
+    if (mode !== "active") {
       return;
     }
+
+    if (publishing) {
+      schedule();
+
+      return;
+    }
+
     publishing = true;
+
     try {
       publish(sequence === 0 ? "startup" : "update", "active", options.listJobs(), options.listWorkflows());
     } catch (error) {
@@ -123,7 +165,10 @@ export function createNativeSubagentsStatePublisher(options: {
 
   return {
     start() {
-      if (mode === "active" || mode === "stopped") return;
+      if (mode === "active" || mode === "stopped") {
+        return;
+      }
+
       mode = "active";
       generation++;
       queued = false;
@@ -133,13 +178,19 @@ export function createNativeSubagentsStatePublisher(options: {
       schedule();
     },
     suspend() {
-      if (mode === "stopped") return;
+      if (mode === "stopped") {
+        return;
+      }
+
       mode = "suspended";
       generation++;
       queued = false;
     },
     stop(finalJobs, finalWorkflows) {
-      if (mode === "stopped") return;
+      if (mode === "stopped") {
+        return;
+      }
+
       mode = "stopped";
       generation++;
       queued = false;

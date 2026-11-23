@@ -3,7 +3,13 @@ import { homedir } from "node:os";
 import { dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { CONFIG_DIR_NAME, getAgentDir, keyHint, SessionManager, sessionEntryToContextMessages } from "@earendil-works/pi-coding-agent";
+import {
+  CONFIG_DIR_NAME,
+  getAgentDir,
+  keyHint,
+  SessionManager,
+  sessionEntryToContextMessages,
+} from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIContext, Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -83,7 +89,17 @@ import {
   type PeerSessionSummary,
   type SessionPeerSource,
 } from "../../src/session-peers.ts";
-import type { AccessMode, AgentSpeed, Backend, HarnessName, EffortLevel, JobSnapshot, ProfileDefinition, ProviderFamily, SendBehavior } from "../../src/types.ts";
+import type {
+  AccessMode,
+  AgentSpeed,
+  Backend,
+  HarnessName,
+  EffortLevel,
+  JobSnapshot,
+  ProfileDefinition,
+  ProviderFamily,
+  SendBehavior,
+} from "../../src/types.ts";
 import type { SpendBudget } from "../../src/budget.ts";
 import { formatSpendBudget } from "../../src/budget.ts";
 import { renderWorkflowActivity, WorkflowActivityStore, type WorkflowActivitySnapshot } from "../workflows/activity.ts";
@@ -104,6 +120,7 @@ export function createRealSessionPeerSource(): SessionPeerSource {
   return {
     async listAll(sessionDir) {
       const sessions = await SessionManager.listAll(sessionDir);
+
       return sessions.map((session) => ({
         id: session.id,
         path: session.path,
@@ -118,7 +135,11 @@ export function createRealSessionPeerSource(): SessionPeerSource {
     fork(sourcePath, targetCwd, sessionDir) {
       const forked = SessionManager.forkFrom(sourcePath, targetCwd, sessionDir);
       const sessionFile = forked.getSessionFile();
-      if (!sessionFile) throw new Error("Session peer fork could not be persisted");
+
+      if (!sessionFile) {
+        throw new Error("Session peer fork could not be persisted");
+      }
+
       return { sessionFile, sessionId: forked.getSessionId() };
     },
   };
@@ -127,8 +148,11 @@ export function createRealSessionPeerSource(): SessionPeerSource {
 /** The configured expand-key hint (e.g. "ctrl+o to expand"), threaded into render options so render.ts stays testable without live keybinding state. */
 function expandHint(): string {
   // Tool renderers can be invoked by headless hosts before Pi's interactive theme initializes.
-  try { return keyHint("app.tools.expand", "to expand"); }
-  catch { return "to expand"; }
+  try {
+    return keyHint("app.tools.expand", "to expand");
+  } catch {
+    return "to expand";
+  }
 }
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
@@ -142,7 +166,8 @@ const MAX_CAPABILITY_LINES = 40;
 const HUMAN_SUBAGENT_ENTRY = "native-human-subagent";
 const FOLLOW_THROUGH_MESSAGE = "native-subagent-followthrough";
 const SUBAGENT_ACTIVITY_WIDGET = "native-subagents-active";
-const HUMAN_SUBAGENT_USAGE = "/subagent [--harness pi|claude|codex] [--model ID] [--name NAME] [--effort LEVEL] [--speed standard|fast] [--access readOnly|full] [--max-tokens N] [--max-cost USD] [--max-turns N] [--cwd PATH] [--profile NAME] [--independent] <task>";
+const HUMAN_SUBAGENT_USAGE =
+  "/subagent [--harness pi|claude|codex] [--model ID] [--name NAME] [--effort LEVEL] [--speed standard|fast] [--access readOnly|full] [--max-tokens N] [--max-cost USD] [--max-turns N] [--cwd PATH] [--profile NAME] [--independent] <task>";
 const SPEEDS = ["standard", "fast"] as const;
 const MAX_FOLLOW_THROUGH_WATCHES = 64;
 
@@ -173,9 +198,16 @@ export function summarizeSubagentActivity(
     workflow: { running: 0, queued: 0 },
   };
   let needInput = 0;
+
   for (const job of jobs) {
-    if (job.interaction && (job.interaction.state === "pending" || job.interaction.state === "answering")) needInput++;
-    if (job.status !== "running" && job.status !== "queued") continue;
+    if (job.interaction && (job.interaction.state === "pending" || job.interaction.state === "answering")) {
+      needInput++;
+    }
+
+    if (job.status !== "running" && job.status !== "queued") {
+      continue;
+    }
+
     counts[job.workflow ? "workflow" : "direct"][job.status]++;
   }
 
@@ -188,16 +220,19 @@ export function summarizeSubagentActivity(
     const { running, queued } = counts[owner];
     const total = running + queued;
     const plural = (n: number) => `${noun}${n === 1 ? "" : "s"}`;
-    const summary = queued === 0
-      ? `${running} ${plural(running)} running`
-      : running === 0
-        ? `${queued} ${plural(queued)} queued`
-        : `${total} ${plural(total)} active`;
-    const breakdown = running && queued
-      ? active.length > 1
-        ? ` (${running} running · ${queued} queued)`
-        : ` · ${running} running · ${queued} queued`
-      : "";
+    const summary =
+      queued === 0
+        ? `${running} ${plural(running)} running`
+        : running === 0
+          ? `${queued} ${plural(queued)} queued`
+          : `${total} ${plural(total)} active`;
+    const breakdown =
+      running && queued
+        ? active.length > 1
+          ? ` (${running} running · ${queued} queued)`
+          : ` · ${running} running · ${queued} queued`
+        : "";
+
     return { owner, running, queued, summary, breakdown, pointer };
   });
 
@@ -268,11 +303,15 @@ interface FollowThroughWatch {
 
 function extractWorkflowAgentStatus(state: WorkflowSnapshot["agents"][number]["state"]): JobSnapshot["status"] {
   switch (state) {
-    case "completed": return "completed";
-    case "failed": return "failed";
+    case "completed":
+      return "completed";
+    case "failed":
+      return "failed";
     case "cancelled":
-    case "aborted": return "cancelled";
-    default: return "running";
+    case "aborted":
+      return "cancelled";
+    default:
+      return "running";
   }
 }
 
@@ -282,10 +321,13 @@ function followThroughCheckpoint(
   workflow: WorkflowSnapshot,
 ): FollowThroughCheckpoint {
   const candidates = workflow.agents
-    .filter((agent) => (agent.state === "running" || agent.state === "queued") && agent.index !== watch.workflow!.agentIndex)
+    .filter(
+      (agent) => (agent.state === "running" || agent.state === "queued") && agent.index !== watch.workflow!.agentIndex,
+    )
     .sort((left, right) => left.index - right.index);
   const next = candidates.find((agent) => agent.index > watch.workflow!.agentIndex) ?? candidates[0];
   const phase = workflow.currentPhase === null ? undefined : workflow.phases[workflow.currentPhase]?.name;
+
   return {
     requestId: truncatePreview(watch.requestId, 200),
     source: {
@@ -300,11 +342,13 @@ function followThroughCheckpoint(
       runId: truncatePreview(workflow.runId, 200),
       status: workflow.status,
       phase: phase ? truncatePreview(phase, 160) : undefined,
-      next: next ? {
-        name: truncatePreview(next.name, 160),
-        state: next.state as "running" | "queued",
-        jobId: next.jobId ? truncatePreview(next.jobId, 200) : undefined,
-      } : undefined,
+      next: next
+        ? {
+            name: truncatePreview(next.name, 160),
+            state: next.state as "running" | "queued",
+            jobId: next.jobId ? truncatePreview(next.jobId, 200) : undefined,
+          }
+        : undefined,
     },
   };
 }
@@ -315,12 +359,17 @@ export default function nativeSubagents(pi: ExtensionAPI): void {
 
 export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationOptions = {}): void {
   const env = options.env ?? process.env;
+
   // A Pi child launched by this package must never register the delegation
   // surface again: nested orchestration is denied by construction, not by prompt.
-  if (env[PI_CHILD_MARKER] === "1") return;
-  const legacyRoot = options.legacyRoot === false
-    ? undefined
-    : options.legacyRoot ?? resolve(homedir(), ".pi/agent/extensions/subagents");
+  if (env[PI_CHILD_MARKER] === "1") {
+    return;
+  }
+
+  const legacyRoot =
+    options.legacyRoot === false
+      ? undefined
+      : (options.legacyRoot ?? resolve(homedir(), ".pi/agent/extensions/subagents"));
   const releaseInstall = claimExtensionInstall(ROOT, options.registry ?? globalThis, legacyRoot);
   const globalProfilesDir = options.globalProfilesDir ?? resolve(getAgentDir(), "subagents");
   const sessionPeers = options.sessionPeerSource ?? createRealSessionPeerSource();
@@ -383,12 +432,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   // provider-status probes. Dispatch revalidates the selected harness through
   // this before a job is created; startup warms it best-effort.
   const availability = new HarnessAvailabilityService(providerStatus, { harnesses: supportedHarnesses });
-  const createManager = () => new JobManager({
-    profiles: profileCatalog.profiles,
-    concurrency: 4,
-    backends,
-  });
-  const getManager = () => manager ??= createManager();
+  const createManager = () =>
+    new JobManager({
+      profiles: profileCatalog.profiles,
+      concurrency: 4,
+      backends,
+    });
+  const getManager = () => (manager ??= createManager());
   const workflowActivity = new WorkflowActivityStore();
   const clearActivityWidget = (ui: ExtensionUIContext) => {
     ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, undefined);
@@ -396,31 +446,40 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     activityWidgetRefresh = undefined;
     activityWidgetInstalled = false;
   };
+
   const legacyActivityLine = (activity: SubagentActivity, theme: Theme): string => {
     const summaries = activity.segments
       .map((segment) => theme.fg("text", segment.summary) + theme.fg("dim", segment.breakdown))
       .join(theme.fg("dim", " · "));
     // Never color alone: the marker carries its own glyph and words.
-    const marker = activity.needInput
-      ? theme.fg("warning", `? ${activity.needInput} need input`)
-      : "";
-    const pointers = (activity.pointers.length ? activity.pointers : ["/subagents"]).map((pointer) => theme.fg("accent", pointer)).join(theme.fg("dim", " · "));
-    return theme.fg("accent", "◆ ") +
+    const marker = activity.needInput ? theme.fg("warning", `? ${activity.needInput} need input`) : "";
+    const pointers = (activity.pointers.length ? activity.pointers : ["/subagents"])
+      .map((pointer) => theme.fg("accent", pointer))
+      .join(theme.fg("dim", " · "));
+
+    return (
+      theme.fg("accent", "◆ ") +
       [summaries, marker].filter(Boolean).join(theme.fg("dim", " · ")) +
       theme.fg("dim", " • ") +
       pointers +
-      (activity.pointers.length <= 1 ? theme.fg("dim", " to view") : "");
+      (activity.pointers.length <= 1 ? theme.fg("dim", " to view") : "")
+    );
   };
-  const activityContext = (activity: SubagentActivity): string => [
-    ...activity.segments.map((segment) => `${segment.summary}${segment.breakdown}`),
-    ...(activity.needInput ? [`? ${activity.needInput} need input`] : []),
-    ...activity.pointers.filter((pointer) => pointer !== "/workflows"),
-  ].join(" · ");
+
+  const activityContext = (activity: SubagentActivity): string =>
+    [
+      ...activity.segments.map((segment) => `${segment.summary}${segment.breakdown}`),
+      ...(activity.needInput ? [`? ${activity.needInput} need input`] : []),
+      ...activity.pointers.filter((pointer) => pointer !== "/workflows"),
+    ].join(" · ");
   const updateSessionUi = (ui: ExtensionUIContext, sessionManager: JobManager, harness: HarnessName) => {
     const activation = currentHarnessActivations?.find((candidate) => candidate.harness === harness);
     const availabilityText = activation
-      ? activation.enabled ? availabilityLabel(activation.availability.status) : "disabled by user"
+      ? activation.enabled
+        ? availabilityLabel(activation.availability.status)
+        : "disabled by user"
       : "status unknown";
+
     if (displayedHarness !== harness || displayedHarnessAvailability !== availabilityText) {
       displayedHarness = harness;
       displayedHarnessAvailability = availabilityText;
@@ -430,29 +489,41 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     const activity = summarizeSubagentActivity(sessionManager.list());
     const workflows = workflowActivity.snapshot();
     const key = `${activity.key}|${workflows.key}`;
-    if (displayedActivity === key) return;
+
+    if (displayedActivity === key) {
+      return;
+    }
+
     displayedActivity = key;
 
     if (!activity.segments.length && !activity.needInput && !workflows.rows.length) {
       clearActivityWidget(ui);
+
       return;
     }
 
     activityWidgetState = { direct: activity, workflows };
+
     if (!activityWidgetInstalled) {
       activityWidgetInstalled = true;
       ui.setWidget(SUBAGENT_ACTIVITY_WIDGET, (tui, theme) => {
         activityWidgetRefresh = () => tui?.requestRender();
+
         return {
           render: (width: number) => {
             const current = activityWidgetState;
-            if (!current) return [];
+
+            if (!current) {
+              return [];
+            }
+
             if (current.workflows.rows.length) {
               return renderWorkflowActivity(current.workflows, theme, width, {
                 context: activityContext(current.direct),
                 openHint: workflowsShortcutHint,
               });
             }
+
             return [truncateToWidth(legacyActivityLine(current.direct, theme), Math.max(0, width), "")];
           },
           invalidate() {},
@@ -462,6 +533,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       activityWidgetRefresh?.();
     }
   };
+
   const spawnJob = (
     params: SpawnToolParams,
     ctx: { cwd: string; isProjectTrusted(): boolean; model?: { provider?: string } },
@@ -469,83 +541,132 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     humanVisible = false,
     parentThread?: ParentThreadSnapshot,
     interaction?: JobInteractionPolicy,
-  ) => spawn(getManager(), capabilities, params, {
-    parentCwd: ctx.cwd,
-    trusted: ctx.isProjectTrusted(),
-    availability,
-    defaultHarness: activeHarness,
-    parentProvider: providerFamily(ctx.model?.provider),
-    profile: params.profile ? profileCatalog.profiles.get(params.profile.trim()) : undefined,
-    humanVisible,
-    humanPiTools: humanVisible ? permittedHumanPiToolNames(parentTools(pi)) : undefined,
-    parentThread,
-    interaction,
-    signal,
-  });
+  ) =>
+    spawn(getManager(), capabilities, params, {
+      parentCwd: ctx.cwd,
+      trusted: ctx.isProjectTrusted(),
+      availability,
+      defaultHarness: activeHarness,
+      parentProvider: providerFamily(ctx.model?.provider),
+      profile: params.profile ? profileCatalog.profiles.get(params.profile.trim()) : undefined,
+      humanVisible,
+      humanPiTools: humanVisible ? permittedHumanPiToolNames(parentTools(pi)) : undefined,
+      parentThread,
+      interaction,
+      signal,
+    });
   const jobCallTarget = (jobId: string): { accent: string; detail: string } => {
     try {
       const job = manager?.check(jobId);
-      if (!job) throw new Error("Job manager is not active");
+
+      if (!job) {
+        throw new Error("Job manager is not active");
+      }
+
       return { accent: job.name, detail: shortId(job.id) };
     } catch {
       return { accent: shortId(jobId), detail: "" };
     }
   };
+
   const renderFailure = (theme: Theme, text: string) => linesComponent([traceResultLine(theme, "×", text, "error")]);
   const stopCardBlink = (blink: LiveCardBlink) => {
     blink.invalidate = undefined;
     blink.shouldContinue = undefined;
     liveCardBlinks.delete(blink);
   };
+
   const clearCardBlinks = () => {
     for (const blink of liveCardBlinks) {
       blink.invalidate = undefined;
       blink.shouldContinue = undefined;
     }
+
     liveCardBlinks.clear();
   };
-  const syncCardBlink = (context: LiveCardRenderContext | undefined, active: boolean, shouldContinue: () => boolean) => {
-    if (!context?.state) return;
-    const blink = context.state.nativeSubagentBlink ??= {};
-    if (!active) return stopCardBlink(blink);
+
+  const syncCardBlink = (
+    context: LiveCardRenderContext | undefined,
+    active: boolean,
+    shouldContinue: () => boolean,
+  ) => {
+    if (!context?.state) {
+      return;
+    }
+
+    const blink = (context.state.nativeSubagentBlink ??= {});
+
+    if (!active) {
+      return stopCardBlink(blink);
+    }
+
     blink.invalidate = context.invalidate;
     blink.shouldContinue = shouldContinue;
     liveCardBlinks.add(blink);
   };
+
   const refreshCardBlinks = () => {
     for (const blink of [...liveCardBlinks]) {
       const keep = blink.shouldContinue?.() === true;
-      try { blink.invalidate?.(); }
-      catch { stopCardBlink(blink); continue; }
-      if (!keep) stopCardBlink(blink);
+
+      try {
+        blink.invalidate?.();
+      } catch {
+        stopCardBlink(blink);
+        continue;
+      }
+
+      if (!keep) {
+        stopCardBlink(blink);
+      }
     }
   };
+
   const cardKey = (job: Pick<JobSnapshot, "id" | "generation">) => `${job.id}:${job.generation}`;
   const rememberCardSnapshot = (job: JobSnapshot) => {
     cardSnapshots.set(cardKey(job), job);
-    if (cardSnapshots.size > 400) cardSnapshots.delete(cardSnapshots.keys().next().value!);
+
+    if (cardSnapshots.size > 400) {
+      cardSnapshots.delete(cardSnapshots.keys().next().value!);
+    }
   };
+
   const liveJob = (fallback: JobSnapshot, context?: LiveCardRenderContext): { job: JobSnapshot; tracked: boolean } => {
     const key = cardKey(fallback);
     let job = cardSnapshots.get(key) ?? context?.state?.nativeSubagentSnapshot ?? fallback;
     let tracked = false;
+
     if (manager) {
       try {
         const current = manager.check(fallback.id);
+
         if (current.generation === fallback.generation) {
           job = current;
           tracked = true;
           rememberCardSnapshot(current);
         }
-      } catch { /* retained row snapshot survives manager eviction */ }
+      } catch {
+        /* retained row snapshot survives manager eviction */
+      }
     }
-    if (context?.state) context.state.nativeSubagentSnapshot = job;
+
+    if (context?.state) {
+      context.state.nativeSubagentSnapshot = job;
+    }
+
     return { job, tracked };
   };
+
   const renderLiveJob = (
     fallback: JobSnapshot,
     theme: Theme,
-    options: { expanded: boolean; isPartial?: boolean; lead?: string; receipt?: string | ((job: JobSnapshot) => string); answerAudit?: PendingInteraction },
+    options: {
+      expanded: boolean;
+      isPartial?: boolean;
+      lead?: string;
+      receipt?: string | ((job: JobSnapshot) => string);
+      answerAudit?: PendingInteraction;
+    },
     context?: LiveCardRenderContext,
   ) => {
     const current = liveJob(fallback, context);
@@ -553,19 +674,33 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     const key = cardKey(fallback);
     syncCardBlink(context, active, () => {
       const remembered = cardSnapshots.get(key);
-      if (remembered && isTerminal(remembered.status)) return false;
-      if (!manager) return false;
+
+      if (remembered && isTerminal(remembered.status)) {
+        return false;
+      }
+
+      if (!manager) {
+        return false;
+      }
+
       try {
         const latest = manager.check(fallback.id);
+
         return latest.generation === fallback.generation && !isTerminal(latest.status);
-      } catch { return false; }
+      } catch {
+        return false;
+      }
     });
     const now = Date.now();
+
     if (!options.expanded && options.receipt) {
       const action = typeof options.receipt === "function" ? options.receipt(current.job) : options.receipt;
+
       return renderJobReceipt(current.job, theme, { action, now });
     }
+
     const parentIsWaiting = active && (waitInterest.get(resultKey(current.job.id, current.job.generation)) ?? 0) > 0;
+
     return renderJobCard(current.job, theme, {
       ...options,
       now,
@@ -574,6 +709,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       expandHint: expandHint(),
     });
   };
+
   const renderLiveList = (
     fallback: JobSnapshot[],
     theme: Theme,
@@ -586,8 +722,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       !!manager && jobs.some((job) => !isTerminal(job.status)),
       () => !!manager && manager.list().some((job) => !isTerminal(job.status)),
     );
+
     return renderJobListCard(jobs, theme, { expanded, now: Date.now() });
   };
+
   const workflows = (options.workflowRegistrationFactory ?? registerWorkflows)(pi, {
     artifactRoot: options.workflowArtifactRoot,
     savedWorkflowRoot: options.savedWorkflowRoot,
@@ -602,7 +740,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       statePublisher?.changed();
       workflowActivity.observe(snapshot);
       observeFollowThroughWorkflow(snapshot);
-      if (sessionUi && manager) updateSessionUi(sessionUi, manager, activeHarness);
+
+      if (sessionUi && manager) {
+        updateSessionUi(sessionUi, manager, activeHarness);
+      }
     },
     onInitialized: () => {
       statePublisher?.start();
@@ -610,33 +751,52 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     onResultDelivered: (runId) => {
       clearFollowThroughWatchesForWorkflow(runId);
       workflowActivity.markDelivered(runId);
-      if (sessionUi && manager) updateSessionUi(sessionUi, manager, activeHarness);
+
+      if (sessionUi && manager) {
+        updateSessionUi(sessionUi, manager, activeHarness);
+      }
     },
   });
 
   pi.registerMessageRenderer(SUBAGENT_RESULT_MESSAGE, (message, { expanded }, theme) => {
     const job = (message.details as { job?: JobSnapshot } | undefined)?.job;
-    if (!job) return renderToolCallLine(theme, "Inspect", "subagent result unavailable");
+
+    if (!job) {
+      return renderToolCallLine(theme, "Inspect", "subagent result unavailable");
+    }
+
     return renderJobCard(job, theme, { expanded, now: Date.now(), expandHint: expandHint(), standalone: true });
   });
 
   pi.registerMessageRenderer(SUBAGENT_QUESTION_MESSAGE, (message, { expanded }, theme) => {
     const delivered = (message.details as { interaction?: PendingInteraction } | undefined)?.interaction;
-    if (!delivered) return renderToolCallLine(theme, "Inspect", "subagent question unavailable");
+
+    if (!delivered) {
+      return renderToolCallLine(theme, "Inspect", "subagent question unavailable");
+    }
+
     // The message body is the question as delivered; the card reports the
     // outcome, so an answered, dismissed, or expired question stops advertising
     // itself as pending in the transcript.
     const current = live(delivered.requestId) ?? questionStates.get(delivered.requestId) ?? delivered;
+
     return renderInteractionCard(current, theme, { expanded, now: Date.now(), standalone: true });
   });
   pi.registerMessageRenderer(FOLLOW_THROUGH_MESSAGE, (message, { expanded }, theme) => {
     const checkpoint = (message.details as { checkpoint?: FollowThroughCheckpoint } | undefined)?.checkpoint;
-    if (!checkpoint) return renderToolCallLine(theme, "Inspect", "subagent follow-through unavailable");
+
+    if (!checkpoint) {
+      return renderToolCallLine(theme, "Inspect", "subagent follow-through unavailable");
+    }
+
     return renderFollowThroughCard(checkpoint, theme, { expanded, standalone: true });
   });
   const live = (requestId: string): PendingInteraction | undefined => {
-    try { return manager?.interaction(requestId); }
-    catch { return undefined; /* the manager may be gone after session shutdown */ }
+    try {
+      return manager?.interaction(requestId);
+    } catch {
+      return undefined; /* the manager may be gone after session shutdown */
+    }
   };
 
   // Human-triggered jobs use durable TUI-only entries instead of custom messages,
@@ -645,12 +805,25 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   // anchor, preventing completion from creating a duplicate card.
   pi.registerEntryRenderer<HumanSubagentEntryData>(HUMAN_SUBAGENT_ENTRY, (entry, { expanded }, theme) => {
     const job = entry.data?.job;
-    if (!job) return renderToolCallLine(theme, "Inspect", "human subagent entry unavailable");
-    if (entry.data?.kind === "update" || hiddenLegacyHumanEntries.has(entry.id)) return emptyComponent();
+
+    if (!job) {
+      return renderToolCallLine(theme, "Inspect", "human subagent entry unavailable");
+    }
+
+    if (entry.data?.kind === "update" || hiddenLegacyHumanEntries.has(entry.id)) {
+      return emptyComponent();
+    }
+
     return {
       render(width: number) {
         const current = liveJob(job).job;
-        return renderJobCard(current, theme, { expanded, now: Date.now(), expandHint: expandHint(), standalone: true }).render(width);
+
+        return renderJobCard(current, theme, {
+          expanded,
+          now: Date.now(),
+          expandHint: expandHint(),
+          standalone: true,
+        }).render(width);
       },
       invalidate() {},
     };
@@ -659,24 +832,37 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
   const appendHumanEntry = (job: JobSnapshot, kind: "anchor" | "update") => {
     pi.appendEntry<HumanSubagentEntryData>(HUMAN_SUBAGENT_ENTRY, { job: compactJob(job), kind });
   };
+
   const publishHumanResult = (job: JobSnapshot) => {
     const key = resultKey(job.id, job.generation);
-    if (humanResultsPublished.has(key)) return;
-    if (!humanEntryReady.has(key) && job.generation === 0) {
-      pendingHumanResults.set(key, job);
+
+    if (humanResultsPublished.has(key)) {
       return;
     }
+
+    if (!humanEntryReady.has(key) && job.generation === 0) {
+      pendingHumanResults.set(key, job);
+
+      return;
+    }
+
     humanResultsPublished.add(key);
     rememberCardSnapshot(job);
     const kind = humanEntryReady.has(key) ? "update" : "anchor";
-    if (kind === "anchor") humanEntryReady.add(key);
+
+    if (kind === "anchor") {
+      humanEntryReady.add(key);
+    }
+
     appendHumanEntry(job, kind);
   };
+
   const appendHumanAnchor = (job: JobSnapshot) => {
     const key = resultKey(job.id, job.generation);
     humanEntryReady.add(key);
     appendHumanEntry(job, "anchor");
     const pending = pendingHumanResults.get(key);
+
     if (pending) {
       pendingHumanResults.delete(key);
       humanResultsPublished.add(key);
@@ -692,63 +878,100 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
    */
   const flushDeferredQuestions = () => {
     const deliverable: PendingInteraction[] = [];
+
     for (const requestId of [...deferredQuestions.keys()]) {
       // A question that expired, was dismissed, or whose job settled while the
       // parent was busy must never wake a turn for an answer nobody can use.
       const current = manager?.interaction(requestId);
+
       if (!current || current.state !== "pending") {
         deferredQuestions.delete(requestId);
         continue;
       }
+
       deliverable.push(current);
     }
+
     for (const [index, interaction] of deliverable.entries()) {
       try {
-        pi.sendMessage({
-          customType: SUBAGENT_QUESTION_MESSAGE,
-          content: renderOrchestratorQuestion(interaction),
-          display: true,
-          details: { interaction },
-        }, { deliverAs: "followUp", triggerTurn: index === deliverable.length - 1 });
+        pi.sendMessage(
+          {
+            customType: SUBAGENT_QUESTION_MESSAGE,
+            content: renderOrchestratorQuestion(interaction),
+            display: true,
+            details: { interaction },
+          },
+          { deliverAs: "followUp", triggerTurn: index === deliverable.length - 1 },
+        );
       } catch {
         // Session may be shutting down; the question stays pending and is
         // retried on the next flush rather than being silently dropped.
         continue;
       }
+
       // Only mark delivered once sendMessage actually returned.
       deferredQuestions.delete(interaction.requestId);
       deliveredQuestions.add(interaction.requestId);
-      if (deliveredQuestions.size > 200) deliveredQuestions.delete(deliveredQuestions.values().next().value!);
+
+      if (deliveredQuestions.size > 200) {
+        deliveredQuestions.delete(deliveredQuestions.values().next().value!);
+      }
     }
   };
+
   /** Bounded last-known state per request, keyed for the transcript renderer. */
   const rememberQuestionState = (interaction: PendingInteraction) => {
     questionStates.delete(interaction.requestId);
     questionStates.set(interaction.requestId, interaction);
-    if (questionStates.size > 64) questionStates.delete(questionStates.keys().next().value!);
+
+    if (questionStates.size > 64) {
+      questionStates.delete(questionStates.keys().next().value!);
+    }
   };
+
   const deferQuestion = (interaction: PendingInteraction) => {
-    if (interaction.target.kind !== "orchestrator" || interaction.state !== "pending") return;
+    if (interaction.target.kind !== "orchestrator" || interaction.state !== "pending") {
+      return;
+    }
+
     // Human `/subagent` jobs deliberately never notify the orchestrator; their
     // question is answered inline from `/subagents` instead.
-    if (interaction.humanVisible) return;
-    if (deliveredQuestions.has(interaction.requestId) || deferredQuestions.has(interaction.requestId)) return;
+    if (interaction.humanVisible) {
+      return;
+    }
+
+    if (deliveredQuestions.has(interaction.requestId) || deferredQuestions.has(interaction.requestId)) {
+      return;
+    }
+
     deferredQuestions.set(interaction.requestId, interaction);
+
     // Re-entering the active turn is not safe; wait for agent_settled instead.
-    if (sessionContext?.isIdle()) flushDeferredQuestions();
+    if (sessionContext?.isIdle()) {
+      flushDeferredQuestions();
+    }
   };
 
   const isWorkflowTerminal = (status: WorkflowSnapshot["status"]): boolean =>
     status === "completed" || status === "failed" || status === "aborted";
   const workflowPhaseName = (snapshot: WorkflowSnapshot | undefined): string | undefined => {
-    if (!snapshot || snapshot.currentPhase === null) return undefined;
+    if (!snapshot || snapshot.currentPhase === null) {
+      return undefined;
+    }
+
     const phase = snapshot.phases[snapshot.currentPhase]?.name;
+
     return phase ? truncatePreview(phase, 160) : undefined;
   };
+
   const exactWatchedJob = (watch: FollowThroughWatch): JobSnapshot | undefined => {
-    if (!manager) return undefined;
+    if (!manager) {
+      return undefined;
+    }
+
     try {
       const current = manager.check(watch.sourceJobId);
+
       return current.generation === watch.sourceGeneration ? current : undefined;
     } catch {
       // JobManager may have evicted the terminal source while the workflow
@@ -756,32 +979,53 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       return undefined;
     }
   };
+
   const removeFollowThroughWatch = (watch: FollowThroughWatch): void => {
-    if (followThroughWatches.get(watch.key) === watch) followThroughWatches.delete(watch.key);
+    if (followThroughWatches.get(watch.key) === watch) {
+      followThroughWatches.delete(watch.key);
+    }
   };
+
   const clearFollowThroughWatchesForSource = (sourceJobId: string): void => {
     for (const watch of followThroughWatches.values()) {
-      if (watch.sourceJobId === sourceJobId) removeFollowThroughWatch(watch);
+      if (watch.sourceJobId === sourceJobId) {
+        removeFollowThroughWatch(watch);
+      }
     }
   };
+
   const clearFollowThroughWatchesForWorkflow = (runId: string): void => {
     for (const watch of followThroughWatches.values()) {
-      if (watch.workflow?.runId === runId) removeFollowThroughWatch(watch);
+      if (watch.workflow?.runId === runId) {
+        removeFollowThroughWatch(watch);
+      }
     }
   };
+
   const pruneFollowThroughWatches = (): void => {
     for (const watch of followThroughWatches.values()) {
-      if (!exactWatchedJob(watch)) removeFollowThroughWatch(watch);
+      if (!exactWatchedJob(watch)) {
+        removeFollowThroughWatch(watch);
+      }
     }
   };
+
   const workflowHasContinued = (snapshot: WorkflowSnapshot, watch: FollowThroughWatch): boolean => {
-    if (!watch.workflow || isWorkflowTerminal(snapshot.status)) return false;
+    if (!watch.workflow || isWorkflowTerminal(snapshot.status)) {
+      return false;
+    }
+
     const source = snapshot.agents.find((agent) => agent.index === watch.workflow!.agentIndex);
-    if (!source || !isTerminal(extractWorkflowAgentStatus(source.state))) return false;
+
+    if (!source || !isTerminal(extractWorkflowAgentStatus(source.state))) {
+      return false;
+    }
+
     const next = snapshot.agents
       .filter((agent) => (agent.state === "running" || agent.state === "queued") && agent.index !== source.index)
       .sort((left, right) => left.index - right.index)[0];
     const waitingSibling = snapshot.agents.some((agent) => agent.index !== source.index && agent.state === "waiting");
+
     // A phase notification can arrive just before a workflow returns its
     // final result. A successor still active, queued, or waiting, or an
     // explicit pause, is observable evidence that the run meaningfully
@@ -789,111 +1033,181 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     // answered generation; this avoids racing the workflow's final delivery.
     return !!next || waitingSibling || snapshot.status === "paused";
   };
+
   const queueFollowThroughFlush = (): void => {
-    if (followThroughFlushQueued || !sessionContext?.isIdle()) return;
+    if (followThroughFlushQueued || !sessionContext?.isIdle()) {
+      return;
+    }
+
     followThroughFlushQueued = true;
     const scheduledFor = followThroughSessionGeneration;
     queueMicrotask(() => {
-      if (scheduledFor !== followThroughSessionGeneration) return;
+      if (scheduledFor !== followThroughSessionGeneration) {
+        return;
+      }
+
       followThroughFlushQueued = false;
-      if (!sessionContext?.isIdle()) return;
+
+      if (!sessionContext?.isIdle()) {
+        return;
+      }
+
       flushFollowThrough();
     });
   };
+
   const observeFollowThroughWorkflow = (snapshot: WorkflowSnapshot): void => {
     if (isWorkflowTerminal(snapshot.status)) {
       clearFollowThroughWatchesForWorkflow(snapshot.runId);
+
       return;
     }
+
     for (const watch of followThroughWatches.values()) {
-      if (watch.workflow?.runId !== snapshot.runId || !watch.settled) continue;
+      if (watch.workflow?.runId !== snapshot.runId || !watch.settled) {
+        continue;
+      }
+
       if (!exactWatchedJob(watch)) {
         removeFollowThroughWatch(watch);
         continue;
       }
+
       if (workflowHasContinued(snapshot, watch)) {
         watch.deliverable = true;
         queueFollowThroughFlush();
       }
     }
   };
+
   const markFollowThroughSettled = (watch: FollowThroughWatch): void => {
     if (watch.workflow === undefined) {
       removeFollowThroughWatch(watch);
+
       return;
     }
+
     watch.settled = true;
     const snapshot = workflows.check(watch.workflow.runId);
-    if (snapshot) observeFollowThroughWorkflow(snapshot);
+
+    if (snapshot) {
+      observeFollowThroughWorkflow(snapshot);
+    }
   };
+
   const observeFollowThroughJob = (job: JobSnapshot, event: { type: string }): void => {
-    if (event.type !== "completed" && event.type !== "failed" && event.type !== "cancelled") return;
-    const watch = [...followThroughWatches.values()].find((candidate) =>
-      candidate.sourceJobId === job.id && candidate.sourceGeneration === job.generation,
+    if (event.type !== "completed" && event.type !== "failed" && event.type !== "cancelled") {
+      return;
+    }
+
+    const watch = [...followThroughWatches.values()].find(
+      (candidate) => candidate.sourceJobId === job.id && candidate.sourceGeneration === job.generation,
     );
-    if (!watch || !isTerminal(job.status)) return;
+
+    if (!watch || !isTerminal(job.status)) {
+      return;
+    }
+
     markFollowThroughSettled(watch);
   };
+
   const registerFollowThroughWatch = (interaction: PendingInteraction, source: JobSnapshot | undefined): void => {
-    if (!source || source.generation !== interaction.sourceGeneration) return;
+    if (!source || source.generation !== interaction.sourceGeneration) {
+      return;
+    }
+
     clearFollowThroughWatchesForSource(interaction.sourceJobId);
     const watch: FollowThroughWatch = {
       key: followThroughKey(interaction.requestId, interaction.sourceJobId, interaction.sourceGeneration),
       requestId: interaction.requestId,
       sourceJobId: interaction.sourceJobId,
       sourceGeneration: interaction.sourceGeneration,
-      workflow: interaction.workflow ? { ...interaction.workflow } : source.workflow ? { ...source.workflow } : undefined,
+      workflow: interaction.workflow
+        ? { ...interaction.workflow }
+        : source.workflow
+          ? { ...source.workflow }
+          : undefined,
       answeredAt: interaction.answeredAt ?? Date.now(),
       settled: false,
       deliverable: false,
     };
     followThroughWatches.set(watch.key, watch);
+
     while (followThroughWatches.size > MAX_FOLLOW_THROUGH_WATCHES) {
       const oldest = followThroughWatches.keys().next().value;
-      if (!oldest) break;
+
+      if (!oldest) {
+        break;
+      }
+
       followThroughWatches.delete(oldest);
     }
+
     const current = exactWatchedJob(watch);
+
     if (!current) {
       removeFollowThroughWatch(watch);
+
       return;
     }
-    if (isTerminal(current.status)) markFollowThroughSettled(watch);
+
+    if (isTerminal(current.status)) {
+      markFollowThroughSettled(watch);
+    }
   };
+
   const flushFollowThrough = (): void => {
     const deliverable: Array<{ checkpoint: FollowThroughCheckpoint; watch: FollowThroughWatch }> = [];
+
     for (const watch of [...followThroughWatches.values()]) {
-      if (!watch.settled || !watch.deliverable) continue;
+      if (!watch.settled || !watch.deliverable) {
+        continue;
+      }
+
       const current = exactWatchedJob(watch);
+
       if (!current || !isTerminal(current.status)) {
         removeFollowThroughWatch(watch);
         continue;
       }
+
       if (!watch.workflow) {
         removeFollowThroughWatch(watch);
         continue;
       }
+
       const workflow = workflows.check(watch.workflow.runId);
+
       if (!workflow || isWorkflowTerminal(workflow.status)) {
         removeFollowThroughWatch(watch);
         continue;
       }
+
       const workflowSource = workflow.agents.find((agent) => agent.index === watch.workflow!.agentIndex);
+
       if (!workflowSource || !isTerminal(extractWorkflowAgentStatus(workflowSource.state))) {
         removeFollowThroughWatch(watch);
         continue;
       }
+
       deliverable.push({ checkpoint: followThroughCheckpoint(watch, current, workflow), watch });
     }
-    for (const { watch } of deliverable) removeFollowThroughWatch(watch);
+
+    for (const { watch } of deliverable) {
+      removeFollowThroughWatch(watch);
+    }
+
     for (const [index, { checkpoint }] of deliverable.entries()) {
       try {
-        pi.sendMessage({
-          customType: FOLLOW_THROUGH_MESSAGE,
-          content: followThroughText(checkpoint),
-          display: true,
-          details: { checkpoint },
-        }, { deliverAs: "followUp", triggerTurn: index === deliverable.length - 1 });
+        pi.sendMessage(
+          {
+            customType: FOLLOW_THROUGH_MESSAGE,
+            content: followThroughText(checkpoint),
+            display: true,
+            details: { checkpoint },
+          },
+          { deliverAs: "followUp", triggerTurn: index === deliverable.length - 1 },
+        );
       } catch {
         // A closing parent cannot accept a follow-up. The one-shot watch was
         // already removed, so a late event cannot redeliver it.
@@ -903,51 +1217,87 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 
   const deliverResult = (job: JobSnapshot) => {
     const compact = compactJob(job);
-    pi.sendMessage({
-      customType: SUBAGENT_RESULT_MESSAGE,
-      content: terminalText(job),
-      display: true,
-      details: { job: compact },
-    }, { deliverAs: "followUp", triggerTurn: true });
+    pi.sendMessage(
+      {
+        customType: SUBAGENT_RESULT_MESSAGE,
+        content: terminalText(job),
+        display: true,
+        details: { job: compact },
+      },
+      { deliverAs: "followUp", triggerTurn: true },
+    );
   };
+
   const flushDeferredResults = () => {
     for (const [id, job] of deferredResults) {
       deferredResults.delete(id);
-      try { deliverResult(job); } catch { /* session may be shutting down */ }
+
+      try {
+        deliverResult(job);
+      } catch {
+        /* session may be shutting down */
+      }
     }
   };
+
   const deferResult = (job: JobSnapshot) => {
     if (job.humanVisible) {
       publishHumanResult(job);
+
       return;
     }
+
     const key = resultKey(job.id, job.generation);
-    if (job.workflow || consumedResults.has(key) || (waitInterest.get(key) ?? 0) > 0) return;
+
+    if (job.workflow || consumedResults.has(key) || (waitInterest.get(key) ?? 0) > 0) {
+      return;
+    }
+
     deferredResults.set(key, job);
-    if (sessionContext?.isIdle()) flushDeferredResults();
+
+    if (sessionContext?.isIdle()) {
+      flushDeferredResults();
+    }
   };
+
   const beginResultConsumption = (id: string): number => {
     const generation = manager?.check(id).generation ?? 0;
     const key = resultKey(id, generation);
     waitInterest.set(key, (waitInterest.get(key) ?? 0) + 1);
     deferredResults.delete(key);
     refreshCardBlinks();
+
     return generation;
   };
+
   const endResultConsumption = (id: string, generation: number, consumed: boolean) => {
     const key = resultKey(id, generation);
     const count = (waitInterest.get(key) ?? 1) - 1;
-    if (count <= 0) waitInterest.delete(key);
-    else waitInterest.set(key, count);
+
+    if (count <= 0) {
+      waitInterest.delete(key);
+    } else {
+      waitInterest.set(key, count);
+    }
+
     refreshCardBlinks();
+
     if (consumed) {
       consumedResults.add(key);
-      if (consumedResults.size > 200) consumedResults.delete(consumedResults.values().next().value!);
+
+      if (consumedResults.size > 200) {
+        consumedResults.delete(consumedResults.values().next().value!);
+      }
     } else {
       try {
         const current = manager?.check(id);
-        if (current && current.generation === generation && isTerminal(current.status)) deferResult(current);
-      } catch { /* job may have been evicted */ }
+
+        if (current && current.generation === generation && isTerminal(current.status)) {
+          deferResult(current);
+        }
+      } catch {
+        /* job may have been evicted */
+      }
     }
   };
 
@@ -989,18 +1339,37 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     pendingHumanResults.clear();
     hiddenLegacyHumanEntries.clear();
     activeHarness = configuredHarness;
+
     for (const entry of ctx.sessionManager.getBranch()) {
-      if (entry.type !== "custom") continue;
+      if (entry.type !== "custom") {
+        continue;
+      }
+
       const data = entry.data as { harness?: unknown; job?: JobSnapshot; kind?: "anchor" | "update" } | undefined;
       const restored = entry.customType === STATE_ENTRY ? normalizeHarness(data?.harness) : undefined;
-      if (restored) activeHarness = restored;
-      if (entry.customType !== HUMAN_SUBAGENT_ENTRY || !data?.job) continue;
+
+      if (restored) {
+        activeHarness = restored;
+      }
+
+      if (entry.customType !== HUMAN_SUBAGENT_ENTRY || !data?.job) {
+        continue;
+      }
+
       const key = resultKey(data.job.id, data.job.generation);
       rememberCardSnapshot({ ...data.job, speed: data.job.speed ?? "standard" });
-      if (data.kind === "update" || humanEntryReady.has(key)) hiddenLegacyHumanEntries.add(entry.id);
-      else humanEntryReady.add(key);
-      if (isTerminal(data.job.status)) humanResultsPublished.add(key);
+
+      if (data.kind === "update" || humanEntryReady.has(key)) {
+        hiddenLegacyHumanEntries.add(entry.id);
+      } else {
+        humanEntryReady.add(key);
+      }
+
+      if (isTerminal(data.job.status)) {
+        humanResultsPublished.add(key);
+      }
     }
+
     const sessionManager = manager;
     let sessionPublisher: NativeSubagentsStatePublisher;
     sessionPublisher = createNativeSubagentsStatePublisher({
@@ -1008,45 +1377,83 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       listJobs: () => sessionManager.list(),
       listWorkflows: () => workflows.list(),
       emit: (channel, state) => {
-        if (manager !== sessionManager || statePublisher !== sessionPublisher) return;
+        if (manager !== sessionManager || statePublisher !== sessionPublisher) {
+          return;
+        }
+
         pi.events.emit(channel, state);
       },
       reportError: (message) => {
-        if (manager !== sessionManager || statePublisher !== sessionPublisher) return;
-        try { ctx.ui.notify(message, "warning"); } catch { /* UI may be unavailable during teardown. */ }
+        if (manager !== sessionManager || statePublisher !== sessionPublisher) {
+          return;
+        }
+
+        try {
+          ctx.ui.notify(message, "warning");
+        } catch {
+          /* UI may be unavailable during teardown. */
+        }
       },
     });
     statePublisher = sessionPublisher;
     unsubscribeManager = sessionManager.subscribe((job, event) => {
-      if (manager !== sessionManager) return;
+      if (manager !== sessionManager) {
+        return;
+      }
+
       sessionPublisher.changed();
-      if (sessionClosing) return;
+
+      if (sessionClosing) {
+        return;
+      }
+
       rememberCardSnapshot(job);
       refreshCardBlinks();
       pruneFollowThroughWatches();
       updateSessionUi(ctx.ui, sessionManager, activeHarness);
+
       if (event.type === "interaction") {
         if (event.interaction.state === "pending" || event.interaction.state === "answering") {
           clearFollowThroughWatchesForSource(event.interaction.sourceJobId);
         }
+
         rememberQuestionState(event.interaction);
         deferQuestion(event.interaction);
+
         return;
       }
+
       observeFollowThroughJob(job, event);
-      if (event.type === "completed" || event.type === "failed" || (event.type === "cancelled" && event.reason !== "Session shutdown")) {
-        if (job.humanVisible) publishHumanResult(job);
-        else deferResult(job);
+
+      if (
+        event.type === "completed" ||
+        event.type === "failed" ||
+        (event.type === "cancelled" && event.reason !== "Session shutdown")
+      ) {
+        if (job.humanVisible) {
+          publishHumanResult(job);
+        } else {
+          deferResult(job);
+        }
       }
     });
     updateSessionUi(ctx.ui, sessionManager, activeHarness);
     workflows.sessionStart(ctx, sessionManager);
+
     if (ctx.isProjectTrusted()) {
       const controller = new AbortController();
       startupAvailabilityController = controller;
-      void availability.activations({ cwd: ctx.cwd, harnesses: supportedHarnesses, signal: controller.signal })
+      void availability
+        .activations({ cwd: ctx.cwd, harnesses: supportedHarnesses, signal: controller.signal })
         .then((activations) => {
-          if (controller.signal.aborted || discoveryGeneration !== availabilityGeneration || manager !== sessionManager) return;
+          if (
+            controller.signal.aborted ||
+            discoveryGeneration !== availabilityGeneration ||
+            manager !== sessionManager
+          ) {
+            return;
+          }
+
           currentHarnessActivations = activations;
           updateSessionUi(ctx.ui, sessionManager, activeHarness);
         })
@@ -1085,10 +1492,17 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     pendingHumanResults.clear();
     hiddenLegacyHumanEntries.clear();
     workflowActivity.reset();
+
     try {
       sessionUi?.setStatus("native-subagents", undefined);
-      if (sessionUi) clearActivityWidget(sessionUi);
-    } catch { /* UI may already be unavailable during teardown. */ }
+
+      if (sessionUi) {
+        clearActivityWidget(sessionUi);
+      }
+    } catch {
+      /* UI may already be unavailable during teardown. */
+    }
+
     sessionUi = undefined;
     displayedHarness = undefined;
     displayedHarnessAvailability = undefined;
@@ -1098,53 +1512,102 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     let finalWorkflowsRead = false;
     let finalJobsRead = closingManager === undefined;
     let shutdownError: unknown;
-    const rememberShutdownError = (error: unknown) => { shutdownError ??= error; };
+    const rememberShutdownError = (error: unknown) => {
+      shutdownError ??= error;
+    };
+
     try {
-      try { closingPublisher?.suspend(); }
-      catch (error) { rememberShutdownError(error); }
+      try {
+        closingPublisher?.suspend();
+      } catch (error) {
+        rememberShutdownError(error);
+      }
+
       try {
         finalWorkflows = await workflows.sessionShutdown();
         finalWorkflowsRead = true;
-      }
-      catch (error) {
+      } catch (error) {
         rememberShutdownError(error);
+
         try {
           finalWorkflows = workflows.list();
           finalWorkflowsRead = true;
+        } catch (readError) {
+          rememberShutdownError(readError);
         }
-        catch (readError) { rememberShutdownError(readError); }
       }
-      try { await closingManager?.shutdown(); }
-      catch (error) { rememberShutdownError(error); }
+
+      try {
+        await closingManager?.shutdown();
+      } catch (error) {
+        rememberShutdownError(error);
+      }
+
       try {
         finalJobs = closingManager?.list() ?? [];
         finalJobsRead = true;
+      } catch (error) {
+        rememberShutdownError(error);
       }
-      catch (error) { rememberShutdownError(error); }
+
       try {
-        if (finalJobsRead && finalWorkflowsRead) closingPublisher?.stop(finalJobs, finalWorkflows);
+        if (finalJobsRead && finalWorkflowsRead) {
+          closingPublisher?.stop(finalJobs, finalWorkflows);
+        }
+      } catch (error) {
+        rememberShutdownError(error);
       }
-      catch (error) { rememberShutdownError(error); }
     } finally {
       finalJobs = [];
       finalWorkflows = [];
-      try { unsubscribeManager?.(); }
-      catch (error) { rememberShutdownError(error); }
+
+      try {
+        unsubscribeManager?.();
+      } catch (error) {
+        rememberShutdownError(error);
+      }
+
       unsubscribeManager = undefined;
-      try { workflows.sessionClosed(); }
-      catch (error) { rememberShutdownError(error); }
-      if (manager === closingManager) manager = undefined;
-      if (statePublisher === closingPublisher) statePublisher = undefined;
-      try { releaseInstall(); }
-      catch (error) { rememberShutdownError(error); }
+
+      try {
+        workflows.sessionClosed();
+      } catch (error) {
+        rememberShutdownError(error);
+      }
+
+      if (manager === closingManager) {
+        manager = undefined;
+      }
+
+      if (statePublisher === closingPublisher) {
+        statePublisher = undefined;
+      }
+
+      try {
+        releaseInstall();
+      } catch (error) {
+        rememberShutdownError(error);
+      }
     }
-    if (shutdownError) throw shutdownError;
+
+    if (shutdownError) {
+      throw shutdownError;
+    }
   });
 
   /** Text inventory shared by `/subagents capabilities` and `subagent_capabilities`. */
-  const capabilityReport = async (
-    request: { cwd: string; access: AccessMode; refresh?: boolean; query?: string; harness?: HarnessName; kind?: CapabilityKind; effect?: CapabilityEffect; includeUnavailable?: boolean; limit?: number; signal?: AbortSignal },
-  ): Promise<string> => {
+  const capabilityReport = async (request: {
+    cwd: string;
+    access: AccessMode;
+    refresh?: boolean;
+    query?: string;
+    harness?: HarnessName;
+    kind?: CapabilityKind;
+    effect?: CapabilityEffect;
+    includeUnavailable?: boolean;
+    limit?: number;
+    signal?: AbortSignal;
+  }): Promise<string> => {
     const found = await capabilities.search(request);
     const now = Date.now();
     const lines = [
@@ -1155,15 +1618,20 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         : `No capability matches ${request.query ? `for "${request.query}" ` : ""}under ${request.access} access.`,
       ...found.matches.map((match) => formatCapabilityLine(match, now)),
     ];
+
     for (const catalog of found.catalogs) {
-      for (const warning of catalog.warnings) lines.push(`warning (${catalog.harness}): ${warning}`);
+      for (const warning of catalog.warnings) {
+        lines.push(`warning (${catalog.harness}): ${warning}`);
+      }
     }
+
     return lines.slice(0, MAX_CAPABILITY_LINES).join("\n").trim();
   };
 
   const configure = async (args: string, ctx: ExtensionCommandContext) => {
     const value = args.trim().toLowerCase();
     const selected = normalizeHarness(value);
+
     if (selected) {
       activeHarness = selected;
       pi.appendEntry(STATE_ENTRY, { harness: selected });
@@ -1172,36 +1640,59 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     } else if (value === "status") {
       const activation = currentHarnessActivations?.find((candidate) => candidate.harness === activeHarness);
       const state = activation
-        ? activation.enabled ? availabilityLabel(activation.availability.status) : "disabled by user"
+        ? activation.enabled
+          ? availabilityLabel(activation.availability.status)
+          : "disabled by user"
         : "status unknown";
-      ctx.ui.notify(`Default harness: ${activeHarness} (${state})\nProfiles: ${profileCatalog.profiles.size}\nModels: caller-selected or native harness default`, "info");
+      ctx.ui.notify(
+        `Default harness: ${activeHarness} (${state})\nProfiles: ${profileCatalog.profiles.size}\nModels: caller-selected or native harness default`,
+        "info",
+      );
     } else if (value === "profiles") {
       const resolved = [...profileCatalog.profiles.values()]
         .sort((a, b) => a.name.localeCompare(b.name))
         .map((profile) => `${profile.name} (${profile.origin}) — ${profile.filePath}`);
-      const warnings = profileCatalog.warnings.map((warning) => `Warning (${warning.origin}) ${warning.filePath}: ${warning.message}`);
-      ctx.ui.notify([...resolved, ...warnings].join("\n") || "No subagent profiles configured.", warnings.length ? "warning" : "info");
+      const warnings = profileCatalog.warnings.map(
+        (warning) => `Warning (${warning.origin}) ${warning.filePath}: ${warning.message}`,
+      );
+      ctx.ui.notify(
+        [...resolved, ...warnings].join("\n") || "No subagent profiles configured.",
+        warnings.length ? "warning" : "info",
+      );
     } else if (value === "capabilities" || value.startsWith("capabilities ")) {
       if (!ctx.isProjectTrusted()) {
         ctx.ui.notify("Subagent capability discovery is disabled for untrusted projects.", "warning");
+
         return;
       }
+
       const refresh = value.slice("capabilities".length).trim() === "refresh";
+
       try {
-        ctx.ui.notify(await capabilityReport({ cwd: ctx.cwd, access: "full", refresh, includeUnavailable: true }), "info");
+        ctx.ui.notify(
+          await capabilityReport({ cwd: ctx.cwd, access: "full", refresh, includeUnavailable: true }),
+          "info",
+        );
       } catch (error) {
-        ctx.ui.notify(`Capability discovery failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
+        ctx.ui.notify(
+          `Capability discovery failed: ${error instanceof Error ? error.message : String(error)}`,
+          "warning",
+        );
       }
     } else if (value === "providers" || value.startsWith("providers ")) {
       if (!ctx.isProjectTrusted()) {
         ctx.ui.notify("Subagent provider status is disabled for untrusted projects.", "warning");
+
         return;
       }
+
       const refresh = value.slice("providers".length).trim() === "refresh";
+
       try {
         const now = Date.now();
-        const statuses = (await providerStatus.statuses({ cwd: ctx.cwd, refresh, harnesses: supportedHarnesses }))
-          .filter((status) => supportedHarnesses.includes(status.harness));
+        const statuses = (
+          await providerStatus.statuses({ cwd: ctx.cwd, refresh, harnesses: supportedHarnesses })
+        ).filter((status) => supportedHarnesses.includes(status.harness));
         // Derive normalized availability from the same probe — no second scan.
         const activations = harnessActivations(statuses);
         currentHarnessActivations = activations;
@@ -1212,27 +1703,66 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         ctx.ui.notify(`Provider status failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
       }
     } else {
-      ctx.ui.notify("Usage: /subagents [status|profiles|providers [refresh]|capabilities [refresh]|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <harness>", "warning");
+      ctx.ui.notify(
+        "Usage: /subagents [status|profiles|providers [refresh]|capabilities [refresh]|codex|claude|pi|--use-codex|--use-claude] or /subagents-config <harness>",
+        "warning",
+      );
     }
   };
 
   pi.registerCommand("subagents", {
-    description: "Open the subagent dashboard; inspect profiles with /subagents profiles, provider login state with /subagents providers, and native capabilities with /subagents capabilities.",
-    getArgumentCompletions: (prefix) => ["status", "profiles", "providers", "providers refresh", "capabilities", "capabilities refresh", ...HARNESSES, "--use-codex", "--use-claude"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    description:
+      "Open the subagent dashboard; inspect profiles with /subagents profiles, provider login state with /subagents providers, and native capabilities with /subagents capabilities.",
+    getArgumentCompletions: (prefix) =>
+      [
+        "status",
+        "profiles",
+        "providers",
+        "providers refresh",
+        "capabilities",
+        "capabilities refresh",
+        ...HARNESSES,
+        "--use-codex",
+        "--use-claude",
+      ]
+        .filter((value) => value.startsWith(prefix.trim()))
+        .map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
-      if (args.trim()) await configure(args, ctx);
-      else await openSubagentsDashboard(ctx, getManager(), { availability: currentHarnessActivations });
+      if (args.trim()) {
+        await configure(args, ctx);
+      } else {
+        await openSubagentsDashboard(ctx, getManager(), { availability: currentHarnessActivations });
+      }
     },
   });
 
   pi.registerCommand("subagent", {
     description: "Spawn a background subagent for the human without notifying the orchestrator.",
-    getArgumentCompletions: (prefix) => ["--harness", "--model", "--name", "--effort", "--speed", "--access", "--max-tokens", "--max-cost", "--max-turns", "--cwd", "--profile", "--independent", "--independent-of"].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    getArgumentCompletions: (prefix) =>
+      [
+        "--harness",
+        "--model",
+        "--name",
+        "--effort",
+        "--speed",
+        "--access",
+        "--max-tokens",
+        "--max-cost",
+        "--max-turns",
+        "--cwd",
+        "--profile",
+        "--independent",
+        "--independent-of",
+      ]
+        .filter((value) => value.startsWith(prefix.trim()))
+        .map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       if (!args.trim() || args.trim() === "--help" || args.trim() === "-h") {
         ctx.ui.notify(`Usage: ${HUMAN_SUBAGENT_USAGE}`, "info");
+
         return;
       }
+
       try {
         const params = parseHumanSubagentCommand(args);
         const messages = ctx.sessionManager.buildContextEntries().flatMap(sessionEntryToContextMessages);
@@ -1250,7 +1780,10 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 
   pi.registerCommand("subagents-config", {
     description: "Show or switch the default native subagent harness.",
-    getArgumentCompletions: (prefix) => ["status", ...HARNESSES].filter((value) => value.startsWith(prefix.trim())).map((value) => ({ value, label: value })),
+    getArgumentCompletions: (prefix) =>
+      ["status", ...HARNESSES]
+        .filter((value) => value.startsWith(prefix.trim()))
+        .map((value) => ({ value, label: value })),
     handler: configure,
   });
 
@@ -1258,28 +1791,81 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     task: Type.String({ minLength: 1, maxLength: 100_000 }),
     name: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
     cwd: Type.Optional(Type.String()),
-    harness: Type.Optional(StringEnum(REQUESTED_HARNESSES, { description: "Explicit harness, or auto to pick a healthy/authenticated route and satisfy any supplied requirements" })),
-    requires: Type.Optional(Type.Array(
-      Type.String({ minLength: 1, maxLength: MAX_REQUIREMENT_LENGTH }),
-      { maxItems: MAX_REQUIREMENTS, description: "Capability IDs from subagent_capabilities the child must really have; verified live before dispatch" },
-    )),
-    model: Type.Optional(Type.String({ minLength: 1, maxLength: 256, description: "Harness-local model ID; omit with harness auto or to use the explicit harness default" })),
-    effort: Type.Optional(StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" })),
-    speed: Type.Optional(StringEnum(SPEEDS, { description: "Per-agent speed policy; fast is an explicit Codex-only opt-in that uses Codex credits" })),
-    access: Type.Optional(StringEnum(ACCESS, { description: "Access policy; defaults to full after project trust is established" })),
+    harness: Type.Optional(
+      StringEnum(REQUESTED_HARNESSES, {
+        description:
+          "Explicit harness, or auto to pick a healthy/authenticated route and satisfy any supplied requirements",
+      }),
+    ),
+    requires: Type.Optional(
+      Type.Array(Type.String({ minLength: 1, maxLength: MAX_REQUIREMENT_LENGTH }), {
+        maxItems: MAX_REQUIREMENTS,
+        description:
+          "Capability IDs from subagent_capabilities the child must really have; verified live before dispatch",
+      }),
+    ),
+    model: Type.Optional(
+      Type.String({
+        minLength: 1,
+        maxLength: 256,
+        description: "Harness-local model ID; omit with harness auto or to use the explicit harness default",
+      }),
+    ),
+    effort: Type.Optional(
+      StringEnum(EFFORTS, { description: "Optional provider effort hint; omitted by default for adaptive behavior" }),
+    ),
+    speed: Type.Optional(
+      StringEnum(SPEEDS, {
+        description: "Per-agent speed policy; fast is an explicit Codex-only opt-in that uses Codex credits",
+      }),
+    ),
+    access: Type.Optional(
+      StringEnum(ACCESS, { description: "Access policy; defaults to full after project trust is established" }),
+    ),
     independent: Type.Optional(Type.Boolean({ description: "Require a native provider different from the parent" })),
-    independentOf: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Route on a native provider different from this existing job ID" })),
-    profile: Type.Optional(Type.String({ minLength: 1, maxLength: 160, description: "Human-authored profile name; omit unless the human explicitly requested one" })),
-    maxTokens: Type.Optional(Type.Integer({ minimum: 1, maximum: 100_000_000, description: "Optional cumulative fresh input plus output token boundary for the retained session" })),
-    maxCost: Type.Optional(Type.Number({ exclusiveMinimum: 0, maximum: 10_000, description: "Optional cumulative reported-cost boundary for the retained session" })),
-    maxTurns: Type.Optional(Type.Integer({ minimum: 1, maximum: 10_000, description: "Optional cumulative native-turn boundary for the retained session" })),
+    independentOf: Type.Optional(
+      Type.String({
+        minLength: 1,
+        maxLength: 200,
+        description: "Route on a native provider different from this existing job ID",
+      }),
+    ),
+    profile: Type.Optional(
+      Type.String({
+        minLength: 1,
+        maxLength: 160,
+        description: "Human-authored profile name; omit unless the human explicitly requested one",
+      }),
+    ),
+    maxTokens: Type.Optional(
+      Type.Integer({
+        minimum: 1,
+        maximum: 100_000_000,
+        description: "Optional cumulative fresh input plus output token boundary for the retained session",
+      }),
+    ),
+    maxCost: Type.Optional(
+      Type.Number({
+        exclusiveMinimum: 0,
+        maximum: 10_000,
+        description: "Optional cumulative reported-cost boundary for the retained session",
+      }),
+    ),
+    maxTurns: Type.Optional(
+      Type.Integer({
+        minimum: 1,
+        maximum: 10_000,
+        description: "Optional cumulative native-turn boundary for the retained session",
+      }),
+    ),
   });
 
   pi.registerTool({
     name: "subagent_capabilities",
     renderShell: "self",
     label: "Subagent Capabilities",
-    description: "List the native tools, skills, commands, plugins, MCP servers, and hooks a subagent would really have on each harness, with the access ceiling already applied. Use the returned capability IDs as subagent requires.",
+    description:
+      "List the native tools, skills, commands, plugins, MCP servers, and hooks a subagent would really have on each harness, with the access ceiling already applied. Use the returned capability IDs as subagent requires.",
     promptSnippet: "Discover what native capabilities each subagent harness actually provides",
     promptGuidelines: [
       "Call this before requiring a capability; requires must use IDs reported here, never guessed names.",
@@ -1287,17 +1873,38 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       "Match the discovery access ceiling to the child request; use readOnly for review and inspection.",
     ],
     parameters: Type.Object({
-      query: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Case-insensitive filter over capability ID, name, description, and origin" })),
-      harness: Type.Optional(StringEnum(HARNESSES, { description: "Limit discovery to one harness; omit to compare every configured harness" })),
+      query: Type.Optional(
+        Type.String({
+          minLength: 1,
+          maxLength: 200,
+          description: "Case-insensitive filter over capability ID, name, description, and origin",
+        }),
+      ),
+      harness: Type.Optional(
+        StringEnum(HARNESSES, {
+          description: "Limit discovery to one harness; omit to compare every configured harness",
+        }),
+      ),
       kind: Type.Optional(StringEnum(CAPABILITY_KINDS)),
       effect: Type.Optional(StringEnum(CAPABILITY_EFFECTS)),
       access: Type.Optional(StringEnum(ACCESS, { description: "Access ceiling to evaluate; defaults to full" })),
-      includeUnavailable: Type.Optional(Type.Boolean({ description: "Include denied or blocked capabilities with the reason they are unusable" })),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_SEARCH_LIMIT, description: `Maximum capabilities to return (default ${DEFAULT_SEARCH_LIMIT})` })),
+      includeUnavailable: Type.Optional(
+        Type.Boolean({ description: "Include denied or blocked capabilities with the reason they are unusable" }),
+      ),
+      limit: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: MAX_SEARCH_LIMIT,
+          description: `Maximum capabilities to return (default ${DEFAULT_SEARCH_LIMIT})`,
+        }),
+      ),
       refresh: Type.Optional(Type.Boolean({ description: "Bypass the bounded discovery cache" })),
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
-      if (!ctx.isProjectTrusted()) throw new Error("Subagent capability discovery is disabled for untrusted projects");
+      if (!ctx.isProjectTrusted()) {
+        throw new Error("Subagent capability discovery is disabled for untrusted projects");
+      }
+
       const access = (params.access ?? "full") as AccessMode;
       const text = await capabilityReport({
         cwd: ctx.cwd,
@@ -1311,19 +1918,45 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         refresh: params.refresh,
         signal,
       });
+
       return { content: [{ type: "text" as const, text }], details: { access } };
     },
     renderCall(args, theme) {
       const input = args ?? {};
-      const detail = [input.harness ?? "all harnesses", input.kind ?? "", input.effect ?? "", input.access ?? "full", input.refresh ? "refresh" : ""].filter(Boolean).join(" · ");
-      return renderToolCallLine(theme, "Inspect", input.query ? `capabilities: ${input.query}` : "capabilities", detail);
+      const detail = [
+        input.harness ?? "all harnesses",
+        input.kind ?? "",
+        input.effect ?? "",
+        input.access ?? "full",
+        input.refresh ? "refresh" : "",
+      ]
+        .filter(Boolean)
+        .join(" · ");
+
+      return renderToolCallLine(
+        theme,
+        "Inspect",
+        input.query ? `capabilities: ${input.query}` : "capabilities",
+        detail,
+      );
     },
     renderResult(res, { expanded }, theme) {
       const text = (res.content?.[0] as { text?: string } | undefined)?.text ?? "";
       const lines = text.split("\n").filter(Boolean);
       const budget = expanded ? MAX_EXPANDED_LINES - 1 : MAX_COLLAPSED_LINES - 1;
       const shown = lines.slice(0, budget).map((line) => traceResultLine(theme, "·", line));
-      if (lines.length > budget) shown.push(traceResultLine(theme, "…", `${lines.length - budget} more line${lines.length - budget === 1 ? "" : "s"} hidden`, "dim"));
+
+      if (lines.length > budget) {
+        shown.push(
+          traceResultLine(
+            theme,
+            "…",
+            `${lines.length - budget} more line${lines.length - budget === 1 ? "" : "s"} hidden`,
+            "dim",
+          ),
+        );
+      }
+
       return linesComponent(shown.length ? shown : [traceResultLine(theme, "○", "No capabilities reported.", "muted")]);
     },
   });
@@ -1332,7 +1965,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     name: "subagent_spawn",
     renderShell: "self",
     label: "Spawn Subagent",
-    description: "Spawn a generic task-driven native background subagent. Maximum four jobs run concurrently. Set speed=fast only for an explicit Codex route; Codex credits apply and monetary cost is unreported. Unconsumed results are delivered automatically as one follow-up.",
+    description:
+      "Spawn a generic task-driven native background subagent. Maximum four jobs run concurrently. Set speed=fast only for an explicit Codex route; Codex credits apply and monetary cost is unreported. Unconsumed results are delivered automatically as one follow-up.",
     promptSnippet: "Spawn a native Pi, Claude Code, or Codex subagent in the background",
     promptGuidelines: [
       "Give each isolated agent a complete task with all relevant paths, requirements, constraints, and expected verification.",
@@ -1349,18 +1983,40 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       // spawned it is not blocked on this tool result.
       const spawned = await spawnJob(params, ctx, signal, false, undefined, { orchestrator: "allow" });
       const snapshot = await getManager().wait(spawned.id, { timeoutMs: 0, signal });
-      return result(snapshot, `Spawned ${snapshot.id} (${snapshot.name}, ${snapshot.access}, ${snapshot.harness}/${snapshot.model}, effort ${formatEffort(snapshot.effort)}${capabilityText(snapshot)})`);
+
+      return result(
+        snapshot,
+        `Spawned ${snapshot.id} (${snapshot.name}, ${snapshot.access}, ${snapshot.harness}/${snapshot.model}, effort ${formatEffort(snapshot.effort)}${capabilityText(snapshot)})`,
+      );
     },
     renderCall(args, theme) {
-      const route = args.independentOf ? `independent-of:${shortId(args.independentOf)}` : args.independent ? "independent" : args.harness
-        ? `${args.harness}${args.model ? `/${args.model}` : ""}`
-        : args.model ?? "";
-      const detail = [args.access ?? "full", args.profile ? `profile:${args.profile}` : "", route, args.effort ? `effort:${args.effort}` : "", args.speed === "fast" ? "speed:fast · Codex credits apply" : "", truncatePreview(args.task)].filter(Boolean).join(" · ");
+      const route = args.independentOf
+        ? `independent-of:${shortId(args.independentOf)}`
+        : args.independent
+          ? "independent"
+          : args.harness
+            ? `${args.harness}${args.model ? `/${args.model}` : ""}`
+            : (args.model ?? "");
+      const detail = [
+        args.access ?? "full",
+        args.profile ? `profile:${args.profile}` : "",
+        route,
+        args.effort ? `effort:${args.effort}` : "",
+        args.speed === "fast" ? "speed:fast · Codex credits apply" : "",
+        truncatePreview(args.task),
+      ]
+        .filter(Boolean)
+        .join(" · ");
+
       return renderToolCallLine(theme, "Spawn", args.name ?? "agent", detail);
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
-      if (!job) return renderFailure(theme, "spawn failed");
+
+      if (!job) {
+        return renderFailure(theme, "spawn failed");
+      }
+
       return renderLiveJob(job, theme, { expanded, isPartial }, context);
     },
   });
@@ -1373,15 +2029,21 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     parameters: Type.Object({ jobId: Type.String() }),
     async execute(_id, params) {
       const snapshot = getManager().check(params.jobId);
+
       return result(snapshot, statusLine(snapshot));
     },
     renderCall(args, theme) {
       const target = jobCallTarget(args.jobId);
+
       return renderToolCallLine(theme, "Inspect", target.accent, target.detail);
     },
     renderResult(res, { expanded }, theme, context) {
       const job = jobOf(res);
-      if (!job) return renderFailure(theme, "subagent not found");
+
+      if (!job) {
+        return renderFailure(theme, "subagent not found");
+      }
+
       return renderLiveJob(job, theme, { expanded, receipt: (current) => current.status }, context);
     },
   });
@@ -1404,9 +2066,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         onUpdate?.({ content: [{ type: "text", text: statusLine(current) }], details: { job: compactJob(current) } });
       }, 500);
       timer.unref();
+
       try {
         const snapshot = await manager.wait(params.jobId, { timeoutMs: params.timeoutMs ?? 600_000, signal });
         consumed = isTerminal(snapshot.status);
+
         return result(snapshot, terminalText(snapshot));
       } finally {
         clearInterval(timer);
@@ -1420,15 +2084,25 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     },
     renderResult(res, { isPartial }, theme, context) {
       const job = jobOf(res);
-      if (!job) return renderFailure(theme, "subagent not found");
-      if (isPartial || job.status === "completed") return emptyComponent();
+
+      if (!job) {
+        return renderFailure(theme, "subagent not found");
+      }
+
+      if (isPartial || job.status === "completed") {
+        return emptyComponent();
+      }
+
       const current = liveJob(job, context).job;
-      if (current.status === "completed") return emptyComponent();
+
+      if (current.status === "completed") {
+        return emptyComponent();
+      }
+
       const timeoutMs = (context.args as { timeoutMs?: number } | undefined)?.timeoutMs ?? 600_000;
       const timeout = timeoutMs < 1_000 ? "<1s" : `${Math.round(timeoutMs / 1000)}s`;
-      const action = isTerminal(current.status)
-        ? current.status
-        : `${current.status} after ${timeout} wait timeout`;
+      const action = isTerminal(current.status) ? current.status : `${current.status} after ${timeout} wait timeout`;
+
       return renderJobReceipt(current, theme, { action, now: Date.now(), standalone: true });
     },
   });
@@ -1444,23 +2118,44 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       behavior: Type.Optional(StringEnum(["steer", "followUp"] as const)),
     }),
     async execute(_id, params) {
-      const snapshot = await getManager().send(params.jobId, params.message, (params.behavior ?? "steer") as SendBehavior);
+      const snapshot = await getManager().send(
+        params.jobId,
+        params.message,
+        (params.behavior ?? "steer") as SendBehavior,
+      );
+
       return result(snapshot, `Sent ${params.behavior ?? "steer"} message to ${snapshot.id}`);
     },
     renderCall(args, theme) {
       const resolved = (args.behavior ?? "steer") as SendBehavior;
       const target = jobCallTarget(args.jobId);
-      return renderToolCallLine(theme, sendTitle(resolved), target.accent, [target.detail, truncatePreview(args.message)].filter(Boolean).join(" · "));
+
+      return renderToolCallLine(
+        theme,
+        sendTitle(resolved),
+        target.accent,
+        [target.detail, truncatePreview(args.message)].filter(Boolean).join(" · "),
+      );
     },
     renderResult(res, { expanded }, theme, context) {
       const resolved = ((context.args as { behavior?: SendBehavior } | undefined)?.behavior ?? "steer") as SendBehavior;
       const job = jobOf(res);
-      if (!job) return renderFailure(theme, `${sendBehaviorLabel(resolved)} failed`);
+
+      if (!job) {
+        return renderFailure(theme, `${sendBehaviorLabel(resolved)} failed`);
+      }
+
       const behavior = sendBehaviorLabel(resolved);
-      return renderLiveJob(job, theme, {
-        expanded,
-        receipt: behavior === "follow-up" ? "follow-up sent" : "steer sent",
-      }, context);
+
+      return renderLiveJob(
+        job,
+        theme,
+        {
+          expanded,
+          receipt: behavior === "follow-up" ? "follow-up sent" : "steer sent",
+        },
+        context,
+      );
     },
   });
 
@@ -1468,7 +2163,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     name: SUBAGENT_ANSWER_TOOL_NAME,
     renderShell: "self",
     label: "Answer Subagent",
-    description: "Answer one pending subagent question by its requestId. The asking subagent is parked on a provider tool call and resumes with this answer. Exactly one answer resolves a request; late, duplicate, or unknown request IDs are rejected. This is not a steer or follow-up message.",
+    description:
+      "Answer one pending subagent question by its requestId. The asking subagent is parked on a provider tool call and resumes with this answer. Exactly one answer resolves a request; late, duplicate, or unknown request IDs are rejected. This is not a steer or follow-up message.",
     promptSnippet: "Answer a blocked subagent's question from this thread's own context",
     promptGuidelines: [
       "Answer from this conversation's context: the child asked precisely because it cannot see it.",
@@ -1476,7 +2172,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       "Keep the answer bounded and specific; it is reference data for the child, not a new task.",
     ],
     parameters: Type.Object({
-      requestId: Type.String({ minLength: 1, maxLength: 200, description: "Request ID from the subagent question message" }),
+      requestId: Type.String({
+        minLength: 1,
+        maxLength: 200,
+        description: "Request ID from the subagent question message",
+      }),
       answer: Type.String({ minLength: 1, maxLength: MAX_ANSWER_CHARS }),
     }),
     async execute(_id, params) {
@@ -1484,14 +2184,27 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       deferredQuestions.delete(params.requestId);
       const sourceKey = resultKey(interaction.sourceJobId, interaction.sourceGeneration);
       let source: JobSnapshot | undefined;
+
       try {
         const current = getManager().check(interaction.sourceJobId);
-        if (current.generation === interaction.sourceGeneration) source = current;
-      } catch { /* the accepted answer still returns even if retention raced the lookup */ }
+
+        if (current.generation === interaction.sourceGeneration) {
+          source = current;
+        }
+      } catch {
+        /* the accepted answer still returns even if retention raced the lookup */
+      }
+
       source ??= cardSnapshots.get(sourceKey);
       registerFollowThroughWatch(interaction, source);
+
       return {
-        content: [{ type: "text" as const, text: `Answered ${interaction.sourceName} (${shortId(interaction.sourceJobId)}); the subagent resumed.` }],
+        content: [
+          {
+            type: "text" as const,
+            text: `Answered ${interaction.sourceName} (${shortId(interaction.sourceJobId)}); the subagent resumed.`,
+          },
+        ],
         details: {
           interaction,
           source: { jobId: interaction.sourceJobId, generation: interaction.sourceGeneration },
@@ -1504,16 +2217,30 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     },
     renderResult(res, { expanded }, theme, context) {
       const interaction = (res.details as { interaction?: PendingInteraction } | undefined)?.interaction;
-      if (!interaction) return renderFailure(theme, "answer failed");
+
+      if (!interaction) {
+        return renderFailure(theme, "answer failed");
+      }
+
       const source = jobOf(res);
-      if (!source) return renderInteractionCard(interaction, theme, { expanded, now: Date.now() });
+
+      if (!source) {
+        return renderInteractionCard(interaction, theme, { expanded, now: Date.now() });
+      }
+
       const workflow = interaction.workflow ? workflows.check(interaction.workflow.runId) : undefined;
-      return renderLiveJob(source, theme, {
-        expanded,
-        lead: `answered ${truncatePreview(interaction.sourceName, 160)} · resumed`,
-        receipt: (current) => answeredQuestionReceipt(interaction, current, workflowPhaseName(workflow)),
-        answerAudit: interaction,
-      }, context as LiveCardRenderContext | undefined);
+
+      return renderLiveJob(
+        source,
+        theme,
+        {
+          expanded,
+          lead: `answered ${truncatePreview(interaction.sourceName, 160)} · resumed`,
+          receipt: (current) => answeredQuestionReceipt(interaction, current, workflowPhaseName(workflow)),
+          answerAudit: interaction,
+        },
+        context as LiveCardRenderContext | undefined,
+      );
     },
   });
 
@@ -1526,9 +2253,11 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     async execute(_id, params) {
       const generation = beginResultConsumption(params.jobId);
       let consumed = false;
+
       try {
         const snapshot = await getManager().cancel(params.jobId);
         consumed = isTerminal(snapshot.status);
+
         return result(snapshot, statusLine(snapshot));
       } finally {
         endResultConsumption(params.jobId, generation, consumed);
@@ -1536,11 +2265,16 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     },
     renderCall(args, theme) {
       const target = jobCallTarget(args.jobId);
+
       return renderToolCallLine(theme, "Cancel", target.accent, target.detail);
     },
     renderResult(res, { expanded }, theme, context) {
       const job = jobOf(res);
-      if (!job) return renderFailure(theme, "cancel failed");
+
+      if (!job) {
+        return renderFailure(theme, "cancel failed");
+      }
+
       return renderLiveJob(job, theme, { expanded, receipt: (current) => current.status }, context);
     },
   });
@@ -1554,6 +2288,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     async execute() {
       const jobs = getManager().list();
       const text = jobs.length ? jobs.map(statusLine).join("\n") : "No subagent jobs in this session.";
+
       return { content: [{ type: "text", text }], details: { jobs: jobs.map(compactJob) } };
     },
     renderCall(_args, theme) {
@@ -1561,6 +2296,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     },
     renderResult(res, { expanded }, theme, context) {
       const jobs = (res.details as { jobs?: JobSnapshot[] } | undefined)?.jobs ?? [];
+
       return renderLiveList(jobs, theme, expanded, context);
     },
   });
@@ -1594,14 +2330,26 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         onUpdate?.({ content: [{ type: "text", text: statusLine(current) }], details: { job: compactJob(current) } });
       }, 500);
       timer.unref();
+
       try {
         const final = await getManager().wait(snapshot.id, { signal });
-        if (!isTerminal(final.status)) throw new Error("Subagent wait ended before completion");
+
+        if (!isTerminal(final.status)) {
+          throw new Error("Subagent wait ended before completion");
+        }
+
         consumed = true;
-        if (final.status === "failed") throw new Error(final.error ?? "Subagent failed");
+
+        if (final.status === "failed") {
+          throw new Error(final.error ?? "Subagent failed");
+        }
+
         return result(final, terminalText(final));
       } catch (error) {
-        if (signal?.aborted) await getManager().cancel(snapshot.id, "Parent tool aborted");
+        if (signal?.aborted) {
+          await getManager().cancel(snapshot.id, "Parent tool aborted");
+        }
+
         throw error;
       } finally {
         clearInterval(timer);
@@ -1609,16 +2357,30 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
     },
     renderCall(args, theme) {
-      const harness = args.independentOf ? `independent-of:${shortId(args.independentOf)}` : args.independent ? "independent" : args.harness ?? activeHarness;
+      const harness = args.independentOf
+        ? `independent-of:${shortId(args.independentOf)}`
+        : args.independent
+          ? "independent"
+          : (args.harness ?? activeHarness);
       const route = args.model ? `${harness}/${args.model}` : harness;
       const effort = args.effort ? ` · effort:${args.effort}` : "";
       const profile = args.profile ? ` · profile:${args.profile}` : "";
       const speed = args.speed === "fast" ? " · speed:fast · Codex credits apply" : "";
-      return renderToolCallLine(theme, "Run", args.name ?? "agent", `[${route}${effort}${profile}${speed}] ${truncatePreview(args.task)}`);
+
+      return renderToolCallLine(
+        theme,
+        "Run",
+        args.name ?? "agent",
+        `[${route}${effort}${profile}${speed}] ${truncatePreview(args.task)}`,
+      );
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
-      if (!job) return renderFailure(theme, "subagent failed");
+
+      if (!job) {
+        return renderFailure(theme, "subagent failed");
+      }
+
       return renderLiveJob(job, theme, { expanded, isPartial }, context);
     },
   });
@@ -1627,34 +2389,59 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     name: "session_peer_list",
     renderShell: "self",
     label: "List Session Peers",
-    description: "List saved Pi sessions available to fork as a read-only clarification peer, excluding the current session. Bounded and optionally filtered by query.",
+    description:
+      "List saved Pi sessions available to fork as a read-only clarification peer, excluding the current session. Bounded and optionally filtered by query.",
     promptSnippet: "List saved Pi sessions that can be forked as a read-only clarification peer",
     promptGuidelines: [
       "Use this before session_peer_fork to find the exact sessionId of a saved conversation.",
       "Filter with query when you know part of the session's name, first message, or project directory.",
     ],
     parameters: Type.Object({
-      query: Type.Optional(Type.String({ minLength: 1, maxLength: 200, description: "Case-insensitive filter over session name, first message, and project cwd" })),
-      limit: Type.Optional(Type.Integer({ minimum: 1, maximum: MAX_PEER_LIST_LIMIT, description: `Maximum sessions to return (default ${DEFAULT_PEER_LIST_LIMIT})` })),
+      query: Type.Optional(
+        Type.String({
+          minLength: 1,
+          maxLength: 200,
+          description: "Case-insensitive filter over session name, first message, and project cwd",
+        }),
+      ),
+      limit: Type.Optional(
+        Type.Integer({
+          minimum: 1,
+          maximum: MAX_PEER_LIST_LIMIT,
+          description: `Maximum sessions to return (default ${DEFAULT_PEER_LIST_LIMIT})`,
+        }),
+      ),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      if (!ctx.isProjectTrusted()) throw new Error("Session peers are disabled for untrusted projects");
+      if (!ctx.isProjectTrusted()) {
+        throw new Error("Session peers are disabled for untrusted projects");
+      }
+
       const peers = await listPeerSessions(sessionPeers, {
         query: params.query,
         limit: params.limit,
         excludeSessionId: ctx.sessionManager.getSessionId(),
       });
       const text = peers.length
-        ? peers.map((peer) => `${peer.sessionId} ${peer.name ?? "(unnamed)"} · ${peer.cwd} · ${peer.messageCount} messages`).join("\n")
+        ? peers
+            .map(
+              (peer) => `${peer.sessionId} ${peer.name ?? "(unnamed)"} · ${peer.cwd} · ${peer.messageCount} messages`,
+            )
+            .join("\n")
         : "No other saved sessions available to fork.";
+
       return { content: [{ type: "text", text }], details: { peers } };
     },
     renderCall(args, theme) {
-      const detail = [args.query ? `query:${args.query}` : "", args.limit ? `limit:${args.limit}` : ""].filter(Boolean).join(" · ");
+      const detail = [args.query ? `query:${args.query}` : "", args.limit ? `limit:${args.limit}` : ""]
+        .filter(Boolean)
+        .join(" · ");
+
       return renderToolCallLine(theme, "List", "session peers", detail);
     },
     renderResult(res, { expanded }, theme) {
       const peers = (res.details as { peers?: PeerSessionSummary[] } | undefined)?.peers ?? [];
+
       return renderPeerListCard(peers, theme, { expanded });
     },
   });
@@ -1663,7 +2450,8 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     name: "session_peer_fork",
     renderShell: "self",
     label: "Fork Session Peer",
-    description: "Fork a saved Pi session (chosen from session_peer_list) into a new read-only, tool-less background job under the current trusted project, without mutating the source session. The peer retains the source conversation's context; continue talking to it with subagent_send/wait/check/cancel using the returned jobId.",
+    description:
+      "Fork a saved Pi session (chosen from session_peer_list) into a new read-only, tool-less background job under the current trusted project, without mutating the source session. The peer retains the source conversation's context; continue talking to it with subagent_send/wait/check/cancel using the returned jobId.",
     promptSnippet: "Fork a saved Pi session as a read-only clarification peer and ask it an initial question",
     promptGuidelines: [
       "Call session_peer_list first and pass the exact sessionId it returns; arbitrary paths are never accepted.",
@@ -1671,12 +2459,23 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       "Use subagent_wait for its reply, then subagent_send for follow-up turns on the same jobId.",
     ],
     parameters: Type.Object({
-      sessionId: Type.String({ minLength: 1, maxLength: 128, description: "Stable session id returned by session_peer_list" }),
-      message: Type.String({ minLength: 1, maxLength: 100_000, description: "Initial clarification question sent to the forked peer" }),
+      sessionId: Type.String({
+        minLength: 1,
+        maxLength: 128,
+        description: "Stable session id returned by session_peer_list",
+      }),
+      message: Type.String({
+        minLength: 1,
+        maxLength: 100_000,
+        description: "Initial clarification question sent to the forked peer",
+      }),
       name: Type.Optional(Type.String({ minLength: 1, maxLength: 160 })),
     }),
     async execute(_id, params, _signal, _onUpdate, ctx) {
-      if (!ctx.isProjectTrusted()) throw new Error("Session peers are disabled for untrusted projects");
+      if (!ctx.isProjectTrusted()) {
+        throw new Error("Session peers are disabled for untrusted projects");
+      }
+
       const forked = await forkPeerSession(sessionPeers, {
         sessionId: params.sessionId,
         targetCwd: ctx.cwd,
@@ -1696,14 +2495,24 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
           sessionFile: forked.sessionFile,
         },
       });
+
       return result(snapshot, `Forked session peer ${snapshot.id} (${snapshot.name}) from ${forked.source.id}`);
     },
     renderCall(args, theme) {
-      return renderToolCallLine(theme, "Fork", args.name ?? "peer", [args.sessionId, truncatePreview(args.message)].filter(Boolean).join(" · "));
+      return renderToolCallLine(
+        theme,
+        "Fork",
+        args.name ?? "peer",
+        [args.sessionId, truncatePreview(args.message)].filter(Boolean).join(" · "),
+      );
     },
     renderResult(res, { expanded, isPartial }, theme, context) {
       const job = jobOf(res);
-      if (!job) return renderFailure(theme, "session peer fork failed");
+
+      if (!job) {
+        return renderFailure(theme, "session peer fork failed");
+      }
+
       return renderLiveJob(job, theme, { expanded, isPartial }, context);
     },
   });
@@ -1717,12 +2526,19 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
 export function permittedHumanPiToolNames(
   tools: Array<{ name: string; description?: string; source?: string }>,
 ): string[] {
-  const permitted = tools.filter((tool) => capabilityAvailability(normalizeCapability("pi", {
-    kind: "tool",
-    name: tool.name,
-    description: tool.description,
-    origin: tool.source,
-  }), "full").available);
+  const permitted = tools.filter(
+    (tool) =>
+      capabilityAvailability(
+        normalizeCapability("pi", {
+          kind: "tool",
+          name: tool.name,
+          description: tool.description,
+          origin: tool.source,
+        }),
+        "full",
+      ).available,
+  );
+
   return [...new Set(permitted.map((tool) => tool.name.trim()).filter(Boolean))];
 }
 
@@ -1734,7 +2550,9 @@ function parentTools(pi: ExtensionAPI): Array<{ name: string; description?: stri
       description: typeof tool.description === "string" ? tool.description : undefined,
       source: tool.sourceInfo?.source,
     }));
-  } catch { return []; }
+  } catch {
+    return [];
+  }
 }
 
 function parentCommands(pi: ExtensionAPI): Array<{ name: string; description?: string; source?: string }> {
@@ -1744,7 +2562,9 @@ function parentCommands(pi: ExtensionAPI): Array<{ name: string; description?: s
       description: command.description,
       source: command.source,
     }));
-  } catch { return []; }
+  } catch {
+    return [];
+  }
 }
 
 function rejectSchemaMismatch(params: object): void {
@@ -1763,18 +2583,28 @@ export function parseHumanSubagentCommand(input: string): SpawnToolParams {
   const task: string[] = [];
   let parseFlags = true;
 
-  const takeValue = (flag: string, inlineValue: string | undefined, index: number): { value: string; nextIndex: number } => {
+  const takeValue = (
+    flag: string,
+    inlineValue: string | undefined,
+    index: number,
+  ): { value: string; nextIndex: number } => {
     const value = inlineValue ?? tokens[index + 1];
-    if (!value || value.startsWith("--")) throw new Error(`${flag} requires a value. Usage: ${HUMAN_SUBAGENT_USAGE}`);
+
+    if (!value || value.startsWith("--")) {
+      throw new Error(`${flag} requires a value. Usage: ${HUMAN_SUBAGENT_USAGE}`);
+    }
+
     return { value, nextIndex: inlineValue === undefined ? index + 1 : index };
   };
 
   for (let index = 0; index < tokens.length; index++) {
     const token = tokens[index];
+
     if (parseFlags && token === "--") {
       parseFlags = false;
       continue;
     }
+
     if (!parseFlags || !token.startsWith("--")) {
       task.push(token);
       continue;
@@ -1783,80 +2613,122 @@ export function parseHumanSubagentCommand(input: string): SpawnToolParams {
     const equals = token.indexOf("=");
     const flag = equals >= 0 ? token.slice(0, equals) : token;
     const inlineValue = equals >= 0 ? token.slice(equals + 1) : undefined;
+
     switch (flag) {
       case "--harness": {
         const taken = takeValue(flag, inlineValue, index);
         const harness = normalizeHarness(taken.value);
-        if (!harness) throw new Error(`Unknown harness '${taken.value}'. Choose pi, claude, or codex.`);
+
+        if (!harness) {
+          throw new Error(`Unknown harness '${taken.value}'. Choose pi, claude, or codex.`);
+        }
+
         params.harness = harness;
         index = taken.nextIndex;
         break;
       }
+
       case "--model": {
         const taken = takeValue(flag, inlineValue, index);
         params.model = taken.value;
         index = taken.nextIndex;
         break;
       }
+
       case "--name": {
         const taken = takeValue(flag, inlineValue, index);
         params.name = taken.value;
         index = taken.nextIndex;
         break;
       }
+
       case "--effort": {
         const taken = takeValue(flag, inlineValue, index);
-        if (!(EFFORTS as readonly string[]).includes(taken.value)) throw new Error(`Unknown effort '${taken.value}'. Choose ${EFFORTS.join(", ")}.`);
+
+        if (!(EFFORTS as readonly string[]).includes(taken.value)) {
+          throw new Error(`Unknown effort '${taken.value}'. Choose ${EFFORTS.join(", ")}.`);
+        }
+
         params.effort = taken.value as EffortLevel;
         index = taken.nextIndex;
         break;
       }
+
       case "--access": {
         const taken = takeValue(flag, inlineValue, index);
-        if (!(ACCESS as readonly string[]).includes(taken.value)) throw new Error(`Unknown access '${taken.value}'. Choose ${ACCESS.join(" or ")}.`);
+
+        if (!(ACCESS as readonly string[]).includes(taken.value)) {
+          throw new Error(`Unknown access '${taken.value}'. Choose ${ACCESS.join(" or ")}.`);
+        }
+
         params.access = taken.value as AccessMode;
         index = taken.nextIndex;
         break;
       }
+
       case "--speed": {
         const taken = takeValue(flag, inlineValue, index);
-        if (!(SPEEDS as readonly string[]).includes(taken.value)) throw new Error(`Unknown speed '${taken.value}'. Choose ${SPEEDS.join(" or ")}.`);
+
+        if (!(SPEEDS as readonly string[]).includes(taken.value)) {
+          throw new Error(`Unknown speed '${taken.value}'. Choose ${SPEEDS.join(" or ")}.`);
+        }
+
         params.speed = taken.value as AgentSpeed;
         index = taken.nextIndex;
         break;
       }
+
       case "--max-tokens":
       case "--max-turns": {
         const taken = takeValue(flag, inlineValue, index);
         const value = Number(taken.value);
-        if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${flag} requires a positive integer.`);
-        if (flag === "--max-tokens") params.maxTokens = value;
-        else params.maxTurns = value;
+
+        if (!Number.isSafeInteger(value) || value < 1) {
+          throw new Error(`${flag} requires a positive integer.`);
+        }
+
+        if (flag === "--max-tokens") {
+          params.maxTokens = value;
+        } else {
+          params.maxTurns = value;
+        }
+
         index = taken.nextIndex;
         break;
       }
+
       case "--max-cost": {
         const taken = takeValue(flag, inlineValue, index);
         const value = Number(taken.value);
-        if (!Number.isFinite(value) || value <= 0) throw new Error(`${flag} requires a positive number.`);
+
+        if (!Number.isFinite(value) || value <= 0) {
+          throw new Error(`${flag} requires a positive number.`);
+        }
+
         params.maxCost = value;
         index = taken.nextIndex;
         break;
       }
+
       case "--cwd": {
         const taken = takeValue(flag, inlineValue, index);
         params.cwd = taken.value;
         index = taken.nextIndex;
         break;
       }
+
       case "--profile": {
         const taken = takeValue(flag, inlineValue, index);
         params.profile = taken.value;
         index = taken.nextIndex;
         break;
       }
+
       case "--independent":
-        if (inlineValue !== undefined) throw new Error(`${flag} does not take a value.`);
+        if (inlineValue !== undefined) {
+          throw new Error(`${flag} does not take a value.`);
+        }
+
         params.independent = true;
         break;
       case "--independent-of": {
@@ -1865,13 +2737,18 @@ export function parseHumanSubagentCommand(input: string): SpawnToolParams {
         index = taken.nextIndex;
         break;
       }
+
       default:
         throw new Error(`Unknown option '${flag}'. Usage: ${HUMAN_SUBAGENT_USAGE}`);
     }
   }
 
   params.task = task.join(" ").trim();
-  if (!params.task) throw new Error(`A task is required. Usage: ${HUMAN_SUBAGENT_USAGE}`);
+
+  if (!params.task) {
+    throw new Error(`A task is required. Usage: ${HUMAN_SUBAGENT_USAGE}`);
+  }
+
   return params;
 }
 
@@ -1891,8 +2768,12 @@ function tokenizeCommandArgs(input: string): string[] {
       escaped = true;
       started = true;
     } else if (quote) {
-      if (character === quote) quote = undefined;
-      else current += character;
+      if (character === quote) {
+        quote = undefined;
+      } else {
+        current += character;
+      }
+
       started = true;
     } else if (character === "'" || character === '"') {
       quote = character;
@@ -1909,9 +2790,18 @@ function tokenizeCommandArgs(input: string): string[] {
     }
   }
 
-  if (escaped) current += "\\";
-  if (quote) throw new Error("Unclosed quote in /subagent command.");
-  if (started) tokens.push(current);
+  if (escaped) {
+    current += "\\";
+  }
+
+  if (quote) {
+    throw new Error("Unclosed quote in /subagent command.");
+  }
+
+  if (started) {
+    tokens.push(current);
+  }
+
   return tokens;
 }
 
@@ -1956,7 +2846,10 @@ async function spawn(
     signal?: AbortSignal;
   },
 ): Promise<JobSnapshot> {
-  if (!context.trusted) throw new Error("Subagents are disabled for untrusted projects");
+  if (!context.trusted) {
+    throw new Error("Subagents are disabled for untrusted projects");
+  }
+
   const cwd = secureCwd(context.parentCwd, params.cwd);
   const request = {
     name: params.name,
@@ -1986,6 +2879,7 @@ async function spawn(
     availability: context.availability,
     signal: context.signal,
   });
+
   return manager.spawn({
     ...request,
     harness: routing.harness ?? (params.harness === "auto" ? undefined : params.harness),
@@ -1996,9 +2890,13 @@ async function spawn(
 
 /** Provider of an existing independence target, when it is still retained. */
 function independenceProvider(manager: JobManager, independentOf?: string): ProviderFamily | undefined {
-  if (!independentOf) return undefined;
+  if (!independentOf) {
+    return undefined;
+  }
+
   try {
     const harness = manager.check(independentOf).harness;
+
     return harness === "claude" || harness === "codex" ? harness : undefined;
   } catch {
     // Unknown or evicted targets keep failing closed inside JobManager.spawn().
@@ -2009,12 +2907,18 @@ function independenceProvider(manager: JobManager, independentOf?: string): Prov
 function secureCwd(parentCwd: string, requested?: string): string {
   const root = realpathSync(parentCwd);
   const candidatePath = resolve(root, requested ?? ".");
-  if (!existsSync(candidatePath)) throw new Error(`Subagent cwd does not exist: ${candidatePath}`);
+
+  if (!existsSync(candidatePath)) {
+    throw new Error(`Subagent cwd does not exist: ${candidatePath}`);
+  }
+
   const candidate = realpathSync(candidatePath);
   const relation = relative(root, candidate);
+
   if (relation === ".." || relation.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
     throw new Error("Subagent cwd must stay within the trusted project directory");
   }
+
   return candidate;
 }
 
@@ -2023,45 +2927,78 @@ export function configuredHarnessFromEnv(env: NodeJS.ProcessEnv): HarnessName {
 }
 
 export function normalizeHarness(value: unknown): HarnessName | undefined {
-  const text = String(value ?? "").trim().toLowerCase().replace(/^--use-/, "");
-  if (text === "codex" || text === "openai" || text === "gpt") return "codex";
-  if (text === "claude" || text === "anthropic") return "claude";
-  if (text === "pi") return "pi";
+  const text = String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/^--use-/, "");
+
+  if (text === "codex" || text === "openai" || text === "gpt") {
+    return "codex";
+  }
+
+  if (text === "claude" || text === "anthropic") {
+    return "claude";
+  }
+
+  if (text === "pi") {
+    return "pi";
+  }
+
   return undefined;
 }
 
 function statusLine(job: JobSnapshot): string {
   const profile = job.profile ? `; profile ${job.profile}` : "";
   const speed = formatSpeedBilling({ speed: job.speed, effectiveSpeed: job.context?.effectiveSpeed });
+
   return `${job.id} ${job.status} ${job.name} [${job.access}; ${job.harness}/${job.model}; effort ${formatEffort(job.effort)}${profile}${speed ? `; ${speed}` : ""}; budget ${formatSpendBudget(job.budget, job.usage, job.harness)}]`;
 }
 
 function directBudget(params: Pick<SpawnToolParams, "maxTokens" | "maxCost" | "maxTurns">): SpendBudget | undefined {
   const budget = { maxTokens: params.maxTokens, maxCost: params.maxCost, maxTurns: params.maxTurns };
+
   return Object.values(budget).some((value) => value !== undefined) ? budget : undefined;
 }
+
 /** Route provenance for tool text: what was required, and which live inventory satisfied it. */
 function capabilityText(job: JobSnapshot): string {
-  if (!job.capabilities) return "";
+  if (!job.capabilities) {
+    return "";
+  }
+
   const route = job.capabilities;
+
   return `, capabilities ${route.matched.join(", ") || "none"}${route.auto ? " (auto-routed)" : ""} @ ${route.revision.slice(7, 15)}`;
 }
+
 function terminalText(job: JobSnapshot): string {
   const warnings = terminalWarnings(job.warnings);
-  if (job.status === "completed") return `${job.output || "(completed with no text output)"}${warnings}`;
-  if (job.status === "failed" || job.status === "cancelled") return `${statusLine(job)}\n${job.error ?? ""}${warnings}`.trim();
+
+  if (job.status === "completed") {
+    return `${job.output || "(completed with no text output)"}${warnings}`;
+  }
+
+  if (job.status === "failed" || job.status === "cancelled") {
+    return `${statusLine(job)}\n${job.error ?? ""}${warnings}`.trim();
+  }
+
   return statusLine(job);
 }
+
 function terminalWarnings(warnings: string[] | undefined): string {
   const shown = warnings?.slice(-3) ?? [];
+
   return shown.length ? `\nWarnings:\n${shown.map((warning) => `- ${warning}`).join("\n")}` : "";
 }
+
 function compactJob(job: JobSnapshot): JobSnapshot {
   return { ...job, transcript: [], liveThinking: "", queuedMessages: [] };
 }
+
 function result(job: JobSnapshot, text: string) {
   return { content: [{ type: "text" as const, text }], details: { job: compactJob(job) } };
 }
+
 function jobOf(res: { details?: unknown }): JobSnapshot | undefined {
   return (res.details as { job?: JobSnapshot } | undefined)?.job;
 }

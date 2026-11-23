@@ -17,7 +17,8 @@ export const PARENT_THREAD_INPUT_SCHEMA = {
     offset: {
       type: "integer",
       minimum: 0,
-      description: "Zero-based offset in the matching message list. Omit to receive the most recent page when query is absent.",
+      description:
+        "Zero-based offset in the matching message list. Omit to receive the most recent page when query is absent.",
     },
     limit: {
       type: "integer",
@@ -67,16 +68,22 @@ export function captureParentThread(messages: unknown[], capturedAt = Date.now()
     const text = truncateUtf8(message.text, MAX_MESSAGE_BYTES);
     const candidate = { ...message, text };
     const size = Buffer.byteLength(JSON.stringify(candidate), "utf8");
+
     if (bytes + size > MAX_SNAPSHOT_BYTES) {
       truncated = true;
       break;
     }
-    if (text !== message.text) truncated = true;
+
+    if (text !== message.text) {
+      truncated = true;
+    }
+
     retained.push(candidate);
     bytes += size;
   }
 
   retained.reverse();
+
   return {
     capturedAt,
     totalMessages: converted.length,
@@ -108,46 +115,84 @@ export function renderParentThreadContext(snapshot: ParentThreadSnapshot, rawInp
   ];
 
   for (const { message, index } of page) {
-    lines.push(`[${index}] ${message.role.toUpperCase()}${message.timestamp ? ` @ ${new Date(message.timestamp).toISOString()}` : ""}`);
+    lines.push(
+      `[${index}] ${message.role.toUpperCase()}${message.timestamp ? ` @ ${new Date(message.timestamp).toISOString()}` : ""}`,
+    );
     lines.push(message.text);
     lines.push("");
   }
-  if (page.length === 0) lines.push("No matching parent-thread messages.");
-  if (offset + page.length < matches.length) lines.push(`More results available at offset ${offset + page.length}.`);
-  return truncateUtf8(lines.join("\n").trimEnd(), MAX_TOOL_OUTPUT_BYTES, "\n\n[Tool output truncated; request a smaller page with offset/limit.]");
+
+  if (page.length === 0) {
+    lines.push("No matching parent-thread messages.");
+  }
+
+  if (offset + page.length < matches.length) {
+    lines.push(`More results available at offset ${offset + page.length}.`);
+  }
+
+  return truncateUtf8(
+    lines.join("\n").trimEnd(),
+    MAX_TOOL_OUTPUT_BYTES,
+    "\n\n[Tool output truncated; request a smaller page with offset/limit.]",
+  );
 }
 
 function toParentThreadMessage(value: unknown): ParentThreadMessage | undefined {
   const message = object(value);
   const role = String(message.role ?? "");
   let safeRole: ParentThreadRole;
-  if (role === "user") safeRole = "user";
-  else if (role === "assistant") safeRole = "assistant";
-  else if (role === "compactionSummary" || role === "branchSummary") safeRole = "summary";
-  else return undefined;
 
-  const text = safeRole === "summary"
-    ? typeof message.summary === "string" ? message.summary : ""
-    : textContent(message.content);
-  if (!text.trim()) return undefined;
+  if (role === "user") {
+    safeRole = "user";
+  } else if (role === "assistant") {
+    safeRole = "assistant";
+  } else if (role === "compactionSummary" || role === "branchSummary") {
+    safeRole = "summary";
+  } else {
+    return undefined;
+  }
+
+  const text =
+    safeRole === "summary"
+      ? typeof message.summary === "string"
+        ? message.summary
+        : ""
+      : textContent(message.content);
+
+  if (!text.trim()) {
+    return undefined;
+  }
+
   return {
     role: safeRole,
     text,
-    timestamp: typeof message.timestamp === "number" && Number.isFinite(message.timestamp) ? message.timestamp : undefined,
+    timestamp:
+      typeof message.timestamp === "number" && Number.isFinite(message.timestamp) ? message.timestamp : undefined,
   };
 }
 
 function textContent(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (!Array.isArray(value)) return "";
-  return value.map((part) => {
-    const block = object(part);
-    return block.type === "text" && typeof block.text === "string" ? block.text : "";
-  }).filter(Boolean).join("\n");
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (!Array.isArray(value)) {
+    return "";
+  }
+
+  return value
+    .map((part) => {
+      const block = object(part);
+
+      return block.type === "text" && typeof block.text === "string" ? block.text : "";
+    })
+    .filter(Boolean)
+    .join("\n");
 }
 
 function asInput(value: unknown): ParentThreadContextInput {
   const input = object(value);
+
   return {
     query: typeof input.query === "string" ? input.query.slice(0, 500) : undefined,
     offset: typeof input.offset === "number" ? input.offset : undefined,
@@ -156,24 +201,36 @@ function asInput(value: unknown): ParentThreadContextInput {
 }
 
 function clampInteger(value: number | undefined, minimum: number, maximum: number, fallback: number): number {
-  if (value === undefined || !Number.isFinite(value)) return fallback;
+  if (value === undefined || !Number.isFinite(value)) {
+    return fallback;
+  }
+
   return Math.max(minimum, Math.min(maximum, Math.floor(value)));
 }
 
 function object(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
 
 function truncateUtf8(value: string, maxBytes: number, suffix = "\n[message truncated]"): string {
-  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) {
+    return value;
+  }
+
   const suffixBytes = Buffer.byteLength(suffix, "utf8");
   const budget = Math.max(0, maxBytes - suffixBytes);
   let low = 0;
   let high = value.length;
+
   while (low < high) {
     const middle = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(value.slice(0, middle), "utf8") <= budget) low = middle;
-    else high = middle - 1;
+
+    if (Buffer.byteLength(value.slice(0, middle), "utf8") <= budget) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
   }
+
   return value.slice(0, low) + suffix;
 }

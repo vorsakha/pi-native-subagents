@@ -2,12 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { tempDir } from "./helpers.ts";
 import { mkdtemp, rm } from "node:fs/promises";
-import { runWorkflowSandbox, type WorkflowConvergenceProgress, type WorkflowSandboxOptions } from "../src/workflows/sandbox.ts";
+import {
+  runWorkflowSandbox,
+  type WorkflowConvergenceProgress,
+  type WorkflowSandboxOptions,
+} from "../src/workflows/sandbox.ts";
 
-async function fixture(
-  source: string,
-  overrides: Partial<WorkflowSandboxOptions> = {},
-) {
+async function fixture(source: string, overrides: Partial<WorkflowSandboxOptions> = {}) {
   const cwd = await tempDir("workflow-sandbox");
   const controller = new AbortController();
   const phases: string[] = [];
@@ -30,13 +31,19 @@ async function fixture(
     }),
     onMeta: () => {},
     onPhase: (title) => phases.push(title),
-    onPhaseCapacity: (titles) => new Set([...phases, ...titles]).size <= 64
-      ? { ok: true }
-      : { ok: false, reason: "the run has fewer than two workflow phase slots left, so another implement/review round cannot start" },
+    onPhaseCapacity: (titles) =>
+      new Set([...phases, ...titles]).size <= 64
+        ? { ok: true }
+        : {
+            ok: false,
+            reason:
+              "the run has fewer than two workflow phase slots left, so another implement/review round cannot start",
+          },
     onLog: (message) => logs.push(message),
     onConvergence: (progress) => convergence.push(progress),
     ...overrides,
   };
+
   return { cwd, controller, phases, logs, convergence, options };
 }
 
@@ -55,6 +62,7 @@ test("runs sequential agent calls and exposes args through globals and arguments
       return { one, two, inputValue: input.value };
     }
   `);
+
   try {
     const value = await runWorkflowSandbox(f.options);
     assert.deepEqual(value, {
@@ -66,13 +74,16 @@ test("runs sequential agent calls and exposes args through globals and arguments
       },
     });
     assert.deepEqual(f.phases, ["first", "last"]);
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("pipelines items without a stage barrier and emits bounded progress logs", async () => {
   const events: string[] = [];
   const callIndices: number[] = [];
-  const f = await fixture(`
+  const f = await fixture(
+    `
     export default async () => {
       log("pipeline started");
       const values = await pipeline(
@@ -86,28 +97,35 @@ test("pipelines items without a stage barrier and emits bounded progress logs", 
       log("pipeline finished");
       return values.map((value) => value.output);
     }
-  `, {
-    onAgent: async (prompt, _options, _signal, callIndex) => {
-      callIndices.push(callIndex);
-      events.push(`start:${prompt}`);
-      if (prompt === "stage-1:slow") await new Promise((resolve) => setTimeout(resolve, 50));
-      events.push(`end:${prompt}`);
-      return { ok: true, output: prompt, jobId: `job-${events.length}` };
+  `,
+    {
+      onAgent: async (prompt, _options, _signal, callIndex) => {
+        callIndices.push(callIndex);
+        events.push(`start:${prompt}`);
+
+        if (prompt === "stage-1:slow") {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+
+        events.push(`end:${prompt}`);
+
+        return { ok: true, output: prompt, jobId: `job-${events.length}` };
+      },
     },
-  });
+  );
+
   try {
     const value = await runWorkflowSandbox(f.options);
-    assert.deepEqual(value.result, [
-      "stage-2:fast:stage-1:fast",
-      "stage-2:slow:stage-1:slow",
-    ]);
+    assert.deepEqual(value.result, ["stage-2:fast:stage-1:fast", "stage-2:slow:stage-1:slow"]);
     assert.ok(
       events.indexOf("start:stage-2:fast:stage-1:fast") < events.indexOf("end:stage-1:slow"),
       "a fast item advances to its next stage before slower items finish the prior stage",
     );
     assert.deepEqual(callIndices, [0, 1, 2, 3], "sandbox invocation ordinals are explicit and contiguous");
     assert.deepEqual(f.logs, ["pipeline started", "stage-2:fast:0", "stage-2:slow:1", "pipeline finished"]);
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("pipeline drops an item to null when one of its stages throws", async () => {
@@ -122,37 +140,56 @@ test("pipeline drops an item to null when one of its stages throws", async () =>
       () => "unreachable for dropped items",
     );
   `);
+
   try {
     assert.deepEqual((await runWorkflowSandbox(f.options)).result, ["unreachable for dropped items", null]);
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("aborts a running workflow and aborts in-flight agent work", async () => {
   let agentAborted = false;
   let markAgentStarted!: () => void;
-  const agentStarted = new Promise<void>((resolve) => { markAgentStarted = resolve; });
-  const f = await fixture(`export default async () => agent("wait", {})`, {
-    onAgent: async (_prompt, _options, signal) => new Promise((resolve) => {
-      markAgentStarted();
-      signal.addEventListener("abort", () => {
-        agentAborted = true;
-        resolve({ ok: false, output: "", error: "aborted" });
-      }, { once: true });
-    }),
+  const agentStarted = new Promise<void>((resolve) => {
+    markAgentStarted = resolve;
   });
+  const f = await fixture(`export default async () => agent("wait", {})`, {
+    onAgent: async (_prompt, _options, signal) =>
+      new Promise((resolve) => {
+        markAgentStarted();
+        signal.addEventListener(
+          "abort",
+          () => {
+            agentAborted = true;
+            resolve({ ok: false, output: "", error: "aborted" });
+          },
+          { once: true },
+        );
+      }),
+  });
+
   try {
     const running = runWorkflowSandbox(f.options);
     await agentStarted;
     f.controller.abort();
     await assert.rejects(running, (error: Error) => error.name === "AbortError");
     assert.equal(agentAborted, true);
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 
   let markStuckStarted!: () => void;
-  const stuckStarted = new Promise<void>((resolve) => { markStuckStarted = resolve; });
-  const stuck = await fixture(`export default async () => agent("stuck", {})`, {
-    onAgent: async () => new Promise(() => { markStuckStarted(); }),
+  const stuckStarted = new Promise<void>((resolve) => {
+    markStuckStarted = resolve;
   });
+  const stuck = await fixture(`export default async () => agent("stuck", {})`, {
+    onAgent: async () =>
+      new Promise(() => {
+        markStuckStarted();
+      }),
+  });
+
   try {
     const running = runWorkflowSandbox(stuck.options);
     await stuckStarted;
@@ -160,89 +197,136 @@ test("aborts a running workflow and aborts in-flight agent work", async () => {
     stuck.controller.abort();
     await assert.rejects(running, (error: Error) => error.name === "AbortError");
     assert.ok(Date.now() - startedAt < 1_500, "stuck agent drain must remain bounded");
-  } finally { await cleanup(stuck.cwd); }
+  } finally {
+    await cleanup(stuck.cwd);
+  }
 });
 
 test("terminates the sandbox when a host progress callback fails", async () => {
-  const f = await fixture(`
+  const f = await fixture(
+    `
     export const meta = { name: "callback-failure" };
     export default async () => new Promise(() => {});
-  `, {
-    onMeta: () => { throw new Error("meta callback failed"); },
-  });
+  `,
+    {
+      onMeta: () => {
+        throw new Error("meta callback failed");
+      },
+    },
+  );
+
   try {
     await assert.rejects(runWorkflowSandbox(f.options));
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("rejects a stalled script that cannot make further progress", async () => {
   const f = await fixture(`export default async () => new Promise(() => {})`);
+
   try {
     await assert.rejects(runWorkflowSandbox(f.options), /pending|stalled|settle/i);
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("rejects workflows that return before all agent calls are awaited", async () => {
   let aborted = false;
   let dispatched = false;
-  const f = await fixture(`
+  const f = await fixture(
+    `
     export default async () => {
       void agent("forgotten", {});
       return "premature";
     }
-  `, {
-    onAgent: async (_prompt, _options, signal) => new Promise((resolve) => {
-      dispatched = true;
-      const onAbort = () => {
-        aborted = true;
-        resolve({ ok: false, output: "", error: "aborted" });
-      };
-      if (signal.aborted) onAbort();
-      else signal.addEventListener("abort", onAbort, { once: true });
-    }),
-  });
+  `,
+    {
+      onAgent: async (_prompt, _options, signal) =>
+        new Promise((resolve) => {
+          dispatched = true;
+          const onAbort = () => {
+            aborted = true;
+            resolve({ ok: false, output: "", error: "aborted" });
+          };
+
+          if (signal.aborted) {
+            onAbort();
+          } else {
+            signal.addEventListener("abort", onAbort, { once: true });
+          }
+        }),
+    },
+  );
+
   try {
     await assert.rejects(runWorkflowSandbox(f.options), /returned before 1 agent call settled/i);
     assert.ok(!dispatched || aborted, "unawaited work must be prevented or cancelled");
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("accepts large source and args whose combined size exceeds 512 KiB", async () => {
   const largeArgs = "y".repeat(200 * 1024);
   const largeSource = `/*${"x".repeat(400 * 1024)}*/\nexport default async () => args.length`;
   const f = await fixture(largeSource, { args: largeArgs });
+
   try {
     const value = await runWorkflowSandbox(f.options);
     assert.equal(value.result, largeArgs.length);
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("enforces payload, call, phase, and parallel limits", async () => {
   const source = await fixture("x".repeat(512 * 1024 + 1));
-  try { await assert.rejects(runWorkflowSandbox(source.options), /source.*512 KiB/i); }
-  finally { await cleanup(source.cwd); }
+
+  try {
+    await assert.rejects(runWorkflowSandbox(source.options), /source.*512 KiB/i);
+  } finally {
+    await cleanup(source.cwd);
+  }
 
   const args = await fixture(`export default async () => null`, { args: "x".repeat(256 * 1024) });
-  try { await assert.rejects(runWorkflowSandbox(args.options), /args.*256 KiB/i); }
-  finally { await cleanup(args.cwd); }
+
+  try {
+    await assert.rejects(runWorkflowSandbox(args.options), /args.*256 KiB/i);
+  } finally {
+    await cleanup(args.cwd);
+  }
 
   const result = await fixture(`export default async () => "x".repeat(1024 * 1024)`);
-  try { await assert.rejects(runWorkflowSandbox(result.options), /result.*1 MiB/i); }
-  finally { await cleanup(result.cwd); }
+
+  try {
+    await assert.rejects(runWorkflowSandbox(result.options), /result.*1 MiB/i);
+  } finally {
+    await cleanup(result.cwd);
+  }
 
   const ipc = await fixture(`export default async () => agent("x".repeat(512 * 1024), {})`);
+
   try {
     const value = await runWorkflowSandbox(ipc.options);
     assert.match((value.result as { error: string }).error, /512 KiB/i);
-  } finally { await cleanup(ipc.cwd); }
+  } finally {
+    await cleanup(ipc.cwd);
+  }
+
   const phases = await fixture(`
     export default async () => {
       for (let index = 0; index < 129; index++) phase("phase-" + index);
       return "unreachable";
     }
   `);
-  try { await assert.rejects(runWorkflowSandbox(phases.options), /phase event limit exceeded \(128\)/i); }
-  finally { await cleanup(phases.cwd); }
+
+  try {
+    await assert.rejects(runWorkflowSandbox(phases.options), /phase event limit exceeded \(128\)/i);
+  } finally {
+    await cleanup(phases.cwd);
+  }
 
   const logs = await fixture(`
     export default async () => {
@@ -250,44 +334,76 @@ test("enforces payload, call, phase, and parallel limits", async () => {
       return "unreachable";
     }
   `);
-  try { await assert.rejects(runWorkflowSandbox(logs.options), /log event limit exceeded \(256\)/i); }
-  finally { await cleanup(logs.cwd); }
+
+  try {
+    await assert.rejects(runWorkflowSandbox(logs.options), /log event limit exceeded \(256\)/i);
+  } finally {
+    await cleanup(logs.cwd);
+  }
 
   const oversizedLog = await fixture(`export default async () => log("x".repeat(4096))`);
-  try { await assert.rejects(runWorkflowSandbox(oversizedLog.options), /log message exceeds the 4 KiB limit/i); }
-  finally { await cleanup(oversizedLog.cwd); }
+
+  try {
+    await assert.rejects(runWorkflowSandbox(oversizedLog.options), /log message exceeds the 4 KiB limit/i);
+  } finally {
+    await cleanup(oversizedLog.cwd);
+  }
 
   let calls = 0;
-  const agents = await fixture(`
+  const agents = await fixture(
+    `
     export default async () => {
       const values = [];
       for (let index = 0; index < 33; index++) values.push(await agent(String(index), {}));
       return values;
     }
-  `, {
-    onAgent: async (prompt) => { calls++; return { ok: true, output: prompt }; },
-  });
+  `,
+    {
+      onAgent: async (prompt) => {
+        calls++;
+
+        return { ok: true, output: prompt };
+      },
+    },
+  );
+
   try {
     const value = await runWorkflowSandbox(agents.options);
     assert.equal(calls, 32);
     const values = value.result as Array<{ ok: boolean; error?: string }>;
     assert.equal(values[31]?.ok, true);
     assert.deepEqual(values[32], { ok: false, output: "", error: "Agent call limit exceeded (32)" });
-  } finally { await cleanup(agents.cwd); }
+  } finally {
+    await cleanup(agents.cwd);
+  }
 
   for (const concurrency of [0, 5]) {
     const parallel = await fixture(`export default async () => parallel([() => 1], ${concurrency})`);
-    try { await assert.rejects(runWorkflowSandbox(parallel.options), /concurrency.*1.*4/i); }
-    finally { await cleanup(parallel.cwd); }
+
+    try {
+      await assert.rejects(runWorkflowSandbox(parallel.options), /concurrency.*1.*4/i);
+    } finally {
+      await cleanup(parallel.cwd);
+    }
   }
 
   const noStages = await fixture(`export default async () => pipeline([1])`);
-  try { await assert.rejects(runWorkflowSandbox(noStages.options), /one or more stage functions/i); }
-  finally { await cleanup(noStages.cwd); }
 
-  const tooManyItems = await fixture(`export default async () => pipeline(Array.from({ length: 4097 }, (_, index) => index), (item) => item)`);
-  try { await assert.rejects(runWorkflowSandbox(tooManyItems.options), /at most 4096 items/i); }
-  finally { await cleanup(tooManyItems.cwd); }
+  try {
+    await assert.rejects(runWorkflowSandbox(noStages.options), /one or more stage functions/i);
+  } finally {
+    await cleanup(noStages.cwd);
+  }
+
+  const tooManyItems = await fixture(
+    `export default async () => pipeline(Array.from({ length: 4097 }, (_, index) => index), (item) => item)`,
+  );
+
+  try {
+    await assert.rejects(runWorkflowSandbox(tooManyItems.options), /at most 4096 items/i);
+  } finally {
+    await cleanup(tooManyItems.cwd);
+  }
 });
 
 test("forbids nondeterministic time and random APIs used by replayable workflows", async () => {
@@ -313,6 +429,7 @@ test("forbids nondeterministic time and random APIs used by replayable workflows
       return { failures, explicitDate: new Date(0).toISOString(), parsed: Date.parse("1970-01-01T00:00:00.000Z") };
     }
   `);
+
   try {
     const result = await runWorkflowSandbox(f.options);
     assert.deepEqual(result.result, {
@@ -347,10 +464,15 @@ test("rejects imports and denies require, process, global, filesystem, and netwo
     [`export default async () => fetch("https://example.com")`, /fetch.*not defined/i],
     [`export default async () => (() => {}).constructor("return process")()`, /process.*not available|not defined/i],
   ] as const;
+
   for (const [source, pattern] of cases) {
     const f = await fixture(source);
-    try { await assert.rejects(runWorkflowSandbox(f.options), pattern); }
-    finally { await cleanup(f.cwd); }
+
+    try {
+      await assert.rejects(runWorkflowSandbox(f.options), pattern);
+    } finally {
+      await cleanup(f.cwd);
+    }
   }
 });
 
@@ -367,15 +489,18 @@ async function convergeFixture(script: string, reviews: unknown[]) {
   const followUps: Array<{ jobId: string; prompt: string; options: Record<string, unknown> }> = [];
   let reviewCall = 0;
   const nextReview = () => reviews[Math.min(reviewCall++, reviews.length - 1)];
+
   return fixture(script, {
     onAgent: async (prompt, options) => {
       agentCalls.push({ prompt, options });
+
       return options.schema
         ? { ok: true, output: "reviewed", jobId: "job-reviewer", structured: nextReview() }
         : { ok: true, output: "implemented", jobId: "job-implementer" };
     },
     onFollowUp: async (jobId, prompt, options) => {
       followUps.push({ jobId, prompt, options });
+
       return jobId === "job-reviewer"
         ? { ok: true, output: "reviewed", jobId, structured: nextReview() }
         : { ok: true, output: "fixed", jobId };
@@ -394,10 +519,15 @@ const CONVERGE_SCRIPT = (options = "") => `
 
 test("converge reuses both retained sessions across fix rounds and reports bounded progress", async () => {
   const f = await convergeFixture(CONVERGE_SCRIPT("independentReview: true,"), [REQUEST_CHANGES, APPROVE]);
+
   try {
     const value = await runWorkflowSandbox(f.options);
     const result = value.result as {
-      ok: boolean; outcome: string; roundsAttempted: number; implementerJobId: string; reviewerJobId: string;
+      ok: boolean;
+      outcome: string;
+      roundsAttempted: number;
+      implementerJobId: string;
+      reviewerJobId: string;
       rounds: Array<{ round: number; verdict: string; actionableCount: number; fingerprint: string }>;
     };
     assert.equal(result.ok, true);
@@ -405,19 +535,32 @@ test("converge reuses both retained sessions across fix rounds and reports bound
     assert.equal(result.roundsAttempted, 2);
     assert.equal(result.implementerJobId, "job-implementer");
     assert.equal(result.reviewerJobId, "job-reviewer");
-    assert.deepEqual(result.rounds.map((round) => [round.round, round.verdict, round.actionableCount]), [
-      [1, "request_changes", 1],
-      [2, "approve", 0],
-    ]);
+    assert.deepEqual(
+      result.rounds.map((round) => [round.round, round.verdict, round.actionableCount]),
+      [
+        [1, "request_changes", 1],
+        [2, "approve", 0],
+      ],
+    );
 
     assert.equal(f.agentCalls.length, 2, "only the first round starts fresh children");
     assert.equal(f.agentCalls[1]?.options.access, "readOnly", "the reviewer is always read-only");
     assert.equal(f.agentCalls[1]?.options.independentOf, "job-implementer");
     assert.ok(f.agentCalls[1]?.options.schema, "every review is schema-validated");
-    assert.deepEqual(f.followUps.map((call) => call.jobId), ["job-implementer", "job-reviewer"]);
+    assert.deepEqual(
+      f.followUps.map((call) => call.jobId),
+      ["job-implementer", "job-reviewer"],
+    );
     assert.match(f.followUps[0]!.prompt, /\[blocker\] F1 \(src\/a\.ts:12\): guard the null case/);
-    assert.ok(!f.followUps[0]!.prompt.includes("implement it"), "only bounded review evidence goes back to the implementer");
-    assert.deepEqual(f.followUps[1]!.options, { schema: f.agentCalls[1]!.options.schema }, "portable re-reviews repeat the same schema");
+    assert.ok(
+      !f.followUps[0]!.prompt.includes("implement it"),
+      "only bounded review evidence goes back to the implementer",
+    );
+    assert.deepEqual(
+      f.followUps[1]!.options,
+      { schema: f.agentCalls[1]!.options.schema },
+      "portable re-reviews repeat the same schema",
+    );
     assert.deepEqual(f.phases, ["implement 1", "review 1", "fix 1", "review 2"]);
 
     const terminal = f.convergence.at(-1)!;
@@ -426,8 +569,13 @@ test("converge reuses both retained sessions across fix rounds and reports bound
     assert.equal(terminal.round, 2);
     assert.equal(terminal.maxRounds, 3);
     assert.match(terminal.stoppingReason ?? "", /approved in round 2/);
-    assert.ok(f.convergence.some((entry) => entry.state === "running"), "progress is reported while the loop runs");
-  } finally { await cleanup(f.cwd); }
+    assert.ok(
+      f.convergence.some((entry) => entry.state === "running"),
+      "progress is reported while the loop runs",
+    );
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("converge never turns missing, malformed, or unactionable review structure into approval", async () => {
@@ -436,19 +584,46 @@ test("converge never turns missing, malformed, or unactionable review structure 
     [{ verdict: "approve" }, /summary must be a non-empty string/],
     [{ verdict: "looks-good", summary: "fine", findings: [] }, /verdict must be approve/],
     [{ verdict: "request_changes", summary: "s", findings: [] }, /without reporting an actionable finding/],
-    [{ verdict: "request_changes", summary: "s", findings: [{ id: "F1", severity: "blocker", body: "a" }, { id: "F1", severity: "issue", body: "b" }] }, /ids must be unique/],
-    [{ verdict: "request_changes", summary: "s", findings: [{ id: "F1", severity: "nit", body: "a" }] }, /unknown severity/],
-    [{ verdict: "request_changes", summary: "s", findings: [{ id: "S1", severity: "suggestion", body: "a" }] }, /all suggestions/],
-    [{ verdict: "approve", summary: "s", findings: [{ id: "F1", severity: "issue", body: "still broken" }] }, /approved while still reporting 1 actionable finding/],
+    [
+      {
+        verdict: "request_changes",
+        summary: "s",
+        findings: [
+          { id: "F1", severity: "blocker", body: "a" },
+          { id: "F1", severity: "issue", body: "b" },
+        ],
+      },
+      /ids must be unique/,
+    ],
+    [
+      { verdict: "request_changes", summary: "s", findings: [{ id: "F1", severity: "nit", body: "a" }] },
+      /unknown severity/,
+    ],
+    [
+      { verdict: "request_changes", summary: "s", findings: [{ id: "S1", severity: "suggestion", body: "a" }] },
+      /all suggestions/,
+    ],
+    [
+      { verdict: "approve", summary: "s", findings: [{ id: "F1", severity: "issue", body: "still broken" }] },
+      /approved while still reporting 1 actionable finding/,
+    ],
   ];
+
   for (const [structured, pattern] of cases) {
     const f = await convergeFixture(CONVERGE_SCRIPT(), [structured]);
+
     try {
-      const result = (await runWorkflowSandbox(f.options)).result as { ok: boolean; outcome: string; stoppingReason: string };
+      const result = (await runWorkflowSandbox(f.options)).result as {
+        ok: boolean;
+        outcome: string;
+        stoppingReason: string;
+      };
       assert.equal(result.ok, false, `${JSON.stringify(structured)} must not approve`);
       assert.equal(result.outcome, "failed");
       assert.match(result.stoppingReason, pattern);
-    } finally { await cleanup(f.cwd); }
+    } finally {
+      await cleanup(f.cwd);
+    }
   }
 
   const approvalWithAdvisorySuggestion = {
@@ -457,17 +632,28 @@ test("converge never turns missing, malformed, or unactionable review structure 
     findings: [{ id: "S1", severity: "suggestion", body: "rename the helper" }],
   };
   const advisory = await convergeFixture(CONVERGE_SCRIPT(), [approvalWithAdvisorySuggestion]);
+
   try {
     const result = (await runWorkflowSandbox(advisory.options)).result as { outcome: string };
     assert.equal(result.outcome, "approved", "a suggestion stays advisory under the default policy");
-  } finally { await cleanup(advisory.cwd); }
+  } finally {
+    await cleanup(advisory.cwd);
+  }
 
-  const optedInSuggestion = await convergeFixture(CONVERGE_SCRIPT("includeSuggestions: true,"), [approvalWithAdvisorySuggestion]);
+  const optedInSuggestion = await convergeFixture(CONVERGE_SCRIPT("includeSuggestions: true,"), [
+    approvalWithAdvisorySuggestion,
+  ]);
+
   try {
-    const result = (await runWorkflowSandbox(optedInSuggestion.options)).result as { outcome: string; stoppingReason: string };
+    const result = (await runWorkflowSandbox(optedInSuggestion.options)).result as {
+      outcome: string;
+      stoppingReason: string;
+    };
     assert.equal(result.outcome, "failed");
     assert.match(result.stoppingReason, /approved while still reporting 1 actionable finding/);
-  } finally { await cleanup(optedInSuggestion.cwd); }
+  } finally {
+    await cleanup(optedInSuggestion.cwd);
+  }
 });
 
 test("converge keeps every actionable finding in the bounded fix evidence", async () => {
@@ -478,47 +664,92 @@ test("converge keeps every actionable finding in the bounded fix evidence", asyn
     filePath: `src/${"nested/".repeat(80)}file-${index + 1}.ts`,
     startLine: index + 1,
   }));
-  const f = await convergeFixture(CONVERGE_SCRIPT(), [{ verdict: "request_changes", summary: "many findings", findings }, APPROVE]);
+  const f = await convergeFixture(CONVERGE_SCRIPT(), [
+    { verdict: "request_changes", summary: "many findings", findings },
+    APPROVE,
+  ]);
+
   try {
     await runWorkflowSandbox(f.options);
     const prompt = f.followUps[0]!.prompt;
     assert.ok(prompt.length <= 8192, "fix evidence stays inside its documented prompt bound");
+
     for (const [index, finding] of findings.entries()) {
-      assert.match(prompt, new RegExp(`\\[issue\\] ${finding.id}.*finding ${index + 1}`), `${finding.id} retains its actionable body`);
+      assert.match(
+        prompt,
+        new RegExp(`\\[issue\\] ${finding.id}.*finding ${index + 1}`),
+        `${finding.id} retains its actionable body`,
+      );
     }
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("converge stops a stalled loop by default and honours an explicit stall tolerance", async () => {
   const repeated = [REQUEST_CHANGES, REQUEST_CHANGES, REQUEST_CHANGES];
   const stalled = await convergeFixture(CONVERGE_SCRIPT(), repeated);
+
   try {
-    const result = (await runWorkflowSandbox(stalled.options)).result as { outcome: string; roundsAttempted: number; rounds: Array<{ fingerprint: string }>; stoppingReason: string };
+    const result = (await runWorkflowSandbox(stalled.options)).result as {
+      outcome: string;
+      roundsAttempted: number;
+      rounds: Array<{ fingerprint: string }>;
+      stoppingReason: string;
+    };
     assert.equal(result.outcome, "stalled");
     assert.equal(result.roundsAttempted, 2);
-    assert.equal(result.rounds[0]!.fingerprint, result.rounds[1]!.fingerprint, "the repeated finding set keeps its fingerprint");
+    assert.equal(
+      result.rounds[0]!.fingerprint,
+      result.rounds[1]!.fingerprint,
+      "the repeated finding set keeps its fingerprint",
+    );
     assert.match(result.stoppingReason, /repeated the same 1 unresolved finding/);
-  } finally { await cleanup(stalled.cwd); }
+  } finally {
+    await cleanup(stalled.cwd);
+  }
 
   const tolerant = await convergeFixture(CONVERGE_SCRIPT("stallTolerance: 1,"), repeated);
+
   try {
-    const result = (await runWorkflowSandbox(tolerant.options)).result as { outcome: string; roundsAttempted: number; finalReview: { verdict: string } };
+    const result = (await runWorkflowSandbox(tolerant.options)).result as {
+      outcome: string;
+      roundsAttempted: number;
+      finalReview: { verdict: string };
+    };
     assert.equal(result.outcome, "stalled", "one tolerated repeat buys exactly one more round");
     assert.equal(result.roundsAttempted, 3);
     assert.equal(result.finalReview.verdict, "request_changes", "the last review is preserved as evidence");
-  } finally { await cleanup(tolerant.cwd); }
+  } finally {
+    await cleanup(tolerant.cwd);
+  }
 
-  const bounded = await convergeFixture(`
+  const bounded = await convergeFixture(
+    `
     export default async () => converge({ maxRounds: 2, implement: "implement it", review: "review it" });
-  `, [REQUEST_CHANGES, { ...REQUEST_CHANGES, findings: [{ id: "F2", severity: "issue", body: "another problem" }] }]);
+  `,
+    [REQUEST_CHANGES, { ...REQUEST_CHANGES, findings: [{ id: "F2", severity: "issue", body: "another problem" }] }],
+  );
+
   try {
-    const result = (await runWorkflowSandbox(bounded.options)).result as { ok: boolean; outcome: string; roundsAttempted: number; stoppingReason: string; finalReview: { findings: Array<{ id: string }> } };
+    const result = (await runWorkflowSandbox(bounded.options)).result as {
+      ok: boolean;
+      outcome: string;
+      roundsAttempted: number;
+      stoppingReason: string;
+      finalReview: { findings: Array<{ id: string }> };
+    };
     assert.equal(result.ok, false);
     assert.equal(result.outcome, "limit-reached", "progressing rounds still stop at the configured maximum");
     assert.equal(result.roundsAttempted, 2);
     assert.match(result.stoppingReason, /maximum of 2 round\(s\)/);
-    assert.deepEqual(result.finalReview.findings.map((finding) => finding.id), ["F2"]);
-  } finally { await cleanup(bounded.cwd); }
+    assert.deepEqual(
+      result.finalReview.findings.map((finding) => finding.id),
+      ["F2"],
+    );
+  } finally {
+    await cleanup(bounded.cwd);
+  }
 });
 
 test("converge counts suggestions only when the workflow opts in", async () => {
@@ -531,18 +762,29 @@ test("converge counts suggestions only when the workflow opts in", async () => {
     ],
   };
   const strict = await convergeFixture(CONVERGE_SCRIPT(), [review, APPROVE]);
+
   try {
     const result = (await runWorkflowSandbox(strict.options)).result as { rounds: Array<{ actionableCount: number }> };
     assert.equal(result.rounds[0]!.actionableCount, 1);
-    assert.ok(!strict.followUps[0]!.prompt.includes("rename the helper"), "advisory suggestions stay out of the fix prompt");
-  } finally { await cleanup(strict.cwd); }
+    assert.ok(
+      !strict.followUps[0]!.prompt.includes("rename the helper"),
+      "advisory suggestions stay out of the fix prompt",
+    );
+  } finally {
+    await cleanup(strict.cwd);
+  }
 
   const inclusive = await convergeFixture(CONVERGE_SCRIPT("includeSuggestions: true,"), [review, APPROVE]);
+
   try {
-    const result = (await runWorkflowSandbox(inclusive.options)).result as { rounds: Array<{ actionableCount: number }> };
+    const result = (await runWorkflowSandbox(inclusive.options)).result as {
+      rounds: Array<{ actionableCount: number }>;
+    };
     assert.equal(result.rounds[0]!.actionableCount, 2);
     assert.match(inclusive.followUps[0]!.prompt, /rename the helper/);
-  } finally { await cleanup(inclusive.cwd); }
+  } finally {
+    await cleanup(inclusive.cwd);
+  }
 });
 
 test("converge validates its contract before dispatching any call", async () => {
@@ -551,24 +793,41 @@ test("converge validates its contract before dispatching any call", async () => 
     [`converge({ implement: "a", review: "b", maxRounds: 0 })`, /maxRounds must be an integer from 1 to 16/],
     [`converge({ implement: "a", review: "b", maxRounds: 17 })`, /maxRounds must be an integer from 1 to 16/],
     [`converge({ implement: "", review: "b" })`, /implement requires a non-empty prompt/],
-    [`converge({ implement: "a", review: { prompt: "b", options: { access: "full" } } })`, /reviewers are always access/],
-    [`converge({ implement: "a", review: { prompt: "b", options: { schema: { type: "object" } } } })`, /do not pass a review schema/],
-    [`converge({ implement: { prompt: "a", options: { isolation: "worktree" } }, review: "b" })`, /cannot use isolation/],
-    [`converge({ implement: "a", review: { prompt: "b", options: { phase: "distinct review" } } })`, /review options cannot set phase/],
+    [
+      `converge({ implement: "a", review: { prompt: "b", options: { access: "full" } } })`,
+      /reviewers are always access/,
+    ],
+    [
+      `converge({ implement: "a", review: { prompt: "b", options: { schema: { type: "object" } } } })`,
+      /do not pass a review schema/,
+    ],
+    [
+      `converge({ implement: { prompt: "a", options: { isolation: "worktree" } }, review: "b" })`,
+      /cannot use isolation/,
+    ],
+    [
+      `converge({ implement: "a", review: { prompt: "b", options: { phase: "distinct review" } } })`,
+      /review options cannot set phase/,
+    ],
     [`converge({ implement: "a", review: "b", stallTolerance: 9 })`, /stallTolerance must be an integer from 0 to 4/],
   ];
+
   for (const [expression, pattern] of cases) {
     const f = await convergeFixture(`export default async () => ${expression};`, [APPROVE]);
+
     try {
       await assert.rejects(runWorkflowSandbox(f.options), pattern, expression);
       assert.equal(f.agentCalls.length, 0, `${expression} must be rejected before dispatch`);
       assert.deepEqual(f.phases, []);
-    } finally { await cleanup(f.cwd); }
+    } finally {
+      await cleanup(f.cwd);
+    }
   }
 });
 
 test("converge stops with limit-reached when the run cannot fund another round", async () => {
-  const f = await convergeFixture(`
+  const f = await convergeFixture(
+    `
     export default async () => {
       for (let index = 0; index < 28; index++) await agent("burn " + index, { name: "burn" });
       return converge({
@@ -577,56 +836,96 @@ test("converge stops with limit-reached when the run cannot fund another round",
         review: "review it",
       });
     }
-  `, [REQUEST_CHANGES, { ...REQUEST_CHANGES, findings: [{ id: "F9", severity: "issue", body: "a different problem" }] }]);
+  `,
+    [REQUEST_CHANGES, { ...REQUEST_CHANGES, findings: [{ id: "F9", severity: "issue", body: "a different problem" }] }],
+  );
+
   try {
-    const result = (await runWorkflowSandbox(f.options)).result as { outcome: string; roundsAttempted: number; stoppingReason: string; finalReview: { verdict: string } };
+    const result = (await runWorkflowSandbox(f.options)).result as {
+      outcome: string;
+      roundsAttempted: number;
+      stoppingReason: string;
+      finalReview: { verdict: string };
+    };
     assert.equal(result.outcome, "limit-reached");
     assert.equal(result.roundsAttempted, 2, "two rounds fit in the four remaining agent calls");
     assert.match(result.stoppingReason, /fewer than two agent calls left/);
     assert.equal(result.finalReview.verdict, "request_changes", "the last review survives the limit");
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("converge preflights the configured call budget before starting a fix without its review", async () => {
   const f = await convergeFixture(CONVERGE_SCRIPT(), [REQUEST_CHANGES]);
   f.options.maxAgentCalls = 3;
+
   try {
-    const result = (await runWorkflowSandbox(f.options)).result as { outcome: string; roundsAttempted: number; stoppingReason: string };
+    const result = (await runWorkflowSandbox(f.options)).result as {
+      outcome: string;
+      roundsAttempted: number;
+      stoppingReason: string;
+    };
     assert.equal(result.outcome, "limit-reached");
     assert.equal(result.roundsAttempted, 1);
     assert.match(result.stoppingReason, /fewer than two agent calls left/);
     assert.deepEqual(f.followUps, [], "the implementer is not mutated when no matching review call can fit");
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("converge preflights the manager's 64 unique-phase cap", async () => {
-  const f = await convergeFixture(`
+  const f = await convergeFixture(
+    `
     export default async () => {
       for (let index = 0; index < 63; index++) phase("prior " + index);
       return converge({ maxRounds: 2, implement: "implement", review: "review" });
     };
-  `, [APPROVE]);
+  `,
+    [APPROVE],
+  );
+
   try {
-    const result = (await runWorkflowSandbox(f.options)).result as { outcome: string; roundsAttempted: number; stoppingReason: string };
+    const result = (await runWorkflowSandbox(f.options)).result as {
+      outcome: string;
+      roundsAttempted: number;
+      stoppingReason: string;
+    };
     assert.equal(result.outcome, "limit-reached");
     assert.equal(result.roundsAttempted, 0);
     assert.match(result.stoppingReason, /fewer than two workflow phase slots left/);
     assert.deepEqual(f.agentCalls, [], "phase exhaustion is detected before the mutating implementation call");
     assert.equal(f.phases.length, 63);
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });
 
 test("converge reports a budget-refused call as limit-reached rather than a failure", async () => {
   const f = await fixture(CONVERGE_SCRIPT(), {
-    onAgent: async (_prompt, options) => options.schema
-      ? { ok: true, output: "reviewed", jobId: "job-reviewer", structured: REQUEST_CHANGES }
-      : { ok: true, output: "implemented", jobId: "job-implementer" },
-    onFollowUp: async () => ({ ok: false, output: "", error: "Workflow token budget exhausted (10/10)", limit: "budget" as const }),
+    onAgent: async (_prompt, options) =>
+      options.schema
+        ? { ok: true, output: "reviewed", jobId: "job-reviewer", structured: REQUEST_CHANGES }
+        : { ok: true, output: "implemented", jobId: "job-implementer" },
+    onFollowUp: async () => ({
+      ok: false,
+      output: "",
+      error: "Workflow token budget exhausted (10/10)",
+      limit: "budget" as const,
+    }),
   });
+
   try {
-    const result = (await runWorkflowSandbox(f.options)).result as { outcome: string; stoppingReason: string; finalReview: { verdict: string } };
+    const result = (await runWorkflowSandbox(f.options)).result as {
+      outcome: string;
+      stoppingReason: string;
+      finalReview: { verdict: string };
+    };
     assert.equal(result.outcome, "limit-reached");
     assert.match(result.stoppingReason, /token budget exhausted/);
     assert.equal(result.finalReview.verdict, "request_changes");
-  } finally { await cleanup(f.cwd); }
+  } finally {
+    await cleanup(f.cwd);
+  }
 });

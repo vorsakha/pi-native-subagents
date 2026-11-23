@@ -1,9 +1,10 @@
+import type { CapabilityHealth, CapabilitySourceStatus, DiscoveredCapability } from "./capabilities.ts";
 import type {
-  CapabilityHealth,
-  CapabilitySourceStatus,
-  DiscoveredCapability,
-} from "./capabilities.ts";
-import type { InteractionHandler, InteractionTargetKind, JobInteractionPolicy, PendingInteraction } from "./interactions.ts";
+  InteractionHandler,
+  InteractionTargetKind,
+  JobInteractionPolicy,
+  PendingInteraction,
+} from "./interactions.ts";
 import type { ParentThreadSnapshot } from "./parent-thread-context.ts";
 import type { SpendBudget } from "./budget.ts";
 import type { ProviderUnavailability } from "./provider-unavailability.ts";
@@ -63,7 +64,15 @@ export type BackendEvent =
   | { type: "message"; text: string; at?: number }
   | { type: "queue_changed"; messages: QueuedMessage[]; at?: number }
   | { type: "tool_start"; id: string; name: string; args?: Record<string, unknown>; summary?: string; at?: number }
-  | { type: "tool_end"; id: string; name?: string; result?: ToolResultSnapshot; output?: string; error?: boolean; at?: number }
+  | {
+      type: "tool_end";
+      id: string;
+      name?: string;
+      result?: ToolResultSnapshot;
+      output?: string;
+      error?: boolean;
+      at?: number;
+    }
   | { type: "usage"; usage: Partial<Usage>; at?: number }
   | { type: "context"; context: ContextSnapshot; at?: number }
   /** `structured` is the authoritative terminal payload from a provider-native structured-result channel; present only when `BackendPolicy.structuredOutput` was requested and the runtime honored it. */
@@ -77,7 +86,11 @@ export type BackendEvent =
   /** The job's pending question is no longer displayable; the caller resumed. */
   | { type: "interaction_cleared"; requestId: string; at?: number }
   /** This job's retained session started or finished producing a peer answer. */
-  | { type: "interaction_answering"; answering?: { requestId: string; sourceJobId: string; sourceName: string }; at?: number };
+  | {
+      type: "interaction_answering";
+      answering?: { requestId: string; sourceJobId: string; sourceName: string };
+      at?: number;
+    };
 
 /** Bounded JSON Schema a caller wants a provider-native terminal channel to validate and return, instead of prompt/parse text extraction. Workflow-internal only; never a model-facing tool field. */
 export interface StructuredOutputPolicy {

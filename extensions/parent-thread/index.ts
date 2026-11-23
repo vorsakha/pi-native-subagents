@@ -16,13 +16,26 @@ export default function parentThreadChildExtension(pi: ExtensionAPI): void {
 }
 
 export function registerParentThreadChildTool(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env): void {
-  if (env[PI_CHILD_MARKER] !== "1") return;
+  if (env[PI_CHILD_MARKER] !== "1") {
+    return;
+  }
+
   const snapshotPath = env[PI_PARENT_THREAD_FILE];
-  if (!snapshotPath) return;
+
+  if (!snapshotPath) {
+    return;
+  }
+
   const snapshot = JSON.parse(readFileSync(snapshotPath, "utf8")) as ParentThreadSnapshot;
-  if (!Array.isArray(snapshot.messages) || typeof snapshot.capturedAt !== "number" || typeof snapshot.totalMessages !== "number") {
+
+  if (
+    !Array.isArray(snapshot.messages) ||
+    typeof snapshot.capturedAt !== "number" ||
+    typeof snapshot.totalMessages !== "number"
+  ) {
     throw new Error("Invalid parent-thread snapshot");
   }
+
   pi.registerTool({
     name: PARENT_THREAD_TOOL_NAME,
     label: "Parent Thread Context",
@@ -35,7 +48,11 @@ export function registerParentThreadChildTool(pi: ExtensionAPI, env: NodeJS.Proc
     async execute(_id, params) {
       return {
         content: [{ type: "text" as const, text: renderParentThreadContext(snapshot, params) }],
-        details: { capturedAt: snapshot.capturedAt, retainedMessages: snapshot.messages.length, totalMessages: snapshot.totalMessages },
+        details: {
+          capturedAt: snapshot.capturedAt,
+          retainedMessages: snapshot.messages.length,
+          totalMessages: snapshot.totalMessages,
+        },
       };
     },
   });

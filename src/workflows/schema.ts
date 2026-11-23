@@ -13,83 +13,205 @@ export const SCHEMA_MISMATCH = "Agent output did not match the requested JSON Sc
  * portable prompt/parse fallback, so both transports enforce the same policy.
  */
 export function workflowSchema(value: unknown): TSchema | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+
   const types = new Set(["null", "boolean", "object", "array", "number", "integer", "string"]);
-  const annotations = new Set(["$id", "$schema", "title", "description", "default", "examples", "readOnly", "writeOnly"]);
-  const numeric = new Set(["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"]);
+  const annotations = new Set([
+    "$id",
+    "$schema",
+    "title",
+    "description",
+    "default",
+    "examples",
+    "readOnly",
+    "writeOnly",
+  ]);
+  const numeric = new Set([
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "multipleOf",
+    "minLength",
+    "maxLength",
+    "minItems",
+    "maxItems",
+    "minProperties",
+    "maxProperties",
+  ]);
   const nonnegative = new Set(["minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"]);
   const seen = new WeakSet<object>();
   let nodes = 0;
   const schema = (current: unknown, depth: number): boolean => {
-    if (current === true || current === false) return true;
-    if (!current || typeof current !== "object" || Array.isArray(current) || seen.has(current) || ++nodes > 2_000 || depth > 16) return false;
+    if (current === true || current === false) {
+      return true;
+    }
+
+    if (
+      !current ||
+      typeof current !== "object" ||
+      Array.isArray(current) ||
+      seen.has(current) ||
+      ++nodes > 2_000 ||
+      depth > 16
+    ) {
+      return false;
+    }
+
     seen.add(current);
     let constraint = false;
+
     for (const [key, item] of Object.entries(current)) {
-      if (["__proto__", "prototype", "constructor", "$ref", "$dynamicRef"].includes(key)) return false;
+      if (["__proto__", "prototype", "constructor", "$ref", "$dynamicRef"].includes(key)) {
+        return false;
+      }
+
       if (annotations.has(key)) {
-        if (["$id", "$schema", "title", "description"].includes(key) && typeof item !== "string") return false;
+        if (["$id", "$schema", "title", "description"].includes(key) && typeof item !== "string") {
+          return false;
+        }
+
         continue;
       }
+
       if (key === "type") {
         const values = Array.isArray(item) ? item : [item];
-        if (!values.length || !values.every((entry) => typeof entry === "string" && types.has(entry))) return false;
+
+        if (!values.length || !values.every((entry) => typeof entry === "string" && types.has(entry))) {
+          return false;
+        }
+
         constraint = true;
       } else if (["properties", "patternProperties", "$defs", "dependentSchemas"].includes(key)) {
-        if (!item || typeof item !== "object" || Array.isArray(item) || !Object.values(item).every((entry) => schema(entry, depth + 1))) return false;
+        if (
+          !item ||
+          typeof item !== "object" ||
+          Array.isArray(item) ||
+          !Object.values(item).every((entry) => schema(entry, depth + 1))
+        ) {
+          return false;
+        }
+
         constraint = true;
-      } else if (["items", "contains", "additionalProperties", "unevaluatedProperties", "propertyNames", "not", "if", "then", "else"].includes(key)) {
-        if (!schema(item, depth + 1)) return false;
+      } else if (
+        [
+          "items",
+          "contains",
+          "additionalProperties",
+          "unevaluatedProperties",
+          "propertyNames",
+          "not",
+          "if",
+          "then",
+          "else",
+        ].includes(key)
+      ) {
+        if (!schema(item, depth + 1)) {
+          return false;
+        }
+
         constraint = true;
       } else if (["allOf", "anyOf", "oneOf", "prefixItems"].includes(key)) {
-        if (!Array.isArray(item) || !item.length || !item.every((entry) => schema(entry, depth + 1))) return false;
+        if (!Array.isArray(item) || !item.length || !item.every((entry) => schema(entry, depth + 1))) {
+          return false;
+        }
+
         constraint = true;
       } else if (key === "required" || key === "dependentRequired") {
-        const valid = key === "required"
-          ? Array.isArray(item) && item.every((entry) => typeof entry === "string")
-          : !!item && typeof item === "object" && !Array.isArray(item) && Object.values(item).every((entry) => Array.isArray(entry) && entry.every((name) => typeof name === "string"));
-        if (!valid) return false;
+        const valid =
+          key === "required"
+            ? Array.isArray(item) && item.every((entry) => typeof entry === "string")
+            : !!item &&
+              typeof item === "object" &&
+              !Array.isArray(item) &&
+              Object.values(item).every(
+                (entry) => Array.isArray(entry) && entry.every((name) => typeof name === "string"),
+              );
+
+        if (!valid) {
+          return false;
+        }
+
         constraint = true;
       } else if (key === "enum") {
-        if (!Array.isArray(item) || !item.length) return false;
+        if (!Array.isArray(item) || !item.length) {
+          return false;
+        }
+
         constraint = true;
       } else if (key === "const") {
         constraint = true;
       } else if (numeric.has(key)) {
-        if (typeof item !== "number" || !Number.isFinite(item) || nonnegative.has(key) && (!Number.isInteger(item) || item < 0) || key === "multipleOf" && item <= 0) return false;
+        if (
+          typeof item !== "number" ||
+          !Number.isFinite(item) ||
+          (nonnegative.has(key) && (!Number.isInteger(item) || item < 0)) ||
+          (key === "multipleOf" && item <= 0)
+        ) {
+          return false;
+        }
+
         constraint = true;
       } else if (key === "pattern") {
-        if (typeof item !== "string") return false;
-        try { new RegExp(item); } catch { return false; }
+        if (typeof item !== "string") {
+          return false;
+        }
+
+        try {
+          new RegExp(item);
+        } catch {
+          return false;
+        }
+
         constraint = true;
       } else if (key === "format") {
-        if (typeof item !== "string") return false;
+        if (typeof item !== "string") {
+          return false;
+        }
+
         constraint = true;
       } else if (key === "uniqueItems") {
-        if (typeof item !== "boolean") return false;
+        if (typeof item !== "boolean") {
+          return false;
+        }
+
         constraint = true;
       } else {
         return false;
       }
     }
+
     seen.delete(current);
+
     return constraint;
   };
-  return schema(value, 0) ? value as TSchema : undefined;
+
+  return schema(value, 0) ? (value as TSchema) : undefined;
 }
 
 /** Fallback text extraction: strips a markdown fence, if present, and parses the remainder as JSON. Never used on a native transport's authoritative terminal payload. */
 export function parseStructuredOutput(output: string): unknown {
   const text = output.trim();
-  const candidate = text.startsWith("```")
-    ? text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "")
-    : text;
-  try { return JSON.parse(candidate); } catch { return undefined; }
+  const candidate = text.startsWith("```") ? text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "") : text;
+
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return undefined;
+  }
 }
 
 /** Validates an already-parsed value (native terminal payload) or `undefined` (missing) against the bounded schema. Shared by both transports so an invalid or missing payload fails identically either way. */
-export function validateWorkflowStructured(schema: TSchema, value: unknown): { ok: true; value: unknown } | { ok: false; error: string } {
-  if (value === undefined || !Check(schema, value)) return { ok: false, error: SCHEMA_MISMATCH };
+export function validateWorkflowStructured(
+  schema: TSchema,
+  value: unknown,
+): { ok: true; value: unknown } | { ok: false; error: string } {
+  if (value === undefined || !Check(schema, value)) {
+    return { ok: false, error: SCHEMA_MISMATCH };
+  }
+
   return { ok: true, value };
 }
 
@@ -106,9 +228,14 @@ export function resolveWorkflowStructured(
 ): { ok: true; value: unknown } | { ok: false; error: string } {
   if (transport === "native") {
     if (final.structured === undefined) {
-      return { ok: false, error: "Native structured output was requested but the runtime reported no terminal structured result" };
+      return {
+        ok: false,
+        error: "Native structured output was requested but the runtime reported no terminal structured result",
+      };
     }
+
     return validateWorkflowStructured(schema, final.structured);
   }
+
   return validateWorkflowStructured(schema, parseStructuredOutput(final.output));
 }

@@ -13,14 +13,30 @@ import type {
 const FINGERPRINT_VERSION = "workflow-v1";
 
 export function canonicalJson(value: unknown): string {
-  if (value === null) return "null";
-  if (typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
-  if (typeof value === "number") return Number.isFinite(value) ? JSON.stringify(value) : "null";
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
-  if (typeof value !== "object") throw new TypeError("Workflow fingerprint values must be JSON-compatible");
+  if (value === null) {
+    return "null";
+  }
+
+  if (typeof value === "string" || typeof value === "boolean") {
+    return JSON.stringify(value);
+  }
+
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? JSON.stringify(value) : "null";
+  }
+
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+
+  if (typeof value !== "object") {
+    throw new TypeError("Workflow fingerprint values must be JSON-compatible");
+  }
+
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, item]) => item !== undefined)
-    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0);
+    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+
   return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
 }
 
@@ -36,13 +52,21 @@ function fingerprint(kind: string, value: unknown): string {
 
 export function workflowCallFingerprint(prompt: string, options: Record<string, unknown>): string {
   const canonicalOptions = { ...options };
-  if (canonicalOptions.speed === "standard") delete canonicalOptions.speed;
+
+  if (canonicalOptions.speed === "standard") {
+    delete canonicalOptions.speed;
+  }
+
   return fingerprint("agent-call", { options: canonicalOptions, prompt });
 }
 
 /** Binds prompt, options, and the exact retained target so a follow-up cannot
  * replay against a different job than the one it originally continued. */
-export function workflowFollowUpFingerprint(input: { jobId: string; prompt: string; options: Record<string, unknown> }): string {
+export function workflowFollowUpFingerprint(input: {
+  jobId: string;
+  prompt: string;
+  options: Record<string, unknown>;
+}): string {
   return fingerprint("followup-call", { jobId: input.jobId, options: input.options, prompt: input.prompt });
 }
 
@@ -81,11 +105,13 @@ function callKind(record: WorkflowJournalRecord): "agent" | "followUp" {
 
 function routeIdentity(route: WorkflowJournalRoute): Omit<WorkflowJournalRoute, "continuation" | "effectiveSpeed"> {
   const { continuation: _continuation, effectiveSpeed: _effectiveSpeed, ...identity } = route;
+
   return identity;
 }
 
 function usageContainsAttempt(progress: WorkflowContinuationProgress): boolean {
   const keys = ["input", "output", "cacheRead", "cacheWrite", "cost", "turns"] as const;
+
   return keys.every((key) => progress.attemptUsage[key] <= progress.usage[key]);
 }
 
@@ -102,14 +128,27 @@ function continuationCheckpointsMatch(
   const handoff = handoffRecord.continuation;
   const progressRoute = progressRecord.route;
   const handoffRoute = handoffRecord.route;
-  if (!progress || !handoff || !progressRoute || !handoffRoute
-      || progressRecord.replayProof !== handoffRecord.replayProof
-      || progressRecord.replayUsageClaim !== handoffRecord.replayUsageClaim) return false;
-  if (callKind(progressRecord) !== callKind(handoffRecord)
-      || progressRecord.agentIndex !== progress.agentIndex
-      || handoffRecord.agentIndex !== handoff.agentIndex
-      || progress.agentIndex !== handoff.agentIndex
-      || !usageContainsAttempt(progress)) return false;
+
+  if (
+    !progress ||
+    !handoff ||
+    !progressRoute ||
+    !handoffRoute ||
+    progressRecord.replayProof !== handoffRecord.replayProof ||
+    progressRecord.replayUsageClaim !== handoffRecord.replayUsageClaim
+  ) {
+    return false;
+  }
+
+  if (
+    callKind(progressRecord) !== callKind(handoffRecord) ||
+    progressRecord.agentIndex !== progress.agentIndex ||
+    handoffRecord.agentIndex !== handoff.agentIndex ||
+    progress.agentIndex !== handoff.agentIndex ||
+    !usageContainsAttempt(progress)
+  ) {
+    return false;
+  }
 
   const progressProof = {
     agentIndex: progress.agentIndex,
@@ -129,23 +168,31 @@ function continuationCheckpointsMatch(
     attemptUsage: handoff.attemptUsage ?? handoff.usage,
     usage: handoff.usage,
   };
-  if (canonicalJson(progressProof) !== canonicalJson(handoffProof)
-      || canonicalJson(routeIdentity(progressRoute)) !== canonicalJson(routeIdentity(handoffRoute))) return false;
+
+  if (
+    canonicalJson(progressProof) !== canonicalJson(handoffProof) ||
+    canonicalJson(routeIdentity(progressRoute)) !== canonicalJson(routeIdentity(handoffRoute))
+  ) {
+    return false;
+  }
 
   const continuation = handoffRoute.continuation;
-  return progress.trigger.provider !== progress.target.harness
-    && progressRoute.continuation === undefined
-    && progressRoute.jobId === progress.failedJobId
-    && progressRoute.logicalJobId === (progress.logicalJobId ?? progress.failedJobId)
-    && progressRoute.harness === progress.trigger.provider
-    && canonicalJson(progressRoute.continuationFallback ?? null) === canonicalJson(progress.target)
-    && continuation?.state === "handoff"
-    && continuation.fromHarness === progress.trigger.provider
-    && continuation.toHarness === progress.target.harness
-    && continuation.failedJobId === progress.failedJobId
-    && continuation.replacementJobId === undefined
-    && continuation.checkoutDigest === handoff.checkout.digest
-    && canonicalJson(continuation.trigger) === canonicalJson(progress.trigger);
+
+  return (
+    progress.trigger.provider !== progress.target.harness &&
+    progressRoute.continuation === undefined &&
+    progressRoute.jobId === progress.failedJobId &&
+    progressRoute.logicalJobId === (progress.logicalJobId ?? progress.failedJobId) &&
+    progressRoute.harness === progress.trigger.provider &&
+    canonicalJson(progressRoute.continuationFallback ?? null) === canonicalJson(progress.target) &&
+    continuation?.state === "handoff" &&
+    continuation.fromHarness === progress.trigger.provider &&
+    continuation.toHarness === progress.target.harness &&
+    continuation.failedJobId === progress.failedJobId &&
+    continuation.replacementJobId === undefined &&
+    continuation.checkoutDigest === handoff.checkout.digest &&
+    canonicalJson(continuation.trigger) === canonicalJson(progress.trigger)
+  );
 }
 
 /**
@@ -162,11 +209,20 @@ function continuationTerminalMatches(
   const terminalRoute = terminalRecord.route;
   const authorized = handoffRoute?.continuation;
   const completed = terminalRoute?.continuation;
-  if (!handoff || !handoffRoute || !terminalRoute || !authorized || !completed
-      || terminalRecord.result?.ok !== true
-      || callKind(handoffRecord) !== callKind(terminalRecord)
-      || terminalRecord.agentIndex !== handoff.agentIndex
-      || terminalRecord.agentIndex !== handoffRecord.agentIndex) return false;
+
+  if (
+    !handoff ||
+    !handoffRoute ||
+    !terminalRoute ||
+    !authorized ||
+    !completed ||
+    terminalRecord.result?.ok !== true ||
+    callKind(handoffRecord) !== callKind(terminalRecord) ||
+    terminalRecord.agentIndex !== handoff.agentIndex ||
+    terminalRecord.agentIndex !== handoffRecord.agentIndex
+  ) {
+    return false;
+  }
 
   const logicalJobId = handoff.logicalJobId ?? handoff.failedJobId;
   const authorizedProvenance = {
@@ -174,19 +230,22 @@ function continuationTerminalMatches(
     state: "completed",
     replacementJobId: completed.replacementJobId,
   };
-  return authorized.state === "handoff"
-    && authorized.replacementJobId === undefined
-    && completed.state === "completed"
-    && typeof completed.replacementJobId === "string"
-    && completed.replacementJobId.length > 0
-    && canonicalJson(completed) === canonicalJson(authorizedProvenance)
-    && terminalRoute.jobId === completed.replacementJobId
-    && terminalRoute.logicalJobId === logicalJobId
-    && terminalRoute.harness === handoff.target.harness
-    && (terminalRoute.speed ?? "standard") === (handoffRoute.speed ?? "standard")
-    && terminalRecord.result.jobId === logicalJobId
-    && canonicalJson(terminalRoute.continuationFallback ?? null) === canonicalJson(handoff.target)
-    && (handoff.target.model === undefined || terminalRoute.model === handoff.target.model);
+
+  return (
+    authorized.state === "handoff" &&
+    authorized.replacementJobId === undefined &&
+    completed.state === "completed" &&
+    typeof completed.replacementJobId === "string" &&
+    completed.replacementJobId.length > 0 &&
+    canonicalJson(completed) === canonicalJson(authorizedProvenance) &&
+    terminalRoute.jobId === completed.replacementJobId &&
+    terminalRoute.logicalJobId === logicalJobId &&
+    terminalRoute.harness === handoff.target.harness &&
+    (terminalRoute.speed ?? "standard") === (handoffRoute.speed ?? "standard") &&
+    terminalRecord.result.jobId === logicalJobId &&
+    canonicalJson(terminalRoute.continuationFallback ?? null) === canonicalJson(handoff.target) &&
+    (handoff.target.model === undefined || terminalRoute.model === handoff.target.model)
+  );
 }
 
 export function workflowReplayReferenceKey(reference: { runId: string; callIndex: number }): string {
@@ -209,8 +268,15 @@ function localContinuationProof(
   progressRecord: WorkflowJournalRecord,
   handoffRecord: WorkflowJournalRecord,
 ): NonNullable<WorkflowReplayCall["continuationProof"]> | undefined {
-  if (!progressRecord.continuationProgress || !progressRecord.route
-      || !handoffRecord.continuation || !handoffRecord.route) return undefined;
+  if (
+    !progressRecord.continuationProgress ||
+    !progressRecord.route ||
+    !handoffRecord.continuation ||
+    !handoffRecord.route
+  ) {
+    return undefined;
+  }
+
   return {
     progress: structuredClone(progressRecord.continuationProgress),
     progressRoute: structuredClone(progressRecord.route),
@@ -224,16 +290,26 @@ function validatedReplayContinuationProof(
   replaySources: ReadonlyMap<string, WorkflowReplayCall>,
 ): NonNullable<WorkflowReplayCall["continuationProof"]> | undefined {
   const reference = record.replayedFrom;
-  if (!reference || record.agentIndex === undefined) return undefined;
+
+  if (!reference || record.agentIndex === undefined) {
+    return undefined;
+  }
+
   const source = replaySources.get(workflowReplayReferenceKey(reference));
-  if (!source?.continuationProof
-      || source.callIndex !== reference.callIndex
-      || source.fingerprint !== record.fingerprint
-      || source.kind !== callKind(record)
-      || canonicalJson(source.result) !== canonicalJson(record.result)
-      || canonicalJson(source.route ?? null) !== canonicalJson(record.route ?? null)) return undefined;
+
+  if (
+    !source?.continuationProof ||
+    source.callIndex !== reference.callIndex ||
+    source.fingerprint !== record.fingerprint ||
+    source.kind !== callKind(record) ||
+    canonicalJson(source.result) !== canonicalJson(record.result) ||
+    canonicalJson(source.route ?? null) !== canonicalJson(record.route ?? null)
+  ) {
+    return undefined;
+  }
 
   const proof = bindContinuationProof(source.continuationProof, record.agentIndex);
+
   return continuationProofMatchesTerminal(proof, record) ? proof : undefined;
 }
 
@@ -241,7 +317,10 @@ function continuationProofMatchesTerminal(
   proof: NonNullable<WorkflowReplayCall["continuationProof"]>,
   record: WorkflowJournalRecord,
 ): boolean {
-  if (record.agentIndex === undefined) return false;
+  if (record.agentIndex === undefined) {
+    return false;
+  }
+
   const handoffRecord: WorkflowJournalRecord = {
     version: 1,
     sequence: record.sequence,
@@ -254,6 +333,7 @@ function continuationProofMatchesTerminal(
     route: proof.handoffRoute,
     continuation: proof.handoff,
   };
+
   return continuationTerminalMatches(handoffRecord, record);
 }
 
@@ -281,57 +361,89 @@ export function replayableJournalCalls(
     // Peer questions carry their own ordinal namespace in `callIndex`; they are
     // replayed by `replayableJournalInteractions` and must never be confused
     // with the sandbox's contiguous agent()/followUp() ordinals.
-    if (record.kind === "peerQuestion") continue;
-    const priorStart = started.get(record.callIndex);
-    if (record.state === "started") {
-      if (priorStart || completed.has(record.callIndex)) invalid.add(record.callIndex);
-      else started.set(record.callIndex, record);
+    if (record.kind === "peerQuestion") {
       continue;
     }
+
+    const priorStart = started.get(record.callIndex);
+
+    if (record.state === "started") {
+      if (priorStart || completed.has(record.callIndex)) {
+        invalid.add(record.callIndex);
+      } else {
+        started.set(record.callIndex, record);
+      }
+
+      continue;
+    }
+
     if (record.state === "progressed") {
-      if (!priorStart || priorStart.fingerprint !== record.fingerprint || progressed.has(record.callIndex)
-          || callKind(priorStart) !== callKind(record) || handoffs.has(record.callIndex)
-          || completed.has(record.callIndex) || !record.continuationProgress) {
+      if (
+        !priorStart ||
+        priorStart.fingerprint !== record.fingerprint ||
+        progressed.has(record.callIndex) ||
+        callKind(priorStart) !== callKind(record) ||
+        handoffs.has(record.callIndex) ||
+        completed.has(record.callIndex) ||
+        !record.continuationProgress
+      ) {
         invalid.add(record.callIndex);
       } else {
         progressed.set(record.callIndex, record);
         durableProgressEvidence.set(record.callIndex, record);
       }
+
       continue;
     }
+
     if (record.state === "handoff") {
       const progress = progressed.get(record.callIndex);
+
       if (!priorStart || priorStart.fingerprint !== record.fingerprint || !record.continuation) {
         invalid.add(record.callIndex);
-      } else if (!progress || handoffs.has(record.callIndex) || completed.has(record.callIndex)
-          || rejectedTerminals.has(record.callIndex)
-          || !continuationCheckpointsMatch(progress, record)) {
+      } else if (
+        !progress ||
+        handoffs.has(record.callIndex) ||
+        completed.has(record.callIndex) ||
+        rejectedTerminals.has(record.callIndex) ||
+        !continuationCheckpointsMatch(progress, record)
+      ) {
         rejectedHandoffs.set(record.callIndex, record);
         handoffs.delete(record.callIndex);
         completed.delete(record.callIndex);
-      } else handoffs.set(record.callIndex, record);
+      } else {
+        handoffs.set(record.callIndex, record);
+      }
+
       continue;
     }
-    if (rejectedHandoffs.has(record.callIndex)) continue;
+
+    if (rejectedHandoffs.has(record.callIndex)) {
+      continue;
+    }
+
     if (!priorStart || priorStart.fingerprint !== record.fingerprint || completed.has(record.callIndex)) {
       invalid.add(record.callIndex);
       continue;
     }
+
     if (record.state === "completed" && record.result?.ok === true) {
       const progress = progressed.get(record.callIndex);
       const handoff = handoffs.get(record.callIndex);
       const carriesContinuation = record.route?.continuation !== undefined;
-      const localProof = progress && handoff && continuationTerminalMatches(handoff, record)
-        ? localContinuationProof(progress, handoff)
-        : undefined;
-      const replayProof = !progress && carriesContinuation
-        ? validatedReplayContinuationProof(record, replaySources)
-        : undefined;
-      const lineageProof = !progress && carriesContinuation && record.agentIndex !== undefined
-        ? acceptedLineageProofs
-          .map((proof) => bindContinuationProof(proof, record.agentIndex!))
-          .find((proof) => continuationProofMatchesTerminal(proof, record))
-        : undefined;
+      const localProof =
+        progress && handoff && continuationTerminalMatches(handoff, record)
+          ? localContinuationProof(progress, handoff)
+          : undefined;
+      const replayProof =
+        !progress && carriesContinuation ? validatedReplayContinuationProof(record, replaySources) : undefined;
+      const lineageProof =
+        !progress && carriesContinuation && record.agentIndex !== undefined
+          ? acceptedLineageProofs
+              .map((proof) => bindContinuationProof(proof, record.agentIndex!))
+              .find((proof) => continuationProofMatchesTerminal(proof, record))
+          : undefined;
+
       if ((carriesContinuation && !localProof && !replayProof && !lineageProof) || (progress && !localProof)) {
         rejectedTerminals.add(record.callIndex);
         rejectedContinuationTerminals.set(record.callIndex, record);
@@ -340,47 +452,76 @@ export function replayableJournalCalls(
       } else {
         completed.set(record.callIndex, record);
         const proof = localProof ?? replayProof ?? lineageProof;
-        if ((record.result.progressed === true || record.unsafeToReplay === true)) durableProgressEvidence.set(record.callIndex, record);
+
+        if (record.result.progressed === true || record.unsafeToReplay === true) {
+          durableProgressEvidence.set(record.callIndex, record);
+        }
+
         if (proof) {
           continuationProofs.set(record.callIndex, proof);
           acceptedLineageProofs.push(proof);
           durableProgressEvidence.set(record.callIndex, record);
         }
       }
-    }
-    else if (record.state === "failed" && record.result?.ok === false
-        && (progressed.has(record.callIndex) || handoffs.has(record.callIndex) || (record.result.progressed === true || record.unsafeToReplay === true))) {
+    } else if (
+      record.state === "failed" &&
+      record.result?.ok === false &&
+      (progressed.has(record.callIndex) ||
+        handoffs.has(record.callIndex) ||
+        record.result.progressed === true ||
+        record.unsafeToReplay === true)
+    ) {
       completed.set(record.callIndex, record);
-      if ((record.result.progressed === true || record.unsafeToReplay === true) || progressed.has(record.callIndex) || handoffs.has(record.callIndex)) {
+
+      if (
+        record.result.progressed === true ||
+        record.unsafeToReplay === true ||
+        progressed.has(record.callIndex) ||
+        handoffs.has(record.callIndex)
+      ) {
         durableProgressEvidence.set(record.callIndex, record);
       }
+    } else {
+      invalid.add(record.callIndex);
     }
-    else invalid.add(record.callIndex);
   }
 
   const replayable = new Map(completed);
+
   for (const [callIndex, record] of progressed) {
     const handoff = handoffs.get(callIndex);
-    if (!invalid.has(callIndex) && completed.has(callIndex)) continue;
-    if (!invalid.has(callIndex) && handoff && handoff.replayProof !== true) continue;
+
+    if (!invalid.has(callIndex) && completed.has(callIndex)) {
+      continue;
+    }
+
+    if (!invalid.has(callIndex) && handoff && handoff.replayProof !== true) {
+      continue;
+    }
+
     const progress = record.continuationProgress!;
     const route = record.route ? structuredClone(record.route) : undefined;
+
     if (route && !route.attempts?.length) {
-      route.attempts = [{
-        index: 0,
-        jobId: progress.failedJobId,
-        harness: progress.trigger.provider,
-        requestedHarness: progress.trigger.provider,
-        model: route.model,
-        error: route.error,
-        usage: { ...progress.attemptUsage },
-        disposition: "continuation",
-        trigger: { ...progress.trigger },
-      }];
+      route.attempts = [
+        {
+          index: 0,
+          jobId: progress.failedJobId,
+          harness: progress.trigger.provider,
+          requestedHarness: progress.trigger.provider,
+          model: route.model,
+          error: route.error,
+          usage: { ...progress.attemptUsage },
+          disposition: "continuation",
+          trigger: { ...progress.trigger },
+        },
+      ];
     }
-    const error = handoff?.replayProof === true
-      ? "Replayed continuation proof stopped before its terminal record; copied proof cannot authorize another replacement"
-      : "Progressed primary stopped before a safe continuation handoff; the original prompt was not replayed";
+
+    const error =
+      handoff?.replayProof === true
+        ? "Replayed continuation proof stopped before its terminal record; copied proof cannot authorize another replacement"
+        : "Progressed primary stopped before a safe continuation handoff; the original prompt was not replayed";
     replayable.set(callIndex, {
       ...record,
       state: "failed",
@@ -395,8 +536,12 @@ export function replayableJournalCalls(
     });
     failClosedProgress.add(callIndex);
   }
+
   for (const [callIndex, record] of durableProgressEvidence) {
-    if (!invalid.has(callIndex) || failClosedProgress.has(callIndex)) continue;
+    if (!invalid.has(callIndex) || failClosedProgress.has(callIndex)) {
+      continue;
+    }
+
     const usage = progressed.get(callIndex)?.continuationProgress?.usage ?? record.result?.usage;
     replayable.set(callIndex, {
       ...record,
@@ -412,8 +557,12 @@ export function replayableJournalCalls(
     });
     failClosedProgress.add(callIndex);
   }
+
   for (const [callIndex, record] of rejectedHandoffs) {
-    if (invalid.has(callIndex) || progressed.has(callIndex)) continue;
+    if (invalid.has(callIndex) || progressed.has(callIndex)) {
+      continue;
+    }
+
     replayable.set(callIndex, {
       ...record,
       state: "failed",
@@ -426,8 +575,12 @@ export function replayableJournalCalls(
       },
     });
   }
+
   for (const [callIndex, record] of rejectedContinuationTerminals) {
-    if (invalid.has(callIndex) || progressed.has(callIndex)) continue;
+    if (invalid.has(callIndex) || progressed.has(callIndex)) {
+      continue;
+    }
+
     replayable.set(callIndex, {
       ...record,
       state: "failed",
@@ -435,7 +588,8 @@ export function replayableJournalCalls(
       result: {
         ok: false,
         output: "",
-        error: "Continuation completion lacks durable checkpoint or validated replay provenance; neither provider was dispatched",
+        error:
+          "Continuation completion lacks durable checkpoint or validated replay provenance; neither provider was dispatched",
         progressed: true,
       },
     });
@@ -471,30 +625,59 @@ export function replayableJournalHandoffs(records: WorkflowJournalRecord[]): Wor
   const invalid = new Set<number>();
 
   for (const record of records) {
-    if (record.kind === "peerQuestion") continue;
-    if (record.state === "started") {
-      if (started.has(record.callIndex)) invalid.add(record.callIndex);
-      else started.set(record.callIndex, record);
+    if (record.kind === "peerQuestion") {
       continue;
     }
+
+    if (record.state === "started") {
+      if (started.has(record.callIndex)) {
+        invalid.add(record.callIndex);
+      } else {
+        started.set(record.callIndex, record);
+      }
+
+      continue;
+    }
+
     const start = started.get(record.callIndex);
+
     if (!start || start.fingerprint !== record.fingerprint) {
       invalid.add(record.callIndex);
       continue;
     }
+
     if (record.state === "progressed") {
-      if (callKind(start) !== callKind(record) || progressed.has(record.callIndex)
-          || handoffs.has(record.callIndex) || !record.continuationProgress) invalid.add(record.callIndex);
-      else progressed.set(record.callIndex, record);
+      if (
+        callKind(start) !== callKind(record) ||
+        progressed.has(record.callIndex) ||
+        handoffs.has(record.callIndex) ||
+        !record.continuationProgress
+      ) {
+        invalid.add(record.callIndex);
+      } else {
+        progressed.set(record.callIndex, record);
+      }
+
       continue;
     }
+
     if (record.state === "handoff") {
       const progress = progressed.get(record.callIndex);
-      if (!progress || handoffs.has(record.callIndex) || !record.continuation
-          || !continuationCheckpointsMatch(progress, record)) invalid.add(record.callIndex);
-      else handoffs.set(record.callIndex, record);
+
+      if (
+        !progress ||
+        handoffs.has(record.callIndex) ||
+        !record.continuation ||
+        !continuationCheckpointsMatch(progress, record)
+      ) {
+        invalid.add(record.callIndex);
+      } else {
+        handoffs.set(record.callIndex, record);
+      }
+
       continue;
     }
+
     terminal.add(record.callIndex);
   }
 
@@ -524,40 +707,66 @@ export function replayableJournalInteractions(records: WorkflowJournalRecord[]):
   const invalid = new Set<number>();
 
   for (const record of records) {
-    if (record.kind !== "peerQuestion") continue;
-    const ordinal = record.callIndex;
-    const priorStart = started.get(ordinal);
-    if (record.state === "started") {
-      if (priorStart || provisional.has(ordinal) || completed.has(ordinal)) invalid.add(ordinal);
-      else started.set(ordinal, record);
+    if (record.kind !== "peerQuestion") {
       continue;
     }
+
+    const ordinal = record.callIndex;
+    const priorStart = started.get(ordinal);
+
+    if (record.state === "started") {
+      if (priorStart || provisional.has(ordinal) || completed.has(ordinal)) {
+        invalid.add(ordinal);
+      } else {
+        started.set(ordinal, record);
+      }
+
+      continue;
+    }
+
     if (!priorStart || priorStart.fingerprint !== record.fingerprint || completed.has(ordinal)) {
       invalid.add(ordinal);
       continue;
     }
+
     if (record.state === "completed" && record.result?.ok === true && record.interaction) {
-      if (provisional.has(ordinal)) invalid.add(ordinal);
-      else if (record.interactionPending === true) provisional.set(ordinal, record);
-      else completed.set(ordinal, record); // Backward-compatible journals predate two-phase acceptance.
+      if (provisional.has(ordinal)) {
+        invalid.add(ordinal);
+      } else if (record.interactionPending === true) {
+        provisional.set(ordinal, record);
+      } else {
+        completed.set(ordinal, record);
+      } // Backward-compatible journals predate two-phase acceptance.
+
       continue;
     }
+
     const answer = provisional.get(ordinal);
-    if (record.state === "accepted" && answer?.interaction && record.interaction
-        && answer.agentIndex === record.agentIndex
-        && canonicalJson(answer.interaction) === canonicalJson(record.interaction)) {
+
+    if (
+      record.state === "accepted" &&
+      answer?.interaction &&
+      record.interaction &&
+      answer.agentIndex === record.agentIndex &&
+      canonicalJson(answer.interaction) === canonicalJson(record.interaction)
+    ) {
       completed.set(ordinal, answer);
-    } else invalid.add(ordinal);
+    } else {
+      invalid.add(ordinal);
+    }
   }
 
   return [...completed.entries()]
     .filter(([ordinal]) => !invalid.has(ordinal))
     .sort(([left], [right]) => left - right)
-    .map(([ordinal, record]) => ({
-      ordinal,
-      questionFingerprint: record.fingerprint,
-      detail: { ...record.interaction! },
-      answer: record.result!.output,
-      usage: record.result!.usage ? { ...record.result!.usage } : undefined,
-    } satisfies WorkflowReplayInteraction));
+    .map(
+      ([ordinal, record]) =>
+        ({
+          ordinal,
+          questionFingerprint: record.fingerprint,
+          detail: { ...record.interaction! },
+          answer: record.result!.output,
+          usage: record.result!.usage ? { ...record.result!.usage } : undefined,
+        }) satisfies WorkflowReplayInteraction,
+    );
 }

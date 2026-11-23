@@ -65,12 +65,12 @@ export interface WorkflowOutlineModel {
 export type WorkflowOutlineRow =
   | { kind: "node"; node: WorkflowOutlineNode }
   | {
-    kind: "omission";
-    key: string;
-    omitted: number;
-    omittedPhases: number;
-    omittedAgents: number;
-  };
+      kind: "omission";
+      key: string;
+      omitted: number;
+      omittedPhases: number;
+      omittedAgents: number;
+    };
 
 export function workflowPhaseNodeKey(phaseIndex: number): WorkflowOutlinePhaseKey {
   return `phase:${phaseIndex}`;
@@ -96,6 +96,7 @@ export function buildWorkflowOutline(
     const visibleAgents = agents.filter((agent) => workflowAgentMatchesFilter(agent, filter));
     const status = phase?.status ?? "pending";
     const current = run.currentPhase === phaseIndex;
+
     return {
       kind: "phase",
       key,
@@ -117,15 +118,15 @@ export function buildWorkflowOutline(
   });
 
   const phaseByKey = new Map(phases.map((phase) => [phase.key, phase]));
-  const requestedAgent = requested?.kind === "agent"
-    ? run.agents.find((agent) => workflowAgentNodeKey(agent.index) === requested.key)
-    : undefined;
-  const requestedAgentPhase = requestedAgent
-    ? phaseForAgent(phases, phaseAgents, requestedAgent)
-    : undefined;
-  const requestedPhase = requested?.kind === "phase"
-    ? phaseByKey.get(requested.phaseKey)
-    : requestedAgentPhase ?? (requested ? phaseByKey.get(requested.phaseKey) : undefined);
+  const requestedAgent =
+    requested?.kind === "agent"
+      ? run.agents.find((agent) => workflowAgentNodeKey(agent.index) === requested.key)
+      : undefined;
+  const requestedAgentPhase = requestedAgent ? phaseForAgent(phases, phaseAgents, requestedAgent) : undefined;
+  const requestedPhase =
+    requested?.kind === "phase"
+      ? phaseByKey.get(requested.phaseKey)
+      : (requestedAgentPhase ?? (requested ? phaseByKey.get(requested.phaseKey) : undefined));
   const currentPhase = phases.find((phase) => phase.current);
   const expandedPhase = requestedPhase ?? currentPhase ?? phases[0];
   const visibleAgents = expandedPhase
@@ -133,30 +134,35 @@ export function buildWorkflowOutline(
     : [];
   const agentNodes = expandedPhase
     ? visibleAgents.map((agent): WorkflowOutlineAgentNode => ({
-      kind: "agent",
-      key: workflowAgentNodeKey(agent.index),
-      phaseKey: expandedPhase.key,
-      phaseIndex: expandedPhase.phaseIndex,
-      agentIndex: agent.index,
-      name: agent.name,
-      state: agent.state,
-      summary: workflowAgentDashboardSummary(agent, now),
-      attention: agentNeedsAttention(agent),
-      agent,
-    }))
+        kind: "agent",
+        key: workflowAgentNodeKey(agent.index),
+        phaseKey: expandedPhase.key,
+        phaseIndex: expandedPhase.phaseIndex,
+        agentIndex: agent.index,
+        name: agent.name,
+        state: agent.state,
+        summary: workflowAgentDashboardSummary(agent, now),
+        attention: agentNeedsAttention(agent),
+        agent,
+      }))
     : [];
 
   const nodes: WorkflowOutlineNode[] = [];
+
   for (const phase of phases) {
     nodes.push(phase);
-    if (phase.key === expandedPhase?.key) nodes.push(...agentNodes);
+
+    if (phase.key === expandedPhase?.key) {
+      nodes.push(...agentNodes);
+    }
   }
 
-  const sameNode = requested?.kind === "agent"
-    ? agentNodes.find((node) => node.key === requested.key)
-    : requested?.kind === "phase"
-      ? phaseByKey.get(requested.key)
-      : undefined;
+  const sameNode =
+    requested?.kind === "agent"
+      ? agentNodes.find((node) => node.key === requested.key)
+      : requested?.kind === "phase"
+        ? phaseByKey.get(requested.key)
+        : undefined;
   const selectedNode = sameNode ?? requestedPhase ?? currentPhase ?? phases[0] ?? nodes[0];
   const selected = selectedNode ? selectionForNode(selectedNode) : undefined;
 
@@ -177,11 +183,20 @@ export function buildWorkflowOutline(
  */
 export function boundWorkflowOutline(model: WorkflowOutlineModel, rows: number): readonly WorkflowOutlineRow[] {
   const budget = Math.max(0, Math.floor(rows));
-  if (!budget || !model.nodes.length) return [];
-  if (model.nodes.length <= budget) return model.nodes.map((node) => ({ kind: "node", node }));
+
+  if (!budget || !model.nodes.length) {
+    return [];
+  }
+
+  if (model.nodes.length <= budget) {
+    return model.nodes.map((node) => ({ kind: "node", node }));
+  }
 
   const selectedIndex = model.selectedIndex >= 0 ? model.selectedIndex : 0;
-  if (budget === 1) return [{ kind: "node", node: model.nodes[selectedIndex]! }];
+
+  if (budget === 1) {
+    return [{ kind: "node", node: model.nodes[selectedIndex]! }];
+  }
 
   const nodeBudget = budget - 1;
   const candidates = model.nodes.map((node, index) => ({
@@ -197,6 +212,7 @@ export function boundWorkflowOutline(model: WorkflowOutlineModel, rows: number):
     .sort((left, right) => left - right)
     .slice(0, nodeBudget)
     .map((index) => ({ index, node: model.nodes[index]! }));
+
   if (!selected.some(({ index }) => index === selectedIndex)) {
     selected[selected.length - 1] = { index: selectedIndex, node: model.nodes[selectedIndex]! };
     selected.sort((left, right) => left.index - right.index);
@@ -215,6 +231,7 @@ export function boundWorkflowOutline(model: WorkflowOutlineModel, rows: number):
   const insertion = selected.findIndex(({ index }) => index > firstOmitted);
   const bounded: WorkflowOutlineRow[] = selected.map(({ node }) => ({ kind: "node", node }));
   bounded.splice(insertion < 0 ? bounded.length : insertion, 0, omission);
+
   return bounded;
 }
 
@@ -225,9 +242,18 @@ export function selectionForNode(node: WorkflowOutlineNode): WorkflowOutlineSele
 }
 
 export function workflowAgentMatchesFilter(agent: WorkflowAgentRecord, filter: WorkflowAgentFilter): boolean {
-  if (filter === "all") return true;
-  if (filter === "active") return agent.state === "queued" || agent.state === "running" || agent.state === "waiting";
-  if (filter === "failed") return agent.state === "failed" || agent.state === "cancelled" || agent.state === "aborted";
+  if (filter === "all") {
+    return true;
+  }
+
+  if (filter === "active") {
+    return agent.state === "queued" || agent.state === "running" || agent.state === "waiting";
+  }
+
+  if (filter === "failed") {
+    return agent.state === "failed" || agent.state === "cancelled" || agent.state === "aborted";
+  }
+
   return agent.state === "completed";
 }
 
@@ -238,11 +264,17 @@ function plannedAndRecordedPhases(run: WorkflowSnapshot): Array<{
 }> {
   const phaseCount = Math.max(run.phases.length, run.plannedPhaseCount ?? 0);
   const usedIndexes = new Set(run.phases.map((phase) => phase.index));
+
   return Array.from({ length: phaseCount }, (_, offset) => {
     const phase = run.phases[offset];
     let phaseIndex = phase?.index ?? offset;
-    while (!phase && usedIndexes.has(phaseIndex)) phaseIndex++;
+
+    while (!phase && usedIndexes.has(phaseIndex)) {
+      phaseIndex++;
+    }
+
     usedIndexes.add(phaseIndex);
+
     return { phase, phaseIndex, position: offset + 1 };
   });
 }
@@ -253,6 +285,7 @@ function agentsForPhase(
   phase: WorkflowPhase | undefined,
 ): readonly WorkflowAgentRecord[] {
   const referenced = new Set(phase?.agents ?? []);
+
   return run.agents.filter((agent) => agent.phase === phaseIndex || referenced.has(agent.index));
 }
 
@@ -261,8 +294,10 @@ function phaseForAgent(
   phaseAgents: ReadonlyMap<WorkflowOutlinePhaseKey, readonly WorkflowAgentRecord[]>,
   agent: WorkflowAgentRecord,
 ): WorkflowOutlinePhaseNode | undefined {
-  return phases.find((phase) => phase.phaseIndex === agent.phase)
-    ?? phases.find((phase) => (phaseAgents.get(phase.key) ?? []).some((candidate) => candidate.index === agent.index));
+  return (
+    phases.find((phase) => phase.phaseIndex === agent.phase) ??
+    phases.find((phase) => (phaseAgents.get(phase.key) ?? []).some((candidate) => candidate.index === agent.index))
+  );
 }
 
 function phaseNeedsAttention(status: WorkflowStatus): boolean {
@@ -270,12 +305,14 @@ function phaseNeedsAttention(status: WorkflowStatus): boolean {
 }
 
 function agentNeedsAttention(agent: WorkflowAgentRecord): boolean {
-  return !!agent.waitingOn
-    || agent.state === "running"
-    || agent.state === "waiting"
-    || agent.state === "failed"
-    || agent.state === "cancelled"
-    || agent.state === "aborted";
+  return (
+    !!agent.waitingOn ||
+    agent.state === "running" ||
+    agent.state === "waiting" ||
+    agent.state === "failed" ||
+    agent.state === "cancelled" ||
+    agent.state === "aborted"
+  );
 }
 
 function outlineNodePriority(
@@ -284,9 +321,21 @@ function outlineNodePriority(
   selectedIndex: number,
   index: number,
 ): number {
-  if (node.key === selected?.key) return 10_000;
-  if (selected?.kind === "agent" && node.kind === "phase" && node.key === selected.phaseKey) return 9_000;
-  if (node.kind === "phase" && node.current) return 8_000;
-  if (node.attention) return 7_000;
+  if (node.key === selected?.key) {
+    return 10_000;
+  }
+
+  if (selected?.kind === "agent" && node.kind === "phase" && node.key === selected.phaseKey) {
+    return 9_000;
+  }
+
+  if (node.kind === "phase" && node.current) {
+    return 8_000;
+  }
+
+  if (node.attention) {
+    return 7_000;
+  }
+
   return 1_000 - Math.abs(selectedIndex - index);
 }

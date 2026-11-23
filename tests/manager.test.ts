@@ -7,9 +7,13 @@ import { ControlledBackend, ImmediateBackend, tick, withTimeout } from "./helper
 function setup(concurrency = 4) {
   const backend = new ControlledBackend();
   const manager = new JobManager({ backends: [backend], concurrency });
+
   return { backend, manager };
 }
-function request(n: number) { return { name: "worker", task: `task ${n}`, cwd: "/tmp", trusted: true, harness: "codex" as const }; }
+
+function request(n: number) {
+  return { name: "worker", task: `task ${n}`, cwd: "/tmp", trusted: true, harness: "codex" as const };
+}
 
 test("manager enforces concurrency cap four and pumps queued work", async () => {
   const { backend, manager } = setup(4);
@@ -19,10 +23,16 @@ test("manager enforces concurrency cap four and pumps queued work", async () => 
   assert.equal(backend.maxActive, 4);
   assert.equal(manager.check(jobs[4]!.id).status, "queued");
   backend.complete(jobs[0]!.id);
-  await tick(); await tick();
+  await tick();
+  await tick();
   assert.equal(backend.starts.length, 5);
-  for (const job of jobs.slice(1, 5)) backend.complete(job.id);
-  await tick(); await tick();
+
+  for (const job of jobs.slice(1, 5)) {
+    backend.complete(job.id);
+  }
+
+  await tick();
+  await tick();
   backend.complete(jobs[5]!.id);
   await manager.wait(jobs[5]!.id);
   await manager.shutdown();
@@ -37,12 +47,15 @@ test("direct jobs take the next free slot ahead of queued workflow fan-out", asy
   const secondWorkflow = manager.spawn({ ...request(2), workflow: { ...workflow, agentIndex: 1 } });
   const interactive = manager.spawn(request(3));
   backend.complete(blocker.id);
-  await tick(); await tick();
+  await tick();
+  await tick();
   assert.equal(backend.starts[1], interactive.id, "interactive work is not trapped behind the workflow queue");
   backend.complete(interactive.id);
-  await tick(); await tick();
+  await tick();
+  await tick();
   backend.complete(firstWorkflow.id);
-  await tick(); await tick();
+  await tick();
+  await tick();
   backend.complete(secondWorkflow.id);
   await manager.wait(secondWorkflow.id);
   await manager.shutdown();
@@ -52,14 +65,20 @@ test("completed native sessions live until session shutdown or oldest-terminal c
   const { backend, manager } = setup(4);
   const jobs = Array.from({ length: 100 }, (_, index) => manager.spawn(request(index)));
   const completed = new Set<string>();
+
   while (completed.size < jobs.length) {
     await tick();
+
     for (const id of backend.starts) {
-      if (completed.has(id)) continue;
+      if (completed.has(id)) {
+        continue;
+      }
+
       backend.complete(id);
       completed.add(id);
     }
   }
+
   await Promise.all(jobs.map((job) => manager.wait(job.id)));
   assert.deepEqual(backend.closes, [], "completed native sessions remain open without an idle TTL");
 
@@ -74,7 +93,9 @@ test("completed native sessions live until session shutdown or oldest-terminal c
 
 test("an evicted terminal job closes a native run that returns after eviction", async () => {
   let releaseStart!: () => void;
-  const startGate = new Promise<void>((resolve) => { releaseStart = resolve; });
+  const startGate = new Promise<void>((resolve) => {
+    releaseStart = resolve;
+  });
   let starts = 0;
   const closes: string[] = [];
   const backend: Backend = {
@@ -82,12 +103,18 @@ test("an evicted terminal job closes a native run that returns after eviction", 
     async start(request, emit) {
       starts++;
       emit({ type: "completed", output: "early completion" });
-      if (starts === 1) await startGate;
+
+      if (starts === 1) {
+        await startGate;
+      }
+
       return {
         completed: Promise.resolve(),
         async send() {},
         async cancel() {},
-        async close() { closes.push(request.jobId); },
+        async close() {
+          closes.push(request.jobId);
+        },
       };
     },
   };
@@ -97,7 +124,11 @@ test("an evicted terminal job closes a native run that returns after eviction", 
   assert.throws(() => manager.check(jobs[0]!.id), /Unknown job/);
 
   releaseStart();
-  while (!closes.includes(jobs[0]!.id)) await tick();
+
+  while (!closes.includes(jobs[0]!.id)) {
+    await tick();
+  }
+
   assert.deepEqual(closes, [jobs[0]!.id], "late native run is closed instead of orphaned");
   await manager.wait(replacement.id);
   await manager.shutdown();
@@ -146,10 +177,26 @@ test("job snapshots clone live activity without exposing manager state", async (
   const { backend, manager } = setup(1);
   const job = manager.spawn(request(1));
   await tick();
-  backend.emit(job.id, { type: "tool_start", id: "read", name: "Read", args: { path: "/tmp/src/index.ts" }, at: 2_000 });
+  backend.emit(job.id, {
+    type: "tool_start",
+    id: "read",
+    name: "Read",
+    args: { path: "/tmp/src/index.ts" },
+    at: 2_000,
+  });
   const checked = manager.check(job.id);
-  assert.deepEqual(checked.activity, { kind: "tool", at: 2_000, tool: "Read", state: "running", target: "src/index.ts" });
-  if (checked.activity?.kind === "tool") checked.activity.target = "tampered";
+  assert.deepEqual(checked.activity, {
+    kind: "tool",
+    at: 2_000,
+    tool: "Read",
+    state: "running",
+    target: "src/index.ts",
+  });
+
+  if (checked.activity?.kind === "tool") {
+    checked.activity.target = "tampered";
+  }
+
   const unchanged = manager.check(job.id).activity;
   assert.equal(unchanged?.kind === "tool" ? unchanged.target : undefined, "src/index.ts");
   backend.complete(job.id, "done");
@@ -163,17 +210,31 @@ test("a synchronous completion subscriber can queue the next generation without 
   const completedGenerations: number[] = [];
   let subscriberFollowUp: Promise<JobSnapshot> | undefined;
   manager.subscribe((snapshot, event) => {
-    if (event.type !== "completed") return;
+    if (event.type !== "completed") {
+      return;
+    }
+
     completedGenerations.push(snapshot.generation);
-    if (snapshot.generation === 0) subscriberFollowUp = manager.send(snapshot.id, "subscriber follow-up", "followUp");
+
+    if (snapshot.generation === 0) {
+      subscriberFollowUp = manager.send(snapshot.id, "subscriber follow-up", "followUp");
+    }
   });
 
   const initial = manager.spawn(request(1));
-  for (let index = 0; index < 20 && !subscriberFollowUp; index++) await tick();
+
+  for (let index = 0; index < 20 && !subscriberFollowUp; index++) {
+    await tick();
+  }
+
   assert.ok(subscriberFollowUp, "subscriber observed the initial completion synchronously");
   const queued = await subscriberFollowUp;
   assert.equal(queued.generation, 1);
-  for (let index = 0; index < 20 && manager.check(initial.id).status !== "completed"; index++) await tick();
+
+  for (let index = 0; index < 20 && manager.check(initial.id).status !== "completed"; index++) {
+    await tick();
+  }
+
   const final = manager.check(initial.id);
   assert.equal(final.generation, 1);
   assert.equal(final.status, "completed");
@@ -225,7 +286,10 @@ test("running-generation follow-ups wait for settlement and recheck cumulative s
   await manager.send(afterObservation.id, "active steering stays allowed", "steer");
   const heldAfter = manager.send(afterObservation.id, "submitted after usage", "followUp");
   await tick();
-  assert.deepEqual(backend.sends.map((send) => send.message), ["active steering stays allowed"]);
+  assert.deepEqual(
+    backend.sends.map((send) => send.message),
+    ["active steering stays allowed"],
+  );
   backend.complete(afterObservation.id, "done");
   await assert.rejects(heldAfter, /later dispatches are blocked/);
 
@@ -254,15 +318,20 @@ test("direct reached warnings are keyed per metric and emitted once as usage cha
   run.emit({ type: "usage", usage: { output: 10, turns: 3, cost: 1.5 } });
   backend.complete(job.id, "done", { output: 1, cost: 1 });
   const warnings = (await manager.wait(job.id)).warnings ?? [];
+
   for (const metric of ["tokens", "turns", "cost"]) {
     assert.equal(warnings.filter((warning) => warning.includes(`${metric} limit reached`)).length, 1);
   }
+
   await manager.shutdown();
 });
 
 test("rejects maxCost before dispatch when the selected route does not report cost", () => {
   const { backend, manager } = setup();
-  assert.throws(() => manager.spawn({ ...request(1), budget: { maxCost: 1 } }), /maxCost is unsupported by the codex route/);
+  assert.throws(
+    () => manager.spawn({ ...request(1), budget: { maxCost: 1 } }),
+    /maxCost is unsupported by the codex route/,
+  );
   assert.equal(backend.requests.length, 0);
 });
 
@@ -272,7 +341,11 @@ test("independentOf routes against the producer job rather than the parent provi
   const manager = new JobManager({ backends: [codex, claude] });
   const producer = manager.spawn({ ...request(1), harness: "claude" });
   const reviewer = manager.spawn({
-    ...request(2), harness: undefined, parentProvider: "codex", independentOf: producer.id, access: "readOnly",
+    ...request(2),
+    harness: undefined,
+    parentProvider: "codex",
+    independentOf: producer.id,
+    access: "readOnly",
   });
   assert.equal(reviewer.harness, "codex", "reviewer differs from the Claude producer even though the parent is Codex");
   assert.equal(reviewer.independent, true);
@@ -286,14 +359,18 @@ test("independentOf routes against the producer job rather than the parent provi
     /Unknown independence target job/,
   );
   const replayReviewer = manager.spawn({
-    ...request(5), harness: undefined, independentOf: "prior-session-job", independentOfProvider: "claude",
+    ...request(5),
+    harness: undefined,
+    independentOf: "prior-session-job",
+    independentOfProvider: "claude",
   });
-  assert.equal(replayReviewer.harness, "codex", "durable replay can preserve routing after the producer leaves JobManager");
-  assert.equal(replayReviewer.independentOf, "prior-session-job");
-  assert.throws(
-    () => manager.spawn({ ...request(6), independentOfProvider: "claude" }),
-    /requires independentOf/,
+  assert.equal(
+    replayReviewer.harness,
+    "codex",
+    "durable replay can preserve routing after the producer leaves JobManager",
   );
+  assert.equal(replayReviewer.independentOf, "prior-session-job");
+  assert.throws(() => manager.spawn({ ...request(6), independentOfProvider: "claude" }), /requires independentOf/);
   await tick();
   claude.complete(producer.id);
   codex.complete(reviewer.id);
@@ -331,13 +408,20 @@ test("wait resolves terminal state and timeout returns current state", async () 
 test("cancel removes queued jobs and tears down running backend", async () => {
   const { backend, manager } = setup(1);
   let runningCancellationEvents = 0;
-  manager.subscribe((job, event) => { if (event.type === "cancelled" && job.status === "cancelled") runningCancellationEvents++; });
+  manager.subscribe((job, event) => {
+    if (event.type === "cancelled" && job.status === "cancelled") {
+      runningCancellationEvents++;
+    }
+  });
   const running = manager.spawn(request(1));
   const queued = manager.spawn(request(2));
   await tick();
   assert.equal((await manager.cancel(queued.id)).status, "cancelled");
   assert.equal((await manager.cancel(running.id)).status, "cancelled");
-  assert.deepEqual(backend.cancels.map((cancel) => cancel.jobId), [running.id]);
+  assert.deepEqual(
+    backend.cancels.map((cancel) => cancel.jobId),
+    [running.id],
+  );
   assert.equal(runningCancellationEvents, 2); // one queued job and one running job, no backend duplicate
   await manager.shutdown();
 });
@@ -345,15 +429,22 @@ test("cancel removes queued jobs and tears down running backend", async () => {
 test("cancellation aborts scheduler admission before backend startup", async () => {
   const { backend, manager } = setup(1);
   let reached!: () => void;
-  const admissionReached = new Promise<void>((resolve) => { reached = resolve; });
+  const admissionReached = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
   const job = manager.spawn({
     ...request(1),
     dispatchAdmission: async (signal) => {
       reached();
+
       return new Promise<undefined>((_resolve, reject) => {
         const abort = () => reject(signal.reason);
-        if (signal.aborted) abort();
-        else signal.addEventListener("abort", abort, { once: true });
+
+        if (signal.aborted) {
+          abort();
+        } else {
+          signal.addEventListener("abort", abort, { once: true });
+        }
       });
     },
   });
@@ -371,12 +462,17 @@ test("scheduler admission is bounded by the aggregate startup deadline", async (
   let admissionAborted = false;
   const job = manager.spawn({
     ...request(1),
-    dispatchAdmission: (signal) => new Promise<undefined>((_resolve, reject) => {
-      signal.addEventListener("abort", () => {
-        admissionAborted = true;
-        reject(signal.reason);
-      }, { once: true });
-    }),
+    dispatchAdmission: (signal) =>
+      new Promise<undefined>((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            admissionAborted = true;
+            reject(signal.reason);
+          },
+          { once: true },
+        );
+      }),
   });
   const final = await manager.wait(job.id);
   assert.equal(final.status, "failed");
@@ -391,10 +487,16 @@ test("cancellation aborts a pending backend start before returning", async () =>
   const backend: Backend = {
     name: "codex",
     async start(request) {
-      await new Promise<void>((_resolve, reject) => request.signal.addEventListener("abort", () => {
-        startupAborted = true;
-        reject(request.signal.reason);
-      }, { once: true }));
+      await new Promise<void>((_resolve, reject) =>
+        request.signal.addEventListener(
+          "abort",
+          () => {
+            startupAborted = true;
+            reject(request.signal.reason);
+          },
+          { once: true },
+        ),
+      );
       assert.fail("aborted startup must not return a run");
     },
   };
@@ -411,7 +513,9 @@ test("manager bounds harness startup and direct cancellation waits", async (t) =
   await t.test("startup", async () => {
     const backend: Backend = {
       name: "codex",
-      async start() { return new Promise<BackendRun>(() => {}); },
+      async start() {
+        return new Promise<BackendRun>(() => {});
+      },
     };
     const manager = new JobManager({ backends: [backend], startupTimeoutMs: 20, operationTimeoutMs: 20 });
     const job = manager.spawn(request(1));
@@ -429,9 +533,13 @@ test("manager bounds harness startup and direct cancellation waits", async (t) =
         return {
           completed: new Promise<void>(() => {}),
           async send() {},
-          async cancel() { await new Promise<void>(() => {}); },
+          async cancel() {
+            await new Promise<void>(() => {});
+          },
           async close() {},
-          async forceClose() { forceCloses++; },
+          async forceClose() {
+            forceCloses++;
+          },
         };
       },
     };
@@ -451,21 +559,28 @@ test("strict workflow settlement bounds time already spent behind hanging cleanu
   let settleCompleted!: () => void;
   let closeReached!: () => void;
   let forceCloses = 0;
-  const closeStarted = new Promise<void>((resolve) => { closeReached = resolve; });
+  const closeStarted = new Promise<void>((resolve) => {
+    closeReached = resolve;
+  });
   const never = new Promise<void>(() => {});
   const backend: Backend = {
     name: "codex",
     async start(_request, emit) {
       emitFailure = () => emit({ type: "failed", error: "quota after progress" });
+
       return {
-        completed: new Promise<void>((resolve) => { settleCompleted = resolve; }),
+        completed: new Promise<void>((resolve) => {
+          settleCompleted = resolve;
+        }),
         async send() {},
         async cancel() {},
         async close() {
           closeReached();
           await never;
         },
-        async forceClose() { forceCloses++; },
+        async forceClose() {
+          forceCloses++;
+        },
       };
     },
   };
@@ -492,17 +607,27 @@ test("strict workflow settlement propagates force-close proof failure without tr
   let fail!: () => void;
   let finish!: () => void;
   let closeReached!: () => void;
-  const closeStarted = new Promise<void>((resolve) => { closeReached = resolve; });
+  const closeStarted = new Promise<void>((resolve) => {
+    closeReached = resolve;
+  });
   const backend: Backend = {
     name: "codex",
     async start(_request, emit) {
       fail = () => emit({ type: "failed", error: "quota after progress" });
+
       return {
-        completed: new Promise<void>((resolve) => { finish = resolve; }),
+        completed: new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
         async send() {},
         async cancel() {},
-        async close() { closeReached(); await new Promise<void>(() => {}); },
-        async forceClose() { throw new Error("process descendants remain"); },
+        async close() {
+          closeReached();
+          await new Promise<void>(() => {});
+        },
+        async forceClose() {
+          throw new Error("process descendants remain");
+        },
       };
     },
   };
@@ -527,10 +652,16 @@ test("shutdown aborts delayed startup with no late run or resource resurrection"
   const backend: Backend = {
     name: "codex",
     async start(request) {
-      await new Promise<void>((_resolve, reject) => request.signal.addEventListener("abort", () => {
-        startupAborted = true;
-        reject(request.signal.reason);
-      }, { once: true }));
+      await new Promise<void>((_resolve, reject) =>
+        request.signal.addEventListener(
+          "abort",
+          () => {
+            startupAborted = true;
+            reject(request.signal.reason);
+          },
+          { once: true },
+        ),
+      );
       resourceCreated = true;
       assert.fail("startup continued after shutdown abort");
     },
@@ -553,12 +684,21 @@ test("shutdown deadline force-closes a backend whose cancellation hangs", async 
     name: "codex",
     async start(_request, emit) {
       let settle!: () => void;
+
       return {
-        completed: new Promise<void>((resolve) => { settle = resolve; }),
+        completed: new Promise<void>((resolve) => {
+          settle = resolve;
+        }),
         send: async () => undefined,
         cancel: async () => new Promise<void>(() => {}),
-        close: async () => { closeCalled = true; },
-        forceClose: async () => { forceCloseCalled = true; emit({ type: "cancelled", reason: "forced" }); settle(); },
+        close: async () => {
+          closeCalled = true;
+        },
+        forceClose: async () => {
+          forceCloseCalled = true;
+          emit({ type: "cancelled", reason: "forced" });
+          settle();
+        },
       };
     },
   };
@@ -581,13 +721,24 @@ test("manager serializes send and cancel and publishes cancellation after teardo
     name: "codex",
     async start(_request, emit) {
       let finish!: () => void;
+
       return {
-        completed: new Promise<void>((resolve) => { finish = resolve; }),
-        async send() { order.push("send-start"); await new Promise<void>((resolve) => { releaseSend = resolve; }); order.push("send-end"); },
+        completed: new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+        async send() {
+          order.push("send-start");
+          await new Promise<void>((resolve) => {
+            releaseSend = resolve;
+          });
+          order.push("send-end");
+        },
         async cancel(reason) {
           order.push("cancel-start");
           emit({ type: "cancelled", reason });
-          await new Promise<void>((resolve) => { releaseCancel = resolve; });
+          await new Promise<void>((resolve) => {
+            releaseCancel = resolve;
+          });
           order.push("cancel-end");
           finish();
         },
@@ -620,7 +771,9 @@ test("manager terminalizes a job when backend cancellation rejects", async () =>
       return {
         completed: new Promise<void>(() => {}),
         async send() {},
-        async cancel() { throw new Error("teardown broke"); },
+        async cancel() {
+          throw new Error("teardown broke");
+        },
         async close() {},
       };
     },
@@ -640,24 +793,41 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
   const streamedSnapshots: JobSnapshot[] = [];
   const unsubscribe = manager.subscribe((job, event) => {
     observed.push(`${job.status}:${event.type}`);
-    if (event.type === "started" || event.type === "text_delta" || event.type === "thinking_delta") streamedSnapshots.push(job);
+
+    if (event.type === "started" || event.type === "text_delta" || event.type === "thinking_delta") {
+      streamedSnapshots.push(job);
+    }
   });
   const job = manager.spawn({ ...request(1), speed: "fast" });
   await tick();
   backend.runs.get(job.id)!.emit({ type: "text_delta", text: "partial" });
   backend.runs.get(job.id)!.emit({ type: "thinking_delta", text: "thinking" });
   assert.equal(streamedSnapshots.length, 3);
-  assert.equal(streamedSnapshots[1]!.transcript, streamedSnapshots[0]!.transcript, "observer projections reuse unchanged transcript clones across deltas");
-  assert.equal(streamedSnapshots[2]!.tools, streamedSnapshots[1]!.tools, "observer projections reuse unchanged tool clones across deltas");
+  assert.equal(
+    streamedSnapshots[1]!.transcript,
+    streamedSnapshots[0]!.transcript,
+    "observer projections reuse unchanged transcript clones across deltas",
+  );
+  assert.equal(
+    streamedSnapshots[2]!.tools,
+    streamedSnapshots[1]!.tools,
+    "observer projections reuse unchanged tool clones across deltas",
+  );
   await manager.send(job.id, "change course", "steer");
   assert.deepEqual(backend.sends, [{ id: job.id, message: "change course", behavior: "steer" }]);
-  backend.runs.get(job.id)!.emit({ type: "context", context: { tokens: 1_000, servingModel: "gen-0-model", effectiveSpeed: "fast" } });
+  backend.runs
+    .get(job.id)!
+    .emit({ type: "context", context: { tokens: 1_000, servingModel: "gen-0-model", effectiveSpeed: "fast" } });
   backend.complete(job.id, "done", { input: 3 });
   await manager.wait(job.id);
   assert.ok(observed.includes("completed:completed"));
   const queued = await manager.send(job.id, "review the fixes", "followUp");
   assert.ok(queued.status === "queued" || queued.status === "running");
-  assert.equal(queued.context, undefined, "the retained generation boundary clears the prior generation's context before any new telemetry arrives, even if this generation never reports one");
+  assert.equal(
+    queued.context,
+    undefined,
+    "the retained generation boundary clears the prior generation's context before any new telemetry arrives, even if this generation never reports one",
+  );
   assert.equal(queued.speed, "fast", "requested speed is fixed across retained generations");
   await tick();
   assert.deepEqual(backend.sends.at(-1), { id: job.id, message: "review the fixes", behavior: "followUp" });
@@ -666,7 +836,11 @@ test("manager forwards steering and emits automatic lifecycle observations", asy
   const continued = await manager.wait(job.id);
   assert.equal(continued.status, "completed");
   assert.equal(continued.output, "second result");
-  assert.deepEqual(continued.context, { tokens: 2_000, servingModel: "gen-1-model" }, "a retained follow-up's context replaces the prior generation's gauge");
+  assert.deepEqual(
+    continued.context,
+    { tokens: 2_000, servingModel: "gen-1-model" },
+    "a retained follow-up's context replaces the prior generation's gauge",
+  );
   assert.equal(continued.usage.input, 5, "usage accumulates across retained generations");
   assert.equal(continued.model, "default", "the configured job model is unaffected by runtime-reported serving models");
 
@@ -692,11 +866,19 @@ test("a follow-up's queued generation clears the prior generation's structured p
   assert.deepEqual(first.structured, { first: true });
 
   const queued = await manager.send(job.id, "continue", "followUp");
-  assert.equal(queued.structured, undefined, "the new generation's structured payload is unread until its own terminal result arrives");
+  assert.equal(
+    queued.structured,
+    undefined,
+    "the new generation's structured payload is unread until its own terminal result arrives",
+  );
   await tick();
   backend.complete(job.id, "second result");
   const second = await manager.wait(job.id);
-  assert.equal(second.structured, undefined, "a generation that reports no structured payload leaves it absent rather than reusing the prior generation's");
+  assert.equal(
+    second.structured,
+    undefined,
+    "a generation that reports no structured payload leaves it absent rather than reusing the prior generation's",
+  );
   await manager.shutdown();
 });
 
@@ -730,9 +912,16 @@ test("continueWorkflowJob is the workflow-only follow-up path: it retains and re
   backend.complete(owned.id, "first output", { input: 3, output: 1 });
   const settled = await manager.wait(owned.id);
   assert.equal(settled.status, "completed");
-  assert.deepEqual(backend.closes, [], "a completed workflow job's session stays retained instead of closing on completion");
+  assert.deepEqual(
+    backend.closes,
+    [],
+    "a completed workflow job's session stays retained instead of closing on completion",
+  );
 
-  await assert.rejects(manager.send(owned.id, "direct override", "steer"), /workflow-owned agents are controlled by their workflow/);
+  await assert.rejects(
+    manager.send(owned.id, "direct override", "steer"),
+    /workflow-owned agents are controlled by their workflow/,
+  );
 
   const continuing = manager.continueWorkflowJob(owned.id, "continue the plan");
   await tick();
@@ -759,7 +948,11 @@ test("continueWorkflowJob rejects direct jobs, unsettled jobs, and jobs whose re
   await tick();
   backend.complete(direct.id, "direct output");
   await manager.wait(direct.id);
-  await assert.rejects(manager.continueWorkflowJob(direct.id, "x"), /not workflow-owned/, "direct subagent jobs can never be continued as a workflow lineage");
+  await assert.rejects(
+    manager.continueWorkflowJob(direct.id, "x"),
+    /not workflow-owned/,
+    "direct subagent jobs can never be continued as a workflow lineage",
+  );
 
   const owned = manager.spawn({ ...request(2), workflow: { runId: "wf-2", agentIndex: 0, label: "worker" } });
   await tick();
@@ -791,10 +984,7 @@ test("queued retained follow-ups cannot bypass the global scheduler", async () =
   await tick();
   const queued = await manager.send(first.id, "first follow-up", "followUp");
   assert.equal(queued.status, "queued");
-  await assert.rejects(
-    manager.send(first.id, "second follow-up", "followUp"),
-    /waiting for an available slot/,
-  );
+  await assert.rejects(manager.send(first.id, "second follow-up", "followUp"), /waiting for an available slot/);
   assert.deepEqual(backend.sends, []);
 
   backend.complete(blocker.id, "blocker result");
@@ -807,7 +997,13 @@ test("queued retained follow-ups cannot bypass the global scheduler", async () =
 
 test("manager rejects unknown explicit profiles, untrusted execution, and empty tasks", () => {
   const backend = new ControlledBackend();
-  const audit: ProfileDefinition = { name: "audit", description: "", systemPrompt: "audit", filePath: "audit.md", origin: "global" };
+  const audit: ProfileDefinition = {
+    name: "audit",
+    description: "",
+    systemPrompt: "audit",
+    filePath: "audit.md",
+    origin: "global",
+  };
   const manager = new JobManager({ backends: [backend], profiles: new Map([[audit.name, audit]]) });
   assert.throws(() => manager.spawn({ ...request(1), profile: "missing" }), /Unknown subagent profile/);
   assert.throws(() => manager.spawn({ ...request(1), profile: "  " }), /non-empty/);
@@ -832,7 +1028,10 @@ test("manager never dispatches Fast from profile metadata alone", async () => {
   await tick();
   assert.equal(profiled.speed, "standard");
   assert.equal(authorized.speed, "fast");
-  assert.deepEqual(backend.policies.map((policy) => policy.speed), ["standard", "fast"]);
+  assert.deepEqual(
+    backend.policies.map((policy) => policy.speed),
+    ["standard", "fast"],
+  );
   backend.complete(profiled.id);
   backend.complete(authorized.id);
   await manager.shutdown();

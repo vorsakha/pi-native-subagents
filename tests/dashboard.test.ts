@@ -35,6 +35,7 @@ test("dashboard truncation respects terminal display width for Unicode and ANSI"
     const rendered = truncateDashboardLine(value, 14);
     assert.ok(visibleWidth(rendered) <= 14, `${JSON.stringify(rendered)} exceeds terminal width`);
   }
+
   assert.equal(truncateDashboardLine("你好世界", 5).replace(/\u001b\[[0-9;]*m/g, ""), "你好…");
   assert.equal(truncateDashboardLine("anything", 0), "");
 });
@@ -54,7 +55,10 @@ test("shared dashboard framing stays within tiny Unicode and ANSI widths", () =>
       frame.hint("[31m提示你好[0m", "· Esc close"),
       alignDashboardRow("[31m你好世界[0m", "右👩🏽‍💻", width),
     ];
-    assert.ok(lines.every((line) => visibleWidth(line) <= width), `a frame line exceeds ${width} columns`);
+    assert.ok(
+      lines.every((line) => visibleWidth(line) <= width),
+      `a frame line exceeds ${width} columns`,
+    );
   }
 });
 
@@ -80,7 +84,10 @@ test("grouped collection rows keep headers presentational and selected entities 
     (item) => item.group,
   );
 
-  assert.deepEqual(collection.items.map((item) => item.id), ["live", "done-1", "done-2"]);
+  assert.deepEqual(
+    collection.items.map((item) => item.id),
+    ["live", "done-1", "done-2"],
+  );
   const view = dashboardCollectionViewport(collection, "done-2", 1, (item) => item.id);
   assert.equal(view.rows.length, 1);
   assert.equal(view.rows[0]?.kind, "item", "a section header never consumes the selected entity's only row");
@@ -98,7 +105,10 @@ test("grouped collection rows keep headers presentational and selected entities 
   );
   const pressuredView = dashboardCollectionViewport(pressured, "live-1", 3, (item) => item.id);
   assert.ok(pressuredView.rows.some((row) => row.kind === "item" && row.item.id === "live-1"));
-  assert.ok(pressuredView.rows.some((row) => row.kind === "section" && row.label === "Active"), "the visible group keeps its textual heading");
+  assert.ok(
+    pressuredView.rows.some((row) => row.kind === "section" && row.label === "Active"),
+    "the visible group keeps its textual heading",
+  );
   assert.ok(
     pressuredView.rows.every((row) => row.kind !== "fold" || row.hidden === 1),
     "a finished fold never counts a displaced active entity",
@@ -116,30 +126,33 @@ test("direct jobs render attention groups with counts and navigate only entity r
   const failed = { ...job("failed", "failed"), name: "error-row" };
   const completed = { ...job("completed", "completed"), name: "done-row" };
   const cancelled = { ...job("cancelled", "cancelled"), name: "cancel-row" };
-  const state = dashboard(
-    [completed, failed, cancelled, queued, working, blocked],
-    30,
-    () => {},
-    undefined,
-    { focusJobId: blocked.id, fullscreen: true },
-  );
+  const state = dashboard([completed, failed, cancelled, queued, working, blocked], 30, () => {}, undefined, {
+    focusJobId: blocked.id,
+    fullscreen: true,
+  });
   t.after(() => state.overlay.dispose());
 
   const lines = state.overlay.render(160);
   const text = lines.join("\n");
-  for (const heading of [
-    "Needs input · 1",
-    "Working · 1",
-    "Queued or waiting · 1",
-    "Failed · 1",
-    "Finished · 2",
-  ]) assert.match(text, new RegExp(heading));
 
-  const positions = ["input-row", "work-row", "queue-row", "error-row", "done-row"]
-    .map((name) => lines.findIndex((line) => line.includes(name)));
+  for (const heading of ["Needs input · 1", "Working · 1", "Queued or waiting · 1", "Failed · 1", "Finished · 2"]) {
+    assert.match(text, new RegExp(heading));
+  }
+
+  const positions = ["input-row", "work-row", "queue-row", "error-row", "done-row"].map((name) =>
+    lines.findIndex((line) => line.includes(name)),
+  );
   assert.ok(positions.every((position) => position >= 0));
-  assert.deepEqual([...positions].sort((left, right) => left - right), positions, "rows follow attention order");
-  assert.match(lines.find((line) => line.includes("input-row") && line.includes("❯")) ?? "", /running/, "a routed question does not erase the lifecycle status");
+  assert.deepEqual(
+    [...positions].sort((left, right) => left - right),
+    positions,
+    "rows follow attention order",
+  );
+  assert.match(
+    lines.find((line) => line.includes("input-row") && line.includes("❯")) ?? "",
+    /running/,
+    "a routed question does not erase the lifecycle status",
+  );
   assert.match(lines.find((line) => line.includes("cancel-row")) ?? "", /cancelled/);
 
   state.overlay.handleInput("j");
@@ -148,7 +161,11 @@ test("direct jobs render attention groups with counts and navigate only entity r
   state.overlay.handleInput("x");
   state.overlay.render(160);
   state.overlay.handleInput("x");
-  assert.deepEqual(state.manager.cancelCalls, ["working"], "the destructive action targets the selected entity, never a header");
+  assert.deepEqual(
+    state.manager.cancelCalls,
+    ["working"],
+    "the destructive action targets the selected entity, never a header",
+  );
 });
 
 test("direct job folding yields to live work and reveals the selected finished identity", (t) => {
@@ -167,15 +184,24 @@ test("direct job folding yields to live work and reveals the selected finished i
   assert.ok(lines.some((line) => line.includes("live")));
   assert.ok(lines.some((line) => line.includes("8 finished hidden")));
 
-  for (let index = 0; index < 6; index++) state.overlay.handleInput("j");
+  for (let index = 0; index < 6; index++) {
+    state.overlay.handleInput("j");
+  }
+
   lines = state.overlay.render(120);
-  assert.ok(lines.some((line) => line.includes("done-6") && line.includes("❯")), "navigation reveals the selected folded job");
+  assert.ok(
+    lines.some((line) => line.includes("done-6") && line.includes("❯")),
+    "navigation reveals the selected folded job",
+  );
   assert.ok(lines.some((line) => line.includes("7 finished hidden")));
 
   finished[5]!.status = "running";
   jobs.reverse();
   lines = state.overlay.render(120);
-  assert.ok(lines.some((line) => line.includes("done-6") && line.includes("❯")), "the selected job ID survives reordering into Working");
+  assert.ok(
+    lines.some((line) => line.includes("done-6") && line.includes("❯")),
+    "the selected job ID survives reordering into Working",
+  );
 });
 
 test("grouped job folding stays within wide, medium, and narrow panel geometry", (t) => {
@@ -186,6 +212,7 @@ test("grouped job folding stays within wide, medium, and narrow panel geometry",
       name: `history-${index}`,
     })),
   ];
+
   for (const width of [120, 72, 52]) {
     const state = dashboard(jobs, 30, () => {}, undefined, { focusJobId: "active", fullscreen: true });
     t.after(() => state.overlay.dispose());
@@ -193,7 +220,10 @@ test("grouped job folding stays within wide, medium, and narrow panel geometry",
     assert.equal(lines.length, 30);
     assert.ok(lines.every((line) => visibleWidth(line) <= width));
     assert.ok(lines.some((line) => line.includes("active")));
-    assert.ok(lines.some((line) => line.includes("finished hidden")), `${width}-column layout exposes the folded count`);
+    assert.ok(
+      lines.some((line) => line.includes("finished hidden")),
+      `${width}-column layout exposes the folded count`,
+    );
   }
 });
 
@@ -208,33 +238,62 @@ test("job summaries render in wide, medium, and narrow rows without displacing i
     t.after(() => state.overlay.dispose());
     const lines = state.overlay.render(width);
     assert.ok(lines.every((line) => visibleWidth(line) <= width));
-    assert.ok(lines.some((line) => line.includes("worker") && line.includes("check")), `${width}-column row shows the job summary`);
+    assert.ok(
+      lines.some((line) => line.includes("worker") && line.includes("check")),
+      `${width}-column row shows the job summary`,
+    );
   }
 
-  const constrained = dashboard([jobSnapshot({
-    id: "identity-priority",
-    name: "identity-survives",
-    liveThinking: "SUMMARY_MUST_YIELD",
-  })], 30, () => {}, undefined, { fullscreen: true });
+  const constrained = dashboard(
+    [
+      jobSnapshot({
+        id: "identity-priority",
+        name: "identity-survives",
+        liveThinking: "SUMMARY_MUST_YIELD",
+      }),
+    ],
+    30,
+    () => {},
+    undefined,
+    { fullscreen: true },
+  );
   t.after(() => constrained.overlay.dispose());
   const text = constrained.overlay.render(40).join("\n");
   assert.match(text, /ide/);
   assert.doesNotMatch(text, /SUMMARY_MUST_YIELD/, "summary yields before the job name at the constrained width");
 
-  const owned = dashboard([jobSnapshot({
-    id: "workflow-owned",
-    name: "owned",
-    workflow: { runId: "run-owned", agentIndex: 0, label: "build" },
-  })], 30, () => {}, undefined, { fullscreen: true });
+  const owned = dashboard(
+    [
+      jobSnapshot({
+        id: "workflow-owned",
+        name: "owned",
+        workflow: { runId: "run-owned", agentIndex: 0, label: "build" },
+      }),
+    ],
+    30,
+    () => {},
+    undefined,
+    { fullscreen: true },
+  );
   t.after(() => owned.overlay.dispose());
   assert.ok(owned.overlay.render(120).some((line) => line.includes("owned") && line.includes("workflow")));
-  assert.ok(owned.overlay.render(40).some((line) => line.includes("owned") && line.includes("workflow")), "workflow ownership survives the minimum width");
+  assert.ok(
+    owned.overlay.render(40).some((line) => line.includes("owned") && line.includes("workflow")),
+    "workflow ownership survives the minimum width",
+  );
 });
 
 test("detail focus keeps Page Up and Page Down aliases in wide and medium layouts", (t) => {
   const output = Array.from({ length: 80 }, (_, index) => `page ${index}`).join("\n");
+
   for (const width of [120, 72]) {
-    const state = dashboard([{ ...job(`paging-${width}`, "completed"), output, transcript: [{ kind: "assistant", text: output }] }], 30, () => {}, (text) => text.split("\n"), { fullscreen: true });
+    const state = dashboard(
+      [{ ...job(`paging-${width}`, "completed"), output, transcript: [{ kind: "assistant", text: output }] }],
+      30,
+      () => {},
+      (text) => text.split("\n"),
+      { fullscreen: true },
+    );
     t.after(() => state.overlay.dispose());
 
     assert.equal(dashboardLayout(width, 30).kind, width === 120 ? "wide" : "medium");
@@ -251,21 +310,39 @@ test("detail focus keeps Page Up and Page Down aliases in wide and medium layout
 
 test("explicit job focus separates selection, detail scrolling, and composer drafts", (t) => {
   const output = Array.from({ length: 80 }, (_, index) => `line ${index}`).join("\n");
-  const first = { ...job("focus-first"), name: "focus-first", output, transcript: [{ kind: "assistant" as const, text: output }] };
+  const first = {
+    ...job("focus-first"),
+    name: "focus-first",
+    output,
+    transcript: [{ kind: "assistant" as const, text: output }],
+  };
   const second = { ...job("focus-second"), name: "focus-second" };
-  const state = dashboard([first, second], 30, () => {}, (text) => text.split("\n"), {
-    focusJobId: first.id,
-    fullscreen: true,
-  });
+  const state = dashboard(
+    [first, second],
+    30,
+    () => {},
+    (text) => text.split("\n"),
+    {
+      focusJobId: first.id,
+      fullscreen: true,
+    },
+  );
   t.after(() => state.overlay.dispose());
   state.overlay.focused = true;
 
   state.overlay.render(120);
   state.overlay.handleInput("j");
-  assert.match(state.overlay.render(120).find((line) => line.includes("focus-second") && line.includes("❯")) ?? "", /focus-second/);
+  assert.match(
+    state.overlay.render(120).find((line) => line.includes("focus-second") && line.includes("❯")) ?? "",
+    /focus-second/,
+  );
   state.overlay.handleInput("k");
   state.overlay.handleInput(RIGHT);
-  assert.match(state.overlay.render(52).join("\n"), /▸ detail/, "Right drills into detail and survives a narrow resize");
+  assert.match(
+    state.overlay.render(52).join("\n"),
+    /▸ detail/,
+    "Right drills into detail and survives a narrow resize",
+  );
 
   state.overlay.handleInput("g");
   const top = state.overlay.render(120).join("\n");
@@ -289,17 +366,29 @@ test("explicit job focus separates selection, detail scrolling, and composer dra
   );
   first.output += "\nline 80";
   first.transcript[0]!.text += "\nline 80";
-  for (const listener of state.manager.listeners) listener(first);
+
+  for (const listener of state.manager.listeners) {
+    listener(first);
+  }
+
   const updatedWhilePaused = state.overlay.render(72);
   assert.doesNotMatch(updatedWhilePaused.join("\n"), /line 80/, "live output does not move a paused viewport");
   assert.match(updatedWhilePaused.find((line) => line.includes("transcript")) ?? "", /paused · G resumes live/);
 
   state.overlay.handleInput("s");
-  for (const character of "keep this draf") state.overlay.handleInput(character);
+
+  for (const character of "keep this draf") {
+    state.overlay.handleInput(character);
+  }
+
   state.overlay.handleInput("x");
   state.overlay.handleInput(LEFT);
   state.overlay.handleInput("t");
-  assert.match(state.overlay.render(120).join("\n"), /keep this draft.*x/s, "Left moves the draft cursor instead of leaving the composer");
+  assert.match(
+    state.overlay.render(120).join("\n"),
+    /keep this draft.*x/s,
+    "Left moves the draft cursor instead of leaving the composer",
+  );
   state.overlay.handleInput(ESCAPE);
   assert.match(state.overlay.render(120).join("\n"), /▸ detail/, "Escape backs out of the composer by one layer");
   state.overlay.handleInput("s");
@@ -332,7 +421,11 @@ test("composer drafts stay bound to one job and composer identity", (t) => {
   state.overlay.render(52);
   state.overlay.handleInput(ENTER);
   state.overlay.handleInput("s");
-  for (const character of "message for first") state.overlay.handleInput(character);
+
+  for (const character of "message for first") {
+    state.overlay.handleInput(character);
+  }
+
   state.overlay.handleInput(ESCAPE);
   state.overlay.handleInput(LEFT);
   state.overlay.handleInput("j");
@@ -340,7 +433,10 @@ test("composer drafts stay bound to one job and composer identity", (t) => {
   state.overlay.handleInput("s");
   assert.doesNotMatch(state.overlay.render(52).join("\n"), /message for first/);
 
-  for (const character of "second draft") state.overlay.handleInput(character);
+  for (const character of "second draft") {
+    state.overlay.handleInput(character);
+  }
+
   state.overlay.handleInput(ESCAPE);
   second.interaction = interactionSnapshot({
     requestId: "draft-second-question",
@@ -348,9 +444,17 @@ test("composer drafts stay bound to one job and composer identity", (t) => {
     sourceName: second.name,
     humanVisible: true,
   });
-  for (const listener of state.manager.listeners) listener(second);
+
+  for (const listener of state.manager.listeners) {
+    listener(second);
+  }
+
   state.overlay.handleInput("a");
-  assert.doesNotMatch(state.overlay.render(52).join("\n"), /second draft/, "another composer kind cannot inherit a steer draft");
+  assert.doesNotMatch(
+    state.overlay.render(52).join("\n"),
+    /second draft/,
+    "another composer kind cannot inherit a steer draft",
+  );
 });
 
 test("compatibility takeover mode preserves a running job's steer draft", (t) => {
@@ -364,7 +468,11 @@ test("compatibility takeover mode preserves a running job's steer draft", (t) =>
   state.overlay.focused = true;
 
   state.overlay.render(52);
-  for (const character of "keep compatibility draft") state.overlay.handleInput(character);
+
+  for (const character of "keep compatibility draft") {
+    state.overlay.handleInput(character);
+  }
+
   state.overlay.handleInput(ESCAPE);
   state.overlay.handleInput("s");
   assert.match(
@@ -386,7 +494,11 @@ test("compatibility takeover mode preserves a completed retained job's follow-up
 
   state.overlay.render(52);
   assert.match(state.overlay.render(52).join("\n"), /composer · follow-up/);
-  for (const character of "keep completed draft") state.overlay.handleInput(character);
+
+  for (const character of "keep completed draft") {
+    state.overlay.handleInput(character);
+  }
+
   state.overlay.handleInput(ESCAPE);
   state.overlay.handleInput("f");
   assert.match(
@@ -407,11 +519,19 @@ test("compatibility takeover drafts do not cross composer kinds", (t) => {
   state.overlay.focused = true;
 
   state.overlay.render(52);
-  for (const character of "running steer draft") state.overlay.handleInput(character);
+
+  for (const character of "running steer draft") {
+    state.overlay.handleInput(character);
+  }
+
   state.overlay.handleInput(ESCAPE);
 
   current.status = "completed";
-  for (const listener of state.manager.listeners) listener(current);
+
+  for (const listener of state.manager.listeners) {
+    listener(current);
+  }
+
   state.overlay.render(52);
   state.overlay.handleInput("f");
   assert.doesNotMatch(
@@ -432,10 +552,16 @@ test("completion leaves an open compatibility steer draft stale and follow-up st
   state.overlay.focused = true;
 
   state.overlay.render(52);
-  for (const character of "stale steer content") state.overlay.handleInput(character);
+
+  for (const character of "stale steer content") {
+    state.overlay.handleInput(character);
+  }
 
   current.status = "completed";
-  for (const listener of state.manager.listeners) listener(current);
+
+  for (const listener of state.manager.listeners) {
+    listener(current);
+  }
 
   const stale = state.overlay.render(52).join("\n");
   assert.match(stale, /stale steer content/, "the open steer draft remains intact after completion");
@@ -480,7 +606,11 @@ test("six-row steer and answer composers keep their input visible", (t) => {
 });
 
 test("terminal job viewport labels use end instead of live", (t) => {
-  const completed = { ...job("terminal-label", "completed"), output: "done", transcript: [{ kind: "assistant" as const, text: "done" }] };
+  const completed = {
+    ...job("terminal-label", "completed"),
+    output: "done",
+    transcript: [{ kind: "assistant" as const, text: "done" }],
+  };
   const state = dashboard([completed], 24, () => {}, undefined, { focusJobId: completed.id, fullscreen: true });
   t.after(() => state.overlay.dispose());
 
@@ -497,11 +627,17 @@ test("minimum-width live cancellation keeps its Unicode hint visible through con
 
   const initial = state.overlay.render(40);
   assert.ok(initial.every((line) => visibleWidth(line) <= 40));
-  assert.ok(initial.some((line) => line.includes("x cancel")), "the minimum-width hint exposes cancellation");
+  assert.ok(
+    initial.some((line) => line.includes("x cancel")),
+    "the minimum-width hint exposes cancellation",
+  );
 
   state.overlay.handleInput("x");
   const confirmation = state.overlay.render(40);
-  assert.ok(confirmation.some((line) => line.includes("Press x again to confirm")), "confirmation remains actionable at the minimum width");
+  assert.ok(
+    confirmation.some((line) => line.includes("Press x again to confirm")),
+    "confirmation remains actionable at the minimum width",
+  );
   assert.ok(confirmation.every((line) => visibleWidth(line) <= 40));
 
   state.overlay.handleInput("x");
@@ -524,7 +660,10 @@ test("compact geometry resets hidden composer state and accepts only its close c
   assert.match(compact.join("\n"), /Esc close/);
   assert.doesNotMatch(compact.join("\n"), /composer|detail/);
 
-  for (const input of [ENTER, "p", "r", "s", "f", "x", PAGE_DOWN]) state.overlay.handleInput(input);
+  for (const input of [ENTER, "p", "r", "s", "f", "x", PAGE_DOWN]) {
+    state.overlay.handleInput(input);
+  }
+
   assert.deepEqual(state.manager.cancelCalls, []);
   assert.deepEqual(state.manager.sendCalls, []);
   assert.deepEqual(closed, []);
@@ -546,7 +685,10 @@ test("narrow list keeps selection keys out of the hidden detail viewport", (t) =
   assert.match(list, /Enter\/→ inspect/);
   assert.doesNotMatch(list, /scroll/);
 
-  for (const input of ["p", "h", "g", PAGE_DOWN, "r"]) state.overlay.handleInput(input);
+  for (const input of ["p", "h", "g", PAGE_DOWN, "r"]) {
+    state.overlay.handleInput(input);
+  }
+
   assert.deepEqual(state.manager.cancelCalls, []);
   assert.deepEqual(state.manager.sendCalls, []);
   assert.match(state.overlay.render(52).join("\n"), /Enter\/→ inspect/);
@@ -556,10 +698,18 @@ test("narrow list keeps selection keys out of the hidden detail viewport", (t) =
 });
 
 test("narrow detail ignores controls that are not exposed by a read-only inspector", (t) => {
-  const state = dashboard([{
-    ...job("narrow-detail", "failed"),
-    output: Array.from({ length: 80 }, (_, index) => `output ${index}`).join("\n"),
-  }], 30, () => {}, undefined, { fullscreen: true });
+  const state = dashboard(
+    [
+      {
+        ...job("narrow-detail", "failed"),
+        output: Array.from({ length: 80 }, (_, index) => `output ${index}`).join("\n"),
+      },
+    ],
+    30,
+    () => {},
+    undefined,
+    { fullscreen: true },
+  );
   t.after(() => state.overlay.dispose());
 
   state.overlay.render(52);
@@ -572,7 +722,10 @@ test("narrow detail ignores controls that are not exposed by a read-only inspect
   state.overlay.handleInput(PAGE_DOWN);
   assert.notEqual(state.overlay.render(52).join("\n"), top, "Page Down scrolls the focused narrow detail pane");
 
-  for (const input of ["p", ENTER, "s", "f", "x", "X"]) state.overlay.handleInput(input);
+  for (const input of ["p", ENTER, "s", "f", "x", "X"]) {
+    state.overlay.handleInput(input);
+  }
+
   assert.deepEqual(state.manager.cancelCalls, []);
   assert.deepEqual(state.manager.sendCalls, []);
   assert.match(state.overlay.render(52).join("\n"), /detail/);
@@ -597,7 +750,10 @@ test("composer accepts input without exposing detail cancellation or paging", (t
   assert.match(takeover, /Enter steer/);
   assert.match(takeover, /Esc back/);
 
-  for (const input of ["p", "r", "x", "f", PAGE_DOWN]) state.overlay.handleInput(input);
+  for (const input of ["p", "r", "x", "f", PAGE_DOWN]) {
+    state.overlay.handleInput(input);
+  }
+
   assert.deepEqual(state.manager.cancelCalls, []);
   assert.deepEqual(state.manager.sendCalls, []);
   assert.match(state.overlay.render(52).join("\n"), /▸ composer · steer/);
@@ -659,38 +815,66 @@ function dashboard(
     sendCalls,
     answerCalls,
     concurrency: 4,
-    ...(options.answerable === false ? {} : {
-      answerInteraction(requestId: string, answer: string, route?: string) {
-        answerCalls.push([requestId, answer, route]);
-        if (options.answerError) throw new Error(options.answerError);
-        return { requestId, answer, state: "answered" };
-      },
-    }),
+    ...(options.answerable === false
+      ? {}
+      : {
+          answerInteraction(requestId: string, answer: string, route?: string) {
+            answerCalls.push([requestId, answer, route]);
+
+            if (options.answerError) {
+              throw new Error(options.answerError);
+            }
+
+            return { requestId, answer, state: "answered" };
+          },
+        }),
     list: () => jobs,
     subscribe(listener: (job: JobSnapshot) => void) {
       listeners.add(listener);
+
       return () => listeners.delete(listener);
     },
     async send(id: string): Promise<JobSnapshot> {
       sendCalls.push(id);
-      if (options.sendError) throw new Error(options.sendError);
-      if (options.sendPromise) return options.sendPromise;
+
+      if (options.sendError) {
+        throw new Error(options.sendError);
+      }
+
+      if (options.sendPromise) {
+        return options.sendPromise;
+      }
+
       const current = jobs.find((item) => item.id === id);
-      if (!current) throw new Error(`unknown job ${id}`);
+
+      if (!current) {
+        throw new Error(`unknown job ${id}`);
+      }
+
       return current;
     },
     async cancel(id: string): Promise<JobSnapshot> {
       cancelCalls.push(id);
       const index = jobs.findIndex((item) => item.id === id);
-      if (index < 0) throw new Error(`unknown job ${id}`);
+
+      if (index < 0) {
+        throw new Error(`unknown job ${id}`);
+      }
+
       const current = { ...jobs[index]!, status: "cancelled" as const, endedAt: 65_000 };
       jobs[index] = current;
-      for (const listener of listeners) listener(current);
+
+      for (const listener of listeners) {
+        listener(current);
+      }
+
       return current;
     },
   };
   const tui = {
-    requestRender: () => { renders++; },
+    requestRender: () => {
+      renders++;
+    },
     terminal,
     ...(options.fullscreen ? { mode: "fullscreen" } : {}),
   } as never;
@@ -714,11 +898,14 @@ function dashboard(
       availability: options.availability,
     },
   );
+
   return {
     overlay,
     manager,
     renders: () => renders,
-    setRows: (nextRows) => { terminal.rows = nextRows; },
+    setRows: (nextRows) => {
+      terminal.rows = nextRows;
+    },
   };
 }
 
@@ -747,12 +934,18 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
   assert.ok(wide.some((line) => line.includes("first")));
   assert.ok(wide.some((line) => line.includes("detail")));
   assert.ok(wide.every((line) => visibleWidth(line) <= 120));
-  assert.ok(wide.some((line) => line.includes("first-39")), "live detail follows the transcript tail");
+  assert.ok(
+    wide.some((line) => line.includes("first-39")),
+    "live detail follows the transcript tail",
+  );
 
   overlay.handleInput(ENTER);
   overlay.handleInput("g");
   const top = overlay.render(120);
-  assert.ok(top.some((line) => line.includes("first-0")), "g scrolls to the transcript top");
+  assert.ok(
+    top.some((line) => line.includes("first-0")),
+    "g scrolls to the transcript top",
+  );
   overlay.handleInput("\u0004"); // Ctrl+D, fullscreen-safe half-page scroll.
   const halfPage = overlay.render(120);
   assert.ok(halfPage.some((line) => line.includes("first-")));
@@ -760,9 +953,15 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
 
   overlay.handleInput(ESCAPE);
   overlay.handleInput("k");
-  assert.ok(overlay.render(72).some((line) => line.includes("second")), "selection moves by job id");
+  assert.ok(
+    overlay.render(72).some((line) => line.includes("second")),
+    "selection moves by job id",
+  );
   overlay.handleInput("x");
-  assert.ok(overlay.render(72).some((line) => line.includes("Press x again")), "cancel is confirmed inline");
+  assert.ok(
+    overlay.render(72).some((line) => line.includes("Press x again")),
+    "cancel is confirmed inline",
+  );
   overlay.handleInput("x");
   await tick();
   assert.deepEqual(manager.cancelCalls, ["second"]);
@@ -770,9 +969,15 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
 
   overlay.handleInput("k");
   overlay.handleInput("f");
-  assert.ok(overlay.render(72).some((line) => line.includes("follow-up")), "the composer stays in the same panel");
+  assert.ok(
+    overlay.render(72).some((line) => line.includes("follow-up")),
+    "the composer stays in the same panel",
+  );
   overlay.handleInput("\x1b");
-  assert.ok(!overlay.render(72).some((line) => line.includes("▸ composer")), "Escape returns from the composer without losing the panel");
+  assert.ok(
+    !overlay.render(72).some((line) => line.includes("▸ composer")),
+    "Escape returns from the composer without losing the panel",
+  );
   overlay.handleInput("\x1b");
   overlay.handleInput("\x1b");
   assert.deepEqual(closed, [null]);
@@ -782,16 +987,22 @@ test("dashboard renders adaptive detail, follows live output, and keeps fullscre
 test("dashboard header exposes normalized harness states in text, not color alone", (t) => {
   const availability = [
     harnessActivation(availabilityFixture("pi"), true),
-    harnessActivation(availabilityFixture("claude", {
-      authenticated: false,
-      ready: false,
-      detail: "Claude Code is not logged in",
-    }), true),
-    harnessActivation(availabilityFixture("codex", {
-      installed: false,
-      authenticated: false,
-      ready: false,
-    }), false),
+    harnessActivation(
+      availabilityFixture("claude", {
+        authenticated: false,
+        ready: false,
+        detail: "Claude Code is not logged in",
+      }),
+      true,
+    ),
+    harnessActivation(
+      availabilityFixture("codex", {
+        installed: false,
+        authenticated: false,
+        ready: false,
+      }),
+      false,
+    ),
   ];
   const { overlay } = dashboard([job("status")], 24, () => {}, undefined, { availability });
   t.after(() => overlay.dispose());
@@ -809,11 +1020,14 @@ test("responsive job header keeps attention counts and abnormal route text befor
   const failed = job("failed", "failed");
   const availability = [
     harnessActivation(availabilityFixture("pi"), true),
-    harnessActivation(availabilityFixture("claude", {
-      authenticated: false,
-      ready: false,
-      detail: "Claude Code is not logged in",
-    }), true),
+    harnessActivation(
+      availabilityFixture("claude", {
+        authenticated: false,
+        ready: false,
+        detail: "Claude Code is not logged in",
+      }),
+      true,
+    ),
   ];
   const state = dashboard([blocked, failed], 24, () => {}, undefined, { availability, fullscreen: true });
   t.after(() => state.overlay.dispose());
@@ -889,10 +1103,17 @@ test("dashboard caches Markdown rendering by transcript and width", (t) => {
     transcript: [{ kind: "assistant" as const, text: "# Verdict\n\n**PASS**" }],
   };
   let calls = 0;
-  const { overlay, manager } = dashboard([current], 24, () => {}, () => {
-    calls++;
-    return ["\u001b[1mVerdict\u001b[0m", "\u001b[32mPASS\u001b[0m"];
-  }, { focusJobId: current.id });
+  const { overlay, manager } = dashboard(
+    [current],
+    24,
+    () => {},
+    () => {
+      calls++;
+
+      return ["\u001b[1mVerdict\u001b[0m", "\u001b[32mPASS\u001b[0m"];
+    },
+    { focusJobId: current.id },
+  );
   t.after(() => overlay.dispose());
   const first = overlay.render(72);
   overlay.render(72);
@@ -901,7 +1122,11 @@ test("dashboard caches Markdown rendering by transcript and width", (t) => {
   overlay.render(80);
   assert.equal(calls, 2, "a width change invalidates the transcript layout cache");
   current.transcript[0] = { kind: "assistant", text: "# Verdict\n\n**FAIL**" };
-  for (const listener of manager.listeners) listener(current);
+
+  for (const listener of manager.listeners) {
+    listener(current);
+  }
+
   overlay.render(80);
   assert.equal(calls, 3, "manager events invalidate equal-length transcript changes");
 });
@@ -915,10 +1140,29 @@ test("transcript delegates structured tool events to Pi execution components", (
       { id: "read-1", name: "Read", status: "failed" as const },
     ],
     transcript: [
-      { kind: "tool" as const, phase: "start" as const, toolId: "grep-1", name: "Grep", args: { pattern: "480", path: "frontend", glob: "*.ts" } },
+      {
+        kind: "tool" as const,
+        phase: "start" as const,
+        toolId: "grep-1",
+        name: "Grep",
+        args: { pattern: "480", path: "frontend", glob: "*.ts" },
+      },
       { kind: "tool" as const, phase: "start" as const, toolId: "read-1", name: "Read", args: { path: "missing.ts" } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "grep-1", name: "Grep", result: { content: [{ type: "text", text: "src/a.ts:1: match\nsrc/b.ts:2: match" }], isError: false } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "read-1", name: "Read", result: { content: [{ type: "text", text: "File not found" }], isError: true }, error: true },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "grep-1",
+        name: "Grep",
+        result: { content: [{ type: "text", text: "src/a.ts:1: match\nsrc/b.ts:2: match" }], isError: false },
+      },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "read-1",
+        name: "Read",
+        result: { content: [{ type: "text", text: "File not found" }], isError: true },
+        error: true,
+      },
     ],
   };
   const lines = buildTranscript(current, 48, ansiTheme, { toolDisplay: "full" });
@@ -934,7 +1178,10 @@ test("transcript delegates structured tool events to Pi execution components", (
   assert.ok(lines.every((line) => visibleWidth(line) <= 48));
 
   const compactLines = buildTranscript(current, 48, ansiTheme);
-  assert.ok(!compactLines.some((line) => line.includes("missing.ts")), "compact mode is the default and omits Pi's native tool shell");
+  assert.ok(
+    !compactLines.some((line) => line.includes("missing.ts")),
+    "compact mode is the default and omits Pi's native tool shell",
+  );
   assert.match(compactLines.join("\n"), /2 tool calls/);
 });
 
@@ -951,13 +1198,56 @@ test("compact tool groups fold consecutive calls between assistant turns and sta
       { kind: "tool" as const, phase: "start" as const, toolId: "e2", name: "edit", args: { path: "b.ts" } },
       { kind: "tool" as const, phase: "start" as const, toolId: "b1", name: "bash", args: { command: "npm test" } },
       { kind: "tool" as const, phase: "start" as const, toolId: "b2", name: "bash", args: { command: "npm run lint" } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "r1", name: "read", result: { content: [], isError: false } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "r2", name: "read", result: { content: [], isError: false } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "r3", name: "read", result: { content: [], isError: false } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "e1", name: "edit", result: { content: [], isError: false } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "e2", name: "edit", result: { content: [], isError: false } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "b1", name: "bash", result: { content: [], isError: true }, error: true },
-      { kind: "tool" as const, phase: "end" as const, toolId: "b2", name: "bash", result: { content: [], isError: false } },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "r1",
+        name: "read",
+        result: { content: [], isError: false },
+      },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "r2",
+        name: "read",
+        result: { content: [], isError: false },
+      },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "r3",
+        name: "read",
+        result: { content: [], isError: false },
+      },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "e1",
+        name: "edit",
+        result: { content: [], isError: false },
+      },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "e2",
+        name: "edit",
+        result: { content: [], isError: false },
+      },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "b1",
+        name: "bash",
+        result: { content: [], isError: true },
+        error: true,
+      },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "b2",
+        name: "bash",
+        result: { content: [], isError: false },
+      },
       { kind: "assistant" as const, text: "concluding work" },
     ],
   };
@@ -967,7 +1257,10 @@ test("compact tool groups fold consecutive calls between assistant turns and sta
   const groupIndex = lines.indexOf(groupLines[0]!);
   const startIndex = lines.findIndex((line) => line.includes("starting work"));
   const endIndex = lines.findIndex((line) => line.includes("concluding work"));
-  assert.ok(startIndex >= 0 && groupIndex > startIndex && endIndex > groupIndex, "the group sits between the surrounding assistant turns");
+  assert.ok(
+    startIndex >= 0 && groupIndex > startIndex && endIndex > groupIndex,
+    "the group sits between the surrounding assistant turns",
+  );
   assert.match(groupLines[0]!, /7 tool calls/);
   assert.match(groupLines[0]!, /✓6/);
   assert.match(groupLines[0]!, /×1/);
@@ -980,24 +1273,46 @@ test("dashboard toggles between compact groups and full Pi tool rendering with t
     output: "",
     transcript: [
       { kind: "tool" as const, phase: "start" as const, toolId: "r1", name: "read", args: { path: "a.ts" } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "r1", name: "read", result: { content: [{ type: "text", text: "contents" }], isError: false } },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "r1",
+        name: "read",
+        result: { content: [{ type: "text", text: "contents" }], isError: false },
+      },
     ],
   };
   const { overlay } = dashboard([current], 24, () => {}, undefined, { focusJobId: current.id });
   t.after(() => overlay.dispose());
 
   const compact = overlay.render(90);
-  assert.ok(compact.some((line) => line.includes("1 tool call")), "compact mode is the default");
-  assert.ok(compact.some((line) => line.includes("t full")), "hint offers the toggle to full mode");
+  assert.ok(
+    compact.some((line) => line.includes("1 tool call")),
+    "compact mode is the default",
+  );
+  assert.ok(
+    compact.some((line) => line.includes("t full")),
+    "hint offers the toggle to full mode",
+  );
 
   overlay.handleInput("t");
   const full = overlay.render(90);
-  assert.ok(full.some((line) => line.includes("a.ts")), "full mode restores Pi's native tool rendering");
-  assert.ok(full.some((line) => line.includes("t compact")), "hint offers the toggle back to compact mode");
+  assert.ok(
+    full.some((line) => line.includes("a.ts")),
+    "full mode restores Pi's native tool rendering",
+  );
+  assert.ok(
+    full.some((line) => line.includes("t compact")),
+    "hint offers the toggle back to compact mode",
+  );
 
   overlay.handleInput("t");
   const backToCompact = overlay.render(90);
-  assert.deepEqual(backToCompact, compact, "toggling twice reproduces the original compact output, including the cache key");
+  assert.deepEqual(
+    backToCompact,
+    compact,
+    "toggling twice reproduces the original compact output, including the cache key",
+  );
 });
 
 test("t toggles tool display from the narrow list pane, and the detail title carries the mode even when hints truncate", (t) => {
@@ -1006,14 +1321,23 @@ test("t toggles tool display from the narrow list pane, and the detail title car
     output: "",
     transcript: [
       { kind: "tool" as const, phase: "start" as const, toolId: "r1", name: "read", args: { path: "a.ts" } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "r1", name: "read", result: { content: [{ type: "text", text: "contents" }], isError: false } },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "r1",
+        name: "read",
+        result: { content: [{ type: "text", text: "contents" }], isError: false },
+      },
     ],
   };
   const { overlay } = dashboard([current], 30, () => {}, undefined, { focusJobId: current.id, fullscreen: true });
   t.after(() => overlay.dispose());
 
   overlay.render(52);
-  assert.ok(overlay.render(52).some((line) => line.includes("jobs ·")), "narrow layout starts on the list pane");
+  assert.ok(
+    overlay.render(52).some((line) => line.includes("jobs ·")),
+    "narrow layout starts on the list pane",
+  );
   overlay.handleInput("t");
   overlay.handleInput("\r");
   const full = overlay.render(52).join("\n");
@@ -1023,7 +1347,11 @@ test("t toggles tool display from the narrow list pane, and the detail title car
   overlay.handleInput(ESCAPE);
   overlay.handleInput("t");
   overlay.handleInput("\r");
-  assert.match(overlay.render(52).join("\n"), /detail · [\w-]+ · completed · compact/, "a second narrow-list t toggle reverts the mode");
+  assert.match(
+    overlay.render(52).join("\n"),
+    /detail · [\w-]+ · completed · compact/,
+    "a second narrow-list t toggle reverts the mode",
+  );
 });
 
 test("? opens a width-safe grouped cheatsheet, dismisses without losing state, and stays printable in the composer", (t) => {
@@ -1038,7 +1366,10 @@ test("? opens a width-safe grouped cheatsheet, dismisses without losing state, a
     state.overlay.handleInput("?");
     const help = state.overlay.render(width);
     assert.equal(help.length, 30);
-    assert.ok(help.every((line) => visibleWidth(line) <= width), `a cheatsheet line exceeds ${width} columns`);
+    assert.ok(
+      help.every((line) => visibleWidth(line) <= width),
+      `a cheatsheet line exceeds ${width} columns`,
+    );
     assert.match(help.join("\n"), /help/);
     assert.match(help.join("\n"), /Navigate/);
 
@@ -1047,7 +1378,11 @@ test("? opens a width-safe grouped cheatsheet, dismisses without losing state, a
 
     state.overlay.handleInput("?");
     state.overlay.handleInput(ESCAPE);
-    assert.equal(state.overlay.render(width).join("\n"), before, "Esc also dismisses the cheatsheet without losing state");
+    assert.equal(
+      state.overlay.render(width).join("\n"),
+      before,
+      "Esc also dismisses the cheatsheet without losing state",
+    );
   }
 });
 
@@ -1069,10 +1404,14 @@ test("the cheatsheet never intercepts ? inside the steer composer", (t) => {
 test("configurable confirm/cancel/submit bindings render their configured key names in hints, falling back to defaults otherwise", (t) => {
   const configured = dashboard([job("configured-keys")], 30, () => {}, undefined, {
     fullscreen: true,
-    getKeys: (binding) => binding === "tui.select.cancel" ? ["q"] : binding === "tui.select.confirm" ? ["space"] : [],
+    getKeys: (binding) => (binding === "tui.select.cancel" ? ["q"] : binding === "tui.select.confirm" ? ["space"] : []),
   });
   t.after(() => configured.overlay.dispose());
-  assert.match(configured.overlay.render(60).join("\n"), /Space\/→ inspect/i, "the narrow list hint reflects the configured confirm key");
+  assert.match(
+    configured.overlay.render(60).join("\n"),
+    /Space\/→ inspect/i,
+    "the narrow list hint reflects the configured confirm key",
+  );
   const wide = configured.overlay.render(90).join("\n");
   assert.match(wide, /Space\/→ inspect/i, "the list hint reflects the configured confirm key");
   assert.match(wide, /Q close/i, "the browse hint reflects the configured cancel key");
@@ -1091,7 +1430,13 @@ test("in-panel composer toggles tool rendering with Ctrl+T and treats a bare t a
     output: "",
     transcript: [
       { kind: "tool" as const, phase: "start" as const, toolId: "r1", name: "read", args: { path: "a.ts" } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "r1", name: "read", result: { content: [{ type: "text", text: "contents" }], isError: false } },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "r1",
+        name: "read",
+        result: { content: [{ type: "text", text: "contents" }], isError: false },
+      },
     ],
   };
   const { overlay } = dashboard([current], 24, () => {}, undefined, { focusJobId: current.id });
@@ -1101,22 +1446,43 @@ test("in-panel composer toggles tool rendering with Ctrl+T and treats a bare t a
   overlay.render(90);
   overlay.handleInput("s");
   const compact = overlay.render(90);
-  assert.ok(compact.some((line) => line.includes("1 tool call")), "takeover compact mode is the default");
-  assert.ok(compact.some((line) => line.includes("Ctrl+T full")), "takeover hint offers the toggle to full mode");
+  assert.ok(
+    compact.some((line) => line.includes("1 tool call")),
+    "takeover compact mode is the default",
+  );
+  assert.ok(
+    compact.some((line) => line.includes("Ctrl+T full")),
+    "takeover hint offers the toggle to full mode",
+  );
 
   overlay.handleInput("t");
   const stillCompact = overlay.render(90);
-  assert.ok(stillCompact.some((line) => line.includes("1 tool call")), "a bare t while composing types into the draft instead of toggling out of compact mode");
-  assert.ok(stillCompact.some((line) => line.includes("> t")), "the composer echoes the typed t");
+  assert.ok(
+    stillCompact.some((line) => line.includes("1 tool call")),
+    "a bare t while composing types into the draft instead of toggling out of compact mode",
+  );
+  assert.ok(
+    stillCompact.some((line) => line.includes("> t")),
+    "the composer echoes the typed t",
+  );
 
   overlay.handleInput(CTRL_T);
   const full = overlay.render(90);
-  assert.ok(full.some((line) => line.includes("a.ts")), "Ctrl+T restores Pi's native tool rendering during takeover");
-  assert.ok(full.some((line) => line.includes("Ctrl+T compact")), "takeover hint offers the toggle back to compact mode");
+  assert.ok(
+    full.some((line) => line.includes("a.ts")),
+    "Ctrl+T restores Pi's native tool rendering during takeover",
+  );
+  assert.ok(
+    full.some((line) => line.includes("Ctrl+T compact")),
+    "takeover hint offers the toggle back to compact mode",
+  );
 
   overlay.handleInput(CTRL_T);
   const backToCompact = overlay.render(90);
-  assert.ok(backToCompact.some((line) => line.includes("1 tool call")), "a second Ctrl+T toggles back to compact mode");
+  assert.ok(
+    backToCompact.some((line) => line.includes("1 tool call")),
+    "a second Ctrl+T toggles back to compact mode",
+  );
 });
 
 test("compact tool group rows keep failures visible and stay within every width", () => {
@@ -1127,14 +1493,37 @@ test("compact tool group rows keep failures visible and stay within every width"
       { kind: "tool" as const, phase: "start" as const, toolId: "r1", name: "read", args: { path: "a.ts" } },
       { kind: "tool" as const, phase: "start" as const, toolId: "r2", name: "read", args: { path: "b.ts" } },
       { kind: "tool" as const, phase: "start" as const, toolId: "b1", name: "bash", args: { command: "npm test" } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "r1", name: "read", result: { content: [], isError: false } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "r2", name: "read", result: { content: [], isError: false } },
-      { kind: "tool" as const, phase: "end" as const, toolId: "b1", name: "bash", result: { content: [], isError: true }, error: true },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "r1",
+        name: "read",
+        result: { content: [], isError: false },
+      },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "r2",
+        name: "read",
+        result: { content: [], isError: false },
+      },
+      {
+        kind: "tool" as const,
+        phase: "end" as const,
+        toolId: "b1",
+        name: "bash",
+        result: { content: [], isError: true },
+        error: true,
+      },
     ],
   };
+
   for (const width of [80, 60, 40, 24, 12]) {
     const lines = buildTranscript(current, width, theme);
-    assert.ok(lines.every((line) => visibleWidth(line) <= width), `every line fits within ${width} columns`);
+    assert.ok(
+      lines.every((line) => visibleWidth(line) <= width),
+      `every line fits within ${width} columns`,
+    );
     const groupLine = lines.find((line) => line.includes("⌁"));
     assert.ok(groupLine?.includes("×1"), `the failed-call count survives at width ${width}`);
   }
@@ -1142,31 +1531,52 @@ test("compact tool group rows keep failures visible and stay within every width"
 
 test("takeover restores a rejected draft without overwriting newer input", async (t) => {
   const current = job("draft");
-  const { overlay } = dashboard([current], 24, () => {}, undefined, { focusJobId: current.id, sendError: "send failed", submitKey: "\u0011" });
+  const { overlay } = dashboard([current], 24, () => {}, undefined, {
+    focusJobId: current.id,
+    sendError: "send failed",
+    submitKey: "\u0011",
+  });
   t.after(() => overlay.dispose());
   overlay.focused = true;
   overlay.render(72);
   overlay.handleInput("s");
-  for (const character of "g/G draft message") overlay.handleInput(character);
+
+  for (const character of "g/G draft message") {
+    overlay.handleInput(character);
+  }
+
   overlay.handleInput("\u0011");
   await tick();
   const lines = overlay.render(72);
   assert.ok(lines.some((line) => line.includes("send failed")));
-  assert.ok(lines.some((line) => line.includes("g") && line.includes("/G draft message")), "failed sends keep ordinary g/G characters and the draft available");
+  assert.ok(
+    lines.some((line) => line.includes("g") && line.includes("/G draft message")),
+    "failed sends keep ordinary g/G characters and the draft available",
+  );
 });
 
 test("a newer draft survives rejection of an earlier in-flight send", async (t) => {
   const current = job("deferred");
   let rejectSend!: (error: Error) => void;
-  const sendPromise = new Promise<JobSnapshot>((_resolve, reject) => { rejectSend = reject; });
+  const sendPromise = new Promise<JobSnapshot>((_resolve, reject) => {
+    rejectSend = reject;
+  });
   const { overlay } = dashboard([current], 24, () => {}, undefined, { focusJobId: current.id, sendPromise });
   t.after(() => overlay.dispose());
   overlay.focused = true;
   overlay.render(72);
   overlay.handleInput("s");
-  for (const character of "first") overlay.handleInput(character);
+
+  for (const character of "first") {
+    overlay.handleInput(character);
+  }
+
   overlay.handleInput("\r");
-  for (const character of "second") overlay.handleInput(character);
+
+  for (const character of "second") {
+    overlay.handleInput(character);
+  }
+
   overlay.handleInput("\r"); // second submit is held as a newer draft while first is pending
   rejectSend(new Error("first failed"));
   await tick();
@@ -1193,12 +1603,22 @@ test("takeover renders normalized thinking, tools, queued messages, and closes r
   const view = new TakeoverView(
     { requestRender() {}, terminal: { rows: 24 } } as never,
     theme,
-    { matches: (data: string, binding: string) => binding === "tui.select.cancel" && data === "\u0003" } as unknown as KeybindingsManager,
+    {
+      matches: (data: string, binding: string) => binding === "tui.select.cancel" && data === "\u0003",
+    } as unknown as KeybindingsManager,
     {
       check: () => current,
-      async send() { return current; },
-      async cancel() { return { ...current, status: "cancelled" as const }; },
-      subscribe(listener: (value: JobSnapshot) => void) { updates.add(listener); return () => updates.delete(listener); },
+      async send() {
+        return current;
+      },
+      async cancel() {
+        return { ...current, status: "cancelled" as const };
+      },
+      subscribe(listener: (value: JobSnapshot) => void) {
+        updates.add(listener);
+
+        return () => updates.delete(listener);
+      },
     } as never,
     current.id,
     (value) => closed.push(value),
@@ -1208,23 +1628,44 @@ test("takeover renders normalized thinking, tools, queued messages, and closes r
   const lines = view.render(72);
   assert.equal(lines.length, 24, "takeover stays within the fullscreen overlay height");
   assert.ok(lines.some((line) => line.includes("considering options")));
-  assert.ok(lines.some((line) => line.includes("1 tool call") && line.includes("read")), "compact mode is the default in takeover");
+  assert.ok(
+    lines.some((line) => line.includes("1 tool call") && line.includes("read")),
+    "compact mode is the default in takeover",
+  );
   assert.ok(!lines.some((line) => line.includes("file.ts")), "compact mode omits Pi's native tool shell");
   assert.ok(lines.some((line) => line.includes("also verify tests")));
-  assert.ok(lines.some((line) => line.includes("effort high")), "takeover metadata shows request effort");
-  assert.ok(lines.some((line) => line.includes("Ctrl+T full")), "footer hint offers the toggle to full mode");
+  assert.ok(
+    lines.some((line) => line.includes("effort high")),
+    "takeover metadata shows request effort",
+  );
+  assert.ok(
+    lines.some((line) => line.includes("Ctrl+T full")),
+    "footer hint offers the toggle to full mode",
+  );
 
   view.handleInput("");
   const fullLines = view.render(72);
-  assert.ok(fullLines.some((line) => line.includes("read") && line.includes("file.ts")), "Ctrl+T restores Pi's native tool rendering");
-  assert.ok(fullLines.some((line) => line.includes("Ctrl+T compact")), "footer hint offers the toggle back to compact mode");
+  assert.ok(
+    fullLines.some((line) => line.includes("read") && line.includes("file.ts")),
+    "Ctrl+T restores Pi's native tool rendering",
+  );
+  assert.ok(
+    fullLines.some((line) => line.includes("Ctrl+T compact")),
+    "footer hint offers the toggle back to compact mode",
+  );
 
   view.handleInput("t");
   const afterLiteralT = view.render(72);
-  assert.ok(afterLiteralT.some((line) => line.includes("read") && line.includes("file.ts")), "a bare t types into the composer instead of toggling");
+  assert.ok(
+    afterLiteralT.some((line) => line.includes("read") && line.includes("file.ts")),
+    "a bare t types into the composer instead of toggling",
+  );
   const compactTakeover = view.render(48);
   assert.equal(compactTakeover.length, 24, "takeover height remains exact after resize");
-  assert.ok(compactTakeover.some((line) => line.includes("effort high")), "effort survives bounded takeover rendering");
+  assert.ok(
+    compactTakeover.some((line) => line.includes("effort high")),
+    "effort survives bounded takeover rendering",
+  );
   assert.ok(buildTranscript(current, 72, theme).every((line) => visibleWidth(line) <= 72));
   view.handleInput("\x1b");
   assert.deepEqual(closed, [null]);
@@ -1241,9 +1682,17 @@ test("takeover renders normalized thinking, tools, queued messages, and closes r
     { matches: () => false } as unknown as KeybindingsManager,
     {
       check: () => workflowCurrent,
-      async send() { workflowSends++; return workflowCurrent; },
-      async cancel() { return { ...workflowCurrent, status: "cancelled" as const }; },
-      subscribe() { return () => {}; },
+      async send() {
+        workflowSends++;
+
+        return workflowCurrent;
+      },
+      async cancel() {
+        return { ...workflowCurrent, status: "cancelled" as const };
+      },
+      subscribe() {
+        return () => {};
+      },
     } as never,
     workflowCurrent.id,
     () => {},
@@ -1259,12 +1708,27 @@ test("takeover renders normalized thinking, tools, queued messages, and closes r
 function parkedJob(id: string, overrides: Parameters<typeof interactionSnapshot>[0] = {}): JobSnapshot {
   return {
     ...job(id),
-    interaction: interactionSnapshot({ sourceJobId: id, sourceName: id, question: "Which fixture is authoritative?", ...overrides }),
+    interaction: interactionSnapshot({
+      sourceJobId: id,
+      sourceName: id,
+      question: "Which fixture is authoritative?",
+      ...overrides,
+    }),
   };
 }
 
 test("a job parked on a question states the wait in words, withdraws steer/follow-up, and keeps cancel", (t) => {
-  const parked = { ...parkedJob("parked"), humanVisible: true, interaction: interactionSnapshot({ sourceJobId: "parked", sourceName: "parked", humanVisible: true, question: "Which fixture is authoritative?", context: "the task and the tests disagree" }) };
+  const parked = {
+    ...parkedJob("parked"),
+    humanVisible: true,
+    interaction: interactionSnapshot({
+      sourceJobId: "parked",
+      sourceName: "parked",
+      humanVisible: true,
+      question: "Which fixture is authoritative?",
+      context: "the task and the tests disagree",
+    }),
+  };
   const { overlay } = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id });
   t.after(() => overlay.dispose());
   overlay.focused = true;
@@ -1274,11 +1738,17 @@ test("a job parked on a question states the wait in words, withdraws steer/follo
   assert.ok(text.includes("needs your answer"), "the wait is carried by words, not colour alone");
   assert.ok(text.includes("?"), "and by its own glyph");
   assert.ok(text.includes("Which fixture is authoritative?"), "the pending question is pinned in the inspector");
-  assert.ok(text.includes("Route · parked → you · waiting 1m 04s"), "the inspector names source, owner, and elapsed wait");
+  assert.ok(
+    text.includes("Route · parked → you · waiting 1m 04s"),
+    "the inspector names source, owner, and elapsed wait",
+  );
   assert.ok(text.includes("the task and the tests disagree"));
   assert.ok(text.includes("1 need input"), "the panel header aggregates blocked jobs");
   assert.ok(text.includes("a answer"), "the inline answer control is offered for a human-owned question");
-  assert.ok(!text.includes("s steer") && !text.includes("f follow-up"), "steer and follow-up are withdrawn while the caller is parked");
+  assert.ok(
+    !text.includes("s steer") && !text.includes("f follow-up"),
+    "steer and follow-up are withdrawn while the caller is parked",
+  );
   assert.ok(text.includes("x cancel"), "cancellation stays available");
   assert.ok(lines.every((line) => visibleWidth(line) <= 120));
 
@@ -1286,7 +1756,10 @@ test("a job parked on a question states the wait in words, withdraws steer/follo
   overlay.handleInput("s");
   overlay.handleInput("f");
   overlay.handleInput("\r");
-  assert.ok(!overlay.render(120).some((line) => line.includes("▸ takeover ·")), "no key opens a competing user turn while a question is pending");
+  assert.ok(
+    !overlay.render(120).some((line) => line.includes("▸ takeover ·")),
+    "no key opens a competing user turn while a question is pending",
+  );
 });
 
 test("a composer opened before a routed question cannot submit and keeps its draft", (t) => {
@@ -1296,14 +1769,21 @@ test("a composer opened before a routed question cannot submit and keeps its dra
   overlay.focused = true;
   overlay.render(120);
   overlay.handleInput("s");
-  for (const character of "keep this draft") overlay.handleInput(character);
+
+  for (const character of "keep this draft") {
+    overlay.handleInput(character);
+  }
 
   current.interaction = interactionSnapshot({
     sourceJobId: current.id,
     sourceName: current.name,
     question: "Which route should answer?",
   });
-  for (const listener of manager.listeners) listener(current);
+
+  for (const listener of manager.listeners) {
+    listener(current);
+  }
+
   overlay.handleInput(ENTER);
 
   const text = overlay.render(120).join("\n");
@@ -1330,10 +1810,17 @@ test("an answer composer cannot submit after its routed request is replaced or c
     overlay.focused = true;
     overlay.render(120);
     overlay.handleInput("a");
-    for (const character of "answer for req-a") overlay.handleInput(character);
+
+    for (const character of "answer for req-a") {
+      overlay.handleInput(character);
+    }
 
     current.interaction = replacement;
-    for (const listener of manager.listeners) listener(current);
+
+    for (const listener of manager.listeners) {
+      listener(current);
+    }
+
     overlay.handleInput("\u0011");
 
     const stale = overlay.render(120).join("\n");
@@ -1342,6 +1829,7 @@ test("an answer composer cannot submit after its routed request is replaced or c
     assert.match(stale, /question changed or closed/);
 
     overlay.handleInput(ESCAPE);
+
     if (replacement) {
       overlay.handleInput("a");
       const next = overlay.render(120).join("\n");
@@ -1351,15 +1839,29 @@ test("an answer composer cannot submit after its routed request is replaced or c
 });
 
 test("the inline answer composer resolves a human-owned question and surfaces a rejected answer", async (t) => {
-  const parked = { ...parkedJob("human"), humanVisible: true, interaction: interactionSnapshot({ sourceJobId: "human", humanVisible: true, requestId: "req-9" }) };
-  const { overlay, manager } = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id, submitKey: "\u0011" });
+  const parked = {
+    ...parkedJob("human"),
+    humanVisible: true,
+    interaction: interactionSnapshot({ sourceJobId: "human", humanVisible: true, requestId: "req-9" }),
+  };
+  const { overlay, manager } = dashboard([parked], 24, () => {}, undefined, {
+    focusJobId: parked.id,
+    submitKey: "\u0011",
+  });
   t.after(() => overlay.dispose());
   overlay.focused = true;
   overlay.render(120);
 
   overlay.handleInput("a");
-  assert.ok(overlay.render(120).some((line) => line.includes("▸ answer ·")), "a opens the answer composer in the same panel");
-  for (const character of "use the fixture") overlay.handleInput(character);
+  assert.ok(
+    overlay.render(120).some((line) => line.includes("▸ answer ·")),
+    "a opens the answer composer in the same panel",
+  );
+
+  for (const character of "use the fixture") {
+    overlay.handleInput(character);
+  }
+
   overlay.handleInput("\u0011");
   await tick();
   assert.deepEqual(manager.answerCalls, [["req-9", "use the fixture", "human"]]);
@@ -1367,12 +1869,20 @@ test("the inline answer composer resolves a human-owned question and surfaces a 
   assert.ok(after.includes("Answer delivered"));
   assert.ok(!after.includes("▸ answer ·"), "a delivered answer returns to browse mode");
 
-  const rejected = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id, submitKey: "\u0011", answerError: "Question req-9 is expired and can no longer be answered" });
+  const rejected = dashboard([parked], 24, () => {}, undefined, {
+    focusJobId: parked.id,
+    submitKey: "\u0011",
+    answerError: "Question req-9 is expired and can no longer be answered",
+  });
   t.after(() => rejected.overlay.dispose());
   rejected.overlay.focused = true;
   rejected.overlay.render(120);
   rejected.overlay.handleInput("a");
-  for (const character of "too late") rejected.overlay.handleInput(character);
+
+  for (const character of "too late") {
+    rejected.overlay.handleInput(character);
+  }
+
   rejected.overlay.handleInput("\u0011");
   await tick();
   const failed = rejected.overlay.render(120).join("\n");
@@ -1382,7 +1892,10 @@ test("the inline answer composer resolves a human-owned question and surfaces a 
 
 test("a model-owned question stays read-only in /subagents and Escape leaves the composer", (t) => {
   const parked = parkedJob("model-owned");
-  const { overlay, manager } = dashboard([parked], 24, () => {}, undefined, { focusJobId: parked.id, submitKey: "\u0011" });
+  const { overlay, manager } = dashboard([parked], 24, () => {}, undefined, {
+    focusJobId: parked.id,
+    submitKey: "\u0011",
+  });
   t.after(() => overlay.dispose());
   overlay.focused = true;
   const lines = overlay.render(120).join("\n");
@@ -1397,7 +1910,11 @@ test("a model-owned question stays read-only in /subagents and Escape leaves the
   assert.ok(notice.includes("routed to the orchestrator"));
   assert.deepEqual(manager.answerCalls, []);
 
-  const human = { ...parked, humanVisible: true, interaction: interactionSnapshot({ sourceJobId: parked.id, humanVisible: true }) };
+  const human = {
+    ...parked,
+    humanVisible: true,
+    interaction: interactionSnapshot({ sourceJobId: parked.id, humanVisible: true }),
+  };
   const composing = dashboard([human], 24, () => {}, undefined, { focusJobId: human.id, submitKey: "\u0011" });
   t.after(() => composing.overlay.dispose());
   composing.overlay.focused = true;
@@ -1405,7 +1922,10 @@ test("a model-owned question stays read-only in /subagents and Escape leaves the
   composing.overlay.handleInput("a");
   assert.ok(composing.overlay.render(120).some((line) => line.includes("▸ answer ·")));
   composing.overlay.handleInput("\u0003");
-  assert.ok(!composing.overlay.render(120).some((line) => line.includes("▸ answer ·")), "cancel layers back to browse without closing the panel");
+  assert.ok(
+    !composing.overlay.render(120).some((line) => line.includes("▸ answer ·")),
+    "cancel layers back to browse without closing the panel",
+  );
   assert.deepEqual(composing.manager.answerCalls, []);
 });
 
@@ -1454,8 +1974,20 @@ test("direct question previews route peer and workflow ownership to the accurate
 test("direct inspectors prioritize activity, results, failures, and queue recovery at constrained geometry", (t) => {
   const cases = [
     jobSnapshot({ id: "live-preview", name: "live-preview", liveThinking: "checking the bounded state preview" }),
-    jobSnapshot({ id: "done-preview", name: "done-preview", status: "completed", output: "final concise result", endedAt: 4_000 }),
-    jobSnapshot({ id: "failed-preview", name: "failed-preview", status: "failed", error: "bounded provider failure", endedAt: 4_000 }),
+    jobSnapshot({
+      id: "done-preview",
+      name: "done-preview",
+      status: "completed",
+      output: "final concise result",
+      endedAt: 4_000,
+    }),
+    jobSnapshot({
+      id: "failed-preview",
+      name: "failed-preview",
+      status: "failed",
+      error: "bounded provider failure",
+      endedAt: 4_000,
+    }),
     jobSnapshot({ id: "queued-preview", name: "queued-preview", status: "queued", startedAt: undefined }),
   ];
 
@@ -1467,13 +1999,16 @@ test("direct inspectors prioritize activity, results, failures, and queue recove
     const lines = state.overlay.render(52);
     const text = lines.join("\n");
     assert.ok(lines.every((line) => visibleWidth(line) <= 52));
-    assert.match(text, current.status === "running"
-      ? /Latest · checking/
-      : current.status === "completed"
-        ? /Result · final concise result/
-        : current.status === "failed"
-          ? /Error · bounded provider failure/
-          : /Waiting · waiting for scheduler slot/);
+    assert.match(
+      text,
+      current.status === "running"
+        ? /Latest · checking/
+        : current.status === "completed"
+          ? /Result · final concise result/
+          : current.status === "failed"
+            ? /Error · bounded provider failure/
+            : /Waiting · waiting for scheduler slot/,
+    );
     const previewAt = lines.findIndex((line) => /Latest ·|Result ·|Error ·|Waiting ·/.test(line));
     const routeAt = lines.findIndex((line) => line.includes("route "));
     assert.ok(previewAt >= 0 && (routeAt < 0 || previewAt < routeAt), "state preview precedes route telemetry");

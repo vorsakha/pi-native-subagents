@@ -21,34 +21,55 @@ function clean(value: string, limit: number): string {
 
 function toolKind(name: string): keyof typeof PATH_FIELDS | undefined {
   const normalized = name.toLowerCase();
-  return normalized && normalized in PATH_FIELDS ? normalized as keyof typeof PATH_FIELDS : undefined;
+
+  return normalized && normalized in PATH_FIELDS ? (normalized as keyof typeof PATH_FIELDS) : undefined;
 }
 
 function safeTarget(job: JobSnapshot, event: Extract<BackendEvent, { type: "tool_start" }>): string | undefined {
   const kind = toolKind(event.name);
-  if (!kind || !event.args) return undefined;
+
+  if (!kind || !event.args) {
+    return undefined;
+  }
+
   const candidate = PATH_FIELDS[kind]
     .map((field) => event.args?.[field])
     .find((value): value is string => typeof value === "string" && value.trim().length > 0);
-  if (!candidate) return undefined;
+
+  if (!candidate) {
+    return undefined;
+  }
+
   // Filesystem tools occasionally receive URI-shaped input from plugins or
   // provider mistakes. Never reinterpret a credential-bearing URL as a local
   // path and expose it through the bounded activity projection.
-  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(candidate.trim())) return undefined;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(candidate.trim())) {
+    return undefined;
+  }
 
   const root = resolve(job.cwd);
   const absolute = isAbsolute(candidate) ? resolve(candidate) : resolve(root, candidate);
   const projectRelative = relative(root, absolute);
-  if (!projectRelative || projectRelative === ".") return ".";
+
+  if (!projectRelative || projectRelative === ".") {
+    return ".";
+  }
+
   if (projectRelative === ".." || projectRelative.startsWith(`..${sep}`) || isAbsolute(projectRelative)) {
     return "[outside workspace]";
   }
+
   return clean(projectRelative.replaceAll("\\", "/"), MAX_TARGET_CHARS);
 }
 
 /** Derive semantic activity without retaining provider text, results, or arbitrary arguments. */
-export function activityFromEvent(job: JobSnapshot, event: BackendEvent, now = Date.now()): AgentActivitySnapshot | undefined {
+export function activityFromEvent(
+  job: JobSnapshot,
+  event: BackendEvent,
+  now = Date.now(),
+): AgentActivitySnapshot | undefined {
   const at = event.at ?? now;
+
   switch (event.type) {
     case "thinking_delta":
     case "thinking_message":
@@ -71,6 +92,7 @@ export function activityFromEvent(job: JobSnapshot, event: BackendEvent, now = D
       const target = trace?.args
         ? safeTarget(job, { type: "tool_start", id: event.id, name: trace.name, args: trace.args })
         : active?.target;
+
       return {
         kind: "tool",
         at,
@@ -79,6 +101,7 @@ export function activityFromEvent(job: JobSnapshot, event: BackendEvent, now = D
         target,
       };
     }
+
     case "completed":
     case "failed":
     case "cancelled":

@@ -45,14 +45,25 @@ const SECONDS_VS_MS_THRESHOLD = 1e11;
  */
 export function normalizeRetryAt(value: unknown, now: number): number | undefined {
   let ms: number | undefined;
+
   if (typeof value === "number" && Number.isFinite(value)) {
     ms = value < SECONDS_VS_MS_THRESHOLD ? value * 1000 : value;
   } else if (typeof value === "string" && value.trim()) {
     const parsed = Date.parse(value);
-    if (Number.isFinite(parsed)) ms = parsed;
+
+    if (Number.isFinite(parsed)) {
+      ms = parsed;
+    }
   }
-  if (ms === undefined || !Number.isFinite(ms)) return undefined;
-  if (ms <= now || ms > now + MAX_PROVIDER_WAIT_CEILING_MS) return undefined;
+
+  if (ms === undefined || !Number.isFinite(ms)) {
+    return undefined;
+  }
+
+  if (ms <= now || ms > now + MAX_PROVIDER_WAIT_CEILING_MS) {
+    return undefined;
+  }
+
   return ms;
 }
 
@@ -78,15 +89,26 @@ export function waitDecision(input: {
   remainingWaitMs: number;
 }): ProviderWaitDecision {
   const { unavailable, now, attempt, maxAttempts, remainingWaitMs } = input;
+
   if (!unavailable.authoritative || unavailable.retryAt === undefined) {
-    return { wait: false, reason: `Provider ${unavailable.provider} reported unavailability without an authoritative retry time; not waiting automatically.` };
+    return {
+      wait: false,
+      reason: `Provider ${unavailable.provider} reported unavailability without an authoritative retry time; not waiting automatically.`,
+    };
   }
+
   if (attempt >= maxAttempts) {
     return { wait: false, reason: `Workflow provider wait exhausted (attempt ${attempt}/${maxAttempts})` };
   }
+
   const waitMs = unavailable.retryAt - now;
+
   if (waitMs > remainingWaitMs) {
-    return { wait: false, reason: `Provider ${unavailable.provider} retry window exceeds the workflow maxWaitMs allowance (needs ${waitMs}ms, ${remainingWaitMs}ms remaining)` };
+    return {
+      wait: false,
+      reason: `Provider ${unavailable.provider} retry window exceeds the workflow maxWaitMs allowance (needs ${waitMs}ms, ${remainingWaitMs}ms remaining)`,
+    };
   }
+
   return { wait: true, until: unavailable.retryAt };
 }

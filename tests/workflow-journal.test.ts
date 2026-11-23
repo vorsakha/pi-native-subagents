@@ -3,11 +3,7 @@ import assert from "node:assert/strict";
 import { tempDir } from "./helpers.ts";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
-import {
-  appendWorkflowJournal,
-  createWorkflowArtifacts,
-  loadWorkflowJournal,
-} from "../src/workflows/artifacts.ts";
+import { appendWorkflowJournal, createWorkflowArtifacts, loadWorkflowJournal } from "../src/workflows/artifacts.ts";
 import {
   replayableJournalCalls,
   replayableJournalHandoffs,
@@ -42,6 +38,7 @@ async function fixture() {
       journalArtifact: "runtime.sqlite",
     },
   });
+
   return { parent, root, created, cleanup: () => rm(parent, { recursive: true, force: true }) };
 }
 
@@ -53,8 +50,18 @@ test("workflow fingerprints are canonical and bind definitions to execution cont
   assert.notEqual(workflowCallFingerprint("inspect", {}), workflowCallFingerprint("review", {}));
   assert.equal(workflowCallFingerprint("inspect", {}), workflowCallFingerprint("inspect", { speed: "standard" }));
   assert.notEqual(workflowCallFingerprint("inspect", {}), workflowCallFingerprint("inspect", { speed: "fast" }));
-  const first = workflowDefinitionFingerprint({ script: "export default 1", argsJson: "null", cwd: "/one", defaultHarness: "codex" });
-  const second = workflowDefinitionFingerprint({ script: "export default 1", argsJson: "null", cwd: "/two", defaultHarness: "codex" });
+  const first = workflowDefinitionFingerprint({
+    script: "export default 1",
+    argsJson: "null",
+    cwd: "/one",
+    defaultHarness: "codex",
+  });
+  const second = workflowDefinitionFingerprint({
+    script: "export default 1",
+    argsJson: "null",
+    cwd: "/two",
+    defaultHarness: "codex",
+  });
   assert.notEqual(first, second);
 });
 
@@ -63,28 +70,59 @@ test("journal loading replays valid completed calls independently across a faile
   const first = workflowCallFingerprint("first", { access: "readOnly" });
   const second = workflowCallFingerprint("second", {});
   const third = workflowCallFingerprint("third", { access: "readOnly" });
+
   try {
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 0, callIndex: 0, fingerprint: first, state: "started", at: 1,
+      version: 1,
+      sequence: 0,
+      callIndex: 0,
+      fingerprint: first,
+      state: "started",
+      at: 1,
     });
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 1, callIndex: 0, fingerprint: first, state: "completed", at: 2,
+      version: 1,
+      sequence: 1,
+      callIndex: 0,
+      fingerprint: first,
+      state: "completed",
+      at: 2,
       agentIndex: 0,
       result: { ok: true, output: "done", jobId: "job-old", usage },
       route: { jobId: "job-old", harness: "codex", model: "review-model" },
     });
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 2, callIndex: 1, fingerprint: second, state: "started", at: 3,
+      version: 1,
+      sequence: 2,
+      callIndex: 1,
+      fingerprint: second,
+      state: "started",
+      at: 3,
     });
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 3, callIndex: 1, fingerprint: second, state: "failed", at: 4,
+      version: 1,
+      sequence: 3,
+      callIndex: 1,
+      fingerprint: second,
+      state: "failed",
+      at: 4,
       result: { ok: false, output: "", error: "interrupted" },
     });
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 4, callIndex: 2, fingerprint: third, state: "started", at: 5,
+      version: 1,
+      sequence: 4,
+      callIndex: 2,
+      fingerprint: third,
+      state: "started",
+      at: 5,
     });
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 5, callIndex: 2, fingerprint: third, state: "completed", at: 6,
+      version: 1,
+      sequence: 5,
+      callIndex: 2,
+      fingerprint: third,
+      state: "completed",
+      at: 6,
       agentIndex: 2,
       result: { ok: true, output: "later", jobId: "job-later", usage },
       route: { jobId: "job-later", harness: "claude", model: "review-model" },
@@ -92,21 +130,24 @@ test("journal loading replays valid completed calls independently across a faile
 
     const records = await loadWorkflowJournal(f.root, f.created.runId);
     assert.equal(records.length, 6, "all committed proof records survive reopen");
-    assert.deepEqual(replayableJournalCalls(records), [{
-      callIndex: 0,
-      fingerprint: first,
-      kind: "agent",
-      agentIndex: 0,
-      result: { ok: true, output: "done", jobId: "job-old", usage },
-      route: { jobId: "job-old", harness: "codex", model: "review-model" },
-    }, {
-      callIndex: 2,
-      fingerprint: third,
-      kind: "agent",
-      agentIndex: 2,
-      result: { ok: true, output: "later", jobId: "job-later", usage },
-      route: { jobId: "job-later", harness: "claude", model: "review-model" },
-    }]);
+    assert.deepEqual(replayableJournalCalls(records), [
+      {
+        callIndex: 0,
+        fingerprint: first,
+        kind: "agent",
+        agentIndex: 0,
+        result: { ok: true, output: "done", jobId: "job-old", usage },
+        route: { jobId: "job-old", harness: "codex", model: "review-model" },
+      },
+      {
+        callIndex: 2,
+        fingerprint: third,
+        kind: "agent",
+        agentIndex: 2,
+        result: { ok: true, output: "later", jobId: "job-later", usage },
+        route: { jobId: "job-later", harness: "claude", model: "review-model" },
+      },
+    ]);
   } finally {
     await f.cleanup();
   }
@@ -140,10 +181,22 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
     continuationFallback: target,
   };
   const started: WorkflowJournalRecord = {
-    version: 1, sequence: 0, callIndex: 0, fingerprint, kind: "agent", state: "started", at: 1,
+    version: 1,
+    sequence: 0,
+    callIndex: 0,
+    fingerprint,
+    kind: "agent",
+    state: "started",
+    at: 1,
   };
   const progressed: WorkflowJournalRecord = {
-    version: 1, sequence: 1, callIndex: 0, fingerprint, kind: "agent", state: "progressed", at: 2,
+    version: 1,
+    sequence: 1,
+    callIndex: 0,
+    fingerprint,
+    kind: "agent",
+    state: "progressed",
+    at: 2,
     agentIndex: 0,
     route,
     continuationProgress: {
@@ -157,7 +210,13 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
     },
   };
   const handoff: WorkflowJournalRecord = {
-    version: 1, sequence: 2, callIndex: 0, fingerprint, kind: "agent", state: "handoff", at: 3,
+    version: 1,
+    sequence: 2,
+    callIndex: 0,
+    fingerprint,
+    kind: "agent",
+    state: "handoff",
+    at: 3,
     agentIndex: 0,
     route: {
       ...route,
@@ -197,7 +256,11 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
   };
 
   assert.equal(replayableJournalHandoffs([started, progressed, handoff]).length, 1);
-  assert.deepEqual(replayableJournalHandoffs([started, handoff]), [], "a handoff cannot replace its missing progress proof");
+  assert.deepEqual(
+    replayableJournalHandoffs([started, handoff]),
+    [],
+    "a handoff cannot replace its missing progress proof",
+  );
   assert.match(
     replayableJournalCalls([started, handoff])[0]?.result.error ?? "",
     /lacks a matching progressed-primary checkpoint/,
@@ -210,14 +273,21 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
       record.route!.jobId = "different-failed-job";
       record.route!.continuation!.failedJobId = "different-failed-job";
     },
-    (record: WorkflowJournalRecord) => { record.route!.model = "different-primary-route"; },
-    (record: WorkflowJournalRecord) => { record.route!.speed = "fast"; },
+    (record: WorkflowJournalRecord) => {
+      record.route!.model = "different-primary-route";
+    },
+    (record: WorkflowJournalRecord) => {
+      record.route!.speed = "fast";
+    },
     (record: WorkflowJournalRecord) => {
       record.continuation!.trigger.detail = "different trigger";
       record.route!.continuation!.trigger.detail = "different trigger";
     },
-    (record: WorkflowJournalRecord) => { record.continuation!.usage.input += 1; },
+    (record: WorkflowJournalRecord) => {
+      record.continuation!.usage.input += 1;
+    },
   ];
+
   for (const mutate of inconsistent) {
     const changed = structuredClone(handoff);
     mutate(changed);
@@ -229,7 +299,13 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
   }
 
   const completed: WorkflowJournalRecord = {
-    version: 1, sequence: 3, callIndex: 0, fingerprint, kind: "agent", state: "completed", at: 4,
+    version: 1,
+    sequence: 3,
+    callIndex: 0,
+    fingerprint,
+    kind: "agent",
+    state: "completed",
+    at: 4,
     agentIndex: 0,
     result: { ok: true, output: "replacement complete", jobId: "logical-job", usage: cumulativeUsage },
     route: {
@@ -276,16 +352,34 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
   assert.deepEqual(replayableJournalHandoffs([started, progressed, duplicateProgress]), []);
 
   const duplicateTerminal = { ...structuredClone(completed), sequence: 4 };
-  const inconsistentAfterCompletion = replayableJournalCalls([started, progressed, handoff, completed, duplicateTerminal]);
+  const inconsistentAfterCompletion = replayableJournalCalls([
+    started,
+    progressed,
+    handoff,
+    completed,
+    duplicateTerminal,
+  ]);
   assert.equal(inconsistentAfterCompletion.length, 1);
   assert.equal(inconsistentAfterCompletion[0]?.result.ok, false);
   assert.equal(inconsistentAfterCompletion[0]?.result.progressed, true);
   assert.deepEqual(replayableJournalHandoffs([started, progressed, handoff, completed, duplicateTerminal]), []);
 
   const progressedFailure: WorkflowJournalRecord = {
-    version: 1, sequence: 1, callIndex: 0, fingerprint, kind: "agent", state: "failed", at: 2,
+    version: 1,
+    sequence: 1,
+    callIndex: 0,
+    fingerprint,
+    kind: "agent",
+    state: "failed",
+    at: 2,
     agentIndex: 0,
-    result: { ok: false, output: "partial work", error: "failed after progress", progressed: true, usage: cumulativeUsage },
+    result: {
+      ok: false,
+      output: "partial work",
+      error: "failed after progress",
+      progressed: true,
+      usage: cumulativeUsage,
+    },
   };
   const duplicateFailure = { ...structuredClone(progressedFailure), sequence: 2 };
   const inconsistentProgressedFailure = replayableJournalCalls([started, progressedFailure, duplicateFailure]);
@@ -327,10 +421,18 @@ test("continuation handoff replay requires a matching progressed-primary checkpo
   assert.equal(missingHandoff[0]?.result.progressed, true);
 
   for (const mutate of [
-    (record: WorkflowJournalRecord) => { record.route!.continuation!.checkpointAt += 1; },
-    (record: WorkflowJournalRecord) => { record.route!.continuation!.replacementJobId = "other-replacement"; },
-    (record: WorkflowJournalRecord) => { record.route!.jobId = "other-replacement"; },
-    (record: WorkflowJournalRecord) => { record.route!.harness = "claude"; },
+    (record: WorkflowJournalRecord) => {
+      record.route!.continuation!.checkpointAt += 1;
+    },
+    (record: WorkflowJournalRecord) => {
+      record.route!.continuation!.replacementJobId = "other-replacement";
+    },
+    (record: WorkflowJournalRecord) => {
+      record.route!.jobId = "other-replacement";
+    },
+    (record: WorkflowJournalRecord) => {
+      record.route!.harness = "claude";
+    },
   ]) {
     const changed = structuredClone(completed);
     mutate(changed);
@@ -352,34 +454,65 @@ test("peer-question journals require lineage provenance from started through set
     targetJobId: "planner-job",
     targetCallFingerprint: target,
   };
+
   try {
     await assert.rejects(
       appendWorkflowJournal(f.root, f.created.runId, {
-        version: 1, sequence: 0, callIndex: 0, fingerprint: question, kind: "peerQuestion", state: "started", at: 1,
+        version: 1,
+        sequence: 0,
+        callIndex: 0,
+        fingerprint: question,
+        kind: "peerQuestion",
+        state: "started",
+        at: 1,
       }),
       /Invalid workflow journal record/,
       "a crash record without source and target identity is not durable replay evidence",
     );
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 0, callIndex: 0, fingerprint: question, kind: "peerQuestion", state: "started", at: 1,
+      version: 1,
+      sequence: 0,
+      callIndex: 0,
+      fingerprint: question,
+      kind: "peerQuestion",
+      state: "started",
+      at: 1,
       agentIndex: 1,
       interaction: detail,
     });
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 1, callIndex: 0, fingerprint: question, kind: "peerQuestion", state: "completed", at: 2,
+      version: 1,
+      sequence: 1,
+      callIndex: 0,
+      fingerprint: question,
+      kind: "peerQuestion",
+      state: "completed",
+      at: 2,
       agentIndex: 1,
       result: { ok: true, output: "keep the legacy flag", usage },
       interaction: { ...detail, targetGeneration: 1, route: "peer" },
       interactionPending: true,
     });
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 2, callIndex: 0, fingerprint: question, kind: "peerQuestion", state: "accepted", at: 3,
+      version: 1,
+      sequence: 2,
+      callIndex: 0,
+      fingerprint: question,
+      kind: "peerQuestion",
+      state: "accepted",
+      at: 3,
       agentIndex: 1,
       interaction: { ...detail, targetGeneration: 1, route: "peer" },
     });
     // A second interaction has only a started record and must never replay.
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 3, callIndex: 1, fingerprint: workflowInteractionFingerprint({ question: "unfinished" }), kind: "peerQuestion", state: "started", at: 4,
+      version: 1,
+      sequence: 3,
+      callIndex: 1,
+      fingerprint: workflowInteractionFingerprint({ question: "unfinished" }),
+      kind: "peerQuestion",
+      state: "started",
+      at: 4,
       agentIndex: 1,
       interaction: detail,
     });
@@ -397,17 +530,23 @@ test("peer-question journals require lineage provenance from started through set
       [],
       "acceptance must bind the exact provisional answer provenance",
     );
-    assert.deepEqual(replayableJournalInteractions(records), [{
-      ordinal: 0,
-      questionFingerprint: question,
-      detail: { ...detail, targetGeneration: 1, route: "peer" },
-      answer: "keep the legacy flag",
-      usage,
-    }]);
+    assert.deepEqual(replayableJournalInteractions(records), [
+      {
+        ordinal: 0,
+        questionFingerprint: question,
+        detail: { ...detail, targetGeneration: 1, route: "peer" },
+        answer: "keep the legacy flag",
+        usage,
+      },
+    ]);
     const legacyCompletion = structuredClone(records.slice(0, 2));
     legacyCompletion[1]!.interactionPending = undefined;
     assert.equal(replayableJournalInteractions(legacyCompletion)[0]?.answer, "keep the legacy flag");
-    assert.deepEqual(replayableJournalCalls(records), [], "interaction ordinals never enter the sandbox call replay stream");
+    assert.deepEqual(
+      replayableJournalCalls(records),
+      [],
+      "interaction ordinals never enter the sandbox call replay stream",
+    );
   } finally {
     await f.cleanup();
   }
@@ -416,14 +555,26 @@ test("peer-question journals require lineage provenance from started through set
 test("route evidence additively records requested harness and normalized availability, and rejects an invalid state", async () => {
   const f = await fixture();
   const fingerprint = workflowCallFingerprint("resolve", { access: "readOnly" });
+
   try {
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 0, callIndex: 0, fingerprint, state: "started", at: 1,
+      version: 1,
+      sequence: 0,
+      callIndex: 0,
+      fingerprint,
+      state: "started",
+      at: 1,
     });
     // A resolved route carries the requested harness and observed availability
     // alongside the resolved harness, so replay can explain the decision.
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 1, callIndex: 0, fingerprint, state: "completed", at: 2, agentIndex: 0,
+      version: 1,
+      sequence: 1,
+      callIndex: 0,
+      fingerprint,
+      state: "completed",
+      at: 2,
+      agentIndex: 0,
       result: { ok: true, output: "done", jobId: "job-1", usage },
       route: {
         jobId: "job-1",
@@ -458,7 +609,13 @@ test("route evidence additively records requested harness and normalized availab
 
     // A legacy route without the additive fields is still accepted unchanged.
     await appendWorkflowJournal(f.root, f.created.runId, {
-      version: 1, sequence: 2, callIndex: 1, fingerprint: workflowCallFingerprint("legacy", {}), state: "completed", at: 3, agentIndex: 1,
+      version: 1,
+      sequence: 2,
+      callIndex: 1,
+      fingerprint: workflowCallFingerprint("legacy", {}),
+      state: "completed",
+      at: 3,
+      agentIndex: 1,
       result: { ok: true, output: "legacy", jobId: "job-2", usage },
       route: { jobId: "job-2", harness: "codex" },
     });
@@ -466,7 +623,13 @@ test("route evidence additively records requested harness and normalized availab
     // An out-of-range availability value is rejected before it can corrupt the journal.
     await assert.rejects(
       appendWorkflowJournal(f.root, f.created.runId, {
-        version: 1, sequence: 3, callIndex: 2, fingerprint: workflowCallFingerprint("bad", {}), state: "completed", at: 4, agentIndex: 2,
+        version: 1,
+        sequence: 3,
+        callIndex: 2,
+        fingerprint: workflowCallFingerprint("bad", {}),
+        state: "completed",
+        at: 4,
+        agentIndex: 2,
         result: { ok: true, output: "bad", jobId: "job-3", usage },
         route: { jobId: "job-3", harness: "claude", availability: "definitely-not-a-state" as never },
       }),

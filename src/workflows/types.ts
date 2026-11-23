@@ -1,4 +1,15 @@
-import type { AccessMode, AgentActivitySnapshot, AgentSpeed, ContextSnapshot, EffortLevel, HarnessName, ProviderFamily, ToolTrace, TranscriptEntry, Usage } from "../types.ts";
+import type {
+  AccessMode,
+  AgentActivitySnapshot,
+  AgentSpeed,
+  ContextSnapshot,
+  EffortLevel,
+  HarnessName,
+  ProviderFamily,
+  ToolTrace,
+  TranscriptEntry,
+  Usage,
+} from "../types.ts";
 import type { RequestedHarness } from "../capability-routing.ts";
 import type { HarnessAvailabilityStatus } from "../harness-availability.ts";
 import type { InteractionRoute, InteractionState } from "../interactions.ts";
@@ -9,14 +20,7 @@ import type { WorkflowCheckoutProof } from "./checkout.ts";
 
 export type WorkflowStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
 
-export type WorkflowAgentState =
-  | "queued"
-  | "running"
-  | "waiting"
-  | "completed"
-  | "failed"
-  | "cancelled"
-  | "aborted";
+export type WorkflowAgentState = "queued" | "running" | "waiting" | "completed" | "failed" | "cancelled" | "aborted";
 
 /**
  * `native` means a provider-native terminal structured-result channel produced

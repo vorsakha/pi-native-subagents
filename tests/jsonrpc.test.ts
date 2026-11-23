@@ -23,7 +23,17 @@ function fakeManaged() {
       }
     },
   };
-  return { managed, child, stdin, stdout, stderr, get terminated() { return terminated; } };
+
+  return {
+    managed,
+    child,
+    stdin,
+    stdout,
+    stderr,
+    get terminated() {
+      return terminated;
+    },
+  };
 }
 
 test("JSON-RPC peer correlates chunked numeric and string-ID responses", async () => {
@@ -32,6 +42,7 @@ test("JSON-RPC peer correlates chunked numeric and string-ID responses", async (
   fake.stdin.on("data", (chunk) => {
     const message = JSON.parse(chunk.toString());
     writes.push(message);
+
     if (message.method === "echo") {
       const result = message.params?.value === 1 ? { text: "a b" } : "string-ok";
       const response = `${JSON.stringify({ id: message.id, result })}\n`;
@@ -40,7 +51,12 @@ test("JSON-RPC peer correlates chunked numeric and string-ID responses", async (
     }
   });
   let activities = 0;
-  const peer = new JsonRpcPeer({ process: fake.managed, onActivity: () => { activities++; } });
+  const peer = new JsonRpcPeer({
+    process: fake.managed,
+    onActivity: () => {
+      activities++;
+    },
+  });
   assert.deepEqual(await peer.request("echo", { value: 1 }), { text: "a b" });
   assert.equal(writes[0]?.method, "echo");
   assert.equal(activities, 1, "valid JSON-RPC responses count as provider activity");
@@ -64,15 +80,19 @@ test("JSON-RPC settles a response before a following notification from the same 
   fake.stdin.on("data", (chunk) => {
     const request = JSON.parse(chunk.toString());
     queueMicrotask(() => {
-      fake.stdout.write([
-        JSON.stringify({ id: request.id, result: { turn: { id: "turn-1" } } }),
-        JSON.stringify({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } }),
-        "",
-      ].join("\n"));
+      fake.stdout.write(
+        [
+          JSON.stringify({ id: request.id, result: { turn: { id: "turn-1" } } }),
+          JSON.stringify({ method: "turn/completed", params: { turn: { id: "turn-1", status: "completed" } } }),
+          "",
+        ].join("\n"),
+      );
     });
   });
 
-  await peer.request("turn/start").then(() => { requestSettled = true; });
+  await peer.request("turn/start").then(() => {
+    requestSettled = true;
+  });
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.equal(notificationObserved, true);
   await peer.close();
@@ -84,7 +104,11 @@ test("JSON-RPC awaits handlers and fails closed for approval requests", async ()
   fake.stdin.on("data", (chunk) => writes.push(JSON.parse(chunk.toString())));
   const peer = new JsonRpcPeer({
     process: fake.managed,
-    onRequest: async () => { await new Promise<void>((resolve) => setTimeout(resolve, 5)); return { decision: "decline" }; },
+    onRequest: async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 5));
+
+      return { decision: "decline" };
+    },
   });
   fake.stdout.write(`${JSON.stringify({ id: "approval-one", method: "approval", params: {} })}\n`);
   await new Promise<void>((resolve) => setTimeout(resolve, 15));
@@ -94,7 +118,9 @@ test("JSON-RPC awaits handlers and fails closed for approval requests", async ()
   const approvalWrites: Record<string, unknown>[] = [];
   approvalFake.stdin.on("data", (chunk) => approvalWrites.push(JSON.parse(chunk.toString())));
   const approvalPeer = new JsonRpcPeer({ process: approvalFake.managed });
-  approvalFake.stdout.write(`${JSON.stringify({ id: 44, method: "item/commandExecution/requestApproval", params: {} })}\n`);
+  approvalFake.stdout.write(
+    `${JSON.stringify({ id: 44, method: "item/commandExecution/requestApproval", params: {} })}\n`,
+  );
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(approvalWrites[0], { id: 44, result: { decision: "decline" } });
   await approvalPeer.close();
@@ -167,7 +193,11 @@ test("JSON-RPC process-exit errors omit arbitrary provider stderr", async () => 
   await assert.rejects(pending, (error: Error) => {
     assert.equal(error.message, "JSON-RPC process exited (7)");
     const serializedFailure = JSON.stringify({ type: "failed", error: error.message });
-    assert.ok(!stderr.split("\n").some((value) => serializedFailure.includes(value)), "no stderr excerpt reaches a serialized failure");
+    assert.ok(
+      !stderr.split("\n").some((value) => serializedFailure.includes(value)),
+      "no stderr excerpt reaches a serialized failure",
+    );
+
     return true;
   });
   await peer.close();

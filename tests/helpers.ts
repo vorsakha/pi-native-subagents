@@ -47,7 +47,9 @@ export const tick = (): Promise<void> => new Promise((resolve) => setImmediate(r
 
 /** Advances only the event loop; unlike {@link waitFor}, this has no clock or sleep. */
 export async function ticks(count = 1): Promise<void> {
-  for (let index = 0; index < count; index++) await tick();
+  for (let index = 0; index < count; index++) {
+    await tick();
+  }
 }
 
 export const delay = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -59,13 +61,18 @@ export class GatedManagedProcess implements ManagedProcess {
   } as unknown as ManagedProcess["child"];
   #terminateReached = false;
   #terminateReachedResolve!: () => void;
-  readonly #terminateReachedPromise = new Promise<void>((resolve) => { this.#terminateReachedResolve = resolve; });
+  readonly #terminateReachedPromise = new Promise<void>((resolve) => {
+    this.#terminateReachedResolve = resolve;
+  });
   #release!: () => void;
-  readonly #released = new Promise<void>((resolve) => { this.#release = resolve; });
+  readonly #released = new Promise<void>((resolve) => {
+    this.#release = resolve;
+  });
 
   terminate(): Promise<void> {
     this.#terminateReached = true;
     this.#terminateReachedResolve();
+
     return this.#released;
   }
 
@@ -87,20 +94,37 @@ export class GatedWorkflowJournalAppender {
   #failAcceptance = false;
   #resolveReached!: () => void;
   #resolveRelease!: () => void;
-  readonly #reachedPromise = new Promise<void>((resolve) => { this.#resolveReached = resolve; });
-  readonly #releasePromise = new Promise<void>((resolve) => { this.#resolveRelease = resolve; });
+  readonly #reachedPromise = new Promise<void>((resolve) => {
+    this.#resolveReached = resolve;
+  });
+  readonly #releasePromise = new Promise<void>((resolve) => {
+    this.#resolveRelease = resolve;
+  });
 
-  readonly append = async (root: string, runId: string, record: WorkflowJournalRecord, projection?: WorkflowSnapshot): Promise<void> => {
+  readonly append = async (
+    root: string,
+    runId: string,
+    record: WorkflowJournalRecord,
+    projection?: WorkflowSnapshot,
+  ): Promise<void> => {
     if (this.#failAcceptance && record.kind === "peerQuestion" && record.state === "accepted") {
       this.#failAcceptance = false;
+
       throw new Error("controlled peer-answer acceptance persistence failure");
     }
+
     if (this.#failInvalidation && record.kind === "peerQuestion" && record.state === "failed") {
       this.#failInvalidation = false;
+
       throw new Error("controlled peer-answer invalidation persistence failure");
     }
+
     await appendWorkflowJournal(root, runId, record, projection);
-    if (!this.#armed || this.#reached || record.kind !== "peerQuestion" || record.state !== this.#gateState) return;
+
+    if (!this.#armed || this.#reached || record.kind !== "peerQuestion" || record.state !== this.#gateState) {
+      return;
+    }
+
     this.#reached = true;
     this.#resolveReached();
     await this.#releasePromise;
@@ -133,8 +157,12 @@ export class GatedWrite {
   #reached = false;
   #resolveReached!: () => void;
   #resolveRelease!: () => void;
-  readonly #reachedPromise = new Promise<void>((resolve) => { this.#resolveReached = resolve; });
-  readonly #releasePromise = new Promise<void>((resolve) => { this.#resolveRelease = resolve; });
+  readonly #reachedPromise = new Promise<void>((resolve) => {
+    this.#resolveReached = resolve;
+  });
+  readonly #releasePromise = new Promise<void>((resolve) => {
+    this.#resolveRelease = resolve;
+  });
   calls = 0;
 
   readonly persist = async (): Promise<void> => {
@@ -170,30 +198,38 @@ export class ControlledInteractionClock implements InteractionDeadlineClock {
   schedule(callback: () => void, delayMs: number): () => void {
     const id = this.#sequence++;
     this.#scheduled.set(id, { at: this.#now + Math.max(0, delayMs), callback });
-    return () => { this.#scheduled.delete(id); };
+
+    return () => {
+      this.#scheduled.delete(id);
+    };
   }
 
   advance(ms: number): void {
     this.#now += Math.max(0, ms);
+
     for (;;) {
       const due = [...this.#scheduled.entries()]
         .filter(([, timer]) => timer.at <= this.#now)
         .sort((left, right) => left[1].at - right[1].at || left[0] - right[0])[0];
-      if (!due) return;
+
+      if (!due) {
+        return;
+      }
+
       this.#scheduled.delete(due[0]);
       due[1].callback();
     }
   }
 }
 
-export async function waitFor(
-  predicate: () => boolean,
-  description: string,
-  timeoutMs = 2_000,
-): Promise<void> {
+export async function waitFor(predicate: () => boolean, description: string, timeoutMs = 2_000): Promise<void> {
   const deadline = Date.now() + timeoutMs;
+
   while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${description}`);
+    if (Date.now() >= deadline) {
+      throw new Error(`timed out waiting for ${description}`);
+    }
+
     await delay(5);
   }
 }
@@ -204,8 +240,14 @@ export async function withTimeout<T>(promise: Promise<T>, description: string, t
     timer = setTimeout(() => reject(new Error(`timed out waiting for ${description}`)), timeoutMs);
     timer.unref();
   });
-  try { return await Promise.race([promise, timeout]); }
-  finally { if (timer) clearTimeout(timer); }
+
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 /** Creates a unique temp directory. Callers are responsible for cleanup. */
@@ -229,12 +271,11 @@ export class ScriptedHarnessAvailability implements HarnessAvailabilityProbe {
   readonly states: Map<HarnessName, HarnessAvailability>;
 
   constructor(states: Partial<Record<HarnessName, Partial<HarnessAvailabilityFacts> | HarnessAvailability>>) {
-    this.states = new Map((Object.entries(states) as Array<[HarnessName, Partial<HarnessAvailabilityFacts> | HarnessAvailability]>).map(([harness, state]) => [
-      harness,
-      "status" in state
-        ? state
-        : availabilityFixture(harness, state),
-    ]));
+    this.states = new Map(
+      (Object.entries(states) as Array<[HarnessName, Partial<HarnessAvailabilityFacts> | HarnessAvailability]>).map(
+        ([harness, state]) => [harness, "status" in state ? state : availabilityFixture(harness, state)],
+      ),
+    );
   }
 
   get harnesses(): HarnessName[] {
@@ -244,7 +285,11 @@ export class ScriptedHarnessAvailability implements HarnessAvailabilityProbe {
   async availability(harness: HarnessName, request: { refresh?: boolean }): Promise<HarnessAvailability> {
     this.asked.push({ harness, refresh: request.refresh });
     const state = this.states.get(harness);
-    if (!state) throw new Error(`no scripted availability for ${harness}`);
+
+    if (!state) {
+      throw new Error(`no scripted availability for ${harness}`);
+    }
+
     return state;
   }
 }
@@ -259,7 +304,10 @@ export class GatedHarnessAvailability extends ScriptedHarnessAvailability {
   #releasePromise!: Promise<void>;
   #reachedPromise!: Promise<void>;
 
-  constructor(gated: HarnessName, states: Partial<Record<HarnessName, Partial<HarnessAvailabilityFacts> | HarnessAvailability>>) {
+  constructor(
+    gated: HarnessName,
+    states: Partial<Record<HarnessName, Partial<HarnessAvailabilityFacts> | HarnessAvailability>>,
+  ) {
     super(states);
     this.#gated = gated;
     this.#resetGate();
@@ -271,6 +319,7 @@ export class GatedHarnessAvailability extends ScriptedHarnessAvailability {
       this.#reachedResolve();
       await this.#releasePromise;
     }
+
     return super.availability(harness, request);
   }
 
@@ -279,22 +328,32 @@ export class GatedHarnessAvailability extends ScriptedHarnessAvailability {
   }
 
   release(): void {
-    if (this.#released) return;
+    if (this.#released) {
+      return;
+    }
+
     this.#released = true;
     this.#release();
   }
 
   /** Holds the next matching probe after a prior gate has been released. */
   gateNext(): void {
-    if (!this.#released) throw new Error("Harness availability gate is already active");
+    if (!this.#released) {
+      throw new Error("Harness availability gate is already active");
+    }
+
     this.#resetGate();
   }
 
   #resetGate(): void {
     this.#released = false;
     this.#reached = false;
-    this.#releasePromise = new Promise<void>((resolve) => { this.#release = resolve; });
-    this.#reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
+    this.#releasePromise = new Promise<void>((resolve) => {
+      this.#release = resolve;
+    });
+    this.#reachedPromise = new Promise<void>((resolve) => {
+      this.#reachedResolve = resolve;
+    });
   }
 }
 
@@ -302,15 +361,23 @@ export class GatedHarnessAvailability extends ScriptedHarnessAvailability {
 export class CancellationGatedWorkflowCheckout implements WorkflowCheckoutOperations {
   #reached = false;
   #reachedResolve!: () => void;
-  readonly #reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
+  readonly #reachedPromise = new Promise<void>((resolve) => {
+    this.#reachedResolve = resolve;
+  });
 
   capture(_cwd: string, signal: AbortSignal): Promise<WorkflowCheckoutProof> {
     this.#reached = true;
     this.#reachedResolve();
+
     return new Promise((_, reject) => {
-      const abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
-      if (signal.aborted) abort();
-      else signal.addEventListener("abort", abort, { once: true });
+      const abort = () =>
+        reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+
+      if (signal.aborted) {
+        abort();
+      } else {
+        signal.addEventListener("abort", abort, { once: true });
+      }
     });
   }
 
@@ -327,6 +394,7 @@ export class CancellationGatedWorkflowCheckout implements WorkflowCheckoutOperat
 export class StaticWorkflowCheckout implements WorkflowCheckoutOperations {
   async capture(cwd: string, signal: AbortSignal): Promise<WorkflowCheckoutProof> {
     signal.throwIfAborted();
+
     return {
       cwd,
       root: cwd,
@@ -347,25 +415,34 @@ export class StaticWorkflowCheckout implements WorkflowCheckoutOperations {
 export class GatedWorkflowCheckout extends StaticWorkflowCheckout {
   #reached = false;
   #reachedResolve!: () => void;
-  readonly #reachedPromise = new Promise<void>((resolve) => { this.#reachedResolve = resolve; });
+  readonly #reachedPromise = new Promise<void>((resolve) => {
+    this.#reachedResolve = resolve;
+  });
   #release!: () => void;
-  readonly #releasePromise = new Promise<void>((resolve) => { this.#release = resolve; });
+  readonly #releasePromise = new Promise<void>((resolve) => {
+    this.#release = resolve;
+  });
 
   override async capture(cwd: string, signal: AbortSignal): Promise<WorkflowCheckoutProof> {
     this.#reached = true;
     this.#reachedResolve();
     await new Promise<void>((resolve, reject) => {
-      const abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+      const abort = () =>
+        reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+
       if (signal.aborted) {
         abort();
+
         return;
       }
+
       signal.addEventListener("abort", abort, { once: true });
       void this.#releasePromise.then(() => {
         signal.removeEventListener("abort", abort);
         resolve();
       });
     });
+
     return super.capture(cwd, signal);
   }
 
@@ -383,23 +460,35 @@ export class AdmissionGatedWorkflowCheckout extends StaticWorkflowCheckout {
   #assertions = 0;
   #admissionReached = false;
   #admissionReachedResolve!: () => void;
-  readonly #admissionReachedPromise = new Promise<void>((resolve) => { this.#admissionReachedResolve = resolve; });
+  readonly #admissionReachedPromise = new Promise<void>((resolve) => {
+    this.#admissionReachedResolve = resolve;
+  });
   #releaseAdmission!: () => void;
-  readonly #admissionRelease = new Promise<void>((resolve) => { this.#releaseAdmission = resolve; });
+  readonly #admissionRelease = new Promise<void>((resolve) => {
+    this.#releaseAdmission = resolve;
+  });
 
   override async assert(proof: WorkflowCheckoutProof, signal: AbortSignal): Promise<void> {
     await super.assert(proof, signal);
     this.#assertions++;
-    if (this.#assertions < 3) return;
+
+    if (this.#assertions < 3) {
+      return;
+    }
+
     this.#admissionReached = true;
     this.#admissionReachedResolve();
     await new Promise<void>((resolve, reject) => {
-      const abort = () => reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
+      const abort = () =>
+        reject(signal.reason instanceof Error ? signal.reason : new Error(String(signal.reason ?? "aborted")));
       const cleanup = () => signal.removeEventListener("abort", abort);
+
       if (signal.aborted) {
         abort();
+
         return;
       }
+
       signal.addEventListener("abort", abort, { once: true });
       void this.#admissionRelease.then(() => {
         cleanup();
@@ -440,6 +529,7 @@ export function readyProviderStatusReader(): ProviderStatusReader {
   return {
     async statuses(request) {
       const harnesses = request.harnesses ?? ["pi", "claude", "codex"];
+
       return harnesses.map((harness) => ({
         harness,
         installed: true,
@@ -465,9 +555,14 @@ export class ScriptedProviderStatusReader implements ProviderStatusReader {
   async statuses(request: ProviderStatusRequest): Promise<ProviderStatus[]> {
     this.requests.push({ ...request });
     const wanted = request.harnesses ?? [...this.script.keys()];
+
     return wanted.map((harness) => {
       const queue = this.script.get(harness);
-      if (!queue?.length) throw new Error(`no scripted status for ${harness}`);
+
+      if (!queue?.length) {
+        throw new Error(`no scripted status for ${harness}`);
+      }
+
       return queue.length > 1 ? queue.shift()! : queue[0]!;
     });
   }
@@ -494,12 +589,11 @@ export const ansiTheme = {
 } as unknown as Theme;
 
 /** Small live workflow snapshot shared by dashboard and pure outline tests. */
-export function workflowSnapshotFixture(
-  id: string,
-  status: WorkflowSnapshot["status"] = "running",
-): WorkflowSnapshot {
-  const settledAgentState = status === "pending" ? "queued" as const : status === "paused" ? "running" as const : status;
+export function workflowSnapshotFixture(id: string, status: WorkflowSnapshot["status"] = "running"): WorkflowSnapshot {
+  const settledAgentState =
+    status === "pending" ? ("queued" as const) : status === "paused" ? ("running" as const) : status;
   const terminal = status === "completed" || status === "failed" || status === "aborted";
+
   return {
     runId: id,
     sessionId: "session",
@@ -515,13 +609,15 @@ export function workflowSnapshotFixture(
       ...(terminal ? { endedAt: 4_000 } : {}),
     },
     currentPhase: 0,
-    phases: [{
-      index: 0,
-      name: "Verification",
-      status,
-      timestamps: { createdAt: 1_000, updatedAt: 3_000 },
-      agents: [0, 1],
-    }],
+    phases: [
+      {
+        index: 0,
+        name: "Verification",
+        status,
+        timestamps: { createdAt: 1_000, updatedAt: 3_000 },
+        agents: [0, 1],
+      },
+    ],
     agents: [
       {
         index: 0,
@@ -604,12 +700,19 @@ export class ImmediateBackend implements Backend {
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     this.requests.push(request);
-    if (this.#options.usage) emit({ type: "usage", usage: this.#options.usage });
+
+    if (this.#options.usage) {
+      emit({ type: "usage", usage: this.#options.usage });
+    }
+
     emit({ type: "completed", output: this.#options.output?.(request) ?? `${this.name}-ok` });
+
     return {
       completed: Promise.resolve(),
       send: async (message: string) => {
-        if (this.#options.echoSend) emit({ type: "completed", output: `${this.name}-${message}` });
+        if (this.#options.echoSend) {
+          emit({ type: "completed", output: `${this.name}-${message}` });
+        }
       },
       async cancel() {},
       async close() {},
@@ -625,6 +728,7 @@ export class ImmediateBackend implements Backend {
   askTask(task: string, input: AskInput): Promise<InteractionAskResult> {
     const request = this.requestForTask(task);
     assert.ok(request, `backend did not start task ${task}`);
+
     return askThroughBackend(this.requests, request.jobId, input);
   }
 
@@ -644,17 +748,15 @@ export class DiscoverableBackend extends ImmediateBackend {
    */
   structuredOutputSupport?: (request: DiscoveryRequest) => Promise<StructuredOutputSupport>;
 
-  constructor(
-    name: HarnessName,
-    capabilities: DiscoveredCapability[] = [],
-    options: ImmediateBackendOptions = {},
-  ) {
+  constructor(name: HarnessName, capabilities: DiscoveredCapability[] = [], options: ImmediateBackendOptions = {}) {
     super(name, options);
     this.#capabilities = capabilities;
+
     if (options.structuredSupport) {
       const support = options.structuredSupport;
       this.structuredOutputSupport = async (request) => {
         this.structuredOutputSupportCalls.push(request);
+
         return support;
       };
     }
@@ -689,8 +791,14 @@ export class HoldingBackend implements Backend {
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     this.requests.push(request);
     this.#emit = emit;
-    const completed = new Promise<void>((resolve) => { this.#settle = resolve; });
-    if (this.#emitStarted) emit({ type: "started", backendSessionId: `${this.name}-session` });
+    const completed = new Promise<void>((resolve) => {
+      this.#settle = resolve;
+    });
+
+    if (this.#emitStarted) {
+      emit({ type: "started", backendSessionId: `${this.name}-session` });
+    }
+
     return {
       completed,
       async send() {},
@@ -698,7 +806,9 @@ export class HoldingBackend implements Backend {
         emit({ type: "cancelled", reason });
         this.#settle?.();
       },
-      close: async () => { this.#settle?.(); },
+      close: async () => {
+        this.#settle?.();
+      },
     };
   }
 
@@ -768,33 +878,51 @@ export class ControlledBackend implements Backend {
 
   /** Resolves from the backend's start event; no wall-clock polling is involved. */
   waitForStart(count = 1): Promise<void> {
-    if (this.requests.length >= count) return Promise.resolve();
+    if (this.requests.length >= count) {
+      return Promise.resolve();
+    }
+
     return new Promise((resolve) => {
       const check = () => {
-        if (this.requests.length < count) return;
+        if (this.requests.length < count) {
+          return;
+        }
+
         this.#startWaiters.delete(check);
         resolve();
       };
+
       this.#startWaiters.add(check);
     });
   }
 
   /** Resolves from a retained-session send event; no wall-clock polling is involved. */
   waitForSend(count = 1): Promise<void> {
-    if (this.sends.length >= count) return Promise.resolve();
+    if (this.sends.length >= count) {
+      return Promise.resolve();
+    }
+
     return new Promise((resolve) => {
       const check = () => {
-        if (this.sends.length < count) return;
+        if (this.sends.length < count) {
+          return;
+        }
+
         this.#sendWaiters.delete(check);
         resolve();
       };
+
       this.#sendWaiters.add(check);
     });
   }
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     this.requests.push(request);
-    for (const waiter of [...this.#startWaiters]) waiter();
+
+    for (const waiter of [...this.#startWaiters]) {
+      waiter();
+    }
+
     this.active++;
     this.maxActive = Math.max(this.maxActive, this.active);
     let finish!: () => void;
@@ -803,44 +931,63 @@ export class ControlledBackend implements Backend {
       emit,
       settled: false,
       settle: () => {
-        if (run.settled) return;
+        if (run.settled) {
+          return;
+        }
+
         run.settled = true;
         this.active--;
         finish();
       },
     };
-    const completed = new Promise<void>((resolve) => { finish = resolve; });
+    const completed = new Promise<void>((resolve) => {
+      finish = resolve;
+    });
     this.runs.set(request.jobId, run);
+
     return {
       completed,
       send: async (message: string, behavior = "steer") => {
         this.sends.push({ id: request.jobId, message, behavior });
-        for (const waiter of [...this.#sendWaiters]) waiter();
+
+        for (const waiter of [...this.#sendWaiters]) {
+          waiter();
+        }
       },
       cancel: async (reason) => {
         this.cancels.push({ jobId: request.jobId, reason });
         const gate = this.#cancellationGates.get(request.jobId);
+
         if (gate) {
           gate.reached = true;
           gate.reach();
           await gate.released;
           this.#cancellationGates.delete(request.jobId);
-          if (gate.usage) emit({ type: "usage", usage: gate.usage });
+
+          if (gate.usage) {
+            emit({ type: "usage", usage: gate.usage });
+          }
         }
+
         emit({ type: "cancelled", reason });
         run.settle();
       },
       close: async () => {
         this.closes.push(request.jobId);
         const gate = this.#closeGates.get(request.jobId);
+
         if (gate) {
           gate.reached = true;
           gate.reach();
           await gate.released;
           this.#closeGates.delete(request.jobId);
         }
+
         const error = this.#closeFailures.get(request.jobId);
-        if (error) throw error;
+
+        if (error) {
+          throw error;
+        }
       },
     };
   }
@@ -854,6 +1001,7 @@ export class ControlledBackend implements Backend {
   askTask(task: string, input: AskInput): Promise<InteractionAskResult> {
     const request = this.requestForTask(task);
     assert.ok(request, `backend did not start task ${task}`);
+
     return askThroughBackend(this.requests, request.jobId, input);
   }
 
@@ -866,14 +1014,19 @@ export class ControlledBackend implements Backend {
     const gate: ControlledCancellationGate = {
       usage,
       reached: false,
-      reachedPromise: new Promise<void>((resolve) => { reach = resolve; }),
+      reachedPromise: new Promise<void>((resolve) => {
+        reach = resolve;
+      }),
       reach: () => reach(),
-      released: new Promise<void>((resolve) => { release = resolve; }),
+      released: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
       release: () => release(),
     };
     this.#cancellationGates.set(jobId, gate);
+
     return {
-      waitUntilReached: () => gate.reached ? Promise.resolve() : gate.reachedPromise,
+      waitUntilReached: () => (gate.reached ? Promise.resolve() : gate.reachedPromise),
       release: gate.release,
     };
   }
@@ -886,14 +1039,19 @@ export class ControlledBackend implements Backend {
     let release!: () => void;
     const gate: ControlledCancellationGate = {
       reached: false,
-      reachedPromise: new Promise<void>((resolve) => { reach = resolve; }),
+      reachedPromise: new Promise<void>((resolve) => {
+        reach = resolve;
+      }),
       reach: () => reach(),
-      released: new Promise<void>((resolve) => { release = resolve; }),
+      released: new Promise<void>((resolve) => {
+        release = resolve;
+      }),
       release: () => release(),
     };
     this.#closeGates.set(jobId, gate);
+
     return {
-      waitUntilReached: () => gate.reached ? Promise.resolve() : gate.reachedPromise,
+      waitUntilReached: () => (gate.reached ? Promise.resolve() : gate.reachedPromise),
       release: gate.release,
     };
   }
@@ -919,7 +1077,11 @@ export class ControlledBackend implements Backend {
   complete(jobId: string, output = "ok", usage?: Partial<Usage>, structured?: unknown): void {
     const run = this.runs.get(jobId);
     assert.ok(run, `backend never started job ${jobId}`);
-    if (usage) run.emit({ type: "usage", usage });
+
+    if (usage) {
+      run.emit({ type: "usage", usage });
+    }
+
     run.emit({ type: "completed", output, ...(structured !== undefined ? { structured } : {}) });
     run.settle();
   }
@@ -943,12 +1105,17 @@ export class ControlledBackend implements Backend {
     assert.ok(request, `backend did not start task ${task}`);
     const run = this.runs.get(request.jobId);
     assert.ok(run && !run.settled, `task ${task} is not active`);
+
     return run;
   }
 
   completeTask(task: string, output = `${task} output`, usage?: Partial<Usage>, structured?: unknown): void {
     const run = this.#activeRunForTask(task);
-    if (usage) run.emit({ type: "usage", usage });
+
+    if (usage) {
+      run.emit({ type: "usage", usage });
+    }
+
     run.emit({ type: "completed", output, ...(structured !== undefined ? { structured } : {}) });
     run.settle();
   }
@@ -974,6 +1141,7 @@ export interface AskInput {
 function askThroughBackend(requests: BackendRequest[], jobId: string, input: AskInput): Promise<InteractionAskResult> {
   const request = requests.find((candidate) => candidate.jobId === jobId);
   assert.ok(request?.interactions, `job ${jobId} was not authorized to ask routed questions`);
+
   return request.interactions.ask({
     question: input.question,
     context: input.context,
@@ -1011,24 +1179,48 @@ export function fakePi(options: FakePiOptions = {}) {
   const entries: Array<{ id: string; customType: string; data: unknown }> = [];
   const api: Record<string, unknown> = {
     events: eventBus,
-    on(name: string, handler: (...args: any[]) => any) { handlers.set(name, handler); },
+    on(name: string, handler: (...args: any[]) => any) {
+      handlers.set(name, handler);
+    },
     registerTool(tool: any) {
-      if (tools.has(tool.name)) throw new Error(`duplicate tool: ${tool.name}`);
+      if (tools.has(tool.name)) {
+        throw new Error(`duplicate tool: ${tool.name}`);
+      }
+
       tools.set(tool.name, tool);
     },
     registerCommand(name: string, command: any) {
-      if (commands.has(name)) throw new Error(`duplicate command: ${name}`);
+      if (commands.has(name)) {
+        throw new Error(`duplicate command: ${name}`);
+      }
+
       commands.set(name, command);
     },
-    registerShortcut(name: string, shortcut: any) { shortcuts.set(name, shortcut); },
-    registerMessageRenderer(name: string, renderer: any) { messageRenderers.set(name, renderer); },
-    registerEntryRenderer(name: string, renderer: any) { entryRenderers.set(name, renderer); },
+    registerShortcut(name: string, shortcut: any) {
+      shortcuts.set(name, shortcut);
+    },
+    registerMessageRenderer(name: string, renderer: any) {
+      messageRenderers.set(name, renderer);
+    },
+    registerEntryRenderer(name: string, renderer: any) {
+      entryRenderers.set(name, renderer);
+    },
     sendMessage(message: any, opts: any) {
       const entry = { message, options: opts };
       messages.push(entry);
+
       for (const waiter of [...messageWaiters]) {
-        if (waiter.customType && message.customType !== waiter.customType) continue;
-        if (messages.filter((candidate) => !waiter.customType || candidate.message.customType === waiter.customType).length < waiter.count) continue;
+        if (waiter.customType && message.customType !== waiter.customType) {
+          continue;
+        }
+
+        if (
+          messages.filter((candidate) => !waiter.customType || candidate.message.customType === waiter.customType)
+            .length < waiter.count
+        ) {
+          continue;
+        }
+
         messageWaiters.delete(waiter);
         waiter.resolve(entry);
       }
@@ -1037,7 +1229,11 @@ export function fakePi(options: FakePiOptions = {}) {
       entries.push({ id: `entry-${entries.length}`, customType, data });
     },
   };
-  if (options.allTools) api.getAllTools = () => options.allTools;
+
+  if (options.allTools) {
+    api.getAllTools = () => options.allTools;
+  }
+
   return {
     api: api as any,
     handlers,
@@ -1051,14 +1247,22 @@ export function fakePi(options: FakePiOptions = {}) {
     eventBus,
     waitForMessage(customType?: string) {
       const found = messages.find((entry) => !customType || entry.message.customType === customType);
-      if (found) return Promise.resolve(found);
+
+      if (found) {
+        return Promise.resolve(found);
+      }
+
       return new Promise<{ message: any; options: any }>((resolve) => {
         messageWaiters.add({ customType, count: 1, resolve });
       });
     },
     waitForMessages(customType: string, count: number) {
       const found = messages.find((entry) => entry.message.customType === customType);
-      if (messages.filter((entry) => entry.message.customType === customType).length >= count) return Promise.resolve(found!);
+
+      if (messages.filter((entry) => entry.message.customType === customType).length >= count) {
+        return Promise.resolve(found!);
+      }
+
       return new Promise<{ message: any; options: any }>((resolve) => {
         messageWaiters.add({ customType, count, resolve });
       });
@@ -1075,10 +1279,7 @@ export class FailingWorkflowRegistration {
   sessionShutdowns = 0;
   sessionCloses = 0;
 
-  readonly factory = (
-    _pi: ExtensionAPI,
-    options: RegisterWorkflowOptions,
-  ): WorkflowRegistration => ({
+  readonly factory = (_pi: ExtensionAPI, options: RegisterWorkflowOptions): WorkflowRegistration => ({
     shortcut: "ctrl+alt+w",
     shortcutHint: "Ctrl+Alt+W",
     sessionStart: (_ctx: ExtensionContext, _jobs: JobManager) => {
@@ -1087,14 +1288,19 @@ export class FailingWorkflowRegistration {
     },
     sessionShutdown: async () => {
       this.sessionShutdowns++;
+
       throw this.shutdownError;
     },
     sessionClosed: () => {
       this.sessionCloses++;
+
       throw this.closeError;
     },
     list: () => {
-      if (this.sessionShutdowns > 0) throw this.listError;
+      if (this.sessionShutdowns > 0) {
+        throw this.listError;
+      }
+
       return [];
     },
     check: () => undefined,
@@ -1124,11 +1330,21 @@ export function context(options: ContextOptions = {}) {
   const statuses = new Map<string, string | undefined>();
   const widgets = new Map<string, unknown>();
   const ui: Record<string, unknown> = {
-    setStatus(key: string, value: string | undefined) { statuses.set(key, value); },
-    setWidget(key: string, value: unknown) { widgets.set(key, value); },
-    notify(message: string, type?: string) { notifications.push({ message, type }); },
+    setStatus(key: string, value: string | undefined) {
+      statuses.set(key, value);
+    },
+    setWidget(key: string, value: unknown) {
+      widgets.set(key, value);
+    },
+    notify(message: string, type?: string) {
+      notifications.push({ message, type });
+    },
   };
-  if (options.confirm) ui.confirm = options.confirm;
+
+  if (options.confirm) {
+    ui.confirm = options.confirm;
+  }
+
   const ctx: Record<string, unknown> = {
     cwd: options.cwd ?? process.cwd(),
     model: options.provider ? { provider: options.provider, id: "parent-model" } : undefined,
@@ -1142,7 +1358,11 @@ export function context(options: ContextOptions = {}) {
     },
     ui,
   };
-  if (options.hasUI !== undefined) ctx.hasUI = options.hasUI;
+
+  if (options.hasUI !== undefined) {
+    ctx.hasUI = options.hasUI;
+  }
+
   return { ctx: ctx as any, notifications, statuses, widgets };
 }
 
@@ -1152,11 +1372,21 @@ export function replaceableContext(options: ContextOptions = {}) {
   let active = true;
   const ctx = new Proxy<ExtensionContext>(session.ctx, {
     get(target, property, receiver) {
-      if (!active) throw new Error("This extension ctx is stale after session replacement or reload.");
+      if (!active) {
+        throw new Error("This extension ctx is stale after session replacement or reload.");
+      }
+
       return Reflect.get(target, property, receiver);
     },
   });
-  return { ...session, ctx, invalidate() { active = false; } };
+
+  return {
+    ...session,
+    ctx,
+    invalidate() {
+      active = false;
+    },
+  };
 }
 
 /* ── snapshot builders ───────────────────────────────────────────────────── */
@@ -1212,19 +1442,29 @@ export function interactionSnapshot(overrides: Partial<PendingInteraction> = {})
 export async function readWorkflowHistory(database: string): Promise<string> {
   const { readWorkflowState } = await import("../src/workflows/state.ts");
   const state = await readWorkflowState(database);
+
   return (state?.history ?? []).join("\n") + "\n";
 }
 
 export async function writeWorkflowHistory(database: string, contents: string): Promise<void> {
   const { updateWorkflowState } = await import("../src/workflows/state.ts");
-  await updateWorkflowState(database, (state) => { state.history = contents.trim().split("\n"); });
+  await updateWorkflowState(database, (state) => {
+    state.history = contents.trim().split("\n");
+  });
 }
 
-export async function writeWorkflowFixture(path: string, contents: string, options?: { mode?: number } | "utf8"): Promise<void> {
+export async function writeWorkflowFixture(
+  path: string,
+  contents: string,
+  options?: { mode?: number } | "utf8",
+): Promise<void> {
   if (basename(path) === "workflow.json") {
     const { updateWorkflowState } = await import("../src/workflows/state.ts");
-    await updateWorkflowState(join(dirname(path), "runtime.sqlite"), (state) => { state.snapshot = contents; });
+    await updateWorkflowState(join(dirname(path), "runtime.sqlite"), (state) => {
+      state.snapshot = contents;
+    });
   }
+
   await writeFile(path, contents, options);
 }
 
@@ -1234,10 +1474,18 @@ export function workflowRuntimeOptions(
   overrides: Partial<import("../src/workflows/sandbox.ts").WorkflowSandboxOptions> = {},
 ): import("../src/workflows/sandbox.ts").WorkflowSandboxOptions {
   return {
-    source, cwd, args: null, signal: new AbortController().signal,
+    source,
+    cwd,
+    args: null,
+    signal: new AbortController().signal,
     onAgent: async () => ({ ok: true, output: "done" }),
-    onFollowUp: async () => { throw new Error("Unexpected follow-up"); },
-    onMeta() {}, onPhase() {}, onLog() {}, onConvergence() {},
+    onFollowUp: async () => {
+      throw new Error("Unexpected follow-up");
+    },
+    onMeta() {},
+    onPhase() {},
+    onLog() {},
+    onConvergence() {},
     onPhaseCapacity: () => ({ ok: true }),
     ...overrides,
   };

@@ -13,6 +13,7 @@ test("checkout proof detects staged index divergence when status and worktree by
   const parent = await tempDir("workflow-checkout-index");
   const cwd = join(parent, "repo");
   const stagedSource = join(parent, "staged-source.txt");
+
   try {
     await mkdir(cwd);
     const tracked = join(cwd, "tracked.txt");
@@ -45,6 +46,7 @@ for (const flag of ["--assume-unchanged", "--skip-worktree"] as const) {
   test(`checkout proof rejects ${flag.slice(2)} entries that can hide worktree divergence`, async () => {
     const parent = await tempDir("workflow-checkout-hidden");
     const cwd = join(parent, "repo");
+
     try {
       await mkdir(cwd);
       const tracked = join(cwd, "tracked.txt");
@@ -75,6 +77,7 @@ test("checkout proof observes an already-cancelled signal before invoking Git", 
 test("checkout proof binds the attached branch and detached HEAD state at the same commit", async () => {
   const parent = await tempDir("workflow-checkout-head-identity");
   const cwd = join(parent, "repo");
+
   try {
     await mkdir(cwd);
     await writeFile(join(cwd, "tracked.txt"), "base\n");
@@ -105,6 +108,7 @@ test("checkout proof binds the attached branch and detached HEAD state at the sa
 test("checkout proof rejects fsmonitor-valid entries that can hide worktree divergence", async () => {
   const parent = await tempDir("workflow-checkout-fsmonitor");
   const cwd = join(parent, "repo");
+
   try {
     await mkdir(cwd);
     const tracked = join(cwd, "tracked.txt");

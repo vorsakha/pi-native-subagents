@@ -52,18 +52,22 @@ const CODEX_PROVIDER_ENV = new Set([
 ]);
 
 function isClaudeProviderOverride(key: string): boolean {
-  return key.startsWith("ANTHROPIC_")
-    || key.startsWith("CLAUDE_CODE_USE_")
-    || key.startsWith("ANTHROPIC_VERTEX_")
-    || key.startsWith("ANTHROPIC_FOUNDRY_")
-    || CLAUDE_PROVIDER_ENV.has(key);
+  return (
+    key.startsWith("ANTHROPIC_") ||
+    key.startsWith("CLAUDE_CODE_USE_") ||
+    key.startsWith("ANTHROPIC_VERTEX_") ||
+    key.startsWith("ANTHROPIC_FOUNDRY_") ||
+    CLAUDE_PROVIDER_ENV.has(key)
+  );
 }
 
 function isCodexProviderOverride(key: string): boolean {
-  return key.startsWith("OPENAI_")
-    || key.startsWith("AZURE_OPENAI_")
-    || key.startsWith("AZURE_AI_")
-    || CODEX_PROVIDER_ENV.has(key);
+  return (
+    key.startsWith("OPENAI_") ||
+    key.startsWith("AZURE_OPENAI_") ||
+    key.startsWith("AZURE_AI_") ||
+    CODEX_PROVIDER_ENV.has(key)
+  );
 }
 
 export function sanitizeSubscriptionEnv(
@@ -71,15 +75,23 @@ export function sanitizeSubscriptionEnv(
   harness: "claude" | "codex" | "pi",
 ): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...source };
-  if (harness === "pi") return env;
+
+  if (harness === "pi") {
+    return env;
+  }
+
   for (const key of Object.keys(env)) {
     const normalized = key.toUpperCase();
+
     if (
-      API_KEY_ENV.has(normalized)
-      || CREDENTIAL_SUFFIX.test(normalized)
-      || harness === "claude" && isClaudeProviderOverride(normalized)
-      || harness === "codex" && isCodexProviderOverride(normalized)
-    ) delete env[key];
+      API_KEY_ENV.has(normalized) ||
+      CREDENTIAL_SUFFIX.test(normalized) ||
+      (harness === "claude" && isClaudeProviderOverride(normalized)) ||
+      (harness === "codex" && isCodexProviderOverride(normalized))
+    ) {
+      delete env[key];
+    }
   }
+
   return env;
 }

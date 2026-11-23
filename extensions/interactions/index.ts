@@ -24,20 +24,32 @@ export default function interactionChildExtension(pi: ExtensionAPI): void {
 }
 
 export function registerInteractionChildTool(pi: ExtensionAPI, env: NodeJS.ProcessEnv = process.env): void {
-  if (env[PI_CHILD_MARKER] !== "1") return;
+  if (env[PI_CHILD_MARKER] !== "1") {
+    return;
+  }
+
   const address = env[PI_INTERACTION_ADDRESS];
   const token = env[PI_INTERACTION_TOKEN];
-  if (!address || !token) return;
-  const targets = (env[PI_INTERACTION_TARGETS] ?? "orchestrator").split(",").map((value) => value.trim()).filter(Boolean);
+
+  if (!address || !token) {
+    return;
+  }
+
+  const targets = (env[PI_INTERACTION_TARGETS] ?? "orchestrator")
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
   pi.registerTool({
     name: SUBAGENT_ASK_TOOL_NAME,
     label: "Ask Orchestrator or Peer",
     description: `${SUBAGENT_ASK_TOOL_DESCRIPTION} Authorized targets: ${targets.join(", ")}.`,
     parameters: Type.Object({
-      target: Type.Optional(Type.Object({
-        type: Type.Union([Type.Literal("orchestrator"), Type.Literal("agent")]),
-        jobId: Type.Optional(Type.String({ maxLength: MAX_TARGET_ID_CHARS })),
-      })),
+      target: Type.Optional(
+        Type.Object({
+          type: Type.Union([Type.Literal("orchestrator"), Type.Literal("agent")]),
+          jobId: Type.Optional(Type.String({ maxLength: MAX_TARGET_ID_CHARS })),
+        }),
+      ),
       question: Type.String({ minLength: 1, maxLength: MAX_QUESTION_CHARS }),
       context: Type.Optional(Type.String({ maxLength: MAX_CONTEXT_CHARS })),
     }),
@@ -49,6 +61,7 @@ export function registerInteractionChildTool(pi: ExtensionAPI, env: NodeJS.Proce
         context: params.context,
         target: params.target,
       });
+
       return {
         content: [{ type: "text" as const, text: answer.answer }],
         details: { requestId: answer.requestId, answeredBy: answer.answeredBy },

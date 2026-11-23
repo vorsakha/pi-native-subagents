@@ -9,8 +9,16 @@ export interface WorkflowBudgetMetric {
   supported: boolean;
 }
 
-function metric(key: WorkflowBudgetMetric["key"], used: number, limit: number | undefined, supported = true): WorkflowBudgetMetric | undefined {
-  if (limit === undefined) return undefined;
+function metric(
+  key: WorkflowBudgetMetric["key"],
+  used: number,
+  limit: number | undefined,
+  supported = true,
+): WorkflowBudgetMetric | undefined {
+  if (limit === undefined) {
+    return undefined;
+  }
+
   return {
     key,
     used: Math.max(0, used),
@@ -26,13 +34,21 @@ export function workflowBudgetMetrics(
   usage: Pick<WorkflowUsage, "input" | "output" | "cost" | "turns">,
 ): WorkflowBudgetMetric[] {
   const budget = snapshot.budget;
-  if (!budget) return [];
+
+  if (!budget) {
+    return [];
+  }
+
   const activeAgents = snapshot.agents.filter((agent) => agent.state === "queued" || agent.state === "running").length;
   const tokens = usage.input + usage.output;
   // Legacy or partially persisted agent records may omit usage or individual
   // usage fields; fold each missing field to 0 instead of collapsing the
   // whole agent's contribution to 0 when only one field is present.
-  const agentTokens = snapshot.agents.reduce((maximum, agent) => Math.max(maximum, (agent.usage?.input ?? 0) + (agent.usage?.output ?? 0)), 0);
+  const agentTokens = snapshot.agents.reduce(
+    (maximum, agent) => Math.max(maximum, (agent.usage?.input ?? 0) + (agent.usage?.output ?? 0)),
+    0,
+  );
+
   return [
     metric("agents", snapshot.agents.length, budget.maxAgents),
     metric("concurrency", activeAgents, budget.maxConcurrency),
@@ -48,11 +64,16 @@ function numberText(value: number): string {
 }
 
 function metricText(value: WorkflowBudgetMetric): string {
-  if (!value.supported) return `${value.key} unsupported`;
+  if (!value.supported) {
+    return `${value.key} unsupported`;
+  }
+
   if (value.key === "cost") {
     return `cost $${value.used.toFixed(4)}/$${value.limit.toFixed(4)} (${value.reached ? "reached" : `$${value.remaining.toFixed(4)} remaining`})`;
   }
+
   const label = value.key === "agentTokens" ? "agent tokens" : value.key;
+
   return `${label} ${numberText(value.used)}/${numberText(value.limit)} (${value.reached ? "reached" : `${numberText(value.remaining)} remaining`})`;
 }
 
@@ -61,6 +82,7 @@ export function formatWorkflowBudget(
   usage: Pick<WorkflowUsage, "input" | "output" | "cost" | "turns">,
 ): string {
   const metrics = workflowBudgetMetrics(snapshot, usage);
+
   return metrics.length ? metrics.map(metricText).join(" · ") : "open";
 }
 
@@ -87,11 +109,26 @@ export function workflowBudgetHealth(
   usage: Pick<WorkflowUsage, "input" | "output" | "cost" | "turns">,
 ): WorkflowBudgetHealth {
   const metrics = workflowBudgetMetrics(snapshot, usage);
-  if (!metrics.length) return { text: "budget open", abnormal: false };
-  const exhausted = metrics.filter((metric) => metric.supported && metric.reached && !SATURATION_METRIC_KEYS.has(metric.key)).map((metric) => metric.key);
+
+  if (!metrics.length) {
+    return { text: "budget open", abnormal: false };
+  }
+
+  const exhausted = metrics
+    .filter((metric) => metric.supported && metric.reached && !SATURATION_METRIC_KEYS.has(metric.key))
+    .map((metric) => metric.key);
   const unsupported = metrics.filter((metric) => !metric.supported).map((metric) => metric.key);
   const parts: string[] = [];
-  if (exhausted.length) parts.push(`reached (${exhausted.join(", ")})`);
-  if (unsupported.length) parts.push(unsupported.map((key) => `${key} unsupported`).join(", "));
-  return parts.length ? { text: `budget ${parts.join(" · ")}`, abnormal: true } : { text: "budget ok", abnormal: false };
+
+  if (exhausted.length) {
+    parts.push(`reached (${exhausted.join(", ")})`);
+  }
+
+  if (unsupported.length) {
+    parts.push(unsupported.map((key) => `${key} unsupported`).join(", "));
+  }
+
+  return parts.length
+    ? { text: `budget ${parts.join(" · ")}`, abnormal: true }
+    : { text: "budget ok", abnormal: false };
 }

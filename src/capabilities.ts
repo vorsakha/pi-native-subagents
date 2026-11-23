@@ -9,19 +9,19 @@ export type CapabilityKind = "tool" | "skill" | "command" | "plugin" | "mcp" | "
  * read-only so an unclassified native surface can never widen the sandbox.
  */
 export type CapabilityEffect =
-  | "inspect"
-  | "external-read"
-  | "workspace-write"
-  | "external-write"
-  | "interactive"
-  | "delegation"
-  | "unknown";
+  "inspect" | "external-read" | "workspace-write" | "external-write" | "interactive" | "delegation" | "unknown";
 
 export type CapabilityHealth = "healthy" | "degraded" | "unavailable" | "unknown";
 
 export const CAPABILITY_KINDS = ["tool", "skill", "command", "plugin", "mcp", "hook", "agent", "context"] as const;
 export const CAPABILITY_EFFECTS = [
-  "inspect", "external-read", "workspace-write", "external-write", "interactive", "delegation", "unknown",
+  "inspect",
+  "external-read",
+  "workspace-write",
+  "external-write",
+  "interactive",
+  "delegation",
+  "unknown",
 ] as const;
 export const CAPABILITY_HEALTH = ["healthy", "degraded", "unavailable", "unknown"] as const;
 
@@ -95,34 +95,94 @@ export interface CapabilityAvailability {
  * interactivity are denied in every access mode and on every harness.
  */
 const DENIAL_RULES: Array<{ test: RegExp; effect: CapabilityEffect; reason: string }> = [
-  { test: /(^|[^a-z])(agents?|tasks?)([^a-z]|$)/i, effect: "delegation", reason: "nested agent orchestration is denied" },
+  {
+    test: /(^|[^a-z])(agents?|tasks?)([^a-z]|$)/i,
+    effect: "delegation",
+    reason: "nested agent orchestration is denied",
+  },
   { test: /sub[-_ ]?agent/i, effect: "delegation", reason: "nested agent orchestration is denied" },
   { test: /work[-_ ]?flow/i, effect: "delegation", reason: "nested workflow orchestration is denied" },
   { test: /session[-_ ]?peer/i, effect: "delegation", reason: "session-peer forking is denied" },
   { test: /\bdelegat/i, effect: "delegation", reason: "nested delegation is denied" },
-  { test: /(plugin|marketplace|extension)[-_ /]?(install|uninstall|add|remove|upgrade|enable|disable|share)/i, effect: "external-write", reason: "plugin administration is denied" },
-  { test: /(install|uninstall|upgrade)[-_ /]?(plugin|marketplace|extension|skill)/i, effect: "external-write", reason: "plugin administration is denied" },
-  { test: /mcp[-_ /]?(add|remove|install|login|auth|oauth|reconnect|toggle)/i, effect: "external-write", reason: "MCP administration is denied" },
-  { test: /(config|settings)[-_ /]?(write|set|batchwrite|update)/i, effect: "external-write", reason: "harness configuration writes are denied" },
+  {
+    test: /(plugin|marketplace|extension)[-_ /]?(install|uninstall|add|remove|upgrade|enable|disable|share)/i,
+    effect: "external-write",
+    reason: "plugin administration is denied",
+  },
+  {
+    test: /(install|uninstall|upgrade)[-_ /]?(plugin|marketplace|extension|skill)/i,
+    effect: "external-write",
+    reason: "plugin administration is denied",
+  },
+  {
+    test: /mcp[-_ /]?(add|remove|install|login|auth|oauth|reconnect|toggle)/i,
+    effect: "external-write",
+    reason: "MCP administration is denied",
+  },
+  {
+    test: /(config|settings)[-_ /]?(write|set|batchwrite|update)/i,
+    effect: "external-write",
+    reason: "harness configuration writes are denied",
+  },
   { test: /ask[-_ ]?user/i, effect: "interactive", reason: "unattended children must not prompt the user" },
-  { test: /request[-_ ]?(approval|permission)/i, effect: "interactive", reason: "unattended children must not request approvals" },
+  {
+    test: /request[-_ ]?(approval|permission)/i,
+    effect: "interactive",
+    reason: "unattended children must not request approvals",
+  },
   { test: /\belicit/i, effect: "interactive", reason: "unattended children must not run elicitation prompts" },
-  { test: /(^|[^a-z])(login|logout|oauth)([^a-z]|$)/i, effect: "interactive", reason: "authentication flows are denied" },
-  { test: /exit[-_ ]?plan[-_ ]?mode/i, effect: "interactive", reason: "unattended children must not request plan approval" },
+  {
+    test: /(^|[^a-z])(login|logout|oauth)([^a-z]|$)/i,
+    effect: "interactive",
+    reason: "authentication flows are denied",
+  },
+  {
+    test: /exit[-_ ]?plan[-_ ]?mode/i,
+    effect: "interactive",
+    reason: "unattended children must not request plan approval",
+  },
 ];
 
 const INSPECT_TOOLS = new Set([
-  "read", "grep", "find", "ls", "glob", "notebookread", "bashoutput", "todowrite", "todoread",
-  "listmcpresources", "readmcpresource", "view", "search",
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "glob",
+  "notebookread",
+  "bashoutput",
+  "todowrite",
+  "todoread",
+  "listmcpresources",
+  "readmcpresource",
+  "view",
+  "search",
 ]);
 const EXTERNAL_READ_TOOLS = new Set(["websearch", "webfetch", "web_search", "web_fetch", "fetch", "browser"]);
 const WORKSPACE_WRITE_TOOLS = new Set([
-  "write", "edit", "multiedit", "bash", "shell", "notebookedit", "apply_patch", "applypatch",
-  "killshell", "kill_shell", "patch", "run", "exec", "command",
+  "write",
+  "edit",
+  "multiedit",
+  "bash",
+  "shell",
+  "notebookedit",
+  "apply_patch",
+  "applypatch",
+  "killshell",
+  "kill_shell",
+  "patch",
+  "run",
+  "exec",
+  "command",
 ]);
 
 function slug(value: string): string {
-  return value.trim().toLowerCase().replace(/[^a-z0-9:._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 120);
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9:._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 120);
 }
 
 export function capabilityId(harness: HarnessName, kind: CapabilityKind, name: string): string {
@@ -130,48 +190,103 @@ export function capabilityId(harness: HarnessName, kind: CapabilityKind, name: s
 }
 
 /** Returns the denial reason when a native surface breaks the orchestration ceiling. */
-export function capabilityDenial(kind: CapabilityKind, name: string): { effect: CapabilityEffect; reason: string } | undefined {
-  if (kind === "agent") return { effect: "delegation", reason: "nested agent orchestration is denied" };
+export function capabilityDenial(
+  kind: CapabilityKind,
+  name: string,
+): { effect: CapabilityEffect; reason: string } | undefined {
+  if (kind === "agent") {
+    return { effect: "delegation", reason: "nested agent orchestration is denied" };
+  }
+
   const subject = name.trim();
-  if (kind === "command" && /^(?:config|permissions?|plugins?|marketplace|mcp|login|logout|install|uninstall)$/i.test(subject)) {
+
+  if (
+    kind === "command" &&
+    /^(?:config|permissions?|plugins?|marketplace|mcp|login|logout|install|uninstall)$/i.test(subject)
+  ) {
     return { effect: "external-write", reason: "harness administration is denied" };
   }
+
   for (const rule of DENIAL_RULES) {
-    if (rule.test.test(subject)) return { effect: rule.effect, reason: rule.reason };
+    if (rule.test.test(subject)) {
+      return { effect: rule.effect, reason: rule.reason };
+    }
   }
+
   return undefined;
 }
 
 export function classifyEffect(kind: CapabilityKind, name: string, declared?: CapabilityEffect): CapabilityEffect {
   const denial = capabilityDenial(kind, name);
-  if (denial) return denial.effect;
-  if (declared) return declared;
+
+  if (denial) {
+    return denial.effect;
+  }
+
+  if (declared) {
+    return declared;
+  }
+
   const normalized = name.trim().toLowerCase();
+
   if (kind === "tool") {
-    if (normalized.startsWith("mcp__") || normalized.startsWith("mcp/")) return "unknown";
-    if (INSPECT_TOOLS.has(normalized)) return "inspect";
-    if (EXTERNAL_READ_TOOLS.has(normalized)) return "external-read";
-    if (WORKSPACE_WRITE_TOOLS.has(normalized)) return "workspace-write";
+    if (normalized.startsWith("mcp__") || normalized.startsWith("mcp/")) {
+      return "unknown";
+    }
+
+    if (INSPECT_TOOLS.has(normalized)) {
+      return "inspect";
+    }
+
+    if (EXTERNAL_READ_TOOLS.has(normalized)) {
+      return "external-read";
+    }
+
+    if (WORKSPACE_WRITE_TOOLS.has(normalized)) {
+      return "workspace-write";
+    }
+
     return "unknown";
   }
-  if (kind === "skill" || kind === "command" || kind === "context") return "inspect";
-  if (kind === "mcp") return "external-write";
-  if (kind === "plugin") return "unknown";
-  if (kind === "hook") return "workspace-write";
+
+  if (kind === "skill" || kind === "command" || kind === "context") {
+    return "inspect";
+  }
+
+  if (kind === "mcp") {
+    return "external-write";
+  }
+
+  if (kind === "plugin") {
+    return "unknown";
+  }
+
+  if (kind === "hook") {
+    return "workspace-write";
+  }
+
   return "unknown";
 }
 
 export function normalizeCapability(harness: HarnessName, input: DiscoveredCapability): HarnessCapability {
   const name = input.name.trim().slice(0, 160) || "unnamed";
   const nameDenial = capabilityDenial(input.kind, name);
-  const descriptionDenial = input.description && /(?:spawn|launch|delegate|orchestrat|parallel)[^.!]{0,100}(?:sub[- ]?agents?|agents?|workflows?)/i.test(input.description)
-    ? { effect: "delegation" as const, reason: "nested delegation described by this capability is denied" }
-    : undefined;
+  const descriptionDenial =
+    input.description &&
+    /(?:spawn|launch|delegate|orchestrat|parallel)[^.!]{0,100}(?:sub[- ]?agents?|agents?|workflows?)/i.test(
+      input.description,
+    )
+      ? { effect: "delegation" as const, reason: "nested delegation described by this capability is denied" }
+      : undefined;
   const effect = descriptionDenial?.effect ?? classifyEffect(input.kind, name, input.effect);
-  const effectDenial = effect === "delegation"
-    ? "nested delegation is denied"
-    : effect === "interactive" ? "unattended children must not prompt the user" : undefined;
+  const effectDenial =
+    effect === "delegation"
+      ? "nested delegation is denied"
+      : effect === "interactive"
+        ? "unattended children must not prompt the user"
+        : undefined;
   const deniedReason = nameDenial?.reason ?? descriptionDenial?.reason ?? effectDenial;
+
   return {
     id: capabilityId(harness, input.kind, name),
     harness,
@@ -190,15 +305,18 @@ export function normalizeCapability(harness: HarnessName, input: DiscoveredCapab
 
 function bounded(value: string, limit: number): string {
   const text = value.replace(/\s+/g, " ").trim();
+
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 
 /** Stable revision hash so routing decisions and replay records can cite an exact catalog state. */
 export function catalogRevision(capabilities: HarnessCapability[]): string {
   const hash = createHash("sha256");
-  for (const capability of [...capabilities].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) {
+
+  for (const capability of [...capabilities].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
     hash.update(`${capability.id} ${capability.health} ${capability.enabled ? 1 : 0} ${capability.effect}\n`);
   }
+
   return `sha256:${hash.digest("hex").slice(0, 32)}`;
 }
 
@@ -215,17 +333,26 @@ export function buildCatalog(input: {
   const warnings = [...(input.warnings ?? [])];
   const seen = new Set<string>();
   const capabilities: HarnessCapability[] = [];
+
   for (const raw of input.capabilities) {
     const capability = normalizeCapability(input.harness, raw);
-    if (seen.has(capability.id)) continue;
+
+    if (seen.has(capability.id)) {
+      continue;
+    }
+
     seen.add(capability.id);
+
     if (capabilities.length >= MAX_CATALOG_CAPABILITIES) {
       warnings.push(`Capability catalog truncated at ${MAX_CATALOG_CAPABILITIES} entries for ${input.harness}`);
       break;
     }
+
     capabilities.push(capability);
   }
+
   const health = worstHealth(input.sources.map((source) => source.health));
+
   return {
     harness: input.harness,
     cwd: input.cwd,
@@ -236,7 +363,8 @@ export function buildCatalog(input: {
     sources: input.sources,
     warnings: warnings.slice(0, 20),
     health,
-    degraded: health === "degraded" || health === "unknown" || input.sources.some((source) => source.health !== "healthy"),
+    degraded:
+      health === "degraded" || health === "unknown" || input.sources.some((source) => source.health !== "healthy"),
     nativeVersion: input.nativeVersion,
   };
 }
@@ -245,7 +373,13 @@ const HEALTH_ORDER: Record<CapabilityHealth, number> = { healthy: 0, degraded: 1
 
 export function worstHealth(values: CapabilityHealth[]): CapabilityHealth {
   let worst: CapabilityHealth = "healthy";
-  for (const value of values) if (HEALTH_ORDER[value] > HEALTH_ORDER[worst]) worst = value;
+
+  for (const value of values) {
+    if (HEALTH_ORDER[value] > HEALTH_ORDER[worst]) {
+      worst = value;
+    }
+  }
+
   return worst;
 }
 
@@ -254,23 +388,51 @@ export function worstHealth(values: CapabilityHealth[]): CapabilityHealth {
  * read-safe integrations only; unknown effects fail closed.
  */
 export function capabilityAvailability(capability: HarnessCapability, access: AccessMode): CapabilityAvailability {
-  if (capability.denied) return { capability, available: false, reason: capability.deniedReason ?? "denied by policy" };
+  if (capability.denied) {
+    return { capability, available: false, reason: capability.deniedReason ?? "denied by policy" };
+  }
+
   if (capability.effect === "delegation" || capability.effect === "interactive") {
-    return { capability, available: false, reason: capability.effect === "delegation" ? "nested delegation is denied" : "unattended children must not prompt the user" };
+    return {
+      capability,
+      available: false,
+      reason:
+        capability.effect === "delegation"
+          ? "nested delegation is denied"
+          : "unattended children must not prompt the user",
+    };
   }
-  if (!capability.enabled) return { capability, available: false, reason: "disabled in the native harness" };
+
+  if (!capability.enabled) {
+    return { capability, available: false, reason: "disabled in the native harness" };
+  }
+
   if (capability.health === "unavailable") {
-    return { capability, available: false, reason: capability.detail ? `unavailable: ${capability.detail}` : "unavailable in the native harness" };
+    return {
+      capability,
+      available: false,
+      reason: capability.detail ? `unavailable: ${capability.detail}` : "unavailable in the native harness",
+    };
   }
+
   if (access === "readOnly") {
     if (capability.effect === "workspace-write" || capability.effect === "external-write") {
-      return { capability, available: false, reason: `read-only children cannot use ${capability.effect} capabilities` };
+      return {
+        capability,
+        available: false,
+        reason: `read-only children cannot use ${capability.effect} capabilities`,
+      };
     }
+
     if (capability.effect === "unknown") {
       return { capability, available: false, reason: "unclassified effect fails closed under read-only access" };
     }
-    if (capability.kind === "hook") return { capability, available: false, reason: "hooks do not execute in read-only children" };
+
+    if (capability.kind === "hook") {
+      return { capability, available: false, reason: "hooks do not execute in read-only children" };
+    }
   }
+
   return { capability, available: true };
 }
 
@@ -293,49 +455,97 @@ export interface CapabilityMatch extends CapabilityAvailability {
   catalog: CapabilityCatalog;
 }
 
-export function searchCapabilities(catalogs: CapabilityCatalog[], query: CapabilityQuery = {}): { matches: CapabilityMatch[]; total: number } {
+export function searchCapabilities(
+  catalogs: CapabilityCatalog[],
+  query: CapabilityQuery = {},
+): { matches: CapabilityMatch[]; total: number } {
   const needle = query.query?.trim().toLowerCase();
   const limit = Math.max(1, Math.min(MAX_SEARCH_LIMIT, query.limit ?? DEFAULT_SEARCH_LIMIT));
   const matches: CapabilityMatch[] = [];
+
   for (const catalog of catalogs) {
-    if (query.harness && catalog.harness !== query.harness) continue;
+    if (query.harness && catalog.harness !== query.harness) {
+      continue;
+    }
+
     for (const capability of catalog.capabilities) {
-      if (query.kind && capability.kind !== query.kind) continue;
-      if (query.effect && capability.effect !== query.effect) continue;
-      if (query.health && capability.health !== query.health) continue;
+      if (query.kind && capability.kind !== query.kind) {
+        continue;
+      }
+
+      if (query.effect && capability.effect !== query.effect) {
+        continue;
+      }
+
+      if (query.health && capability.health !== query.health) {
+        continue;
+      }
+
       const availability = capabilityAvailability(capability, catalog.access);
-      if (!availability.available && !query.includeUnavailable) continue;
-      if (needle && !capabilityMatchesText(capability, needle)) continue;
+
+      if (!availability.available && !query.includeUnavailable) {
+        continue;
+      }
+
+      if (needle && !capabilityMatchesText(capability, needle)) {
+        continue;
+      }
+
       matches.push({ ...availability, catalog });
     }
   }
+
   matches.sort((a, b) => {
-    if (a.available !== b.available) return a.available ? -1 : 1;
+    if (a.available !== b.available) {
+      return a.available ? -1 : 1;
+    }
+
     return a.capability.id < b.capability.id ? -1 : a.capability.id > b.capability.id ? 1 : 0;
   });
+
   return { matches: matches.slice(0, limit), total: matches.length };
 }
 
 function capabilityMatchesText(capability: HarnessCapability, needle: string): boolean {
-  return capability.id.includes(needle)
-    || capability.name.toLowerCase().includes(needle)
-    || (capability.description?.toLowerCase().includes(needle) ?? false)
-    || (capability.origin?.toLowerCase().includes(needle) ?? false);
+  return (
+    capability.id.includes(needle) ||
+    capability.name.toLowerCase().includes(needle) ||
+    (capability.description?.toLowerCase().includes(needle) ?? false) ||
+    (capability.origin?.toLowerCase().includes(needle) ?? false)
+  );
 }
 
 export function normalizeRequirements(value: unknown): string[] | undefined {
-  if (value === undefined) return undefined;
-  if (!Array.isArray(value)) throw new Error("requires must be an array of capability IDs");
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (!Array.isArray(value)) {
+    throw new Error("requires must be an array of capability IDs");
+  }
+
   const requirements: string[] = [];
+
   for (const item of value) {
-    if (typeof item !== "string") throw new Error("requires must contain capability ID strings");
+    if (typeof item !== "string") {
+      throw new Error("requires must contain capability ID strings");
+    }
+
     const requirement = item.trim();
+
     if (!requirement || requirement.length > MAX_REQUIREMENT_LENGTH) {
       throw new Error(`Capability requirement must contain 1–${MAX_REQUIREMENT_LENGTH} characters`);
     }
-    if (!requirements.includes(requirement)) requirements.push(requirement);
+
+    if (!requirements.includes(requirement)) {
+      requirements.push(requirement);
+    }
   }
-  if (requirements.length > MAX_REQUIREMENTS) throw new Error(`At most ${MAX_REQUIREMENTS} capability requirements are supported`);
+
+  if (requirements.length > MAX_REQUIREMENTS) {
+    throw new Error(`At most ${MAX_REQUIREMENTS} capability requirements are supported`);
+  }
+
   return requirements.length ? requirements : undefined;
 }
 
@@ -344,10 +554,19 @@ export function findCapability(catalog: CapabilityCatalog, requirement: string):
   const wanted = requirement.trim().toLowerCase();
   const bare = slug(wanted.includes(":") ? wanted.slice(wanted.lastIndexOf(":") + 1) : wanted);
   const exact = catalog.capabilities.find((capability) => capability.id.toLowerCase() === wanted);
-  if (exact) return exact;
+
+  if (exact) {
+    return exact;
+  }
+
   const qualified = catalog.capabilities.find((capability) => `${capability.kind}:${slug(capability.name)}` === wanted);
-  if (qualified) return qualified;
+
+  if (qualified) {
+    return qualified;
+  }
+
   const available = catalog.capabilities.filter((capability) => slug(capability.name) === bare);
+
   return available.find((capability) => capabilityAvailability(capability, catalog.access).available) ?? available[0];
 }
 
@@ -363,16 +582,24 @@ export function resolveRequirements(catalog: CapabilityCatalog, requires: string
   const satisfied: HarnessCapability[] = [];
   const missing: string[] = [];
   const blocked: RequirementResolution["blocked"] = [];
+
   for (const requirement of requires) {
     const capability = findCapability(catalog, requirement);
+
     if (!capability) {
       missing.push(requirement);
       continue;
     }
+
     const availability = capabilityAvailability(capability, catalog.access);
-    if (availability.available) satisfied.push(capability);
-    else blocked.push({ requirement, capability, reason: availability.reason ?? "denied by policy" });
+
+    if (availability.available) {
+      satisfied.push(capability);
+    } else {
+      blocked.push({ requirement, capability, reason: availability.reason ?? "denied by policy" });
+    }
   }
+
   return { satisfied, missing, blocked };
 }
 
@@ -382,8 +609,15 @@ export function requirementsSatisfied(resolution: RequirementResolution): boolea
 
 export function describeResolution(harness: HarnessName, resolution: RequirementResolution): string {
   const parts: string[] = [];
-  if (resolution.missing.length) parts.push(`${harness} does not provide: ${resolution.missing.join(", ")}`);
-  for (const item of resolution.blocked) parts.push(`${harness} cannot use ${item.capability.id} (${item.reason})`);
+
+  if (resolution.missing.length) {
+    parts.push(`${harness} does not provide: ${resolution.missing.join(", ")}`);
+  }
+
+  for (const item of resolution.blocked) {
+    parts.push(`${harness} cannot use ${item.capability.id} (${item.reason})`);
+  }
+
   return parts.join("; ");
 }
 
@@ -391,6 +625,7 @@ export function formatFreshness(catalog: CapabilityCatalog, now: number): string
   const age = Math.max(0, now - catalog.discoveredAt);
   const seconds = Math.round(age / 1000);
   const label = seconds < 1 ? "just now" : seconds < 90 ? `${seconds}s ago` : `${Math.round(seconds / 60)}m ago`;
+
   return label;
 }
 
@@ -400,6 +635,7 @@ export function formatCapabilityLine(match: CapabilityMatch, now: number): strin
   const health = capability.health === "healthy" ? "" : ` · ${capability.health}`;
   const origin = capability.origin ? ` · ${capability.origin}` : "";
   const description = capability.description ? ` — ${capability.description}` : "";
+
   return `${capability.id} [${capability.effect}${health}${origin}${state}] (${formatFreshness(match.catalog, now)})${description}`;
 }
 
@@ -407,6 +643,9 @@ export function formatCatalogSummary(catalog: CapabilityCatalog, now: number): s
   const available = availableCapabilities(catalog).length;
   const version = catalog.nativeVersion ? ` ${catalog.nativeVersion}` : "";
   const warnings = catalog.warnings.length ? ` · ${catalog.warnings.length} warning(s)` : "";
-  return `${catalog.harness}${version}: ${available}/${catalog.capabilities.length} usable under ${catalog.access}`
-    + ` · health ${catalog.health} · discovered ${formatFreshness(catalog, now)} · revision ${catalog.revision.slice(7, 15)}${warnings}`;
+
+  return (
+    `${catalog.harness}${version}: ${available}/${catalog.capabilities.length} usable under ${catalog.access}` +
+    ` · health ${catalog.health} · discovered ${formatFreshness(catalog, now)} · revision ${catalog.revision.slice(7, 15)}${warnings}`
+  );
 }

@@ -57,6 +57,7 @@ export async function listPeerSessions(
   const limit = Math.max(1, Math.min(MAX_PEER_LIST_LIMIT, options.limit ?? DEFAULT_PEER_LIST_LIMIT));
   const query = options.query?.trim().toLowerCase();
   const sessions = await source.listAll(options.sessionDir);
+
   return sessions
     .filter((session) => session.id !== options.excludeSessionId)
     .filter((session) => !query || matchesQuery(session, query))
@@ -66,9 +67,11 @@ export async function listPeerSessions(
 }
 
 function matchesQuery(session: PeerSessionInfo, query: string): boolean {
-  return (session.name?.toLowerCase().includes(query) ?? false)
-    || session.firstMessage.toLowerCase().includes(query)
-    || session.cwd.toLowerCase().includes(query);
+  return (
+    (session.name?.toLowerCase().includes(query) ?? false) ||
+    session.firstMessage.toLowerCase().includes(query) ||
+    session.cwd.toLowerCase().includes(query)
+  );
 }
 
 function toSummary(session: PeerSessionInfo): PeerSessionSummary {
@@ -106,17 +109,33 @@ export interface ResolvedPeerSession {
  * only ever fork a session that a trusted list actually reports today; it can never hand in a
  * path directly.
  */
-export async function forkPeerSession(source: SessionPeerSource, options: ForkPeerSessionOptions): Promise<ResolvedPeerSession> {
+export async function forkPeerSession(
+  source: SessionPeerSource,
+  options: ForkPeerSessionOptions,
+): Promise<ResolvedPeerSession> {
   const sessionId = options.sessionId.trim();
-  if (!sessionId) throw new Error("sessionId must not be empty");
+
+  if (!sessionId) {
+    throw new Error("sessionId must not be empty");
+  }
+
   if (options.currentSessionId && sessionId === options.currentSessionId) {
     throw new Error("Cannot fork the current session; choose a different saved session from session_peer_list");
   }
+
   const sessions = await source.listAll(options.sessionDir);
   const matches = sessions.filter((session) => session.id === sessionId);
-  if (matches.length === 0) throw new Error(`Unknown session peer: ${sessionId}. Call session_peer_list first.`);
-  if (matches.length > 1) throw new Error(`Ambiguous session peer id: ${sessionId}`);
+
+  if (matches.length === 0) {
+    throw new Error(`Unknown session peer: ${sessionId}. Call session_peer_list first.`);
+  }
+
+  if (matches.length > 1) {
+    throw new Error(`Ambiguous session peer id: ${sessionId}`);
+  }
+
   const match = matches[0]!;
   const forked = source.fork(match.path, options.targetCwd, options.forkSessionDir);
+
   return { sessionFile: forked.sessionFile, sessionId: forked.sessionId, source: match };
 }
