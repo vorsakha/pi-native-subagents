@@ -152,12 +152,13 @@ function toParentThreadMessage(value: unknown): ParentThreadMessage | undefined 
     return undefined;
   }
 
-  const text =
-    safeRole === "summary"
-      ? typeof message.summary === "string"
-        ? message.summary
-        : ""
-      : textContent(message.content);
+  let text: string;
+
+  if (safeRole === "summary") {
+    text = typeof message.summary === "string" ? message.summary : "";
+  } else {
+    text = textContent(message.content);
+  }
 
   if (!text.trim()) {
     return undefined;

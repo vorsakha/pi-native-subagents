@@ -4,22 +4,32 @@ import { defineConfig } from "eslint/config";
 import globals from "globals";
 import tseslint from "typescript-eslint";
 
+const typescriptFiles = ["{src,extensions,tests}/**/*.ts"];
+const javascriptFiles = ["{src,scripts}/**/*.mjs", "eslint.config.js"];
+
 export default defineConfig(
   { ignores: [".pi-worktrees/**", "src/workflows/worker.mjs"] },
   {
-    files: ["src/**/*.ts", "extensions/**/*.ts", "tests/**/*.ts"],
+    files: typescriptFiles,
     extends: [js.configs.recommended, tseslint.configs.recommended],
+    rules: {
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        { argsIgnorePattern: "^_", ignoreRestSiblings: true, reportUsedIgnorePattern: true },
+      ],
+    },
   },
   {
-    files: ["scripts/**/*.mjs", "src/**/*.mjs", "eslint.config.js"],
+    files: javascriptFiles,
     extends: [js.configs.recommended],
     languageOptions: { globals: globals.nodeBuiltin },
   },
   {
-    files: ["{src,extensions,tests}/**/*.ts", "{src,scripts}/**/*.mjs", "eslint.config.js"],
+    files: [...typescriptFiles, ...javascriptFiles],
     plugins: { "@stylistic": stylistic },
     rules: {
       curly: ["error", "all"],
+      "prefer-const": ["error", { ignoreReadBeforeAssign: true }],
       "no-nested-ternary": "error",
       "@stylistic/max-statements-per-line": ["error", { max: 1 }],
       "@stylistic/lines-between-class-members": [

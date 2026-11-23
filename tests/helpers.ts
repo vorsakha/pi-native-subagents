@@ -7,9 +7,13 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   createEventBus,
+  type EntryRenderer,
   type EventBus,
   type ExtensionAPI,
+  type ExtensionCommandContext,
   type ExtensionContext,
+  type ExtensionUIContext,
+  type MessageRenderer,
   type Theme,
 } from "@earendil-works/pi-coding-agent";
 import type { DiscoveredCapability } from "../src/capabilities.ts";
@@ -32,7 +36,7 @@ import type { WorkflowCheckoutProof } from "../src/workflows/checkout.ts";
 import type { WorkflowCheckoutOperations } from "../src/workflows/manager.ts";
 import type { ProviderStatus, ProviderStatusReader, ProviderStatusRequest } from "../src/provider-status.ts";
 import type { ManagedProcess } from "../src/process-tree.ts";
-import type { WorkflowJournalRecord, WorkflowSnapshot } from "../src/workflows/types.ts";
+import type { WorkflowAgentState, WorkflowJournalRecord, WorkflowSnapshot } from "../src/workflows/types.ts";
 import type { RegisterWorkflowOptions, WorkflowRegistration } from "../extensions/workflows/index.ts";
 import { appendWorkflowJournal } from "../src/workflows/artifacts.ts";
 import {
@@ -590,8 +594,16 @@ export const ansiTheme = {
 
 /** Small live workflow snapshot shared by dashboard and pure outline tests. */
 export function workflowSnapshotFixture(id: string, status: WorkflowSnapshot["status"] = "running"): WorkflowSnapshot {
-  const settledAgentState =
-    status === "pending" ? ("queued" as const) : status === "paused" ? ("running" as const) : status;
+  let settledAgentState: WorkflowAgentState;
+
+  if (status === "pending") {
+    settledAgentState = "queued";
+  } else if (status === "paused") {
+    settledAgentState = "running";
+  } else {
+    settledAgentState = status;
+  }
+
   const terminal = status === "completed" || status === "failed" || status === "aborted";
 
   return {
@@ -1158,54 +1170,70 @@ export interface FakePiOptions {
   eventBus?: EventBus;
 }
 
+type FakePiHandler = (...args: unknown[]) => unknown;
+type SentMessage = Parameters<ExtensionAPI["sendMessage"]>[0];
+type SentMessageOptions = Parameters<ExtensionAPI["sendMessage"]>[1];
+type SentMessageEntry = { message: SentMessage; options: SentMessageOptions };
+type RecordedEntry = { id: string; customType: string; data: unknown };
+type FakePiMessageRenderer = (
+  message: SentMessage,
+  options: Pick<Parameters<MessageRenderer>[1], "expanded">,
+  theme: Theme,
+) => ReturnType<MessageRenderer>;
+type FakePiEntryRenderer = (
+  entry: RecordedEntry,
+  options: Parameters<EntryRenderer>[1],
+  theme: Theme,
+) => ReturnType<EntryRenderer>;
+
 /**
  * Records everything `registerNativeSubagents` puts on the extension API.
  * Duplicate tool or command names throw, so double registration is caught.
  */
 export function fakePi(options: FakePiOptions = {}) {
   const eventBus = options.eventBus ?? createEventBus();
-  const handlers = new Map<string, (...args: any[]) => any>();
+  const handlers = new Map<string, FakePiHandler>();
   const tools = new Map<string, any>();
-  const commands = new Map<string, any>();
-  const shortcuts = new Map<string, any>();
-  const messageRenderers = new Map<string, any>();
-  const entryRenderers = new Map<string, any>();
-  const messages: Array<{ message: any; options: any }> = [];
+  const commands = new Map<string, Parameters<ExtensionAPI["registerCommand"]>[1]>();
+  const shortcuts = new Map<string, Parameters<ExtensionAPI["registerShortcut"]>[1]>();
+  const messageRenderers = new Map<string, FakePiMessageRenderer>();
+  const entryRenderers = new Map<string, FakePiEntryRenderer>();
+  const messages: SentMessageEntry[] = [];
   const messageWaiters = new Set<{
     customType?: string;
     count: number;
-    resolve: (entry: { message: any; options: any }) => void;
+    resolve: (entry: SentMessageEntry) => void;
   }>();
-  const entries: Array<{ id: string; customType: string; data: unknown }> = [];
-  const api: Record<string, unknown> = {
+  const entries: RecordedEntry[] = [];
+  const api: Partial<ExtensionAPI> = {
     events: eventBus,
-    on(name: string, handler: (...args: any[]) => any) {
-      handlers.set(name, handler);
+    on(name: string, handler: (...args: never[]) => unknown) {
+      handlers.set(name, handler as FakePiHandler);
     },
-    registerTool(tool: any) {
+    registerTool(tool) {
       if (tools.has(tool.name)) {
         throw new Error(`duplicate tool: ${tool.name}`);
       }
 
       tools.set(tool.name, tool);
     },
-    registerCommand(name: string, command: any) {
+    registerCommand(name, command) {
       if (commands.has(name)) {
         throw new Error(`duplicate command: ${name}`);
       }
 
       commands.set(name, command);
     },
-    registerShortcut(name: string, shortcut: any) {
+    registerShortcut(name, shortcut) {
       shortcuts.set(name, shortcut);
     },
-    registerMessageRenderer(name: string, renderer: any) {
-      messageRenderers.set(name, renderer);
+    registerMessageRenderer<T>(name: string, renderer: MessageRenderer<T>) {
+      messageRenderers.set(name, renderer as FakePiMessageRenderer);
     },
-    registerEntryRenderer(name: string, renderer: any) {
-      entryRenderers.set(name, renderer);
+    registerEntryRenderer<T>(name: string, renderer: EntryRenderer<T>) {
+      entryRenderers.set(name, renderer as FakePiEntryRenderer);
     },
-    sendMessage(message: any, opts: any) {
+    sendMessage(message: SentMessage, opts?: SentMessageOptions) {
       const entry = { message, options: opts };
       messages.push(entry);
 
@@ -1231,11 +1259,11 @@ export function fakePi(options: FakePiOptions = {}) {
   };
 
   if (options.allTools) {
-    api.getAllTools = () => options.allTools;
+    api.getAllTools = () => options.allTools as ReturnType<ExtensionAPI["getAllTools"]>;
   }
 
   return {
-    api: api as any,
+    api: api as ExtensionAPI,
     handlers,
     tools,
     commands,
@@ -1252,7 +1280,7 @@ export function fakePi(options: FakePiOptions = {}) {
         return Promise.resolve(found);
       }
 
-      return new Promise<{ message: any; options: any }>((resolve) => {
+      return new Promise<SentMessageEntry>((resolve) => {
         messageWaiters.add({ customType, count: 1, resolve });
       });
     },
@@ -1263,7 +1291,7 @@ export function fakePi(options: FakePiOptions = {}) {
         return Promise.resolve(found!);
       }
 
-      return new Promise<{ message: any; options: any }>((resolve) => {
+      return new Promise<SentMessageEntry>((resolve) => {
         messageWaiters.add({ customType, count, resolve });
       });
     },
@@ -1329,7 +1357,8 @@ export function context(options: ContextOptions = {}) {
   const notifications: Array<{ message: string; type?: string }> = [];
   const statuses = new Map<string, string | undefined>();
   const widgets = new Map<string, unknown>();
-  const ui: Record<string, unknown> = {
+  const ui: Pick<ExtensionUIContext, "setStatus" | "setWidget" | "notify"> &
+    Partial<Pick<ExtensionUIContext, "confirm">> = {
     setStatus(key: string, value: string | undefined) {
       statuses.set(key, value);
     },
@@ -1345,10 +1374,10 @@ export function context(options: ContextOptions = {}) {
     ui.confirm = options.confirm;
   }
 
-  const ctx: Record<string, unknown> = {
+  const ctx = {
     cwd: options.cwd ?? process.cwd(),
     model: options.provider ? { provider: options.provider, id: "parent-model" } : undefined,
-    mode: "rpc",
+    mode: "rpc" as const,
     isProjectTrusted: () => options.trusted ?? true,
     isIdle: () => options.idle ?? false,
     sessionManager: {
@@ -1357,13 +1386,10 @@ export function context(options: ContextOptions = {}) {
       getSessionId: () => options.sessionId ?? "test-session",
     },
     ui,
+    ...(options.hasUI === undefined ? {} : { hasUI: options.hasUI }),
   };
 
-  if (options.hasUI !== undefined) {
-    ctx.hasUI = options.hasUI;
-  }
-
-  return { ctx: ctx as any, notifications, statuses, widgets };
+  return { ctx: ctx as ExtensionCommandContext, notifications, statuses, widgets };
 }
 
 /** Models Pi's guarded contexts becoming unusable when their runtime is replaced. */

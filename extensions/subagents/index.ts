@@ -50,7 +50,6 @@ import { providerFamily } from "../../src/policy.ts";
 import { captureParentThread, type ParentThreadSnapshot } from "../../src/parent-thread-context.ts";
 import {
   MAX_ANSWER_CHARS,
-  MAX_QUESTION_CHARS,
   renderOrchestratorQuestion,
   SUBAGENT_ANSWER_TOOL_NAME,
   SUBAGENT_QUESTION_MESSAGE,
@@ -220,18 +219,18 @@ export function summarizeSubagentActivity(
     const { running, queued } = counts[owner];
     const total = running + queued;
     const plural = (n: number) => `${noun}${n === 1 ? "" : "s"}`;
-    const summary =
-      queued === 0
-        ? `${running} ${plural(running)} running`
-        : running === 0
-          ? `${queued} ${plural(queued)} queued`
-          : `${total} ${plural(total)} active`;
-    const breakdown =
-      running && queued
-        ? active.length > 1
-          ? ` (${running} running · ${queued} queued)`
-          : ` · ${running} running · ${queued} queued`
-        : "";
+    let summary: string;
+    let breakdown = "";
+
+    if (!queued) {
+      summary = `${running} ${plural(running)} running`;
+    } else if (!running) {
+      summary = `${queued} ${plural(queued)} queued`;
+    } else {
+      summary = `${total} ${plural(total)} active`;
+      const counts = `${running} running · ${queued} queued`;
+      breakdown = active.length > 1 ? ` (${counts})` : ` · ${counts}`;
+    }
 
     return { owner, running, queued, summary, breakdown, pointer };
   });
@@ -241,11 +240,15 @@ export function summarizeSubagentActivity(
   // A blocked question is not "activity" in the running/queued sense, so it is
   // reported as its own marker rather than folded into either count.
   const marker = needInput ? `${needInput} need input` : "";
-  const text = segments.length
-    ? `◆ ${[...segments.map((segment) => `${segment.summary}${segment.breakdown}`), marker].filter(Boolean).join(" · ")} • ${pointers.join(" · ")}${pointers.length === 1 ? " to view" : ""}`
-    : marker
-      ? `◆ ${marker} • /subagents to view`
-      : "";
+  let text = "";
+
+  if (segments.length) {
+    const summaries = segments.map(({ summary, breakdown }) => summary + breakdown);
+    const activity = [...summaries, marker].filter(Boolean).join(" · ");
+    text = `◆ ${activity} • ${pointers.join(" · ")}${pointers.length === 1 ? " to view" : ""}`;
+  } else if (marker) {
+    text = `◆ ${marker} • /subagents to view`;
+  }
 
   return { segments, pointers, key, text, needInput };
 }
@@ -472,13 +475,18 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       ...(activity.needInput ? [`? ${activity.needInput} need input`] : []),
       ...activity.pointers.filter((pointer) => pointer !== "/workflows"),
     ].join(" · ");
-  const updateSessionUi = (ui: ExtensionUIContext, sessionManager: JobManager, harness: HarnessName) => {
+  const harnessStatus = (harness: HarnessName): string => {
     const activation = currentHarnessActivations?.find((candidate) => candidate.harness === harness);
-    const availabilityText = activation
-      ? activation.enabled
-        ? availabilityLabel(activation.availability.status)
-        : "disabled by user"
-      : "status unknown";
+
+    if (!activation) {
+      return "status unknown";
+    }
+
+    return activation.enabled ? availabilityLabel(activation.availability.status) : "disabled by user";
+  };
+
+  const updateSessionUi = (ui: ExtensionUIContext, sessionManager: JobManager, harness: HarnessName) => {
+    const availabilityText = harnessStatus(harness);
 
     if (displayedHarness !== harness || displayedHarnessAvailability !== availabilityText) {
       displayedHarness = harness;
@@ -1117,16 +1125,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     }
 
     clearFollowThroughWatchesForSource(interaction.sourceJobId);
+    const workflow = interaction.workflow ?? source.workflow;
     const watch: FollowThroughWatch = {
       key: followThroughKey(interaction.requestId, interaction.sourceJobId, interaction.sourceGeneration),
       requestId: interaction.requestId,
       sourceJobId: interaction.sourceJobId,
       sourceGeneration: interaction.sourceGeneration,
-      workflow: interaction.workflow
-        ? { ...interaction.workflow }
-        : source.workflow
-          ? { ...source.workflow }
-          : undefined,
+      workflow: workflow ? { ...workflow } : undefined,
       answeredAt: interaction.answeredAt ?? Date.now(),
       settled: false,
       deliverable: false,
@@ -1371,8 +1376,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
     }
 
     const sessionManager = manager;
-    let sessionPublisher: NativeSubagentsStatePublisher;
-    sessionPublisher = createNativeSubagentsStatePublisher({
+    const sessionPublisher = createNativeSubagentsStatePublisher({
       sessionId: ctx.sessionManager.getSessionId(),
       listJobs: () => sessionManager.list(),
       listWorkflows: () => workflows.list(),
@@ -1558,9 +1562,6 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
         rememberShutdownError(error);
       }
     } finally {
-      finalJobs = [];
-      finalWorkflows = [];
-
       try {
         unsubscribeManager?.();
       } catch (error) {
@@ -1638,12 +1639,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       updateSessionUi(ctx.ui, getManager(), activeHarness);
       ctx.ui.notify(`Default subagent harness: ${selected}`, "info");
     } else if (value === "status") {
-      const activation = currentHarnessActivations?.find((candidate) => candidate.harness === activeHarness);
-      const state = activation
-        ? activation.enabled
-          ? availabilityLabel(activation.availability.status)
-          : "disabled by user"
-        : "status unknown";
+      const state = harnessStatus(activeHarness);
       ctx.ui.notify(
         `Default harness: ${activeHarness} (${state})\nProfiles: ${profileCatalog.profiles.size}\nModels: caller-selected or native harness default`,
         "info",
@@ -1990,13 +1986,13 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       );
     },
     renderCall(args, theme) {
-      const route = args.independentOf
-        ? `independent-of:${shortId(args.independentOf)}`
-        : args.independent
-          ? "independent"
-          : args.harness
-            ? `${args.harness}${args.model ? `/${args.model}` : ""}`
-            : (args.model ?? "");
+      let route = independenceLabel(args);
+
+      if (!route && args.harness) {
+        route = args.model ? `${args.harness}/${args.model}` : args.harness;
+      }
+
+      route ??= args.model ?? "";
       const detail = [
         args.access ?? "full",
         args.profile ? `profile:${args.profile}` : "",
@@ -2357,11 +2353,7 @@ export function registerNativeSubagents(pi: ExtensionAPI, options: RegistrationO
       }
     },
     renderCall(args, theme) {
-      const harness = args.independentOf
-        ? `independent-of:${shortId(args.independentOf)}`
-        : args.independent
-          ? "independent"
-          : (args.harness ?? activeHarness);
+      const harness = independenceLabel(args) ?? args.harness ?? activeHarness;
       const route = args.model ? `${harness}/${args.model}` : harness;
       const effort = args.effort ? ` · effort:${args.effort}` : "";
       const profile = args.profile ? ` · profile:${args.profile}` : "";
@@ -2886,6 +2878,14 @@ async function spawn(
     requires: routing.requires,
     capabilityRoute: routing.capabilityRoute,
   });
+}
+
+function independenceLabel(args: { independentOf?: string; independent?: boolean }): string | undefined {
+  if (args.independentOf) {
+    return `independent-of:${shortId(args.independentOf)}`;
+  }
+
+  return args.independent ? "independent" : undefined;
 }
 
 /** Provider of an existing independence target, when it is still retained. */

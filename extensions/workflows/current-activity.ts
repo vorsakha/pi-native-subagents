@@ -79,11 +79,15 @@ export function workflowAgentContext(snapshot: WorkflowSnapshot, agent: Workflow
   }
 
   const ids = [agent.logicalJobId, agent.jobId].filter(Boolean);
-  const role = ids.includes(convergence.reviewerJobId)
-    ? "reviewer"
-    : ids.includes(convergence.implementerJobId)
-      ? "implementer"
-      : sanitizeInline(agent.name);
+  let role: string;
+
+  if (ids.includes(convergence.reviewerJobId)) {
+    role = "reviewer";
+  } else if (ids.includes(convergence.implementerJobId)) {
+    role = "implementer";
+  } else {
+    role = sanitizeInline(agent.name);
+  }
 
   return `${role} · round ${convergence.round}/${convergence.maxRounds} · ${phaseLabel}`;
 }

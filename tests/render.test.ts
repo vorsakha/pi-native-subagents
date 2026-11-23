@@ -530,33 +530,37 @@ test("every direct tool registers width-safe, sanitized trace renderers", () => 
       );
     }
 
-    const details =
-      name === "subagent_list"
-        ? { jobs: [job()] }
-        : name === "subagent_answer"
-          ? {
-              interaction: interactionSnapshot({
-                state: "answered",
-                answer: "keep the legacy flag",
-                answeredAt: 3_000,
-                route: "orchestrator-model",
-              }),
-            }
-          : name === "session_peer_list"
-            ? {
-                peers: [
-                  {
-                    sessionId: "peer-1",
-                    name: "\u001b[31mnamed\u001b[0m",
-                    cwd: "/tmp/project",
-                    createdAt: 0,
-                    modifiedAt: 0,
-                    messageCount: 2,
-                    preview: "hi",
-                  },
-                ],
-              }
-            : { job: job({ status: "completed", endedAt: 3_000, output: "first\nlast" }) };
+    let details;
+
+    if (name === "subagent_list") {
+      details = { jobs: [job()] };
+    } else if (name === "subagent_answer") {
+      details = {
+        interaction: interactionSnapshot({
+          state: "answered",
+          answer: "keep the legacy flag",
+          answeredAt: 3_000,
+          route: "orchestrator-model",
+        }),
+      };
+    } else if (name === "session_peer_list") {
+      details = {
+        peers: [
+          {
+            sessionId: "peer-1",
+            name: "\u001b[31mnamed\u001b[0m",
+            cwd: "/tmp/project",
+            createdAt: 0,
+            modifiedAt: 0,
+            messageCount: 2,
+            preview: "hi",
+          },
+        ],
+      };
+    } else {
+      details = { job: job({ status: "completed", endedAt: 3_000, output: "first\nlast" }) };
+    }
+
     const resultLines = toolDef
       .renderResult({ details }, { expanded: false, isPartial: false }, ansiTheme, { args: args[name] })
       .render(48);

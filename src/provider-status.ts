@@ -383,40 +383,47 @@ export function claudeStatus(facts: ClaudeAuthFacts, checkedAt: number): Provide
   // valid API-key login is authenticated but still not ready for a subagent.
   const subscription = facts.authMethod === "claude.ai";
 
-  return {
+  const status: ProviderStatus = {
     harness: "claude",
     installed: true,
     authenticated: facts.loggedIn,
     ready: facts.loggedIn && subscription,
     account: facts.account,
-    detail: !facts.loggedIn
-      ? "Claude Code is not logged in"
-      : subscription
-        ? undefined
-        : `Claude reports auth method ${facts.authMethod ?? "unknown"}; subagents require a claude.ai subscription login`,
+    detail: undefined,
     checkedAt,
     probe: "claude auth status --json",
   };
+
+  if (!facts.loggedIn) {
+    status.detail = "Claude Code is not logged in";
+  } else if (!subscription) {
+    status.detail = `Claude reports auth method ${facts.authMethod ?? "unknown"}; subagents require a claude.ai subscription login`;
+  }
+
+  return status;
 }
 
 export function codexStatus(facts: CodexAccountFacts, checkedAt: number): ProviderStatus {
   const chatgpt = facts.type === "chatgpt";
 
-  return {
+  const status: ProviderStatus = {
     harness: "codex",
     installed: true,
     authenticated: !!facts.type && facts.type !== "none",
     ready: chatgpt,
     account: facts.account,
-    detail:
-      !facts.type || facts.type === "none"
-        ? "Codex is not logged in"
-        : chatgpt
-          ? undefined
-          : `Codex reports account type ${facts.type}; subagents require a ChatGPT login`,
+    detail: undefined,
     checkedAt,
     probe: "codex app-server account/read",
   };
+
+  if (!facts.type || facts.type === "none") {
+    status.detail = "Codex is not logged in";
+  } else if (!chatgpt) {
+    status.detail = `Codex reports account type ${facts.type}; subagents require a ChatGPT login`;
+  }
+
+  return status;
 }
 
 /**

@@ -279,12 +279,14 @@ export function normalizeCapability(harness: HarnessName, input: DiscoveredCapab
       ? { effect: "delegation" as const, reason: "nested delegation described by this capability is denied" }
       : undefined;
   const effect = descriptionDenial?.effect ?? classifyEffect(input.kind, name, input.effect);
-  const effectDenial =
-    effect === "delegation"
-      ? "nested delegation is denied"
-      : effect === "interactive"
-        ? "unattended children must not prompt the user"
-        : undefined;
+  let effectDenial: string | undefined;
+
+  if (effect === "delegation") {
+    effectDenial = "nested delegation is denied";
+  } else if (effect === "interactive") {
+    effectDenial = "unattended children must not prompt the user";
+  }
+
   const deniedReason = nameDenial?.reason ?? descriptionDenial?.reason ?? effectDenial;
 
   return {
@@ -309,11 +311,19 @@ function bounded(value: string, limit: number): string {
   return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
 }
 
+function compareCapabilityIds(left: HarnessCapability, right: HarnessCapability): number {
+  if (left.id < right.id) {
+    return -1;
+  }
+
+  return left.id > right.id ? 1 : 0;
+}
+
 /** Stable revision hash so routing decisions and replay records can cite an exact catalog state. */
 export function catalogRevision(capabilities: HarnessCapability[]): string {
   const hash = createHash("sha256");
 
-  for (const capability of [...capabilities].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))) {
+  for (const capability of [...capabilities].sort(compareCapabilityIds)) {
     hash.update(`${capability.id} ${capability.health} ${capability.enabled ? 1 : 0} ${capability.effect}\n`);
   }
 
@@ -500,7 +510,7 @@ export function searchCapabilities(
       return a.available ? -1 : 1;
     }
 
-    return a.capability.id < b.capability.id ? -1 : a.capability.id > b.capability.id ? 1 : 0;
+    return compareCapabilityIds(a.capability, b.capability);
   });
 
   return { matches: matches.slice(0, limit), total: matches.length };
@@ -624,9 +634,12 @@ export function describeResolution(harness: HarnessName, resolution: Requirement
 export function formatFreshness(catalog: CapabilityCatalog, now: number): string {
   const age = Math.max(0, now - catalog.discoveredAt);
   const seconds = Math.round(age / 1000);
-  const label = seconds < 1 ? "just now" : seconds < 90 ? `${seconds}s ago` : `${Math.round(seconds / 60)}m ago`;
 
-  return label;
+  if (seconds < 1) {
+    return "just now";
+  }
+
+  return seconds < 90 ? `${seconds}s ago` : `${Math.round(seconds / 60)}m ago`;
 }
 
 export function formatCapabilityLine(match: CapabilityMatch, now: number): string {

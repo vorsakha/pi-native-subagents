@@ -1693,17 +1693,13 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const status = workflowStatusMeta(run);
     const identity = `${this.theme.fg("accent", this.theme.bold(sanitizeInline(run.name) || "Workflow"))} ${this.theme.fg(status.color, `· ${shortId(sanitizeText(run.runId))} · ${status.glyph} ${run.status}${run.status === "completed" ? ` · task ${run.taskOutcome ?? "unspecified"}` : ""}`)} ${this.theme.fg("dim", `· ${formatElapsed(run, this.#now())}`)}`;
     const essential = this.renderRunStatePreview(run, width);
-    const phaseLifecycle =
-      model.phases.length && run.currentPhase === null
-        ? "Phase · no current phase"
-        : model.phaseProgress.waiting
-          ? "Phase · waiting for the first phase"
-          : model.phaseProgress.noPhases
-            ? "Phase · no phases recorded"
-            : undefined;
 
-    if (phaseLifecycle) {
-      essential.push(this.theme.fg("dim", phaseLifecycle));
+    if (model.phases.length && run.currentPhase === null) {
+      essential.push(this.theme.fg("dim", "Phase · no current phase"));
+    } else if (model.phaseProgress.waiting) {
+      essential.push(this.theme.fg("dim", "Phase · waiting for the first phase"));
+    } else if (model.phaseProgress.noPhases) {
+      essential.push(this.theme.fg("dim", "Phase · no phases recorded"));
     }
 
     const optional: string[] = [
@@ -1789,28 +1785,25 @@ export class WorkflowsDashboardOverlay implements Focusable {
     const optionalBudget = Math.min(shownOptional.length, Math.max(0, outlineBudget - wantedOutlineRows));
     const outlineRows = Math.max(0, outlineBudget - optionalBudget - 1);
     const outline = boundWorkflowOutline(model, outlineRows);
-    const lines = [
-      ...essential.slice(0, essentialBudget),
-      ...shownOptional.slice(0, optionalBudget),
-      ...(outlineBudget > optionalBudget
-        ? [
-            this.theme.fg(
-              "muted",
-              `Outline · filter ${this.#agentFilter} · ${model.nodes.length} node${model.nodes.length === 1 ? "" : "s"}`,
-            ),
-            ...(outline.length
-              ? outline.map((row) => this.renderOutlineRow(row, model, run, width))
-              : outlineRows > 0
-                ? [
-                    this.theme.fg(
-                      "dim",
-                      run.status === "pending" ? "No phases recorded yet." : "No recorded or planned phases.",
-                    ),
-                  ]
-                : []),
-          ]
-        : []),
-    ];
+    const lines = [...essential.slice(0, essentialBudget), ...shownOptional.slice(0, optionalBudget)];
+
+    if (outlineBudget > optionalBudget) {
+      lines.push(
+        this.theme.fg(
+          "muted",
+          `Outline · filter ${this.#agentFilter} · ${model.nodes.length} node${model.nodes.length === 1 ? "" : "s"}`,
+        ),
+      );
+
+      for (const row of outline) {
+        lines.push(this.renderOutlineRow(row, model, run, width));
+      }
+
+      if (!outline.length && outlineRows > 0) {
+        const empty = run.status === "pending" ? "No phases recorded yet." : "No recorded or planned phases.";
+        lines.push(this.theme.fg("dim", empty));
+      }
+    }
 
     if (hasWorkflowResult && resultReserve) {
       lines.push(

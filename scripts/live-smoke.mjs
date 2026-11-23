@@ -13,7 +13,8 @@ import { spawnManaged } from "../src/process-tree.ts";
 
 const accessMode = process.argv[2] === "access";
 const requested = accessMode ? process.argv[3] : process.argv[2];
-const names = requested ? [requested] : accessMode ? ["claude", "codex"] : ["pi", "claude", "codex"];
+const defaultNames = accessMode ? ["claude", "codex"] : ["pi", "claude", "codex"];
+const names = requested ? [requested] : defaultNames;
 const live = process.env.PI_NATIVE_SUBAGENTS_LIVE === "1";
 const root = mkdtempSync(join(tmpdir(), "pi-native-subagents-smoke-"));
 
@@ -55,7 +56,15 @@ function verifyAuth(name) {
 }
 
 function policy(name, access = "readOnly") {
-  const common = {
+  let claudeTools = [];
+
+  if (access === "full") {
+    claudeTools = ["Read", "Write", "Edit", "Bash"];
+  } else if (accessMode && name === "claude") {
+    claudeTools = ["Read", "Glob", "Grep", "Write", "Bash"];
+  }
+
+  return {
     harness: name,
     access,
     customization: "native",
@@ -63,21 +72,18 @@ function policy(name, access = "readOnly") {
     effort: accessMode ? "medium" : "low",
     speed: "standard",
     piTools: [],
-    claudeTools:
-      access === "full"
-        ? ["Read", "Write", "Edit", "Bash"]
-        : accessMode && name === "claude"
-          ? ["Read", "Glob", "Grep", "Write", "Bash"]
-          : [],
+    claudeTools,
     approvalPolicy: "never",
     codexSandbox: access === "full" ? { type: "dangerFullAccess" } : { type: "readOnly", networkAccess: false },
   };
-
-  return common;
 }
 
 function harnessAdapter(name) {
-  return name === "pi" ? new PiRpcBackend() : name === "claude" ? new ClaudeBackend() : new CodexAppServerBackend();
+  if (name === "pi") {
+    return new PiRpcBackend();
+  }
+
+  return name === "claude" ? new ClaudeBackend() : new CodexAppServerBackend();
 }
 
 async function within(promise, timeoutMs, label) {
@@ -163,6 +169,18 @@ async function probeCodexReadOnlySandbox(cwd, deniedFile) {
   }
 }
 
+async function closeRun(run, name) {
+  try {
+    await within(run.close(), 10_000, `${name} close`);
+  } catch (error) {
+    if (run.forceClose) {
+      await within(run.forceClose(), 5_000, `${name} forced cleanup`).catch(() => undefined);
+    }
+
+    throw error;
+  }
+}
+
 async function execute(name, cwd, task, systemPrompt, access, parentThread) {
   const terminal = [];
   const startupController = new AbortController();
@@ -204,15 +222,7 @@ async function execute(name, cwd, task, systemPrompt, access, parentThread) {
 
     throw error;
   } finally {
-    try {
-      await within(run.close(), 10_000, `${name} close`);
-    } catch (error) {
-      if (run.forceClose) {
-        await within(run.forceClose(), 5_000, `${name} forced cleanup`).catch(() => undefined);
-      }
-
-      throw error;
-    }
+    await closeRun(run, name);
   }
 
   const event = terminal.at(-1);

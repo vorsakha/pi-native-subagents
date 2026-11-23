@@ -241,17 +241,17 @@ async function acquireRetentionLock(root: string): Promise<() => Promise<void>> 
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
         throw error;
       }
-
-      if (await reclaimDeadRetentionLock(lockPath)) {
-        continue;
-      }
-
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for workflow retention lock: ${normalizedRoot}`);
-      }
-
-      await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, RETENTION_LOCK_RETRY_MS));
     }
+
+    if (await reclaimDeadRetentionLock(lockPath)) {
+      continue;
+    }
+
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for workflow retention lock: ${normalizedRoot}`);
+    }
+
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, RETENTION_LOCK_RETRY_MS));
   }
 }
 

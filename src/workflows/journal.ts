@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import type {
-  WorkflowContinuationHandoff,
   WorkflowContinuationProgress,
   WorkflowJournalRecord,
   WorkflowJournalRoute,
@@ -35,7 +34,13 @@ export function canonicalJson(value: unknown): string {
 
   const entries = Object.entries(value as Record<string, unknown>)
     .filter(([, item]) => item !== undefined)
-    .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0));
+    .sort(([left], [right]) => {
+      if (left < right) {
+        return -1;
+      }
+
+      return left > right ? 1 : 0;
+    });
 
   return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(",")}}`;
 }

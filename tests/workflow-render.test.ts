@@ -589,13 +589,17 @@ test("the phase spine stays bounded for many phases while the current/total frac
   const many = workflow({
     currentPhase: 6,
     plannedPhaseCount: 12,
-    phases: Array.from({ length: 12 }, (_, index) =>
-      phase({
-        index,
-        name: `phase ${index}`,
-        status: index < 6 ? ("completed" as const) : index === 6 ? ("running" as const) : ("pending" as const),
-      }),
-    ),
+    phases: Array.from({ length: 12 }, (_, index) => {
+      let status: WorkflowPhase["status"] = "pending";
+
+      if (index < 6) {
+        status = "completed";
+      } else if (index === 6) {
+        status = "running";
+      }
+
+      return phase({ index, name: `phase ${index}`, status });
+    }),
   });
   const collapsed = buildWorkflowCardLines(many, theme, { expanded: false, now: 6_000 });
   const phasesLine = collapsed.find((line) => line.startsWith("Phases"));

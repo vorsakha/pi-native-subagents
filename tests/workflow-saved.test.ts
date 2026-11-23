@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { tempDir } from "./helpers.ts";
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { listSavedWorkflows, loadSavedWorkflow, loadWorkflowScriptPath } from "../src/workflows/saved.ts";
 

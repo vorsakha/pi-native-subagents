@@ -6,6 +6,7 @@ import { Check } from "typebox/value";
 import { registerNativeSubagents } from "../extensions/subagents/index.ts";
 import { DEFAULT_WORKFLOWS_SHORTCUT, WORKFLOWS_SHORTCUT_ENV } from "../extensions/workflows/index.ts";
 import type { Backend } from "../src/types.ts";
+import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 import {
   ControlledBackend,
   HoldingBackend,
@@ -158,25 +159,19 @@ test("background workflows return immediately and deliver one follow-up result f
   }
 
   assert.equal(pi.messages.length, 1);
-  assert.equal(pi.messages[0]?.message.customType, "native-workflow-result");
-  assert.equal(pi.messages[0]?.options.deliverAs, "followUp");
-  assert.equal(pi.messages[0]?.options.triggerTurn, true);
-  assert.equal(pi.messages[0]?.message.details.workflow.status, "completed");
+  const { message, options } = pi.messages[0]!;
+  assert.equal(message.customType, "native-workflow-result");
+  assert.equal(options?.deliverAs, "followUp");
+  assert.equal(options?.triggerTurn, true);
+  const { workflow } = message.details as { workflow: WorkflowSnapshot };
+  assert.equal(workflow.status, "completed");
   assert.doesNotMatch(
-    pi.messages[0]?.message.content ?? "",
+    (message.content ?? "") as string,
     /Artifacts:|workflow-extension-/i,
     "model-facing results omit machine-local artifact paths",
   );
-  assert.equal(
-    pi.messages[0]?.message.details.workflow.agents[0]?.prompt,
-    undefined,
-    "model-facing compact details exclude agent prompts",
-  );
-  assert.equal(
-    pi.messages[0]?.message.details.workflow.agents[0]?.tools,
-    undefined,
-    "model-facing compact details exclude supervision traces",
-  );
+  assert.equal(workflow.agents[0]?.prompt, undefined, "model-facing compact details exclude agent prompts");
+  assert.equal(workflow.agents[0]?.tools, undefined, "model-facing compact details exclude supervision traces");
   await pi.handlers.get("session_shutdown")?.();
 
   const failed = await setup();
@@ -199,8 +194,9 @@ test("background workflows return immediately and deliver one follow-up result f
   }
 
   assert.equal(failed.pi.messages.length, 1);
-  assert.equal(failed.pi.messages[0]?.message.details.workflow.status, "failed");
-  assert.match(failed.pi.messages[0]?.message.details.workflow.error ?? "", /script exploded/);
+  const failureDetails = failed.pi.messages[0]?.message.details as { workflow: WorkflowSnapshot };
+  assert.equal(failureDetails.workflow.status, "failed");
+  assert.match(failureDetails.workflow.error ?? "", /script exploded/);
   await failed.pi.handlers.get("session_shutdown")?.();
 });
 
@@ -233,7 +229,7 @@ test("terminal delivery includes budget warnings and status retains unsuccessful
     session.ctx,
   );
   await pi.handlers.get("agent_settled")?.();
-  assert.match(pi.messages[0]?.message.content ?? "", /Warnings:\n- Subagent budget tokens limit reached/);
+  assert.match((pi.messages[0]?.message.content ?? "") as string, /Warnings:\n- Subagent budget tokens limit reached/);
   pi.messages.length = 0;
 
   const workflowForeground = await pi.tools.get("workflow").execute(
@@ -275,7 +271,7 @@ test("terminal delivery includes budget warnings and status retains unsuccessful
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
 
-  assert.match(pi.messages[0]?.message.content ?? "", /Warnings:\n- Workflow budget tokens limit reached/);
+  assert.match((pi.messages[0]?.message.content ?? "") as string, /Warnings:\n- Workflow budget tokens limit reached/);
 
   const unsuccessful = await pi.tools.get("workflow").execute(
     "unsuccessful",
@@ -561,7 +557,7 @@ test("workflow tool rejects invalid JSON args and untrusted projects", async () 
       ),
     /disabled for untrusted projects/,
   );
-  await denied.pi.commands.get("workflows").handler("", untrusted.ctx);
+  await denied.pi.commands.get("workflows")!.handler("", untrusted.ctx);
   assert.match(untrusted.notifications.at(-1)?.message ?? "", /unavailable for untrusted projects/);
   await denied.pi.handlers.get("session_shutdown")?.();
 });
@@ -765,19 +761,19 @@ test("/workflows worktrees reports an empty inventory and reclaim refuses withou
   const plain = context({ hasUI: true });
   pi.handlers.get("session_start")?.({}, plain.ctx);
 
-  await pi.commands.get("workflows").handler("worktrees", plain.ctx);
+  await pi.commands.get("workflows")!.handler("worktrees", plain.ctx);
   assert.match(plain.notifications.at(-1)?.message ?? "", /No protected worktrees/);
 
-  await pi.commands.get("workflows").handler("reclaim wf_deadbeef 0", plain.ctx);
+  await pi.commands.get("workflows")!.handler("reclaim wf_deadbeef 0", plain.ctx);
   assert.match(plain.notifications.at(-1)?.message ?? "", /requires host confirmation/);
   await pi.handlers.get("session_shutdown")?.();
 
   const confirmable = context({ hasUI: true, confirm: async () => true });
   pi.handlers.get("session_start")?.({}, confirmable.ctx);
-  await pi.commands.get("workflows").handler("reclaim wf_deadbeef 0", confirmable.ctx);
+  await pi.commands.get("workflows")!.handler("reclaim wf_deadbeef 0", confirmable.ctx);
   assert.match(confirmable.notifications.at(-1)?.message ?? "", /No protected worktree for/);
 
-  await pi.commands.get("workflows").handler("reclaim not-a-run-id", confirmable.ctx);
+  await pi.commands.get("workflows")!.handler("reclaim not-a-run-id", confirmable.ctx);
   assert.match(confirmable.notifications.at(-1)?.message ?? "", /Usage: \/workflows reclaim/);
 
   await pi.handlers.get("session_shutdown")?.();

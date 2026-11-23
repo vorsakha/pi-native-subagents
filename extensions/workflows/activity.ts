@@ -245,9 +245,11 @@ function styledRow(
         return undefined;
       }
 
-      const color = field === "state" ? (row.attention ? "warning" : "dim") : field === "phase" ? "muted" : "dim";
+      if (field === "state" && row.attention) {
+        return theme.fg("warning", value);
+      }
 
-      return theme.fg(color, value);
+      return theme.fg(field === "phase" ? "muted" : "dim", value);
     })
     .filter((value): value is string => value !== undefined);
   const details = values.length ? ` ${values.join(theme.fg("dim", " · "))}` : "";

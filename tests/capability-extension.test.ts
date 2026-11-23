@@ -14,7 +14,7 @@ function setup(backends: Backend[], legacyRoot: string | false = false) {
 }
 
 test("subagent_capabilities exposes a bounded discovery schema and denies untrusted projects", async () => {
-  const { pi, ctx } = setup([
+  const { pi } = setup([
     new DiscoverableBackend("codex"),
     new DiscoverableBackend("claude"),
     new DiscoverableBackend("pi"),

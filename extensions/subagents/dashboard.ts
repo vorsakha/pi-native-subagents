@@ -109,12 +109,12 @@ function directJobStatePreview(
 
   if (interaction) {
     const elapsed = formatDurationLabel(now - interaction.createdAt);
-    const target =
-      interaction.target.kind === "agent"
-        ? `peer ${sanitizeInline(interaction.target.label ?? shortId(interaction.target.jobId ?? "peer"))}`
-        : interaction.humanVisible
-          ? "you"
-          : "parent orchestrator";
+    let target = interaction.humanVisible ? "you" : "parent orchestrator";
+
+    if (interaction.target.kind === "agent") {
+      target = `peer ${sanitizeInline(interaction.target.label ?? shortId(interaction.target.jobId ?? "peer"))}`;
+    }
+
     const owner = interaction.workflow
       ? ` · workflow ${sanitizeInline(interaction.workflow.label)} ${shortId(sanitizeText(interaction.workflow.runId))}`
       : "";
@@ -155,13 +155,13 @@ function directJobStatePreview(
     : undefined;
 
   if (summary.kind === "failure") {
-    const recovery =
-      workflowDestination ??
-      (!takeoverPolicy(job).reusable
-        ? "no recovery action is available in this pane"
-        : isTerminal(job.status)
-          ? "press f to follow up"
-          : "press s to steer");
+    let recovery = workflowDestination;
+
+    if (!recovery && takeoverPolicy(job).reusable) {
+      recovery = isTerminal(job.status) ? "press f to follow up" : "press s to steer";
+    }
+
+    recovery ??= "no recovery action is available in this pane";
 
     return [line("error", `Error · ${summary.text}`), line("text", `Recovery · ${recovery}`)];
   }
@@ -274,7 +274,6 @@ class DashboardOverlay implements Focusable {
   /** Routine telemetry is opt-in; state and recovery remain visible without it. */
   #showInfo = false;
   #notice = "";
-  #behavior: SendBehavior | undefined;
   /** Identity that owns the preserved draft; a draft never crosses jobs or composer kinds. */
   #draftOwner: DraftOwner | undefined;
   #pendingSend: { jobId: string; draft: string; inputRevision: number } | undefined;
@@ -327,17 +326,16 @@ class DashboardOverlay implements Focusable {
     this.#forceFullscreen = options.fullscreen;
     this.#availability = options.availability;
     this.#selectedId = options.focusJobId;
-    this.#focus =
-      options.mode === "takeover"
-        ? { kind: "composer", composer: "steer" }
-        : options.mode === "answer"
-          ? { kind: "composer", composer: "answer" }
-          : { kind: "job-list" };
-    this.#unsubscribe = manager.subscribe((job) => {
+    this.#focus = { kind: "job-list" };
+
+    if (options.mode === "takeover" || options.mode === "answer") {
+      this.#focus = { kind: "composer", composer: options.mode === "answer" ? "answer" : "steer" };
+    }
+
+    this.#unsubscribe = manager.subscribe(() => {
       // Manager snapshots are immutable projections, but bounded fields can
       // change without changing their length. Drop the rendered transcript
       // cache on every lifecycle/output event before coalescing the repaint.
-      this.revalidateTakeoverComposer(job);
       this.invalidate();
       this.invalidateSoon();
     });
@@ -367,7 +365,6 @@ class DashboardOverlay implements Focusable {
       const policy = takeoverPolicy(chosen);
       const composer = takeoverComposer(policy.behavior);
       this.#focus = { kind: "composer", composer };
-      this.#behavior = policy.behavior;
       this.bindDraft({ jobId: chosen.id, composer });
     }
 
@@ -682,7 +679,6 @@ class DashboardOverlay implements Focusable {
 
   private resetCompactHierarchy(): void {
     this.#focus = { kind: "job-list" };
-    this.#behavior = undefined;
     this.#answerIdentity = undefined;
     this.#confirmCancelId = undefined;
     this.#renderedCancelId = undefined;
@@ -765,13 +761,11 @@ class DashboardOverlay implements Focusable {
     const composer = takeoverComposer(behavior);
     this.bindDraft({ jobId: job.id, composer });
     this.#focus = { kind: "composer", composer };
-    this.#behavior = behavior;
     this.#input.focused = this.#focused;
   }
 
   private leaveComposer(): void {
     this.#focus = { kind: "job-detail" };
-    this.#behavior = undefined;
     this.#answerIdentity = undefined;
     this.#input.focused = false;
   }
@@ -807,7 +801,6 @@ class DashboardOverlay implements Focusable {
 
     this.bindDraft({ jobId: job.id, composer: "answer", requestId: interaction.requestId });
     this.#focus = { kind: "composer", composer: "answer" };
-    this.#behavior = undefined;
     this.#answerIdentity = { jobId: job.id, requestId: interaction.requestId };
     this.#input.focused = this.#focused;
   }
@@ -841,16 +834,6 @@ class DashboardOverlay implements Focusable {
       this.#draftOwner.composer === this.#focus.composer &&
       this.#focus.composer === takeoverComposer(policy.behavior)
     );
-  }
-
-  private revalidateTakeoverComposer(job: JobSnapshot): void {
-    if (job.id !== this.#selectedId || this.#focus.kind !== "composer" || this.#focus.composer === "answer") {
-      return;
-    }
-
-    if (!this.takeoverComposerMatches(job)) {
-      this.#behavior = undefined;
-    }
   }
 
   private submit(raw: string): void {
@@ -1428,13 +1411,16 @@ class DashboardOverlay implements Focusable {
 
     const policy = takeoverPolicy(job);
     const current = this.takeoverComposerMatches(job);
-    const behavior = current ? policy.behavior : undefined;
-    const label =
-      policy.reusable && current
-        ? `${behavior === "followUp" ? "follow-up" : "steer"} · ${dashboardSubmitKeyLabel(this.keybindings)} sends`
-        : policy.reusable
-          ? `${this.#focus.kind === "composer" ? this.#focus.composer : "takeover"} draft preserved · no longer sendable`
-          : "read-only session";
+    let label = "read-only session";
+
+    if (policy.reusable && current) {
+      const action = policy.behavior === "followUp" ? "follow-up" : "steer";
+      label = `${action} · ${dashboardSubmitKeyLabel(this.keybindings)} sends`;
+    } else if (policy.reusable) {
+      const composer = this.#focus.kind === "composer" ? this.#focus.composer : "takeover";
+      label = `${composer} draft preserved · no longer sendable`;
+    }
+
     const rule = dashboardScrollRule(this.theme, label, width);
 
     if (!policy.reusable) {

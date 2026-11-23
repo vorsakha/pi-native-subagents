@@ -7,5 +7,9 @@ export function workflowTaskOutcome(result: unknown): WorkflowTaskOutcome {
 
   const ok = (result as Record<string, unknown>).ok;
 
-  return ok === true ? "successful" : ok === false ? "unsuccessful" : "unspecified";
+  if (ok === true) {
+    return "successful";
+  }
+
+  return ok === false ? "unsuccessful" : "unspecified";
 }

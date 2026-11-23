@@ -2,7 +2,7 @@ import { writeWorkflowFixture } from "./helpers.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { tempDir } from "./helpers.ts";
-import { mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   checkpointWorkflow,

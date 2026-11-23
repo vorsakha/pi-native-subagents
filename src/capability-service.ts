@@ -523,28 +523,31 @@ function orderCandidates(candidates: HarnessName[], preference: HarnessName[]): 
  */
 export function configFingerprint(harness: HarnessName, cwd: string, env: NodeJS.ProcessEnv = process.env): string {
   const home = env.HOME ?? env.USERPROFILE ?? homedir();
-  const roots =
-    harness === "claude"
-      ? [
-          resolve(home, ".claude"),
-          resolve(home, ".claude/settings.json"),
-          resolve(home, ".claude/skills"),
-          resolve(cwd, ".claude"),
-          resolve(cwd, ".mcp.json"),
-        ]
-      : harness === "codex"
-        ? [
-            resolve(home, ".codex"),
-            resolve(home, ".codex", "config.toml"),
-            resolve(cwd, ".codex"),
-            resolve(cwd, ".agents"),
-          ]
-        : [
-            resolve(home, ".pi"),
-            resolve(home, ".pi/agent/skills"),
-            resolve(home, ".pi/agent/extensions"),
-            resolve(cwd, ".pi"),
-          ];
+  let roots: string[];
+
+  if (harness === "claude") {
+    roots = [
+      resolve(home, ".claude"),
+      resolve(home, ".claude/settings.json"),
+      resolve(home, ".claude/skills"),
+      resolve(cwd, ".claude"),
+      resolve(cwd, ".mcp.json"),
+    ];
+  } else if (harness === "codex") {
+    roots = [
+      resolve(home, ".codex"),
+      resolve(home, ".codex", "config.toml"),
+      resolve(cwd, ".codex"),
+      resolve(cwd, ".agents"),
+    ];
+  } else {
+    roots = [
+      resolve(home, ".pi"),
+      resolve(home, ".pi/agent/skills"),
+      resolve(home, ".pi/agent/extensions"),
+      resolve(cwd, ".pi"),
+    ];
+  }
 
   return roots
     .map((root) => {

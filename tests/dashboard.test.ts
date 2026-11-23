@@ -1404,7 +1404,13 @@ test("the cheatsheet never intercepts ? inside the steer composer", (t) => {
 test("configurable confirm/cancel/submit bindings render their configured key names in hints, falling back to defaults otherwise", (t) => {
   const configured = dashboard([job("configured-keys")], 30, () => {}, undefined, {
     fullscreen: true,
-    getKeys: (binding) => (binding === "tui.select.cancel" ? ["q"] : binding === "tui.select.confirm" ? ["space"] : []),
+    getKeys: (binding) => {
+      if (binding === "tui.select.cancel") {
+        return ["q"];
+      }
+
+      return binding === "tui.select.confirm" ? ["space"] : [];
+    },
   });
   t.after(() => configured.overlay.dispose());
   assert.match(
@@ -1999,16 +2005,17 @@ test("direct inspectors prioritize activity, results, failures, and queue recove
     const lines = state.overlay.render(52);
     const text = lines.join("\n");
     assert.ok(lines.every((line) => visibleWidth(line) <= 52));
-    assert.match(
-      text,
-      current.status === "running"
-        ? /Latest · checking/
-        : current.status === "completed"
-          ? /Result · final concise result/
-          : current.status === "failed"
-            ? /Error · bounded provider failure/
-            : /Waiting · waiting for scheduler slot/,
-    );
+    let expectedPreview = /Waiting · waiting for scheduler slot/;
+
+    if (current.status === "running") {
+      expectedPreview = /Latest · checking/;
+    } else if (current.status === "completed") {
+      expectedPreview = /Result · final concise result/;
+    } else if (current.status === "failed") {
+      expectedPreview = /Error · bounded provider failure/;
+    }
+
+    assert.match(text, expectedPreview);
     const previewAt = lines.findIndex((line) => /Latest ·|Result ·|Error ·|Waiting ·/.test(line));
     const routeAt = lines.findIndex((line) => line.includes("route "));
     assert.ok(previewAt >= 0 && (routeAt < 0 || previewAt < routeAt), "state preview precedes route telemetry");

@@ -111,6 +111,14 @@ const DEFAULT_INTERACTION_CLOCK: InteractionDeadlineClock = {
 };
 
 function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: JobSnapshot }): JobSnapshot {
+  let warnings: JobSnapshot["warnings"];
+
+  if (previous && previous.source.warnings === snapshot.warnings) {
+    warnings = previous.value.warnings;
+  } else if (snapshot.warnings) {
+    warnings = [...snapshot.warnings];
+  }
+
   return {
     ...snapshot,
     usage: previous?.source.usage === snapshot.usage ? previous.value.usage : { ...snapshot.usage },
@@ -137,12 +145,7 @@ function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: J
           warnings: snapshot.capabilities.warnings ? [...snapshot.capabilities.warnings] : undefined,
         }
       : undefined,
-    warnings:
-      previous && previous.source.warnings === snapshot.warnings
-        ? previous.value.warnings
-        : snapshot.warnings
-          ? [...snapshot.warnings]
-          : undefined,
+    warnings,
     unavailable: snapshot.unavailable ? { ...snapshot.unavailable } : undefined,
     interaction: snapshot.interaction
       ? {
@@ -1151,11 +1154,14 @@ export class JobManager {
       const startBackend = (): Promise<BackendRun> => {
         startupController.signal.throwIfAborted();
         this.#emit(job, { type: "started" });
-        const basePrompt = job.request.peer
-          ? PEER_SYSTEM_PROMPT
-          : job.request.parentThread
-            ? HUMAN_SYSTEM_PROMPT
-            : GENERIC_SYSTEM_PROMPT;
+        let basePrompt = GENERIC_SYSTEM_PROMPT;
+
+        if (job.request.peer) {
+          basePrompt = PEER_SYSTEM_PROMPT;
+        } else if (job.request.parentThread) {
+          basePrompt = HUMAN_SYSTEM_PROMPT;
+        }
+
         const capabilityPrompt = job.request.capabilityRoute?.matched.length
           ? `The parent live-verified these required native capabilities for this task: ${job.request.capabilityRoute.matched.join(", ")}. Use the relevant skill or tool when the task calls for it; do not substitute an unverified capability.`
           : undefined;

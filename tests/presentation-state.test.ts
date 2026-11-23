@@ -872,7 +872,9 @@ test("shutdown releases every resource when workflow shutdown and final reads fa
     .execute("shutdown-job", { task: "remain active until shutdown" }, undefined, undefined, session.ctx);
   await backend.waitForStart();
 
-  await assert.rejects(first.handlers.get("session_shutdown")?.(), (error) => error === workflows.shutdownError);
+  const shutdown = first.handlers.get("session_shutdown")?.();
+  assert.ok(shutdown instanceof Promise);
+  await assert.rejects(shutdown, (error) => error === workflows.shutdownError);
   assert.deepEqual(backend.cancels, [{ jobId: spawned.details.job.id, reason: "Session shutdown" }]);
   assert.equal(workflows.sessionShutdowns, 1);
   assert.equal(workflows.sessionCloses, 1, "workflow close is attempted even after final reads fail");

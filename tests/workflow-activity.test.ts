@@ -29,8 +29,8 @@ interface WorkflowFixtureOptions {
 
 function workflowFixture(options: WorkflowFixtureOptions): WorkflowSnapshot {
   const status = options.status ?? "running";
-  const agentState =
-    options.agentState ?? (status === "completed" ? "completed" : status === "failed" ? "failed" : "running");
+  const defaultAgentState = status === "completed" || status === "failed" ? status : "running";
+  const agentState = options.agentState ?? defaultAgentState;
   const updatedAt = options.updatedAt ?? 1;
   const timestamps = { createdAt: 1, updatedAt, startedAt: 1 };
   const phase: WorkflowPhase = {

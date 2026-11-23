@@ -1,7 +1,7 @@
-import { readWorkflowHistory, writeWorkflowHistory, writeWorkflowFixture } from "./helpers.ts";
+import { readWorkflowHistory, writeWorkflowHistory } from "./helpers.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { CapabilityService } from "../src/capability-service.ts";
 import { JobManager } from "../src/manager.ts";

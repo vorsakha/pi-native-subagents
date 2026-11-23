@@ -133,13 +133,17 @@ test("workflow outline bounding never hides selection and gives current and atte
   const run = workflowSnapshotFixture("bounded");
   const template = run.phases[0]!;
   run.currentPhase = 4;
-  run.phases = Array.from({ length: 7 }, (_, index) => ({
-    ...template,
-    index,
-    name: `Phase ${index}`,
-    status: index === 1 ? ("failed" as const) : index === 4 ? ("running" as const) : ("completed" as const),
-    agents: index === 6 ? [1] : [],
-  }));
+  run.phases = Array.from({ length: 7 }, (_, index) => {
+    let status: typeof template.status = "completed";
+
+    if (index === 1) {
+      status = "failed";
+    } else if (index === 4) {
+      status = "running";
+    }
+
+    return { ...template, index, name: `Phase ${index}`, status, agents: index === 6 ? [1] : [] };
+  });
   run.agents = [run.agents[1]!];
   run.agents[0]!.phase = 6;
   const selected: WorkflowOutlineSelection = { kind: "agent", key: "agent:1", phaseKey: "phase:6" };

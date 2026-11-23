@@ -157,12 +157,14 @@ export function buildWorkflowOutline(
     }
   }
 
-  const sameNode =
-    requested?.kind === "agent"
-      ? agentNodes.find((node) => node.key === requested.key)
-      : requested?.kind === "phase"
-        ? phaseByKey.get(requested.key)
-        : undefined;
+  let sameNode: WorkflowOutlineNode | undefined;
+
+  if (requested?.kind === "agent") {
+    sameNode = agentNodes.find((node) => node.key === requested.key);
+  } else if (requested?.kind === "phase") {
+    sameNode = phaseByKey.get(requested.key);
+  }
+
   const selectedNode = sameNode ?? requestedPhase ?? currentPhase ?? phases[0] ?? nodes[0];
   const selected = selectedNode ? selectionForNode(selectedNode) : undefined;
 

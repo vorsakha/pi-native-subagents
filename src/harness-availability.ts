@@ -183,11 +183,13 @@ export function formatHarnessAvailabilityLine(activation: HarnessActivation): st
   const state = !activation.enabled ? "disabled by user" : availabilityLabel(availability.status);
   const marker = activation.active ? "active" : "inactive";
   const version = availability.version ? ` · version ${availability.version}` : "";
-  const reason = !activation.enabled
-    ? " — the harness is turned off in this session"
-    : availability.reason
-      ? ` — ${availability.reason}. ${availabilityGuidance(availability.status)}`
-      : "";
+  let reason = "";
+
+  if (!activation.enabled) {
+    reason = " — the harness is turned off in this session";
+  } else if (availability.reason) {
+    reason = ` — ${availability.reason}. ${availabilityGuidance(availability.status)}`;
+  }
 
   return `${activation.harness.padEnd(6)} ${marker.padEnd(8)} ${state}${version}${reason}`;
 }

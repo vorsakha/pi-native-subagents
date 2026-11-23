@@ -214,7 +214,7 @@ export function formatSpeedBilling(input: {
 export type TraceStatusColor = "accent" | "success" | "warning" | "error" | "muted" | "dim";
 
 /** Shared width-stable status vocabulary for subagents and workflows. */
-export function traceStatusMeta(status: string, now?: number): { glyph: string; color: TraceStatusColor } {
+export function traceStatusMeta(status: string, _now?: number): { glyph: string; color: TraceStatusColor } {
   switch (status) {
     case "running":
       return { glyph: "●", color: "accent" };
@@ -495,14 +495,15 @@ export function buildJobCardLines(job: JobSnapshot, theme: Theme, options: JobCa
     lines.push(sectionLine(theme, "Context", context, "dim"));
   }
 
-  const footer = theme.fg(
-    "dim",
-    expanded
-      ? `full bounded output: ${DASHBOARD_POINTER}`
-      : options.expandHint
-        ? `${options.expandHint} · ${DASHBOARD_POINTER}`
-        : DASHBOARD_POINTER,
-  );
+  let footerText = DASHBOARD_POINTER;
+
+  if (expanded) {
+    footerText = `full bounded output: ${DASHBOARD_POINTER}`;
+  } else if (options.expandHint) {
+    footerText = `${options.expandHint} · ${DASHBOARD_POINTER}`;
+  }
+
+  const footer = theme.fg("dim", footerText);
   const content = clampLines(theme, lines, Math.max(1, budget - 1));
 
   return [...content, footer].slice(0, budget);
@@ -630,14 +631,17 @@ export function renderInteractionCard(
   options: { expanded: boolean; now: number; state?: string; standalone?: boolean },
 ): Component {
   const state = options.state ?? interaction.state;
-  const meta =
-    state === "answered"
-      ? { glyph: "✓", color: "success" as TraceStatusColor }
-      : state === "pending" || state === "answering"
-        ? { glyph: "?", color: "warning" as TraceStatusColor }
-        : { glyph: "■", color: "warning" as TraceStatusColor };
+  let glyph = "■";
+
+  if (state === "answered") {
+    glyph = "✓";
+  } else if (state === "pending" || state === "answering") {
+    glyph = "?";
+  }
+
+  const color = state === "answered" ? "success" : "warning";
   const lines: string[] = [
-    `${theme.fg(meta.color, meta.glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(interaction.sourceName)))} ${theme.fg("dim", `${shortId(sanitizeText(interaction.sourceJobId))} · asks the orchestrator · ${state}`)}`,
+    `${theme.fg(color, glyph)} ${theme.fg("toolTitle", theme.bold(sanitizeInline(interaction.sourceName)))} ${theme.fg("dim", `${shortId(sanitizeText(interaction.sourceJobId))} · asks the orchestrator · ${state}`)}`,
     sectionLine(theme, "Request", sanitizeInline(interaction.requestId), "muted"),
     sectionLine(theme, "Question", sanitizeInline(interaction.question), "text"),
   ];
@@ -766,21 +770,19 @@ export function renderFollowThroughCard(
       "muted",
     ),
   ];
-  const detail = source.output
-    ? { label: "Output", value: source.output, color: "toolOutput" as const }
-    : source.error
-      ? { label: "Error", value: source.error, color: "error" as const }
-      : undefined;
+  const detail = source.output || source.error;
 
   if (detail) {
-    const detailLines = boundedCheckpointText(detail.value)
+    const label = source.output ? "Output" : "Error";
+    const color = source.output ? "toolOutput" : "error";
+    const detailLines = boundedCheckpointText(detail)
       .split("\n")
       .map((line) => line.trimEnd())
       .filter(Boolean);
     const preview = headTailPreview(detailLines, options.expanded ? MAX_TAIL_EXPANDED : MAX_TAIL_COLLAPSED);
 
     for (const [index, line] of preview.shown.entries()) {
-      lines.push(sectionLine(theme, index ? "" : detail.label, line || " ", detail.color));
+      lines.push(sectionLine(theme, index ? "" : label, line || " ", color));
     }
   }
 
@@ -802,13 +804,17 @@ export function answeredQuestionReceipt(
   job: JobSnapshot,
   workflowPhase?: string,
 ): string {
-  const latest = !isTerminal(job.status)
-    ? job.liveThinking
-      ? activityPreview(job.liveThinking)
-      : truncatePreview(job.output, 96)
-    : job.error
-      ? `error: ${truncatePreview(job.error, 96)}`
-      : truncatePreview(job.output, 96);
+  const terminal = isTerminal(job.status);
+  let latest: string;
+
+  if (!terminal && job.liveThinking) {
+    latest = activityPreview(job.liveThinking);
+  } else if (terminal && job.error) {
+    latest = `error: ${truncatePreview(job.error, 96)}`;
+  } else {
+    latest = truncatePreview(job.output, 96);
+  }
+
   const phase =
     workflowPhase && workflowPhase !== interaction.workflow?.phase
       ? ` · workflow advanced to ${sanitizeInline(workflowPhase)}`

@@ -404,12 +404,13 @@ export class ClaudeBackend implements Backend {
           }
 
           const status = String(server.status ?? "pending");
-          const health: CapabilityHealth =
-            status === "connected"
-              ? "healthy"
-              : status === "failed" || status === "needs-auth"
-                ? "unavailable"
-                : "unknown";
+          let health: CapabilityHealth = "unknown";
+
+          if (status === "connected") {
+            health = "healthy";
+          } else if (status === "failed" || status === "needs-auth") {
+            health = "unavailable";
+          }
 
           if (health !== "healthy") {
             degraded++;
@@ -1068,12 +1069,13 @@ function handleMessage(
       // current context size and, for a server-side fallback hop, the model that actually served the response.
       // The top-level usage fields can be cumulative across those iterations.
       const iteration = lastClaudeIteration(usage);
-      const model =
-        iteration && typeof iteration.model === "string" && iteration.model
-          ? iteration.model
-          : typeof message.message.model === "string" && message.message.model
-            ? message.message.model
-            : undefined;
+      let model: string | undefined;
+
+      if (iteration && typeof iteration.model === "string" && iteration.model) {
+        model = iteration.model;
+      } else if (typeof message.message.model === "string" && message.message.model) {
+        model = message.message.model;
+      }
 
       if (model) {
         setClaudeServingModel(telemetry, model);

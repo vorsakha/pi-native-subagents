@@ -773,6 +773,8 @@ export class PiRpcBackend implements Backend {
         watchdog.touch();
       }
 
+      let commandType: "prompt" | "steer" | "follow_up";
+
       if (restarting) {
         settled = false;
         output = "";
@@ -780,9 +782,12 @@ export class PiRpcBackend implements Backend {
         retryableAssistantProblem = false;
         emit({ type: "started" });
         behavior = "followUp";
+        commandType = "prompt";
+      } else {
+        commandType = behavior === "steer" ? "steer" : "follow_up";
       }
 
-      await command(restarting ? "prompt" : behavior === "steer" ? "steer" : "follow_up", { message });
+      await command(commandType, { message });
 
       if (restarting && !settled) {
         watchdog.arm();

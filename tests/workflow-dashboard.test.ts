@@ -2237,7 +2237,13 @@ test("the cheatsheet reflects runs, outline, and agent-detail focus and never cl
 test("configurable confirm/cancel bindings render their configured key names in workflow hints, falling back to defaults otherwise", (t) => {
   const configured = harness([workflow("configured-keys")], 30, () => {}, {
     fullscreen: true,
-    getKeys: (binding) => (binding === "tui.select.cancel" ? ["q"] : binding === "tui.select.confirm" ? ["space"] : []),
+    getKeys: (binding) => {
+      if (binding === "tui.select.cancel") {
+        return ["q"];
+      }
+
+      return binding === "tui.select.confirm" ? ["space"] : [];
+    },
   });
   t.after(() => configured.overlay.dispose());
   assert.match(
@@ -2424,7 +2430,7 @@ test("workflow inspectors put state preview and real recovery before telemetry",
   lines = failed.overlay.render(120);
   assert.ok(
     lines.findIndex((line) => line.includes("Error ·")) <
-      lines.findIndex((line) => line.includes("codex\/codex-fixture-model")),
+      lines.findIndex((line) => line.includes("codex/codex-fixture-model")),
   );
 
   const completedAgentRun = workflow("completed-agent-no-restart");

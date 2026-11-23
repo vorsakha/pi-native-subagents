@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { tempDir } from "./helpers.ts";
-import { mkdtemp, rm } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import {
   runWorkflowSandbox,
   type WorkflowConvergenceProgress,

@@ -1,0 +1,73 @@
+{
+  "extensions/subagents/render.ts": {
+    "no-control-regex": {
+      "count": 2
+    }
+  },
+  "extensions/workflows/index.ts": {
+    "preserve-caught-error": {
+      "count": 1
+    }
+  },
+  "src/agent-activity.ts": {
+    "no-control-regex": {
+      "count": 1
+    }
+  },
+  "src/interactions.ts": {
+    "no-control-regex": {
+      "count": 1
+    }
+  },
+  "src/presentation-state.ts": {
+    "no-control-regex": {
+      "count": 2
+    },
+    "preserve-caught-error": {
+      "count": 1
+    }
+  },
+  "src/workflows/manager.ts": {
+    "no-control-regex": {
+      "count": 1
+    },
+    "no-unsafe-finally": {
+      "count": 1
+    }
+  },
+  "src/workflows/retention.ts": {
+    "preserve-caught-error": {
+      "count": 1
+    }
+  },
+  "src/workflows/sandbox.ts": {
+    "preserve-caught-error": {
+      "count": 1
+    }
+  },
+  "tests/dashboard.test.ts": {
+    "no-control-regex": {
+      "count": 3
+    }
+  },
+  "tests/helpers.ts": {
+    "@typescript-eslint/no-explicit-any": {
+      "count": 1
+    }
+  },
+  "tests/render.test.ts": {
+    "no-control-regex": {
+      "count": 1
+    }
+  },
+  "tests/workflow-dashboard.test.ts": {
+    "no-control-regex": {
+      "count": 2
+    }
+  },
+  "tests/workflow-render.test.ts": {
+    "no-control-regex": {
+      "count": 1
+    }
+  }
+}

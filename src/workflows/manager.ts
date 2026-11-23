@@ -3413,7 +3413,13 @@ export class WorkflowManager {
     // call: it must not linger from a schema-bearing agent() call now
     // followed by a schemaless followUp() (or the reverse).
     record.generations ??= [this.#snapshotGeneration(record)];
-    record.structuredTransport = nativeLineage ? "native" : effectiveSchema ? "portable" : undefined;
+
+    if (nativeLineage) {
+      record.structuredTransport = "native";
+    } else {
+      record.structuredTransport = effectiveSchema ? "portable" : undefined;
+    }
+
     const message =
       nativeLineage || !schema
         ? prompt
@@ -5571,7 +5577,7 @@ export class WorkflowManager {
 
     agent.usage = addWorkflowUsage(agent.retryUsage, workflowUsage(job.usage));
     agent.context = job.context ? { ...job.context } : undefined;
-    agent.activity = isTerminal(job.status) ? undefined : job.activity ? { ...job.activity } : undefined;
+    agent.activity = !isTerminal(job.status) && job.activity ? { ...job.activity } : undefined;
     agent.timestamps.updatedAt = now;
     agent.timestamps.startedAt ??= job.startedAt;
     agent.timestamps.endedAt = job.endedAt;

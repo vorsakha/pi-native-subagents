@@ -51,12 +51,12 @@ export function toolCallState(call: ToolEntry, result: ToolEntry | undefined, tr
   const callName = call.name === "tool" ? "" : call.name;
   const resultName = result?.name === "tool" ? "" : result?.name;
   const name = normalizeToolName(callName || resultName || trace?.name || "tool");
-  const status: ToolCallState["status"] =
-    result?.error === true || result?.result?.isError === true || trace?.status === "failed"
-      ? "failed"
-      : result || trace?.status === "completed"
-        ? "completed"
-        : "running";
+
+  if (result?.error === true || result?.result?.isError === true || trace?.status === "failed") {
+    return { name, status: "failed" };
+  }
+
+  const status = result || trace?.status === "completed" ? "completed" : "running";
 
   return { name, status };
 }

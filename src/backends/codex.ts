@@ -123,7 +123,13 @@ export function classifyCodexUnavailability(
   currentTurnProgress = false,
 ): ProviderUnavailability | undefined {
   const error = asObject(turnError);
-  const code = typeof error.code === "string" ? error.code : typeof error.type === "string" ? error.type : undefined;
+  let code: string | undefined;
+
+  if (typeof error.code === "string") {
+    code = error.code;
+  } else if (typeof error.type === "string") {
+    code = error.type;
+  }
 
   if (!code || !CODEX_USAGE_LIMIT_CODES.has(code)) {
     return undefined;
@@ -279,12 +285,13 @@ export class CodexAppServerBackend implements Backend {
         await peer.request("initialize", { clientInfo: CODEX_CLIENT_INFO }, this.#requestTimeoutMs),
       );
       const userAgent = asObject(initialize.userAgent);
-      nativeVersion =
-        typeof initialize.version === "string"
-          ? initialize.version
-          : typeof userAgent.codexVersion === "string"
-            ? userAgent.codexVersion
-            : undefined;
+
+      if (typeof initialize.version === "string") {
+        nativeVersion = initialize.version;
+      } else if (typeof userAgent.codexVersion === "string") {
+        nativeVersion = userAgent.codexVersion;
+      }
+
       peer.notify("initialized");
       sources.push({ source: "codex-app-server", health: "healthy" });
 
@@ -364,23 +371,24 @@ export class CodexAppServerBackend implements Backend {
               continue;
             }
 
-            capabilities.push({
+            const capability: DiscoveredCapability = {
               kind: "hook",
               name: hook.key,
               description: typeof hook.eventName === "string" ? `event ${hook.eventName}` : undefined,
               origin: typeof hook.source === "string" ? `hook:${hook.source}` : "hook",
               enabled: hook.enabled !== false,
-              health: nativeIntegrationsEnabled
-                ? hook.trustStatus === "trusted" || hook.trustStatus === undefined
-                  ? "healthy"
-                  : "degraded"
-                : "unavailable",
-              detail: nativeIntegrationsEnabled
-                ? typeof hook.statusMessage === "string"
-                  ? hook.statusMessage
-                  : undefined
-                : "hooks are disabled by the child access/customization policy",
-            });
+            };
+
+            if (nativeIntegrationsEnabled) {
+              capability.health =
+                hook.trustStatus === "trusted" || hook.trustStatus === undefined ? "healthy" : "degraded";
+              capability.detail = typeof hook.statusMessage === "string" ? hook.statusMessage : undefined;
+            } else {
+              capability.health = "unavailable";
+              capability.detail = "hooks are disabled by the child access/customization policy";
+            }
+
+            capabilities.push(capability);
           }
         }
 
@@ -409,17 +417,21 @@ export class CodexAppServerBackend implements Backend {
             degraded++;
           }
 
-          capabilities.push({
+          const capability: DiscoveredCapability = {
             kind: "mcp",
             name: server.name,
             origin: "mcp",
             health,
-            detail: !nativeIntegrationsEnabled
-              ? "MCP is disabled by the child access/customization policy"
-              : authStatus === "notLoggedIn"
-                ? "MCP server is not authenticated"
-                : undefined,
-          });
+            detail: undefined,
+          };
+
+          if (!nativeIntegrationsEnabled) {
+            capability.detail = "MCP is disabled by the child access/customization policy";
+          } else if (authStatus === "notLoggedIn") {
+            capability.detail = "MCP server is not authenticated";
+          }
+
+          capabilities.push(capability);
 
           for (const [toolName, tool] of Object.entries(asObject(server.tools))) {
             const record = asObject(tool);
@@ -513,7 +525,6 @@ export class CodexAppServerBackend implements Backend {
     const completed = new Promise<void>((resolve) => {
       resolveCompleted = resolve;
     });
-    let peer!: JsonRpcPeer;
     let closePromise: Promise<void> | undefined;
     const closePeer = () => (closePromise ??= peer.close());
     const watchdog = createActivityWatchdog(this.#inactivityTimeoutMs, () => {
@@ -565,7 +576,7 @@ export class CodexAppServerBackend implements Backend {
       turnState = "inProgress";
     };
 
-    peer = new JsonRpcPeer({
+    const peer = new JsonRpcPeer({
       process: managed,
       maxFrameBytes: this.#maxFrameBytes,
       onActivity: () => watchdog.touch(),
@@ -715,12 +726,14 @@ export class CodexAppServerBackend implements Backend {
             }
           }
 
-          const contextTokens =
-            typeof last.totalTokens === "number"
-              ? last.totalTokens
-              : typeof last.inputTokens === "number" || typeof last.outputTokens === "number"
-                ? num(last.inputTokens) + num(last.outputTokens)
-                : undefined;
+          let contextTokens: number | undefined;
+
+          if (typeof last.totalTokens === "number") {
+            contextTokens = last.totalTokens;
+          } else if (typeof last.inputTokens === "number" || typeof last.outputTokens === "number") {
+            contextTokens = num(last.inputTokens) + num(last.outputTokens);
+          }
+
           const contextWindow = numOrUndefined(tokenUsage.modelContextWindow ?? params.modelContextWindow);
           lastOccupancy = {
             ...(contextTokens !== undefined ? { tokens: contextTokens } : {}),

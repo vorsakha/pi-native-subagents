@@ -45,5 +45,6 @@ All functionality must be keyboard accessible, support Pi's cancel bindings plus
 - Shared test fakes (backends, Pi host doubles, snapshot builders, async utilities) live in `tests/helpers.ts`. Extend that file rather than re-declaring a fake inside a test.
 - Use braces, one statement per line, and explicit branches for nested decisions. Keep related statements together and separate logical phases with one blank line.
 - Run `npm run lint:fix` then `npm run format` for mechanical cleanup. Review the remaining lint findings individually. The sandbox guard hashes the exact bytes of `src/workflows/worker.mjs`, so edit that file deliberately.
+- The ESLint suppressions file counts intentional control-character regexes, sanitized errors, cleanup errors that take precedence, and the heterogeneous Pi tool registry in the shared test double. Review each finding before changing its count.
 - Release checks: `npm run check` (format, lint, typecheck, tests, and package contents) and available opt-in live provider smokes.
 - Keep changes modular and reviewable. Do not commit or push unless explicitly requested.

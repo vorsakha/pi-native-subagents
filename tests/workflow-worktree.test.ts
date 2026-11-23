@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { tempDir } from "./helpers.ts";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdtemp, mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { finishWorkflowWorktree, prepareWorkflowWorktree, reclaimWorkflowWorktree } from "../src/workflows/worktree.ts";
 

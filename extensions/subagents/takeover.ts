@@ -23,7 +23,7 @@ import { openSubagentsDashboard, type SubagentsDashboardManager } from "./dashbo
 import { buildTranscript } from "./transcript.ts";
 import { DEFAULT_TOOL_DISPLAY, type ToolDisplayMode } from "../tool-summary.ts";
 
-interface TakeoverManager extends Pick<JobManager, "check" | "send" | "cancel" | "subscribe"> {}
+type TakeoverManager = Pick<JobManager, "check" | "send" | "cancel" | "subscribe">;
 
 class TakeoverView implements Focusable {
   readonly #tui: Pick<TUI, "requestRender" | "terminal">;

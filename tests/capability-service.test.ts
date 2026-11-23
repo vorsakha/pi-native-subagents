@@ -364,7 +364,7 @@ test("route() keeps explicit auth failures fail-closed", async () => {
   let discoveries = 0;
   const claude = new FakeBackend("claude", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
   const codex = new FakeBackend("codex", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
-  codex.discover = async (request) => {
+  codex.discover = async () => {
     discoveries++;
 
     if (discoveries > 1) {
@@ -389,7 +389,7 @@ test("route() failover also covers auto routing without explicit requirements", 
   let flakyDiscoveries = 0;
   const flaky = new FakeBackend("codex", []);
   const fallback = new FakeBackend("claude", []);
-  flaky.discover = async (request) => {
+  flaky.discover = async () => {
     flakyDiscoveries++;
 
     if (flakyDiscoveries > 1) {

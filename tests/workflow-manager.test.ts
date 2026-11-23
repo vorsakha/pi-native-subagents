@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { JobManager } from "../src/manager.ts";
 import type { ProfileDefinition } from "../src/types.ts";
@@ -2348,11 +2348,9 @@ test("provider settlement masks release on fresh terminal, exhaustion, routing, 
 
     try {
       const options =
-        scenario === "exhaustion"
+        scenario === "exhaustion" || scenario === "terminal"
           ? `{ harness: "claude", access: "readOnly" }`
-          : scenario === "terminal"
-            ? `{ harness: "claude", access: "readOnly" }`
-            : `{ harness: "claude", access: "readOnly", providerFallback: { harness: "codex" } }`;
+          : `{ harness: "claude", access: "readOnly", providerFallback: { harness: "codex" } }`;
       const started = await f.workflows.start(
         f.request(
           `export default async () => agent("${scenario}", ${options});`,
@@ -6988,7 +6986,8 @@ test("a workflow child asks a completed peer, and the answer becomes a charged g
     assert.equal(planner.answering, undefined);
     assert.equal(planner.usage.turns, 2, "the peer turn is charged to the target lineage");
     assert.equal(aggregateWorkflowUsage(final).turns, 2 + final.agents[1]!.usage.turns);
-    const settled = final.interactions?.[0]!;
+    const settled = final.interactions?.[0];
+    assert.ok(settled, "the peer interaction is retained");
     assert.equal(settled.state, "answered");
     assert.equal(settled.target, "peer");
     assert.equal(settled.targetAgentIndex, 0);

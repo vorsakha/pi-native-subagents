@@ -270,12 +270,7 @@ export function formatWorkflowInteraction(interaction: WorkflowInteractionSummar
       ? "needs orchestrator"
       : `waiting for ${sanitizeInline(interaction.targetName ?? "peer")}`;
   const elapsed = formatDurationLabel(Math.max(0, (interaction.answeredAt ?? now) - interaction.createdAt));
-  const state =
-    interaction.state === "pending" || interaction.state === "answering"
-      ? interaction.state === "answering"
-        ? "answering"
-        : "unanswered"
-      : interaction.state;
+  const state = interaction.state === "pending" ? "unanswered" : interaction.state;
 
   return `${who} · ${elapsed} · ${state} · ${sanitizeInline(interaction.question)}`;
 }
@@ -440,11 +435,13 @@ export function workflowDashboardSummary(snapshot: WorkflowSnapshot, now: number
   const activeFailure = snapshot.status === "pending" || snapshot.status === "running" || snapshot.status === "paused";
 
   if (snapshot.error || snapshot.status === "failed" || (activeFailure && (failedAgent || failedPhase))) {
-    const fallback = failedAgent
-      ? `${sanitizeInline(failedAgent.name)} failed`
-      : failedPhase
-        ? `${sanitizeInline(failedPhase.name)} phase failed`
-        : "Workflow failed";
+    let fallback = "Workflow failed";
+
+    if (failedAgent) {
+      fallback = `${sanitizeInline(failedAgent.name)} failed`;
+    } else if (failedPhase) {
+      fallback = `${sanitizeInline(failedPhase.name)} phase failed`;
+    }
 
     return {
       kind: "failure",
@@ -549,35 +546,31 @@ export function workflowPhaseProgress(snapshot: WorkflowSnapshot, selectedPhaseI
   const terminal = terminalStatus(snapshot.status);
   const declared = snapshot.plannedPhaseCount !== undefined;
   const noPhases = snapshot.phases.length === 0;
-  const phaseIndex =
-    selectedIndex >= 0
-      ? selectedIndex
-      : currentIndex >= 0
-        ? currentIndex
-        : !declared && terminal && snapshot.phases.length
-          ? snapshot.phases.length - 1
-          : -1;
-  const phase = phaseIndex >= 0 ? snapshot.phases[phaseIndex] : undefined;
-  const position = declared
-    ? currentIndex < 0
-      ? 0
-      : selectedIndex >= 0
-        ? selectedIndex + 1
-        : currentIndex + 1
-    : terminal && snapshot.phases.length
-      ? selectedIndex >= 0
-        ? selectedIndex + 1
-        : snapshot.phases.length
-      : phaseIndex >= 0
-        ? phaseIndex + 1
-        : 0;
-  const total = declared
-    ? snapshot.plannedPhaseCount
-    : terminal && snapshot.phases.length
-      ? snapshot.phases.length
-      : undefined;
+  let phaseIndex = selectedIndex >= 0 ? selectedIndex : currentIndex;
+
+  if (phaseIndex < 0 && !declared && terminal) {
+    phaseIndex = snapshot.phases.length - 1;
+  }
+
+  const phase = snapshot.phases[phaseIndex];
+  let position = phaseIndex + 1;
+
+  if (declared && currentIndex < 0) {
+    position = 0;
+  } else if (!declared && terminal && selectedIndex < 0) {
+    position = snapshot.phases.length;
+  }
+
+  const recordedTotal = terminal && !noPhases ? snapshot.phases.length : undefined;
+  const total = snapshot.plannedPhaseCount ?? recordedTotal;
   const waiting = !terminal && position === 0 && !declared;
-  const label = noPhases ? (terminal ? "no phases" : "waiting") : waiting ? "waiting" : `${position}/${total ?? "?"}`;
+  let label = `${position}/${total ?? "?"}`;
+
+  if (noPhases) {
+    label = terminal ? "no phases" : "waiting";
+  } else if (waiting) {
+    label = "waiting";
+  }
 
   return { currentIndex, phaseIndex, phase, position, total, label, waiting, noPhases };
 }
@@ -660,12 +653,8 @@ function phaseRosterLines(snapshot: WorkflowSnapshot, theme: Theme, now: number)
   }
 
   const progress = workflowPhaseProgress(snapshot);
-  const currentIndex =
-    progress.currentIndex >= 0
-      ? progress.currentIndex
-      : snapshot.plannedPhaseCount === undefined
-        ? progress.phaseIndex
-        : -1;
+  const useRecordedPhase = progress.currentIndex < 0 && snapshot.plannedPhaseCount === undefined;
+  const currentIndex = useRecordedPhase ? progress.phaseIndex : progress.currentIndex;
   const radius = Math.floor((MAX_PHASES_EXPANDED - 1) / 2);
   let start = Math.max(0, (currentIndex >= 0 ? currentIndex : 0) - radius);
   const end = Math.min(total - 1, start + MAX_PHASES_EXPANDED - 1);
@@ -788,16 +777,18 @@ function agentRollupValue(snapshot: WorkflowSnapshot, theme: Theme): string {
 
 function agentRow(agent: WorkflowAgentRecord, theme: Theme, now: number): string {
   const status = demoteUnlessAttention(traceStatusMeta(agent.state, now));
-  const continuationAttempt = agent.attempts?.find((attempt) => attempt.disposition === "continuation");
-  const fallbackAttempt = agent.attempts?.find((attempt) => attempt.disposition === "fallback");
-  const routeLabel = continuationAttempt
-    ? `${sanitizeInline(continuationAttempt.requestedHarness ?? continuationAttempt.harness ?? "primary")} → ${sanitizeInline(agent.harness ?? "replacement")} (continued)`
-    : fallbackAttempt
-      ? `${sanitizeInline(fallbackAttempt.requestedHarness ?? fallbackAttempt.harness ?? "primary")} → ${sanitizeInline(agent.harness ?? "fallback")} (fallback)`
-      : agent.harness || agent.model
-        ? `${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}`
-        : undefined;
-  const route = routeLabel ? ` · ${routeLabel}` : "";
+  const continuation = agent.attempts?.find((attempt) => attempt.disposition === "continuation");
+  const attempt = continuation ?? agent.attempts?.find((attempt) => attempt.disposition === "fallback");
+  let route = "";
+
+  if (attempt) {
+    const from = sanitizeInline(attempt.requestedHarness ?? attempt.harness ?? "primary");
+    const to = sanitizeInline(agent.harness ?? (continuation ? "replacement" : "fallback"));
+    route = ` · ${from} → ${to} (${continuation ? "continued" : "fallback"})`;
+  } else if (agent.harness || agent.model) {
+    route = ` · ${sanitizeInline(agent.harness ?? "harness")}/${sanitizeInline(agent.model ?? "model")}`;
+  }
+
   const profile = agent.profile ? ` · profile ${sanitizeInline(agent.profile)}` : "";
   const independent = agent.independent ? " · independent" : "";
   const warning = agent.instructionShaped ? " · ⚠ instruction-like output" : "";
@@ -996,11 +987,14 @@ export function buildWorkflowCardLines(
     }
   }
 
-  const footerText = options.expanded
-    ? `full bounded result: ${WORKFLOWS_POINTER}`
-    : options.expandHint
-      ? `${sanitizeInline(options.expandHint)} · ${WORKFLOWS_POINTER}`
-      : WORKFLOWS_POINTER;
+  let footerText = WORKFLOWS_POINTER;
+
+  if (options.expanded) {
+    footerText = `full bounded result: ${WORKFLOWS_POINTER}`;
+  } else if (options.expandHint) {
+    footerText = `${sanitizeInline(options.expandHint)} · ${WORKFLOWS_POINTER}`;
+  }
+
   const content = clampContent(theme, lines, Math.max(0, budget - 1));
 
   return [...content, theme.fg("dim", footerText)].slice(0, budget);

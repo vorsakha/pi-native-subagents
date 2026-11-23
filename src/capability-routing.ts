@@ -112,14 +112,12 @@ export async function routeCapabilities(
   // arbitrarily excluding a capable harness during catalog selection.
   const independent =
     request.independent === true || input.independentOfProvider !== undefined || input.profile?.independent === true;
-  let candidates: HarnessName[] | undefined =
-    auto && independent
-      ? independenceTarget === "claude"
-        ? ["codex"]
-        : independenceTarget === "codex"
-          ? ["claude"]
-          : ["claude", "codex"]
-      : undefined;
+  let candidates: HarnessName[] | undefined;
+
+  if (auto && independent) {
+    const nativeHarnesses: HarnessName[] = ["claude", "codex"];
+    candidates = nativeHarnesses.filter((harness) => harness !== independenceTarget);
+  }
 
   if (auto && input.profile?.lockedHarness) {
     candidates = candidates

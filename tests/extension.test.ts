@@ -20,7 +20,7 @@ import {
   parseCodexAccount,
   piStatusFromCatalog,
 } from "../src/provider-status.ts";
-import type { HarnessName } from "../src/types.ts";
+import type { HarnessName, JobSnapshot } from "../src/types.ts";
 import {
   ControlledBackend,
   HoldingBackend,
@@ -89,7 +89,8 @@ test("a Pi child with a parent snapshot registers only parent_thread_context", a
 test("the subagent extension surface", async (t) => {
   const pi = fakePi({ allTools: PARENT_TOOLS });
   const registry = {};
-  const backends = ["pi", "claude", "codex"].map((name) => new ImmediateBackend(name as any, { echoSend: true }));
+  const backendNames = ["pi", "claude", "codex"] as const;
+  const backends = backendNames.map((name) => new ImmediateBackend(name, { echoSend: true }));
   const extensionRoot = await tempDir("extension-workflows");
   const workflowArtifactRoot = join(extensionRoot, "runs");
   const globalProfilesDir = join(extensionRoot, "profiles");
@@ -279,7 +280,7 @@ test("the subagent extension surface", async (t) => {
   });
 
   await t.test("resolves global profiles and forks read-only session peers", async () => {
-    await pi.commands.get("subagents").handler("profiles", ctx);
+    await pi.commands.get("subagents")!.handler("profiles", ctx);
     assert.match(notifications.at(-1)?.message ?? "", /audit \(global\)/);
 
     const listedPeers = await pi.tools
@@ -336,7 +337,7 @@ test("the subagent extension surface", async (t) => {
 
   await t.test("reports masked provider readiness and gates it on project trust", async () => {
     const requestsBeforeReport = providerStatusRequests.length;
-    await pi.commands.get("subagents").handler("providers", ctx);
+    await pi.commands.get("subagents")!.handler("providers", ctx);
     const report = notifications.at(-1)?.message ?? "";
     assert.match(report, /no model request was made/);
     // Normalized, non-color-only availability precedes the raw provider readiness.
@@ -354,11 +355,11 @@ test("the subagent extension surface", async (t) => {
       harnesses: ["pi", "claude", "codex"],
     });
 
-    await pi.commands.get("subagents").handler("providers refresh", ctx);
+    await pi.commands.get("subagents")!.handler("providers refresh", ctx);
     assert.equal(providerStatusRequests.at(-1)?.refresh, true, "the refresh argument bypasses the status cache");
 
     const untrusted = context({ trusted: false });
-    await pi.commands.get("subagents").handler("providers", untrusted.ctx);
+    await pi.commands.get("subagents")!.handler("providers", untrusted.ctx);
     assert.match(untrusted.notifications.at(-1)?.message ?? "", /disabled for untrusted projects/);
     assert.equal(
       providerStatusRequests.length,
@@ -366,11 +367,14 @@ test("the subagent extension surface", async (t) => {
       "an untrusted project never probes a provider",
     );
 
-    const completions = pi.commands
-      .get("subagents")
-      .getArgumentCompletions("prov")
-      .map((item: { value: string }) => item.value);
-    assert.deepEqual(completions, ["providers", "providers refresh"]);
+    const command = pi.commands.get("subagents");
+    assert.ok(command?.getArgumentCompletions);
+    const completions = command.getArgumentCompletions("prov");
+    assert.ok(Array.isArray(completions));
+    assert.deepEqual(
+      completions.map((item) => item.value),
+      ["providers", "providers refresh"],
+    );
   });
 
   await t.test("delivers an unconsumed background result exactly once", async () => {
@@ -405,7 +409,7 @@ test("the subagent extension surface", async (t) => {
     const entriesBeforeHumanCommand = pi.entries.length;
     const messagesBeforeHumanCommand = pi.messages.length;
     await pi.commands
-      .get("subagent")
+      .get("subagent")!
       .handler('--harness claude --model caller-model --name "human review" "human task"', ctx);
     assert.equal(pi.messages.length, messagesBeforeHumanCommand, "human-triggered jobs do not notify the orchestrator");
     assert.equal(
@@ -415,13 +419,16 @@ test("the subagent extension surface", async (t) => {
     );
     const humanStart = pi.entries[entriesBeforeHumanCommand];
     const humanResult = pi.entries[entriesBeforeHumanCommand + 1];
+    type HumanEntryData = { kind?: "anchor" | "update"; job: JobSnapshot };
+    const startData = humanStart.data as HumanEntryData;
+    const resultData = humanResult.data as HumanEntryData;
     assert.equal(humanStart.customType, "native-human-subagent");
-    assert.equal((humanStart.data as any).kind, "anchor");
-    assert.equal((humanStart.data as any).job.status, "queued");
-    assert.equal((humanStart.data as any).job.humanVisible, true);
-    assert.equal((humanResult.data as any).kind, "update");
-    assert.equal((humanResult.data as any).job.status, "completed");
-    assert.equal((humanResult.data as any).job.output, "claude-ok");
+    assert.equal(startData.kind, "anchor");
+    assert.equal(startData.job.status, "queued");
+    assert.equal(startData.job.humanVisible, true);
+    assert.equal(resultData.kind, "update");
+    assert.equal(resultData.job.status, "completed");
+    assert.equal(resultData.job.output, "claude-ok");
     const humanRequest = backends
       .find((backend) => backend.name === "claude")
       ?.starts.find((request) => request.task === "human task");
@@ -434,14 +441,12 @@ test("the subagent extension surface", async (t) => {
       ],
       "human jobs receive a filtered spawn-time snapshot without assistant thinking",
     );
-    const humanCard = pi.entryRenderers
-      .get("native-human-subagent")(humanStart, { expanded: true }, theme)
-      .render(120)
-      .join("\n");
+    const renderHumanEntry = pi.entryRenderers.get("native-human-subagent")!;
+    const humanCard = renderHumanEntry(humanStart, { expanded: true }, theme)!.render(120).join("\n");
     assert.match(humanCard, /claude\/caller-model/);
     assert.match(humanCard, /claude-ok/, "the original card settles with the terminal output");
     assert.deepEqual(
-      pi.entryRenderers.get("native-human-subagent")(humanResult, { expanded: true }, theme).render(120),
+      renderHumanEntry(humanResult, { expanded: true }, theme)!.render(120),
       [],
       "the durable terminal update does not create a second visible card",
     );
@@ -449,7 +454,7 @@ test("the subagent extension surface", async (t) => {
 
   await t.test("human jobs inherit permitted parent tools, bounded by access", async () => {
     const entriesBeforeDefaultHumanCommand = pi.entries.length;
-    await pi.commands.get("subagent").handler("default human task", ctx);
+    await pi.commands.get("subagent")!.handler("default human task", ctx);
     assert.equal(pi.entries.length, entriesBeforeDefaultHumanCommand + 2);
     const defaultHumanRequest = backends
       .find((backend) => backend.name === "pi")
@@ -465,7 +470,7 @@ test("the subagent extension surface", async (t) => {
     assert.ok(!defaultHumanRequest?.policy.piTools.includes("workflow"));
     assert.ok(!defaultHumanRequest?.policy.piTools.includes("ask_user"));
 
-    await pi.commands.get("subagent").handler("--access readOnly read-only human task", ctx);
+    await pi.commands.get("subagent")!.handler("--access readOnly read-only human task", ctx);
     const readOnlyHumanRequest = backends
       .find((backend) => backend.name === "pi")
       ?.starts.find((request) => request.task === "read-only human task");
@@ -676,10 +681,11 @@ test("thread and human cards follow live job state without periodic rerenders", 
   const fakeClearInterval = ((timer: object) => {
     blinkTimers.delete(timer);
   }) as unknown as typeof clearInterval;
+  const backendNames = ["pi", "claude", "codex"] as const;
   registerNativeSubagents(blinkPi.api, {
     registry: {},
     legacyRoot: false,
-    backends: ["pi", "claude", "codex"].map((name) => new HoldingBackend(name as any, { emitStarted: true })),
+    backends: backendNames.map((name) => new HoldingBackend(name, { emitStarted: true })),
     workflowArtifactRoot: join(await tempDir("extension-blink-workflows"), "runs"),
     globalProfilesDir: join(await tempDir("extension-blink-profiles"), "profiles"),
     setInterval: fakeSetInterval,
@@ -748,24 +754,23 @@ test("thread and human cards follow live job state without periodic rerenders", 
   );
 
   const humanEntryCount = blinkPi.entries.length;
-  await blinkPi.commands.get("subagent").handler('--name "human live card" "wait for cancellation"', blinkCtx);
+  await blinkPi.commands.get("subagent")!.handler('--name "human live card" "wait for cancellation"', blinkCtx);
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(blinkPi.entries.length, humanEntryCount + 1, "an active human job has only its visible anchor entry");
   const humanAnchor = blinkPi.entries[humanEntryCount];
-  const humanLiveCard = blinkPi.entryRenderers.get("native-human-subagent")(humanAnchor, { expanded: false }, theme);
+  const renderHumanEntry = blinkPi.entryRenderers.get("native-human-subagent")!;
+  const humanLiveCard = renderHumanEntry(humanAnchor, { expanded: false }, theme)!;
   assert.match(humanLiveCard.render(100).join("\n"), /running/);
-  const humanJobs = (await blinkPi.tools.get("subagent_list").execute()).details.jobs;
-  const humanJob = humanJobs.find((job: any) => job.humanVisible && job.name === "human live card");
+  const humanJobs: JobSnapshot[] = (await blinkPi.tools.get("subagent_list").execute()).details.jobs;
+  const humanJob = humanJobs.find((job) => job.humanVisible && job.name === "human live card");
+  assert.ok(humanJob, "the live card has a corresponding job");
   await blinkPi.tools
     .get("subagent_cancel")
     .execute("cancel-human", { jobId: humanJob.id }, undefined, undefined, blinkCtx);
   assert.equal(blinkPi.entries.length, humanEntryCount + 2, "settlement adds only a hidden durable update");
   assert.match(humanLiveCard.render(100).join("\n"), /cancelled/, "the existing component settles in place");
   const humanUpdate = blinkPi.entries[humanEntryCount + 1];
-  assert.deepEqual(
-    blinkPi.entryRenderers.get("native-human-subagent")(humanUpdate, { expanded: false }, theme).render(100),
-    [],
-  );
+  assert.deepEqual(renderHumanEntry(humanUpdate, { expanded: false }, theme)!.render(100), []);
 });
 
 test("summarizeSubagentActivity distinguishes direct and workflow-owned jobs", () => {
@@ -861,11 +866,11 @@ test("routed questions wake the parent thread once and resolve through subagent_
   const questions = pi.messages.filter((entry) => entry.message.customType === "native-subagent-question");
   assert.equal(questions.length, 2);
   assert.deepEqual(
-    questions.map((entry) => entry.options.triggerTurn),
+    questions.map((entry) => entry.options?.triggerTurn),
     [false, true],
     "a deliverable batch wakes exactly one parent turn",
   );
-  assert.match(questions[0]!.message.content, /Which compatibility behavior stays\?/);
+  assert.match(questions[0]!.message.content as string, /Which compatibility behavior stays\?/);
 
   // Re-delivery must not happen for an already-delivered request.
   pi.handlers.get("agent_settled")?.();
@@ -883,10 +888,8 @@ test("routed questions wake the parent thread once and resolve through subagent_
     /Unknown or already-resolved question/,
   );
 
-  const card = pi.messageRenderers
-    .get("native-subagent-question")(questions[0]!.message, { expanded: true }, theme)
-    .render(100)
-    .join("\n");
+  const renderQuestion = pi.messageRenderers.get("native-subagent-question")!;
+  const card = renderQuestion(questions[0]!.message, { expanded: true }, theme)!.render(100).join("\n");
   assert.match(card, /asks the orchestrator/);
   assert.match(card, /Which compatibility behavior stays\?/);
   assert.match(card, /answered/, "a settled question stops advertising itself as pending in the transcript");
@@ -1044,7 +1047,7 @@ test("a workflow answer produces one deferred checkpoint when the workflow conti
   pi.handlers.get("agent_settled")?.();
   const checkpoints = pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough");
   assert.equal(checkpoints.length, 1);
-  assert.equal(checkpoints[0]?.options.triggerTurn, true);
+  assert.equal(checkpoints[0]?.options?.triggerTurn, true);
   const checkpoint = (
     checkpoints[0]?.message.details as {
       checkpoint: {
@@ -1072,7 +1075,7 @@ test("a workflow answer produces one deferred checkpoint when the workflow conti
     state: "running",
     jobId: backend.requests[1]!.jobId,
   });
-  assert.match(checkpoints[0]?.message.content ?? "", /bounded status data/);
+  assert.match((checkpoints[0]?.message.content ?? "") as string, /bounded status data/);
 
   const finalMessage = pi.waitForMessage("native-workflow-result");
   backend.complete(backend.requests[1]!.jobId, "implementation output");
@@ -1157,7 +1160,7 @@ test("an idle parent flushes each ready workflow checkpoint through a fresh micr
       checkpointsBefore + 1,
       "an idle parent receives a ready checkpoint through the queued microtask without agent_settled",
     );
-    assert.equal(checkpoints.at(-1)?.options.triggerTurn, true);
+    assert.equal(checkpoints.at(-1)?.options?.triggerTurn, true);
 
     return {
       nextJobId: backend.requests[expectedStarts]!.jobId,
@@ -1300,7 +1303,7 @@ test("ready workflow follow-through checkpoints batch into one parent wake-up", 
   const checkpoints = pi.messages.filter((entry) => entry.message.customType === "native-subagent-followthrough");
   assert.equal(checkpoints.length, 2);
   assert.deepEqual(
-    checkpoints.map((entry) => entry.options.triggerTurn),
+    checkpoints.map((entry) => entry.options?.triggerTurn),
     [false, true],
   );
   const checkpointJobIds = checkpoints.map(
@@ -1567,9 +1570,11 @@ test("a wait-consumed job still delivers its question, and human jobs keep their
     "subagent_wait consumes the eventual result, never the question that unblocks it",
   );
 
-  await pi.commands.get("subagent").handler('--name "human job" "human task"', ctx);
+  await pi.commands.get("subagent")!.handler('--name "human job" "human task"', ctx);
   await tick();
-  const humanJob = (await pi.tools.get("subagent_list").execute()).details.jobs.find((job: any) => job.humanVisible);
+  const jobs: JobSnapshot[] = (await pi.tools.get("subagent_list").execute()).details.jobs;
+  const humanJob = jobs.find((job) => job.humanVisible);
+  assert.ok(humanJob, "the human job is listed");
   const humanAsk = backend.ask(humanJob.id, { question: "Which directory did you mean?" });
   await tick();
   assert.equal(
@@ -1577,9 +1582,9 @@ test("a wait-consumed job still delivers its question, and human jobs keep their
     1,
     "a human /subagent question stays in /subagents instead of notifying the orchestrator",
   );
-  const parked = (await pi.tools.get("subagent_list").execute()).details.jobs.find(
-    (job: any) => job.id === humanJob.id,
-  );
+  const updatedJobs: JobSnapshot[] = (await pi.tools.get("subagent_list").execute()).details.jobs;
+  const parked = updatedJobs.find((job) => job.id === humanJob.id);
+  assert.ok(parked?.interaction, "the human job has a pending interaction");
   assert.equal(parked.interaction.humanVisible, true);
   assert.equal(parked.interaction.state, "pending");
 

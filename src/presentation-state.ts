@@ -420,7 +420,11 @@ function addSummary(
 }
 
 function compareText(left: string, right: string): number {
-  return left < right ? -1 : left > right ? 1 : 0;
+  if (left < right) {
+    return -1;
+  }
+
+  return left > right ? 1 : 0;
 }
 
 function latestJobTimestamp(job: JobSnapshot): number {
@@ -588,9 +592,11 @@ function safeErrorSummary(
     return kind === "agent" ? "Workflow agent aborted." : "Workflow aborted.";
   }
 
-  const label = kind === "job" ? "Job" : kind === "workflow" ? "Workflow" : "Workflow agent";
+  if (kind === "job") {
+    return "Job failed.";
+  }
 
-  return `${label} failed.`;
+  return kind === "workflow" ? "Workflow failed." : "Workflow agent failed.";
 }
 
 function waitingJobSummary(job: JobSnapshot): string | undefined {
@@ -646,10 +652,20 @@ function projectJob(job: JobSnapshot, context: ProjectionContext): NativeSubagen
   const result = jobResultSummary(job.status);
   const error = safeErrorSummary("job", job.status, job.unavailable?.kind === "quota");
   const usage = optionalUsage(job.usage);
+  const id = boundedId(job.id);
+  const name = boundedName(job.name);
+  let kind: NativeSubagentJobStateV1["kind"];
+
+  if (job.workflow) {
+    kind = "workflow-agent";
+  } else {
+    kind = job.peer ? "session-peer" : "direct";
+  }
+
   const projected: NativeSubagentJobStateV1 = {
-    id: boundedId(job.id),
-    name: boundedName(job.name),
-    kind: job.workflow ? "workflow-agent" : job.peer ? "session-peer" : "direct",
+    id,
+    name,
+    kind,
     status: job.status,
     generation: job.generation,
     timestamps: {
