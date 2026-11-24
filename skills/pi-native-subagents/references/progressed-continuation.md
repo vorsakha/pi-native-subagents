@@ -1,74 +1,25 @@
-# Progressed cross-provider continuation
+# Continue a partially executed call on another provider
 
-Read this before setting `continuationFallback`. It is an explicit recovery route for a workflow-native Claude or Codex call that became authoritatively unavailable after producing model or tool progress. It differs from initial `harness: "auto"`, pre-inference `providerFallback`, and provider waiting.
+Use `continuationFallback` when the caller accepts cross-provider continuation and the task can safely resume after checking for partial effects. Hooks, commands, plugins, and external services may already have performed work. The handoff does not guarantee exactly-once external effects.
 
-```js
-const worker = await agent("Implement the change and verify it.", {
-  name: "implementer",
-  harness: "claude",
-  model: "exact-primary-model",
-  effort: "high",
-  continuationFallback: {
-    harness: "codex",
-    model: "exact-replacement-model",
-  },
-});
-```
+Declare it on the original workflow `agent()` options. For example, use `{ harness: "claude", continuationFallback: { harness: "codex" } }`. The target takes `harness` and an optional exact `model`. Choose explicit opposite native routes (Claude and Codex), standard speed, and a shared Git checkout. Worktree isolation and `providerFallback` are incompatible.
 
-The primary must explicitly be `claude` or `codex`; the target must be the other. The object accepts only `harness` and optional exact `model`. It cannot be combined with `providerFallback`, `harness: "auto"`, Pi, nesting, multiple targets, or `isolation: "worktree"`. Omit it unless the human accepts cross-provider continuation and the exactly-once limitation below.
+## When a replacement can start
 
-It cannot combine with `speed: "fast"`. A cross-provider replacement cannot preserve Codex Fast policy, so the runtime rejects that declaration before primary dispatch. Standard speed remains fixed through the replacement.
+- The active provider must report authoritative unavailability **after model or tool progress in this generation**. Earlier turns cannot qualify a failed follow-up. Pre-inference rejection, cancellation, and ordinary errors end the call.
+- The runtime must confirm cleanup of the failed process tree and retained session. It must be able to verify the checkout's HEAD, branch, index, status, and changed contents. Assume-unchanged, skip-worktree, and fsmonitor-valid index flags prevent verification.
+- At admission the replacement must still be ready, satisfy required capabilities, match the saved checkout, and fit the remaining budget. The original access, trust, effort, schema, approvals, independence constraints, and spend limits carry over.
 
-## Eligibility
+The replacement receives the objective, current turn, failure evidence, bounded prior output and tool activity, and checkout evidence. A convergence handoff also carries the round and pending findings. Inspect existing state before repeating any action. Each lineage permits one handoff, including across retained follow-ups. An ineligible or failed handoff is terminal and does not enter a provider wait.
 
-Continuation opens only when all of these are true:
+Keep using the script-visible job ID. A successful replacement receives later follow-ups, peer questions, and convergence rounds. Provider independence is checked against the replacement provider. Usage includes the primary, replacement, and retained turns. In `/workflows`, inspect the route marked `(continued)`, trigger, checkpoint, and attempts.
 
-- the failed fresh `agent()` or retained `followUp()` reported structured, authoritative provider unavailability for the provider actually running it;
-- the failed generation itself recorded model or tool progress, and the failure is not marked pre-inference; activity from an earlier retained generation never qualifies a new turn;
-- the runtime has proved the failed native process group is absent and its retained resources are closed; bounded cleanup failure authorizes no replacement;
-- the target freshly reports ready and satisfies the original fixed policy, including every required capability;
-- the shared cwd is a provable Git checkout whose commit, symbolic branch or detached HEAD state, staged entries, index flags, status, and changed contents can be checkpointed; assume-unchanged, skip-worktree, and fsmonitor-valid flags are unsupported;
-- this logical lineage has not already used its one continuation.
+## Recover after interruption
 
-Ordinary errors, cancellation, missing or ambiguous evidence, a provider mismatch, pre-inference rejection, unsupported isolation, target unavailability, unsafe or changing checkout state, and a failed replacement are terminal. There is no reverse route, chained route, wait, or loop. `providerFallback` remains the pre-inference option; provider waiting retries the same provider and only fresh `agent()` calls.
+| Evidence for this call in a settled run | What replay can do |
+| --- | --- |
+| Verified completed continuation | Return the recorded result without new usage. |
+| Original interrupted handoff with a matching checkout | Revalidate admission and dispatch only the replacement. |
+| Progress without a valid handoff, copied checkpoint alone, or diverged checkout | Preserve the failure. Inspect partial work and recover manually. |
 
-Continuation never widens trust, access, cwd, profile, capabilities, approval mode, nesting, effort, schema, independence, or workflow/per-agent budgets. The effective native or portable schema is carried into the handoff and replacement unchanged. The target uses its declared model or native default. Budget preflight runs again and all usage already spent remains charged.
-
-## Handoff semantics
-
-The replacement continues the same call and lineage in the current checkout. It does **not** receive a blind replay. The handoff includes:
-
-- durable original objective and current turn;
-- authoritative failure evidence and phase;
-- bounded failed output plus recent tool names, states, and summaries;
-- current convergence round and pending findings when present;
-- the durable checkout digest and a direction to inspect existing state first.
-
-Sections have separate bounds for phase, findings, checkout digest, and instructions.
-
-External commands, hooks, plugins, MCP calls, and services may have completed before the failed provider stopped. Continuation cannot guarantee exactly-once behavior for those effects. The replacement must inspect state and continue remaining work, not repeat commands merely because it did not author the partial result.
-
-When a queued replacement wins a global scheduler slot, admission revalidates target readiness and required capabilities, then proves the checkout and checks workflow budgets before native startup. Admission and backend startup share one deadline. After replacement starts, future `followUp()` calls, peer questions addressed to the logical ID, and later `converge()` rounds target its retained session, including after handoff replay. Results keep the script-visible job ID. `independentOf` and `independentReview` resolve against the replacement provider, not the closed primary. Cancellation covers settlement, checkout capture, handoff creation, admission, replacement execution, and retained follow-ups.
-
-## Durability, accounting, and inspection
-
-Application history in Durable stores progress proof before settlement or checkout. It blocks primary replay but cannot authorize replacement. After settlement, a durable handoff stores trigger, schema, checkout proof, bounded prompt, target, and usage. Replay atomically rebinds the checkpoint's agent index, immutable call ordinal, lineage generation, and native job ownership before events or settlement masks publish. Later output stays on that call's generation. A successful terminal, including terminal-only replay, must bind its route to the handoff; `replayedFrom` is checked against an accepted ancestor chain. Copied checkpoints are provenance-only, so a crash before their terminal cannot create another live handoff. A progressed failure or validated continuation terminal remains a replay refusal if a later record corrupts its ordinal. Missing or inconsistent proof authorizes no dispatch or success after durable progress.
-
-For settled-run `resumeFromRunId` replay:
-
-- a completed continuation is replayed without provider dispatch or new usage;
-- an interrupted durable handoff revalidates the checkout and dispatches only the replacement;
-- a progressed-primary record with no safe handoff is returned as failed and is never rerun;
-- missing proof or checkout divergence fails closed without either provider dispatch.
-
-Usage is cumulative across the failed turn, replacement, and later generations. Follow-up and peer-answer journals include failed-primary usage plus usage reported during settlement. Attempts keep their own delta. Exact replay adds none. Interrupted-handoff admission adds replay-carried source spend to checkpointed current lineages and journal-only deltas when the snapshot lags. Resumed checkpoints durably claim usage moved out of the carried ledger, preventing both omission and double counting after a crash. Reconstructed calls retain capability requirements. Call ordinals, cancellation, approvals, journal order, convergence, and replay provenance stay on the logical call. Manual suffix restart cannot discard an agent-call progressed checkpoint. Exact replay restores that guard for progressed follow-ups. Cancelling the current progressed turn preserves it. Earlier generations and auxiliary peer answers never mark a later call progressed. Peer-question ordinals do not affect this decision.
-
-`/workflows` marks the declaration used as soon as the durable handoff claims it, then shows `claude → codex (continued)` (or the reverse), trigger, checkpoint, failed/replacement job provenance, and attempts. Replacement IDs are historical; persisted or terminal jobs are not called retained. Waiting and pre-inference fallback keep separate labels.
-
-## Recovery
-
-- `requires a provable Git checkout`: continuation did not dispatch. Inspect the partial work and continue manually or move it into a safe Git checkout.
-- `checkout is missing or diverged`: the durable handoff no longer describes the current checkout. Do not force replay; inspect the source run and current changes, then choose a manual recovery.
-- target readiness or policy error: the replacement did not start. Restore the declared target or continue manually; the one route never silently changes.
-- failed process-tree cleanup: the bound includes cleanup already queued on the job. Descendants may remain; no replacement started. Inspect and terminate the failed provider tree before manual recovery.
-- replacement failure: inspect partial state. The route cannot loop back. Interrupted Durable native intents never redispatch automatically.
+Once progress is recorded, replay or suffix restart cannot rerun that primary from its original prompt. If cleanup failed, inspect the failed process tree before resuming work. If checkout verification failed, inspect the recorded changes and current checkout. If target readiness failed, inspect the target provider. A replacement failure requires a fresh assessment of what both attempts may have completed.

@@ -1,38 +1,24 @@
-# Worktree isolation and run retention
+# Worktree isolation and retention
 
-Read this before using `isolation: "worktree"` and before reclaiming or discarding any protected worktree. **A reclaim can destroy the only copy of a child's changed work.**
+Use `isolation: "worktree"` on a workflow `agent()` when authorized writers must run concurrently. Writers that share a checkout are serialized within a workflow. Isolation requires a clean source checkout at the trusted Git repository root. Keep the source clean while the isolated jobs run.
 
-## isolation: "worktree"
+Each isolated call gets a branch named `pi-workflow/<runId>/<agentIndex>`. Ask the child to leave its changes uncommitted. Finalization checks for staged, unstaged, and untracked changes against the worktree's own HEAD. A clean worktree is removed along with its branch, even if the child committed its work there.
 
-Mutating agents that share one checkout are serialized. Use `isolation: "worktree"` when two mutating agents must run concurrently instead:
+## Collect the work
 
-- The source checkout must be clean. Isolation is refused otherwise, so the isolated base cannot silently omit uncommitted work.
-- Each isolated call gets its own Git worktree on a `pi-workflow/<runId>/<agentIndex>` branch.
-- When the call returns, the worktree is finalized. If the child changed nothing, cleanup removes the checkout, Git registration, and branch. The runtime records `removed` only after it verifies all three are absent, whether cleanup came from normal finalization or explicit reclaim. If the child changed something, the diff is written as an `agent-<index>.patch` run artifact and the state becomes `preserved`. A finalization that could not complete cleanly is recorded as `orphaned`.
-- **A finalized worktree can never be continued.** An isolated `agent()` call can never be targeted by `followUp()`, can never answer a peer's routed question, and cannot be used inside `converge()`.
-- `continuationFallback` is also rejected with worktree isolation. Progressed continuation requires one provable shared Git checkout; it never transfers an isolated checkout or patch to another provider.
-- Preserve the resulting patch metadata in the workflow result. The patch is the durable record of what the isolated child produced.
+Inspect `/workflows worktrees` for protected worktrees. Report the run ID, agent index, state, and recorded patch artifact when available.
 
-## Inspecting and reclaiming
+| State | Meaning and action |
+| --- | --- |
+| `active` | The isolated job is still using the checkout. |
+| `removed` | The runtime verified removal of the checkout, Git registration, and branch. |
+| `preserved` | Changes were written to the private `agent-<index>.patch` artifact. Inspect the patch before integrating the work. |
+| `orphaned` | Finalization failed. Inspect the error and worktree path to locate and salvage changed work. |
 
-`/workflows worktrees` enumerates every protected worktree with its run ID, agent index, state, branch, worktree path, patch artifact (if any), and orphaning error.
+Finalization ends the isolated session's usefulness for `followUp()` and peer answers. Use a shared checkout for retained convergence rounds or progressed provider continuation.
 
-`/workflows reclaim <runId> <agentIndex> [--force]` is explicit and confirmation-gated. It removes the Git worktree registration and the `pi-workflow/<runId>/<agentIndex>` branch, refuses a non-terminal run, and refuses to discard an orphaned checkout that has no patch artifact unless `--force` is passed. It never deletes a patch.
+## Reclaim a worktree
 
-When reclaim refuses with "no patch artifact", the orphaned checkout is the only copy of its changed work. Inspect it at the printed worktree path and salvage what you need **before** passing `--force` to discard it.
+For a terminal run, `/workflows reclaim <runId> <agentIndex>` requests confirmation and removes the checkout, registration, and branch. The patch remains in the run artifacts. Verify that any changes you need are recoverable before reclaiming. For an orphaned checkout without a patch, the worktree may hold the **only copy**. Use `--force` only when discarding that copy is intended.
 
-Reclaiming a run's last protected worktree is what makes that run eligible for the retention cap below.
-
-## Run retention
-
-Workflow artifacts, including each private Durable database, are bounded to the newest 64 eligible runs, matching in-session history.
-
-A run is only reclaimed once it is terminal (or a `running`/`paused` checkpoint has gone stale for 24 hours) **and** every isolated worktree it used has reached `removed`. An empty (or absent) `worktrees/` directory is unprotected either way: normal finalization of an unchanged worktree removes only that agent's own checkout, not the parent `worktrees/` directory, so the directory commonly survives on disk after every worktree it held is `removed`.
-
-Never deleted:
-
-- active runs;
-- runs leased by an open session. Each open manager writes a durable process-backed lease for the run IDs it holds, and retention reads leases from every session before deleting, so a terminal run held by another open session stays resumable;
-- any run with an `active`, `preserved`, or `orphaned` worktree, including an unfinalized checkout with no isolation record at all.
-
-Worktree scan failures, unrecognized entries, and ambiguous agent directory names fail closed and are reported rather than treated as an empty directory.
+Retention keeps the newest 64 eligible runs. A terminal run, or a running/paused checkpoint stale for 24 hours, can become eligible once all its worktrees are removed. Open session leases, protected worktrees, and ambiguous checkout entries prevent deletion. Reclaiming the last protected worktree can make the run and its artifacts eligible for later removal.

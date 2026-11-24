@@ -1,108 +1,63 @@
 # Workflow authoring
 
-Read before writing a workflow: source, helpers, phases, fan-out, and result semantics.
+Pass exactly one source to the `workflow` tool. Use `script` for inline JavaScript, `scriptPath` for a trusted project-local `.js` or `.mjs` file, or `workflowName` for a saved definition. A project definition in `.pi/workflows/` takes precedence over a user definition with the same name.
 
-## Source and input contract
+Pass structured JSON as `input`, or use `args` for a legacy JSON string. Both expose the decoded value as the global `args` in the script. Omit both for `null`. Use `background: true` for work that should return a run ID immediately or may need a parent answer. Completion arrives as a follow-up.
 
-The `workflow` tool accepts exactly one source:
+Approval defaults to `"auto"`. Use `approval: "plan"` and explicitly give every child `access: "readOnly"` for read-only planning. Use `approval: "onMutate"` when the host should confirm before the first mutating call.
 
-- `script` — inline JavaScript;
-- `workflowName` — a saved user/project definition;
-- `scriptPath` — a trusted project-local script.
+## Collect parallel reviews
 
-Use zero or one input form: structured `input` or the legacy JSON-string `args`, never both. The selected value is exposed to the script as the global `args`; omitting both exposes `null`. Workflows must be trusted and use a source contained by the trusted project rules.
-
-`approval: "plan"` is for read-only planning; `approval: "onMutate"` requires a host confirmation before mutation; `approval: "auto"` is the unprompted default.
-
-`background: true` returns a start snapshot; completion is delivered as one follow-up and remains inspectable with `/workflows`.
-
-## Script shape and globals
-
-A workflow script must export a default async function. The helpers are globals, not a context object:
-
-- `args` — parsed workflow input;
-- `phase(title)` — report bounded progress;
-- `log(message)` — report bounded progress text;
-- `agent(prompt, options)` — request one generic child and return a result object;
-- `followUp(jobId, prompt, options)` — continue a completed `agent()` call's own retained native session and return the same result shape;
-- `parallel(tasks, { concurrency })` — run deferred tasks with a bounded worker pool;
-- `pipeline(items, ...stages)` — process independent items through ordered stages;
-- `converge(options)` — run a bounded implement/review/fix loop over two retained sessions;
-- `convergenceReviewSchema` — the review schema `converge()` validates every verdict against.
-
-Use helper globals. The default function receives positional helpers, not a context object.
-
-## Declared phases
-
-For a workflow with a known plan, add `phases` to the exported metadata:
+Export a default async function. Call the helpers as globals. This script reviews two modules and returns each review, including any failed call's error.
 
 ```js
-export const meta = { name: "release review", phases: ["review", "verify", "summarize"] };
+export const meta = { name: "retry-review", phases: ["review"] };
+
+export default async function () {
+  phase("review");
+  const files = ["src/manager.ts", "src/workflows/manager.ts"];
+  const reviews = await parallel(
+    files.map((file) => () => agent(`Review retry handling in ${file}. Cite each finding.`, {
+      name: file,
+      access: "readOnly",
+    })),
+    { concurrency: 2 },
+  );
+
+  return { ok: reviews.every((review) => review.ok), reviews };
+}
 ```
 
-The plan accepts 1–64 unique normalized names of at most 160 characters. Matching is case-sensitive. Activate them forward with `phase(title)`; conditional phases may be skipped. Omit `meta.phases` for dynamic phases.
+Declare `meta.phases` when the plan is known. Use 1–64 distinct names of up to 160 characters. Call `phase(title)` in declared order with matching case. Conditional phases may be skipped. Omit the list for dynamic phases. Use `log(message)` for brief progress updates.
 
-## parallel versus pipeline
+Use `parallel(tasks, { concurrency })` when the next step needs all the results. Pass functions that start the work when called. Concurrency is 1–4 and defaults to 4. For independent multi-stage items, use `pipeline(items, ...stages)`. Each stage receives the previous value, original item, and index. A thrown stage leaves that item as `null`. A failed agent call returns an object with `ok: false`. Handle both before consuming the result. Pipelines accept up to 4,096 items across four lanes.
 
-`parallel` receives functions, not started promises. Durable owns execution and recovery; helpers bound concurrency and call numbers. Concurrency is 1 to 4 and defaults to 4. Use it when the next step needs all results; check every result's `ok`.
+## Use the result
 
-`pipeline(items, ...stages)` accepts at most 4096 items and up to four lanes. **A thrown stage makes that item's result `null`; it does not fail the run.** Branch on `null`:
+An `agent()` or `followUp()` call resolves to `{ ok, output, structured?, jobId?, error?, usage? }`. Check `ok` before using `output` or starting dependent work. For a schema-constrained call, use the validated `structured` value directly. Let the runtime handle native and portable JSON transport. Invalid or missing data yields a failed call.
+
+Use `followUp(jobId, prompt, options?)` to reuse a successfully completed, retained session from this run. Check the producer's `ok` and `jobId` first. The only follow-up options are `phase` and `schema`. A native schema-bound session keeps its original schema even if omitted. A follow-up inherits access and routing policy and consumes another call. Finalized worktrees, failed or evicted jobs, and jobs from other runs cannot be continued.
 
 ```js
-const processed = await pipeline(files, (file) => agent(`Summarize ${file}.`, { access: "readOnly" }));
-const failed = files.filter((_, index) => processed[index] === null);
+export default async function () {
+  const plan = await agent("Plan the retry change described in docs/retry.md.", { access: "readOnly" });
+  if (!plan.ok || !plan.jobId) {
+    return { ok: false, error: plan.error ?? "Planner has no retained job", jobId: plan.jobId };
+  }
+
+  const change = await agent(`Implement this plan and verify the changes:\n${plan.output}`, { access: "full" });
+  if (!change.ok) {
+    return change;
+  }
+
+  return await followUp(plan.jobId, "Review the working tree against your plan. Report unresolved findings.");
+}
 ```
 
-Always await every `agent()`/`followUp()` call before returning from the default function. A forgotten promise fails the workflow rather than silently losing the child result.
+Return a top-level object with `ok: true` for a successful task or `ok: false` with bounded failure evidence for an unsuccessful one. Other results leave the task outcome unspecified. An exception or stalled promise fails the run itself.
 
-`agent("task", { harness: "codex", speed: "fast" })` explicitly opts one Codex lineage into Fast mode. Omit `speed` for standard policy. A selected profile never supplies this opt-in. Fast is unsupported by Pi and Claude, does not choose a route for `harness: "auto"`, and cannot combine with provider or continuation fallback.
+## Sandbox boundaries
 
-## Continuing a retained agent with followUp
-
-`followUp(jobId, prompt, options?)` sends another turn to an `agent()` call this same workflow run already completed successfully, reusing its retained native session instead of starting a fresh child. This is the only supported way to return to earlier reasoning:
-
-```js
-phase("plan");
-const planner = await agent("Plan the change.", { name: "planner", access: "readOnly" });
-
-phase("implement");
-const implementation = await agent(`Implement this plan:\n${planner.output}`, { name: "implementer", access: "full" });
-
-phase("review");
-const review = await followUp(planner.jobId, "Review the current implementation against your plan.");
-if (!review.ok) return { ok: false, error: review.error };
-```
-
-Rules:
-
-- The target must be this run's completed retained `agent()` lineage. Its logical ID is stable across continuation and follow-ups. Cross-workflow, direct, expired, failed, cancelled and unsettled jobs are rejected.
-- `options` accepts only `phase` and `schema`. Harness, model, effort, speed, access, cwd, trust, profile, capability route, and nesting policy are fixed at the original `agent()` call.
-- A retained native structured session stays bound to its original schema. Every `followUp()` on that lineage is validated against the original schema and can return `structured` even when the call omits `schema`; a follow-up cannot replace the schema.
-- An `agent()` call that used `isolation: "worktree"` can never be targeted: its worktree is finalized when the call returns, so the follow-up is rejected whether the recorded state is `preserved`, `removed`, or `orphaned`.
-- Each `followUp()` consumes its own agent-call ordinal from the same 32-call budget and appears in `/workflows` as another generation under the same agent, not a new agent card.
-- `followUp()` never provider-waits. It fails immediately unless its original `agent()` explicitly opted into eligible progressed continuation.
-
-## Provider recovery
-
-A fresh explicit Claude/Codex `agent()` may set one opposite native route. `providerFallback: { harness, model? }` handles authoritative pre-inference failure with zero usage; after dispatch it also requires `readOnly`.
-
-`continuationFallback: { harness, model? }` permits one handoff after authoritative unavailability and current-turn progress, including follow-ups. Progress proof blocks primary replay. Queued admission rechecks readiness and requirements, then checkout and budget under the startup deadline. Schema, policy, budgets, usage, cancellation, logical ID, and provider independence stay fixed, including on replay. Unsafe state, unavailable target, isolation, or replacement failure is terminal; no wait or loop.
-
-## Sandbox limits and determinism
-
-- QuickJS exposes orchestration only: no imports, I/O, environment, processes, credentials, or nested delegation. All host calls share a 600-call ceiling.
-- Workflows are deterministic: `Date.now()`, zero-argument `new Date()`, and `Math.random()` all throw, including global, prototype-constructor, and dynamically constructed function access. Explicit dates remain available. The worker installs guards before lockdown; its hash binds replay identity.
-- Workflow data is bounded and JSON-serializable; one agent request is capped at 512 KiB. Await every native call, including direct tool calls; returning with admitted work unresolved fails the run and cancels that work.
-- A run may make at most 32 agent calls (`agent()` and `followUp()` share the budget) and use at most four concurrent workers. Routed questions are bounded separately at 32 per run and never consume a call ordinal.
-- Mutating agents sharing one checkout are serialized; read-only and worktree-isolated calls are not.
-
-## Lifecycle versus task outcome
-
-Workflow lifecycle and task outcome are separate. Sandbox completion sets lifecycle `completed`. A top-level plain object with `ok: true` has outcome `successful`; `ok: false` has outcome `unsuccessful`; every other result is `unspecified`. Script errors and stalled promises fail the run; cancellation, shutdown, and stale restoration abort it. Completed calls remain replayable even when the task outcome is unsuccessful.
-
-## Authoring failures
-
-- `Unexpected identifier` or another parse error: the script is JavaScript. Escape or avoid backticks and other template-literal delimiters in embedded prompts.
-- `Cannot destructure ... of null`: use the default async function with the injected globals; do not assume a callback context object.
-- `parallel tasks must be functions`: wrap every agent call in `() => agent(...)`.
-- `Workflow returned before N agent call(s) settled`: await all calls, including calls started in loops or branches.
+- Keep orchestration deterministic. The script has no imports, filesystem, network, environment, credentials, or subprocesses. Reading the current time or using `Math.random()` throws. Pass needed data through JSON input or validated child results.
+- Await every native call, including calls launched in loops. Returning early fails the run. A run permits 32 native calls, four concurrent jobs, and 600 script-to-host calls. An agent request is capped at 512 KiB.
+- Writers in the same workflow sharing a checkout are serialized. Use clean-source worktree isolation for concurrent writers only when their work can finish in one call.

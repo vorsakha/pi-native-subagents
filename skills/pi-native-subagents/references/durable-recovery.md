@@ -1,35 +1,25 @@
-# Durable execution and recovery
+# Recover or replay a workflow
 
-Read this before recovering an interrupted workflow or replaying a settled run.
+Open `/workflows`, identify the run ID, and inspect the last calls and their effects. A stale restored run can appear aborted even when its Durable task is still pending.
 
-## Runtime ownership
+Repeat the original `workflow` invocation with `resumeFromRunId`. Keep the script, input, trusted project, routing context, and approval mode the same. Use the original budget for interrupted recovery. For a settled run, the original or a compatible larger budget is accepted.
 
-Workflows use pinned Durable/code-mode 1.3.0 with a QuickJS worker and one private SQLite database per run. Durable owns tasks, call results, execution replay, and interrupted-task recovery. The existing native job manager owns Pi, Claude, and Codex execution and the shared four-turn scheduler. No coordinator model turn is added.
+| State of the source | What to expect |
+| --- | --- |
+| Pending Durable task | Recovery keeps the run ID. Completed calls return their saved results. An interrupted native intent returns its recorded interruption failure, even if progress was never observed. |
+| Settled task with retained history | Replay creates a replacement run. Matching completions, including completed parallel lanes, can be reused without dispatch. Eligible unfinished work may run. |
+| Selected agent eligible for restart in `/workflows` | Restart creates a replacement run, reuses the valid prefix, and invalidates calls from the selected one onward. |
+| Legacy Node VM run | Inspect partial effects before starting a fresh workflow. Legacy runs cannot be resumed. |
 
-`runtime.sqlite` contains execution state plus bounded application history for inspection, finished-run replay, and suffix restart. JSON summaries, transcripts, results, and reports are inspection exports. Task-scoped code-mode journals retire at settlement; application history remains until run retention removes it. Keep databases and their sidecars private and out of Git. Only one process may schedule or write a run's database; passive inspection uses a non-reconciling session and leaves task records unchanged. Ownership is published atomically under the interprocess lock; interrupted publication residue is recoverable without replacing a live lease.
+Recovery restores script execution and saved results. It cannot reattach native processes or restore their sessions. A new `followUp()` against a replayed job can therefore fail. Branch on each call's `ok` before starting dependent work.
 
-## Recover an interrupted host
+An interrupted native intent may already have changed files or external services. Inspect those effects before choosing fresh work. Replay preserves the interruption error, and a manual restart cannot discard interrupted or progressed native work. For a progressed call with a valid original handoff, only the declared replacement is eligible. Missing or inconsistent history cannot authorize a dispatch.
 
-Restoration belongs to the Pi session that started it. Replacing or reloading that session discards its late restoration callbacks, including UI notifications and mutation approvals. Inspect the replacement session's `/workflows` history before choosing recovery.
+## When recovery is refused
 
-A restored stale projection is shown as aborted. Repeat the `workflow` call with its original source, input, project, route, approval, and budget, adding `resumeFromRunId`. If its Durable task is still pending, the runtime recovers that task under the same run ID.
+- **Definition, execution context, or budget mismatch.** Use the original request. Starting over can repeat effects.
+- **Database already owned.** Inspect the active run in its owning session. Leave its owner file in place. Only one process may schedule a run. Passive inspection is safe.
+- **Session reload.** Inspect the replacement session's history. Pending mutation approvals and restoration callbacks belonged to the previous session.
+- **Stalled script.** A pending promise needs a host call that can settle it. Await all agent calls before returning. A script also has a 600 host-call ceiling.
 
-Completed calls return their persisted results without native dispatch. A native call interrupted after intent returns an interruption failure and is never automatically redispatched, even if no progress was observed. Inspect partial effects before choosing manual recovery. Native commands, hooks, plugins, MCP calls, and file mutations are not exactly-once. Recovery does not reattach provider processes or restore their retained sessions. A later `followUp()` can therefore fail because the native session no longer exists.
-
-The script may handle that failed result and continue with later calls. Native admission persists agent state before execution. Each application-history commit also stores bounded inspection, transcripts, and usage, so completed results cannot outrun their accounting projection. An unresolved script promise with no host call that could settle it fails as stalled. Active calls may run until completion or explicit cancellation; there is no overall workflow deadline.
-
-## Replay a settled run
-
-For a settled task, `resumeFromRunId` starts a replacement run. The application matches completed calls against bounded persisted proofs, including independently completed parallel lanes. Failed or incomplete work may run again only when no interrupted native intent or progressed-work proof forbids it. Compatible budget increases remain supported for finished replay. Interrupted recovery requires the original budget.
-
-Restarting an eligible selected agent also starts a replacement run, reuses its valid prefix, and invalidates its suffix. It cannot discard progressed or interrupted native work. The dashboard hides restart for those agents; use the recorded handoff where eligible, or inspect partial effects and recover manually. Replaying an interruption preserves the same public failure value, including its error text. Unsafe-replay proof stays private to history and inspection, outside the script result. It never makes that native intent safe to dispatch.
-
-Old Node VM/checkpoint runs are not migrated or resumable. Start a fresh run after inspecting their partial effects.
-
-## Failures
-
-- Database already has a live owner: inspect the active workflow owner. Do not delete its owner file or open a second scheduler.
-- Interrupted call may have partially run: inspect the workspace and external effects. Choose any fresh work explicitly.
-- Execution context or budget mismatch: supply the original values for interrupted recovery. A fresh run is a separate dispatch decision.
-- Missing or inconsistent application history: no unsafe primary replay or continuation is authorized.
-- Sandbox host-call limit: use the documented helpers. The host caps all script-to-host calls at 600, in addition to the 32 native-call limit and individual event/payload bounds.
+Keep the private per-run Durable database, sidecars, transcripts, and result exports out of Git. A JSON summary is for inspection. Recovery uses retained execution history.
