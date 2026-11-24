@@ -1,10 +1,10 @@
 # Routed questions (subagent_ask / subagent_answer)
 
-Read this before telling a child it may ask a question, and before answering one as the parent. A blocked child may have exactly one outstanding bounded question open at a time and waits for its correlated answer before asking another. Host-routed questions cannot delegate, discover jobs, or change policy.
+A child can have one open question at a time. Its tool call waits for a matching answer.
 
 ## Child side — `subagent_ask({ target?, question, context? })`
 
-The tool is injected only into a job the host authorized.
+Only authorized jobs receive this tool.
 
 - Pi, Claude, and Codex expose this same logical tool through their native client-hosted mechanism. The grant adds no approval, elicitation, delegation, discovery, or policy-changing capability.
 - `target: { type: "orchestrator" }` (the default) wakes the parent Pi session that launched the job. The parent answers from its own thread context with `subagent_answer({ requestId, answer })`, asking the human first when the decision is theirs.
@@ -48,7 +48,7 @@ coalesced into one follow-up turn. Repeated lifecycle events cannot redeliver it
 
 ## Where questions are allowed
 
-- Background `subagent_spawn` jobs and background workflows may ask the orchestrator. Human `/subagent` jobs may ask too; their question is answered inline in `/subagents` and never notifies the orchestrator.
+- Background `subagent_spawn` jobs and background workflows may ask the orchestrator. Human `/subagent` jobs share this path. A pending parent question returns immediately from `subagent_wait` with the request ID and question text. Relay a human decision in chat and call `subagent_answer` with the reply. A wait that returned a question leaves the eventual result available.
 - Foreground `subagent` calls and foreground workflows cannot ask the orchestrator and fail fast: that parent turn is already blocked awaiting the tool result. Re-run the work in the background form, or proceed with a stated assumption.
 - Peer questions are workflow-only. The target must belong to the same run, be completed with a retained native session, have no active or queued follow-up, not already be answering or asking, not be the caller, and not have run in an isolated worktree. A peer-answer turn may not ask anything itself, and wait cycles are rejected before the caller parks.
 

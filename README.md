@@ -13,7 +13,7 @@ flowchart LR
     F --> G
 ```
 
-Use the dashboards to see what is running, inspect results, steer retained sessions, or take over a job.
+Delegate in the conversation. A child can ask there when it needs a decision, and Pi brings its result back to the same thread.
 
 ## Install
 
@@ -39,7 +39,7 @@ Pi starts the job in the background and returns a job ID. You can also start one
 /subagent --access readOnly "Review src/auth.ts for missing error handling"
 ```
 
-Open `/subagents` to inspect progress, steer the agent, or take over its native session.
+Answer a question in your own words, or ask Pi what is running. Open `/subagents` in the terminal when you want to scan several jobs, steer one, or take over its native session.
 
 ## Coordinate several tasks
 

@@ -1309,7 +1309,6 @@ export class FailingWorkflowRegistration {
 
   readonly factory = (_pi: ExtensionAPI, options: RegisterWorkflowOptions): WorkflowRegistration => ({
     shortcut: "ctrl+alt+w",
-    shortcutHint: "Ctrl+Alt+W",
     sessionStart: (_ctx: ExtensionContext, _jobs: JobManager) => {
       this.sessionStarts++;
       options.onInitialized?.();

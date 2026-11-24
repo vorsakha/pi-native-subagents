@@ -5,18 +5,18 @@ description: Use when invoking the Pi Native Subagents extension or writing a sa
 
 # Pi Native Subagents
 
-Use this skill for Pi Native Subagents tools. The host's routing skill decides model, harness, effort, and quota preferences.
+Use the host's routing skill for model, harness, effort, and quota preferences.
 
 ## Read the right reference before acting
 
-Paths are relative to this file. Read the reference **before** you write the call, not after it fails.
+Read the relevant reference before calling a tool.
 
 | Before you… | Read |
 | --- | --- |
 | write or edit a workflow script, call a saved `workflowName`, declare `meta.phases`, call `followUp()`, or set `approval`/`background`/`pipeline` | `references/workflow-authoring.md` |
 | call `converge()` | `references/convergence.md` |
 | opt into cross-provider continuation after progressed native failure | `references/progressed-continuation.md` |
-| let a child use `subagent_ask`, or answer with `subagent_answer` | `references/routed-questions.md` |
+| route peer questions, inspect answer delivery, or recover an expired request | `references/routed-questions.md` |
 | set `speed`, spend limits, replay, provider fallback, or retry | `references/budgets-replay-and-provider-waits.md` |
 | use `isolation: "worktree"`, or run `/workflows reclaim` | `references/worktrees-and-retention.md` |
 | subscribe to or consume `native-subagents:state:v1` | `references/presentation-state-v1.md` |
@@ -24,14 +24,14 @@ Paths are relative to this file. Read the reference **before** you write the cal
 
 ## Choose the smallest orchestration surface
 
-- Use `subagent_spawn` for one job or a small independent fan-out. Use `subagent_wait`, `subagent_check`, `subagent_send`, and `subagent_cancel` with the returned job ID when the parent must manage the jobs explicitly.
+- Use `subagent_spawn` for ordinary delegation. Relay questions and results in the current conversation. A human `/subagent` uses the same conversation. Check, wait, steer, or cancel with the returned job ID.
 - Use `workflow` for phases, bounded parallelism, pipelines, structured fan-in, saved definitions, background execution, replay, or durable progress. Do not wrap a simple two-agent review in a workflow only to run two calls.
-- Use `subagent_capabilities` before setting `requires`. Capability IDs are live values; never invent them.
+- Get live IDs from `subagent_capabilities` before setting `requires`.
 - A child cannot delegate again. Do not ask a child to call subagent or workflow tools. It may have only one outstanding bounded routed question at a time.
 
 ## Direct native subagents
 
-Give every child a self-contained task with paths, constraints, result format, and verification.
+Give the child a self-contained task, constraints and expected result. When the caller wants the outcome now, use `subagent_wait`. It returns early for a pending parent question. Ask the human when their input is needed, then call `subagent_answer({ requestId, answer })` and resume waiting.
 
 Usage rules:
 
@@ -59,8 +59,6 @@ const review = await subagent_spawn({
   harness: "auto",
   requires: ["<capability-id-from-discovery>"],
 });
-
-const urgent = await subagent_spawn({ task: "Review the release diff.", harness: "codex", speed: "fast", access: "readOnly" });
 
 await subagent_wait({ jobId: review.jobId, timeoutMs: 600_000 });
 ```

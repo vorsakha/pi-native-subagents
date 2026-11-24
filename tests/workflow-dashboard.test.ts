@@ -2258,19 +2258,7 @@ test("/workflows keeps the host overlay geometry and non-TUI summary contract", 
     overlayOptions: { width: "100%", minWidth: 40, maxHeight: "100%", anchor: "center" },
   });
 
-  let summary = "";
-  const summaryManager = { list: () => runs } as never;
-  await openWorkflowsDashboard(
-    {
-      mode: "rpc",
-      ui: {
-        notify: (message: string) => {
-          summary = message;
-        },
-      },
-    } as never,
-    summaryManager,
-  );
+  const summary = await openWorkflowsDashboard({ mode: "rpc" } as never, { list: () => runs } as never);
   assert.equal(summary, "integration completed Release integration");
 });
 

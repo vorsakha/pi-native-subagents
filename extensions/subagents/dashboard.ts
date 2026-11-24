@@ -69,11 +69,7 @@ import {
 import { buildTranscript, renderAssistantMarkdown, takeoverPolicy, transcriptSignature } from "./transcript.ts";
 import { DEFAULT_TOOL_DISPLAY, type ToolDisplayMode } from "../tool-summary.ts";
 import type { JobSnapshot, SendBehavior } from "../../src/types.ts";
-import {
-  availabilityLabel,
-  formatHarnessAvailabilityReport,
-  type HarnessActivation,
-} from "../../src/harness-availability.ts";
+import { availabilityLabel, type HarnessActivation } from "../../src/harness-availability.ts";
 
 /*
  * `/subagents` is one panel with three explicit focus layers. Job-list focus moves
@@ -1811,18 +1807,19 @@ export async function openSubagentsDashboard(
   ctx: ExtensionCommandContext,
   manager: SubagentsDashboardManager,
   options: { focusJobId?: string; mode?: DashboardMode; availability?: HarnessActivation[] } = {},
-): Promise<void> {
+): Promise<string | void> {
   if (ctx.mode !== "tui") {
     const jobs = manager.list();
-    const availability = options.availability
-      ? `${formatHarnessAvailabilityReport(options.availability, Date.now())}\n\n`
-      : "";
-    ctx.ui.notify(
-      `${availability}${jobs.length ? jobs.map(statusLine).join("\n") : "No subagent jobs in this session."}`,
-      "info",
-    );
 
-    return;
+    return (
+      jobs
+        .map((job) => {
+          const state = job.interaction?.state === "pending" ? "needs input" : job.status;
+
+          return `${sanitizeInline(job.name)} · ${state} · ${shortId(job.id)}`;
+        })
+        .join("\n") || "No subagent jobs in this session."
+    );
   }
 
   await ctx.ui.custom<null>(
@@ -1883,10 +1880,6 @@ export function truncateDashboardLine(value: string, width: number): string {
 
 function truncate(value: string, width: number, ellipsis = "…"): string {
   return truncateToWidth(value, Math.max(0, width), ellipsis);
-}
-
-function statusLine(job: JobSnapshot): string {
-  return `${job.id} ${job.status} ${job.name} [${job.access}${job.independent ? "; independent" : ""}; ${job.harness}/${job.model}; effort ${formatEffort(job.effort)}; budget ${formatSpendBudget(job.budget, job.usage, job.harness)}]`;
 }
 
 export { DashboardOverlay };

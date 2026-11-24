@@ -2556,15 +2556,13 @@ function defaultWorkflow(runs: readonly WorkflowSnapshot[]): WorkflowSnapshot {
 export async function openWorkflowsDashboard(
   ctx: Pick<ExtensionContext, "mode" | "ui">,
   manager: WorkflowsDashboardManager,
-): Promise<void> {
+): Promise<string | void> {
   if (ctx.mode !== "tui") {
     const runs = manager.list();
-    const message = runs.length
+
+    return runs.length
       ? runs.map((run) => `${sanitizeInline(run.runId)} ${run.status} ${sanitizeInline(run.name)}`).join("\n")
       : "No workflow runs in this session.";
-    ctx.ui.notify(message, "info");
-
-    return;
   }
 
   // Actions other than close are applied in place by the overlay itself
