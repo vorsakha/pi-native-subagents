@@ -3,17 +3,31 @@ import assert from "node:assert/strict";
 import { captureParentThread, renderParentThreadContext } from "../src/parent-thread-context.ts";
 
 test("captureParentThread keeps conversation text and summaries while excluding thinking, tool calls, and tool results", () => {
-  const snapshot = captureParentThread([
-    { role: "user", content: [{ type: "text", text: "Build the bridge" }, { type: "image", data: "secret-image" }], timestamp: 1_000 },
-    { role: "assistant", content: [
-      { type: "thinking", thinking: "hidden chain" },
-      { type: "toolCall", name: "bash", arguments: { command: "printenv SECRET" } },
-      { type: "text", text: "We chose a pull-based tool." },
-    ], timestamp: 2_000 },
-    { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "secret tool output" }] },
-    { role: "compactionSummary", summary: "Earlier work changed the manager." },
-    { role: "custom", content: "hidden extension context" },
-  ], 3_000);
+  const snapshot = captureParentThread(
+    [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Build the bridge" },
+          { type: "image", data: "secret-image" },
+        ],
+        timestamp: 1_000,
+      },
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "hidden chain" },
+          { type: "toolCall", name: "bash", arguments: { command: "printenv SECRET" } },
+          { type: "text", text: "We chose a pull-based tool." },
+        ],
+        timestamp: 2_000,
+      },
+      { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "secret tool output" }] },
+      { role: "compactionSummary", summary: "Earlier work changed the manager." },
+      { role: "custom", content: "hidden extension context" },
+    ],
+    3_000,
+  );
 
   assert.deepEqual(snapshot.messages, [
     { role: "user", text: "Build the bridge", timestamp: 1_000 },
@@ -25,11 +39,14 @@ test("captureParentThread keeps conversation text and summaries while excluding 
 });
 
 test("renderParentThreadContext defaults to recent messages and supports bounded search/pagination", () => {
-  const snapshot = captureParentThread([
-    { role: "user", content: "alpha decision" },
-    { role: "assistant", content: [{ type: "text", text: "beta implementation" }] },
-    { role: "user", content: "alpha follow-up" },
-  ], 10_000);
+  const snapshot = captureParentThread(
+    [
+      { role: "user", content: "alpha decision" },
+      { role: "assistant", content: [{ type: "text", text: "beta implementation" }] },
+      { role: "user", content: "alpha follow-up" },
+    ],
+    10_000,
+  );
 
   const recent = renderParentThreadContext(snapshot, { limit: 1 });
   assert.match(recent, /\[2\] USER/);

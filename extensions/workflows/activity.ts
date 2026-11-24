@@ -38,12 +38,22 @@ export interface WorkflowActivityRenderOptions {
 
 function bounded(value: string | undefined, max = MAX_ACTIVITY_CHARS): string | undefined {
   const clean = value ? sanitizeInline(value) : "";
-  if (!clean) return undefined;
+
+  if (!clean) {
+    return undefined;
+  }
+
   return clean.length > max ? `${clean.slice(0, max - 1)}…` : clean;
 }
 
 function activeAgent(agent: WorkflowAgentRecord): boolean {
-  return agent.state === "queued" || agent.state === "running" || agent.state === "waiting" || !!agent.waitingOn || !!agent.answering;
+  return (
+    agent.state === "queued" ||
+    agent.state === "running" ||
+    agent.state === "waiting" ||
+    !!agent.waitingOn ||
+    !!agent.answering
+  );
 }
 
 function focusedAgent(snapshot: WorkflowSnapshot): WorkflowAgentRecord | undefined {
@@ -52,56 +62,94 @@ function focusedAgent(snapshot: WorkflowSnapshot): WorkflowAgentRecord | undefin
 
 function phaseLabel(snapshot: WorkflowSnapshot): string {
   const progress = workflowPhaseProgress(snapshot);
+
   if (progress.phase) {
     const name = bounded(progress.phase.name, 100) ?? "phase";
+
     return `${name} ${progress.label}`;
   }
-  if (progress.waiting) return "waiting for phase";
+
+  if (progress.waiting) {
+    return "waiting for phase";
+  }
+
   return progress.noPhases ? "no phase" : progress.label;
 }
 
 function routeLabel(agent: WorkflowAgentRecord | undefined): string | undefined {
-  if (!agent) return undefined;
+  if (!agent) {
+    return undefined;
+  }
+
   const fallback = agent.attempts?.find((attempt) => attempt.disposition === "fallback");
+
   if (fallback) {
     const requested = bounded(agent.requestedHarness ?? fallback.requestedHarness ?? fallback.harness) ?? "primary";
     const effective = bounded(agent.harness ?? fallback.harness) ?? "fallback";
     const model = bounded(agent.model ?? fallback.model);
+
     return `${requested} → ${effective}${model ? `/${model}` : ""} (fallback)`;
   }
+
   const harness = bounded(agent.harness ?? agent.requestedHarness);
   const model = bounded(agent.model);
-  if (harness && model) return `${harness}/${model}`;
+
+  if (harness && model) {
+    return `${harness}/${model}`;
+  }
+
   return harness ?? model;
 }
 
-function activityLabel(snapshot: WorkflowSnapshot, agent: WorkflowAgentRecord | undefined, now: number): string | undefined {
-  if (!agent && snapshot.status !== "pending" && snapshot.status !== "running") return undefined;
+function activityLabel(
+  snapshot: WorkflowSnapshot,
+  agent: WorkflowAgentRecord | undefined,
+  now: number,
+): string | undefined {
+  if (!agent && snapshot.status !== "pending" && snapshot.status !== "running") {
+    return undefined;
+  }
+
   return bounded(workflowDashboardSummary(snapshot, now).text);
 }
 
 function stateLabel(snapshot: WorkflowSnapshot, agent: WorkflowAgentRecord | undefined): string {
-  if (workflowNeedsInput(snapshot)) return "needs input";
-  if (snapshot.status === "running" && agent?.state === "queued") return "queued";
-  if (snapshot.status === "running" && agent?.state === "waiting") return "waiting";
-  if (snapshot.status === "completed" && snapshot.taskOutcome === "unsuccessful") return "unsuccessful";
+  if (workflowNeedsInput(snapshot)) {
+    return "needs input";
+  }
+
+  if (snapshot.status === "running" && agent?.state === "queued") {
+    return "queued";
+  }
+
+  if (snapshot.status === "running" && agent?.state === "waiting") {
+    return "waiting";
+  }
+
+  if (snapshot.status === "completed" && snapshot.taskOutcome === "unsuccessful") {
+    return "unsuccessful";
+  }
+
   return snapshot.status;
 }
 
 function needsAttention(snapshot: WorkflowSnapshot, agent: WorkflowAgentRecord | undefined): boolean {
-  return workflowNeedsInput(snapshot) > 0
-    || snapshot.status === "paused"
-    || snapshot.status === "failed"
-    || snapshot.status === "aborted"
-    || snapshot.taskOutcome === "unsuccessful"
-    || agent?.state === "failed"
-    || agent?.state === "cancelled"
-    || agent?.state === "aborted";
+  return (
+    workflowNeedsInput(snapshot) > 0 ||
+    snapshot.status === "paused" ||
+    snapshot.status === "failed" ||
+    snapshot.status === "aborted" ||
+    snapshot.taskOutcome === "unsuccessful" ||
+    agent?.state === "failed" ||
+    agent?.state === "cancelled" ||
+    agent?.state === "aborted"
+  );
 }
 
 /** Converts a durable snapshot to the small, credential-free row shown above the editor. */
 export function workflowActivityRow(snapshot: WorkflowSnapshot, now = Date.now()): WorkflowActivityRow {
   const agent = focusedAgent(snapshot);
+
   return {
     runId: snapshot.runId,
     name: bounded(snapshot.name, 120) ?? "workflow",
@@ -124,16 +172,25 @@ export class WorkflowActivityStore {
   readonly #delivered = new Set<string>();
 
   observe(snapshot: WorkflowSnapshot): boolean {
-    if (this.#delivered.has(snapshot.runId)) return false;
+    if (this.#delivered.has(snapshot.runId)) {
+      return false;
+    }
+
     const previous = this.#runs.get(snapshot.runId);
-    if (previous && previous.timestamps.updatedAt > snapshot.timestamps.updatedAt) return false;
+
+    if (previous && previous.timestamps.updatedAt > snapshot.timestamps.updatedAt) {
+      return false;
+    }
+
     this.#runs.set(snapshot.runId, snapshot);
+
     return previous !== snapshot;
   }
 
   /** Removes a row only after its existing result delivery path has completed. */
   markDelivered(runId: string): boolean {
     this.#delivered.add(runId);
+
     return this.#runs.delete(runId);
   }
 
@@ -147,17 +204,20 @@ export class WorkflowActivityStore {
     const active = rows.filter((row) => !row.terminal).length;
     const attention = rows.filter((row) => row.attention).length;
     const finishing = rows.filter((row) => row.terminal).length;
-    const key = JSON.stringify(rows.map((row) => [
-      row.runId,
-      row.name,
-      row.status,
-      row.phase,
-      row.state,
-      row.route,
-      row.activity,
-      row.attention,
-      row.terminal,
-    ]));
+    const key = JSON.stringify(
+      rows.map((row) => [
+        row.runId,
+        row.name,
+        row.status,
+        row.phase,
+        row.state,
+        row.route,
+        row.activity,
+        row.attention,
+        row.terminal,
+      ]),
+    );
+
     return { rows, active, attention, finishing, key };
   }
 }
@@ -166,6 +226,7 @@ type RowField = "phase" | "state" | "route" | "activity";
 
 function rowText(row: WorkflowActivityRow, marker: string, fields: readonly RowField[]): string {
   const values = fields.map((field) => row[field]).filter((value): value is string => !!value);
+
   return `${marker} ${row.name}${values.length ? ` · ${values.join(" · ")}` : ""}`;
 }
 
@@ -179,12 +240,20 @@ function styledRow(
   const values = fields
     .map((field) => {
       const value = overrides[field] ?? row[field];
-      if (!value) return undefined;
-      const color = field === "state" ? row.attention ? "warning" : "dim" : field === "phase" ? "muted" : "dim";
-      return theme.fg(color, value);
+
+      if (!value) {
+        return undefined;
+      }
+
+      if (field === "state" && row.attention) {
+        return theme.fg("warning", value);
+      }
+
+      return theme.fg(field === "phase" ? "muted" : "dim", value);
     })
     .filter((value): value is string => value !== undefined);
   const details = values.length ? ` ${values.join(theme.fg("dim", " · "))}` : "";
+
   return `${theme.fg("dim", marker)} ${theme.fg("toolTitle", row.name)}${details}`;
 }
 
@@ -192,11 +261,18 @@ function narrowRow(row: WorkflowActivityRow, marker: string, theme: Theme, width
   const prefix = `${marker} `;
   const suffix = ` · ${row.state}`;
   const nameWidth = width - visibleWidth(prefix) - visibleWidth(suffix);
+
   if (nameWidth > 0) {
     const name = truncateToWidth(row.name, nameWidth, "");
+
     return `${theme.fg("dim", marker)} ${theme.fg("toolTitle", name)}${theme.fg(row.attention ? "warning" : "dim", suffix)}`;
   }
-  return truncateToWidth(`${theme.fg("dim", marker)} ${theme.fg(row.attention ? "warning" : "dim", row.state)}`, width, "");
+
+  return truncateToWidth(
+    `${theme.fg("dim", marker)} ${theme.fg(row.attention ? "warning" : "dim", row.state)}`,
+    width,
+    "",
+  );
 }
 
 function renderRow(row: WorkflowActivityRow, index: number, total: number, theme: Theme, width: number): string {
@@ -208,25 +284,40 @@ function renderRow(row: WorkflowActivityRow, index: number, total: number, theme
     ["state"],
     [],
   ];
+
   for (const fields of candidates) {
-    if (visibleWidth(rowText(row, marker, fields)) <= width) return styledRow(row, marker, fields, theme);
+    if (visibleWidth(rowText(row, marker, fields)) <= width) {
+      return styledRow(row, marker, fields, theme);
+    }
   }
+
   const compactFields: readonly RowField[] = ["phase", "state", "route"];
   const compact = rowText(row, marker, compactFields);
+
   if (row.activity && visibleWidth(compact) <= width) {
     const activityWidth = width - visibleWidth(compact) - visibleWidth(" · ");
+
     if (activityWidth >= 8) {
       const activity = truncateToWidth(row.activity, activityWidth, "…");
+
       return styledRow(row, marker, [...compactFields, "activity"], theme, { activity });
     }
   }
+
   return narrowRow(row, marker, theme, width);
 }
 
 function summary(snapshot: WorkflowActivitySnapshot): string {
   const parts = [`${snapshot.active} active`];
-  if (snapshot.finishing) parts.push(`${snapshot.finishing} finishing`);
-  if (snapshot.attention) parts.push(`${snapshot.attention} need attention`);
+
+  if (snapshot.finishing) {
+    parts.push(`${snapshot.finishing} finishing`);
+  }
+
+  if (snapshot.attention) {
+    parts.push(`${snapshot.attention} need attention`);
+  }
+
   return parts.join(" · ");
 }
 
@@ -238,10 +329,15 @@ export function renderWorkflowActivity(
   options: WorkflowActivityRenderOptions = {},
 ): string[] {
   const safeWidth = Math.max(0, Math.floor(width));
-  if (!safeWidth || !snapshot.rows.length) return [];
+
+  if (!safeWidth || !snapshot.rows.length) {
+    return [];
+  }
+
   const context = options.context ? ` · ${sanitizeInline(options.context)}` : "";
   const hint = options.openHint ? ` · ${sanitizeInline(options.openHint)}` : "";
   const header = `${theme.fg("accent", "◆")} ${theme.fg("toolTitle", "Workflows")}${theme.fg("dim", ` · ${summary(snapshot)}${context} · /workflows${hint}`)}`;
+
   return [
     truncateToWidth(header, safeWidth, ""),
     ...snapshot.rows.map((row, index) => renderRow(row, index, snapshot.rows.length, theme, safeWidth)),

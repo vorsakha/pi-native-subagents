@@ -48,9 +48,7 @@ export type DashboardSummary =
   | { kind: "result"; text: string }
   | { kind: "lifecycle"; text: string };
 
-export function dashboardSummaryColor(
-  summary: DashboardSummary,
-): "warning" | "error" | "muted" | "dim" {
+export function dashboardSummaryColor(summary: DashboardSummary): "warning" | "error" | "muted" | "dim" {
   switch (summary.kind) {
     case "input":
     case "wait":
@@ -90,6 +88,7 @@ export function dashboardViewportLabel(
 ): string {
   const range = end > start ? `${start + 1}–${end}` : "0";
   const tail = canGrow ? "live" : "end";
+
   return `${section} ${range}/${total} · ${following ? tail : `paused · G resumes ${tail}`}`;
 }
 
@@ -97,8 +96,10 @@ export function dashboardLayout(width: number, rows: number): DashboardLayout {
   const height = Math.max(0, Math.floor(rows));
   const contentRows = Math.max(1, height - DASHBOARD_CHROME_ROWS);
   const innerWidth = Math.max(0, Math.floor(width) - 2);
+
   if (width >= DASHBOARD_WIDE_MIN_WIDTH && contentRows >= DASHBOARD_SPLIT_MIN_ROWS) {
     const railWidth = Math.max(26, Math.min(44, Math.round(innerWidth * 0.32)));
+
     return {
       kind: "wide",
       height,
@@ -108,8 +109,10 @@ export function dashboardLayout(width: number, rows: number): DashboardLayout {
       detailRows: contentRows,
     };
   }
+
   if (width >= DASHBOARD_MEDIUM_MIN_WIDTH && contentRows >= DASHBOARD_SPLIT_MIN_ROWS) {
     const listRows = Math.max(2, Math.min(6, Math.floor((contentRows - 1) * 0.3)));
+
     return {
       kind: "medium",
       height,
@@ -119,6 +122,7 @@ export function dashboardLayout(width: number, rows: number): DashboardLayout {
       detailRows: Math.max(1, contentRows - 1 - listRows),
     };
   }
+
   return {
     kind: "narrow",
     height,
@@ -136,6 +140,7 @@ export function isFullscreenTui(tui: unknown): boolean {
 
 export function dashboardMaxHeight(terminalRows: number): number {
   const availableRows = Math.max(10, terminalRows || 30);
+
   return Math.max(0, Math.floor(availableRows * DASHBOARD_MAX_HEIGHT_RATIO));
 }
 
@@ -146,6 +151,7 @@ export function dashboardMaxHeight(terminalRows: number): number {
  */
 export function dashboardOverlayRows(terminalRows: number, fullscreen: boolean): number {
   const rows = Math.max(0, Math.floor(terminalRows || 0)) || 24;
+
   return fullscreen ? rows : Math.max(0, Math.floor(rows * DASHBOARD_MAX_HEIGHT_RATIO));
 }
 
@@ -158,31 +164,36 @@ export function createDashboardFrame(theme: Theme, width: number, focused: boole
   const padTo = (text: string, width: number) => {
     const target = Math.max(0, width);
     const truncated = truncateToWidth(text, target);
+
     return truncated + " ".repeat(Math.max(0, target - visibleWidth(truncated)));
   };
+
   const pad = (text: string) => padTo(text, innerWidth);
 
   const segment = (title: string, width: number) => {
     const target = Math.max(0, width);
-    if (!target) return "";
+
+    if (!target) {
+      return "";
+    }
+
     // A titled segment needs one leading rule plus two label spaces. At tiny
     // widths the rule is the only representation that can fit.
-    const label = title && target >= 4
-      ? ` ${truncateToWidth(title, target - 3)} `
-      : "";
+    const label = title && target >= 4 ? ` ${truncateToWidth(title, target - 3)} ` : "";
     const labelWidth = visibleWidth(label);
+
     return (
-      border("─") +
-      (label ? theme.fg("text", label) : "") +
-      border("─".repeat(Math.max(0, target - 1 - labelWidth)))
+      border("─") + (label ? theme.fg("text", label) : "") + border("─".repeat(Math.max(0, target - 1 - labelWidth)))
     );
   };
+
   const borderSegment = (title: string) => segment(title, innerWidth);
   const fitFrameLine = (line: string) => truncateToWidth(line, safeWidth, "");
 
   /** Column widths for a vertical split: `left │ right` inside the panel. */
   const columns = (leftWidth: number) => {
     const left = Math.max(0, Math.min(Math.floor(leftWidth), Math.max(0, innerWidth - 1)));
+
     return { left, right: Math.max(0, innerWidth - left - 1) };
   };
 
@@ -190,14 +201,9 @@ export function createDashboardFrame(theme: Theme, width: number, focused: boole
     innerWidth,
     columns,
     header(left: string, right: string): string {
-      const gap = Math.max(
-        1,
-        safeWidth - visibleWidth(left) - visibleWidth(right) - 4,
-      );
-      return truncateToWidth(
-        `  ${left}${" ".repeat(gap)}${right}  `,
-        safeWidth,
-      );
+      const gap = Math.max(1, safeWidth - visibleWidth(left) - visibleWidth(right) - 4);
+
+      return truncateToWidth(`  ${left}${" ".repeat(gap)}${right}  `, safeWidth);
     },
     top(title: string): string {
       return fitFrameLine(border("╭") + borderSegment(title) + border("╮"));
@@ -213,56 +219,47 @@ export function createDashboardFrame(theme: Theme, width: number, focused: boole
     },
     splitTop(leftTitle: string, rightTitle: string, leftWidth: number): string {
       const { left, right } = columns(leftWidth);
-      return fitFrameLine(border("╭") + segment(leftTitle, left) + border("┬") + segment(rightTitle, right) + border("╮"));
+
+      return fitFrameLine(
+        border("╭") + segment(leftTitle, left) + border("┬") + segment(rightTitle, right) + border("╮"),
+      );
     },
     splitRow(leftText: string, rightText: string, leftWidth: number): string {
       const { left, right } = columns(leftWidth);
+
       return fitFrameLine(border("│") + padTo(leftText, left) + border("│") + padTo(rightText, right) + border("│"));
     },
     splitBottom(leftWidth: number): string {
       const { left, right } = columns(leftWidth);
-      return fitFrameLine(border("╰") + border("─".repeat(left)) + border("┴") + border("─".repeat(right)) + border("╯"));
+
+      return fitFrameLine(
+        border("╰") + border("─".repeat(left)) + border("┴") + border("─".repeat(right)) + border("╯"),
+      );
     },
     hint(text: string, right?: string): string {
       if (!right) {
         return truncateToWidth(theme.fg("dim", `  ${text}`), safeWidth);
       }
+
       const contentWidth = Math.max(0, safeWidth - 4);
       const rightWidth = visibleWidth(right);
       const leftWidth = Math.max(0, contentWidth - rightWidth - 2);
       const left = truncateToWidth(text, leftWidth);
-      const gap = Math.max(
-        1,
-        contentWidth - visibleWidth(left) - rightWidth,
-      );
-      return truncateToWidth(
-        theme.fg(
-          "dim",
-          `  ${left}${" ".repeat(gap)}${right}  `,
-        ),
-        safeWidth,
-      );
+      const gap = Math.max(1, contentWidth - visibleWidth(left) - rightWidth);
+
+      return truncateToWidth(theme.fg("dim", `  ${left}${" ".repeat(gap)}${right}  `), safeWidth);
     },
   };
 }
 
-export function alignDashboardRow(
-  left: string,
-  right: string,
-  width: number,
-): string {
+export function alignDashboardRow(left: string, right: string, width: number): string {
   const safeWidth = Math.max(0, width);
   const rightWidth = visibleWidth(right);
   const leftMax = Math.max(0, safeWidth - rightWidth - 2);
   const leftTruncated = truncateToWidth(left, leftMax);
-  const gap = Math.max(
-    2,
-    safeWidth - visibleWidth(leftTruncated) - rightWidth,
-  );
-  return truncateToWidth(
-    leftTruncated + " ".repeat(gap) + right,
-    safeWidth,
-  );
+  const gap = Math.max(2, safeWidth - visibleWidth(leftTruncated) - rightWidth);
+
+  return truncateToWidth(leftTruncated + " ".repeat(gap) + right, safeWidth);
 }
 
 /**
@@ -270,31 +267,21 @@ export function alignDashboardRow(
  * and lifecycle metadata remain right-aligned, while the summary gives way
  * before the job/run name at constrained widths.
  */
-export function alignDashboardSummaryRow(
-  identity: string,
-  summary: string,
-  right: string,
-  width: number,
-): string {
+export function alignDashboardSummaryRow(identity: string, summary: string, right: string, width: number): string {
   const safeWidth = Math.max(0, width);
   const gapWidth = safeWidth >= 2 ? 2 : 0;
   const rightWidth = visibleWidth(right);
   const minimumRight = Math.min(rightWidth, Math.min(25, Math.floor(safeWidth * 0.65)));
   const identityMax = Math.max(0, safeWidth - minimumRight - gapWidth);
   const fittedIdentity = truncateToWidth(identity, identityMax);
-  const fittedRight = truncateToWidth(
-    right,
-    Math.max(0, safeWidth - visibleWidth(fittedIdentity) - gapWidth),
-  );
+  const fittedRight = truncateToWidth(right, Math.max(0, safeWidth - visibleWidth(fittedIdentity) - gapWidth));
   const leftMax = Math.max(0, safeWidth - visibleWidth(fittedRight) - gapWidth);
   let left = fittedIdentity;
 
-  if (
-    visibleWidth(fittedIdentity) === visibleWidth(identity)
-    && visibleWidth(fittedRight) === rightWidth
-  ) {
+  if (visibleWidth(fittedIdentity) === visibleWidth(identity) && visibleWidth(fittedRight) === rightWidth) {
     const separator = " · ";
     const summaryWidth = leftMax - visibleWidth(identity) - visibleWidth(separator);
+
     if (summaryWidth >= 2) {
       left += separator + truncateToWidth(summary, summaryWidth);
     }
@@ -312,16 +299,25 @@ export interface DashboardListViewport<T> {
   end: number;
 }
 
-export function dashboardListViewport<T>(items: readonly T[], selected: number, rows: number): DashboardListViewport<T> {
+export function dashboardListViewport<T>(
+  items: readonly T[],
+  selected: number,
+  rows: number,
+): DashboardListViewport<T> {
   const size = Math.max(0, Math.min(rows, items.length));
   const start = clampDashboard(selected - Math.floor(size / 2), 0, Math.max(0, items.length - size));
+
   return { items: items.slice(start, start + size), start, end: start + size };
 }
 
 /** Pads or truncates `lines` to exactly `rows` entries so panel geometry never shifts. */
 export function fitDashboardRows(lines: string[], rows: number): string[] {
   const bounded = lines.slice(0, Math.max(0, rows));
-  while (bounded.length < rows) bounded.push("");
+
+  while (bounded.length < rows) {
+    bounded.push("");
+  }
+
   return bounded;
 }
 
@@ -332,12 +328,14 @@ export function clampDashboard(value: number, min: number, max: number): number 
 /** Shared `Ns`/`Nm SSs` elapsed-time formatting for jobs, runs, and agents. */
 export function formatDurationLabel(elapsedMs: number): string {
   const seconds = Math.floor(Math.max(0, elapsedMs) / 1000);
+
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, "0")}s`;
 }
 
 /** A `── label ──` divider matching the panel's rounded-border rule style. */
 export function dashboardScrollRule(theme: Theme, label: string, width: number): string {
   const safeWidth = Math.max(0, width);
+
   return theme.fg("dim", truncateToWidth(`── ${label} ${"─".repeat(safeWidth)}`, safeWidth, ""));
 }
 
@@ -354,6 +352,7 @@ export function dashboardSectionRow(theme: Theme, label: string, count: number, 
 /** Width-safe notice for automatically folded low-priority entities. */
 export function dashboardFoldRow(theme: Theme, label: string, hidden: number, width: number): string {
   const safeWidth = Math.max(0, width);
+
   return theme.fg("dim", truncateToWidth(`… ${hidden} ${label} hidden`, safeWidth, ""));
 }
 
@@ -381,8 +380,12 @@ export function renderDashboardConfirmHint(
 ): { rendered: string; confirmed: boolean } {
   for (const [text, hintRight] of candidates) {
     const rendered = frame.hint(text, hintRight);
-    if (rendered.includes(marker)) return { rendered, confirmed: true };
+
+    if (rendered.includes(marker)) {
+      return { rendered, confirmed: true };
+    }
   }
+
   return { rendered: frame.hint(fallbackText, fallbackRight), confirmed: false };
 }
 
@@ -391,7 +394,10 @@ const DEFAULT_CANCEL_KEYS: readonly string[] = ["escape", "ctrl+c"];
 const DEFAULT_SUBMIT_KEYS: readonly string[] = ["enter"];
 
 function formatKeyId(key: string): string {
-  return key.split("+").map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join("+");
+  return key
+    .split("+")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join("+");
 }
 
 /**
@@ -408,8 +414,13 @@ function resolveKeyLabel(
 ): string {
   try {
     const keys = keybindings.getKeys(binding);
-    if (!keys.length) return fallback;
+
+    if (!keys.length) {
+      return fallback;
+    }
+
     const isDefault = keys.length === defaultKeys.length && keys.every((key, index) => key === defaultKeys[index]);
+
     return isDefault ? fallback : keys.map(formatKeyId).join("/");
   } catch {
     return fallback;
@@ -454,15 +465,25 @@ export function renderDashboardHelp(
     Math.max(4, ...groups.flatMap((group) => group.entries.map(([key]) => visibleWidth(key)))),
   );
   const body: string[] = [];
+
   for (const group of groups) {
-    if (!group.entries.length) continue;
-    if (body.length) body.push("");
+    if (!group.entries.length) {
+      continue;
+    }
+
+    if (body.length) {
+      body.push("");
+    }
+
     body.push(theme.fg("accent", group.title));
+
     for (const [key, description] of group.entries) {
       const label = truncateToWidth(key, keyColumn).padEnd(keyColumn, " ");
       body.push(truncateToWidth(`  ${theme.fg("text", label)}  ${theme.fg("muted", description)}`, width, ""));
     }
   }
+
   const lines = [frame.top(header), ...fitDashboardRows(body, rows).map((line) => frame.row(line)), frame.bottom()];
+
   return lines;
 }

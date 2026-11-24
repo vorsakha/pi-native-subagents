@@ -1,11 +1,20 @@
-import { readWorkflowHistory, writeWorkflowHistory, writeWorkflowFixture } from "./helpers.ts";
+import { readWorkflowHistory, writeWorkflowHistory } from "./helpers.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { CapabilityService } from "../src/capability-service.ts";
 import { JobManager } from "../src/manager.ts";
-import { availabilityFixture, ControlledBackend, DiscoverableBackend, ImmediateBackend, ScriptedHarnessAvailability, StaticWorkflowCheckout, tempDir, waitFor } from "./helpers.ts";
+import {
+  availabilityFixture,
+  ControlledBackend,
+  DiscoverableBackend,
+  ImmediateBackend,
+  ScriptedHarnessAvailability,
+  StaticWorkflowCheckout,
+  tempDir,
+  waitFor,
+} from "./helpers.ts";
 import { WorkflowManager } from "../src/workflows/manager.ts";
 import { loadWorkflowJournal } from "../src/workflows/artifacts.ts";
 
@@ -20,10 +29,25 @@ async function fixture() {
   const jobs = new JobManager({ backends: [codex, claude, pi] });
   const router = new CapabilityService({ backends: [codex, claude, pi], fingerprint: () => "stable" });
   const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1", router });
+
   return {
-    parent, cwd, codex, claude, pi, jobs, workflows,
+    parent,
+    cwd,
+    codex,
+    claude,
+    pi,
+    jobs,
+    workflows,
     request(script: string, overrides: Partial<Parameters<WorkflowManager["start"]>[0]> = {}) {
-      return { sessionId: "session-1", name: "capability workflow", script, cwd, trusted: true, defaultHarness: "codex" as const, ...overrides };
+      return {
+        sessionId: "session-1",
+        name: "capability workflow",
+        script,
+        cwd,
+        trusted: true,
+        defaultHarness: "codex" as const,
+        ...overrides,
+      };
     },
     async cleanup() {
       await workflows.shutdown(200).catch(() => undefined);
@@ -35,10 +59,13 @@ async function fixture() {
 
 test("workflow agent() with harness auto and requires routes to the harness that provides the capability", async () => {
   const f = await fixture();
+
   try {
-    const started = await f.workflows.start(f.request(`
+    const started = await f.workflows.start(
+      f.request(`
       export default async () => agent("lint the workspace", { name: "linter", harness: "auto", requires: ["tool:lint"] });
-    `));
+    `),
+    );
     const final = await started.completion;
     assert.equal(final.status, "completed");
     const agentRecord = final.agents[0]!;
@@ -56,10 +83,13 @@ test("workflow agent() with harness auto and requires routes to the harness that
 
 test("workflow agent() with an explicit harness that cannot satisfy requires fails that call without dispatching", async () => {
   const f = await fixture();
+
   try {
-    const started = await f.workflows.start(f.request(`
+    const started = await f.workflows.start(
+      f.request(`
       export default async () => agent("lint the workspace", { name: "linter", harness: "codex", requires: ["tool:lint"] });
-    `));
+    `),
+    );
     const final = await started.completion;
     const outcome = final.result as { ok: boolean; error?: string };
     assert.equal(outcome.ok, false);
@@ -102,33 +132,63 @@ test("replayed follow-up continuation retains and revalidates the original capab
     });
     return followUp(first.jobId, "lint follow-up");
   };`;
+
   try {
     const sourceRun = await workflows.start({
-      sessionId: "session-1", name: "capability continuation", script, cwd, trusted: true, defaultHarness: "codex",
+      sessionId: "session-1",
+      name: "capability continuation",
+      script,
+      cwd,
+      trusted: true,
+      defaultHarness: "codex",
     });
     await claude.waitForStart();
     const lineage = claude.starts[0]!;
     claude.complete(lineage, "initial lint");
     await claude.waitForSend();
     claude.emit(lineage, { type: "message", text: "follow-up progress" });
-    claude.fail(lineage, "quota", { provider: "claude", kind: "quota", authoritative: true, detail: "quota after progress" });
+    claude.fail(lineage, "quota", {
+      provider: "claude",
+      kind: "quota",
+      authoritative: true,
+      detail: "quota after progress",
+    });
     const source = await sourceRun.completion;
     assert.equal(codex.requests.length, 0, "the live continuation keeps the capability requirement");
 
     const journalPath = join(source.artifactDir, "runtime.sqlite");
-    const records = (await readWorkflowHistory(journalPath)).trim().split("\n").map((line) => JSON.parse(line) as { callIndex: number; state: string });
+    const records = (await readWorkflowHistory(journalPath))
+      .trim()
+      .split("\n")
+      .map((line) => JSON.parse(line) as { callIndex: number; state: string });
     const handoffIndex = records.findIndex((record) => record.callIndex === 1 && record.state === "handoff");
     assert.ok(handoffIndex >= 0);
-    await writeWorkflowHistory(journalPath, `${records.slice(0, handoffIndex + 1).map((record) => JSON.stringify(record)).join("\n")}\n`);
+    await writeWorkflowHistory(
+      journalPath,
+      `${records
+        .slice(0, handoffIndex + 1)
+        .map((record) => JSON.stringify(record))
+        .join("\n")}\n`,
+    );
 
     const replayed = await workflows.start({
-      sessionId: "session-1", name: "capability continuation", script, cwd, trusted: true, defaultHarness: "codex", resumeFromRunId: source.runId,
+      sessionId: "session-1",
+      name: "capability continuation",
+      script,
+      cwd,
+      trusted: true,
+      defaultHarness: "codex",
+      resumeFromRunId: source.runId,
     });
     const final = await replayed.completion;
     assert.equal((final.result as { ok: boolean }).ok, false);
     assert.match((final.result as { error?: string }).error ?? "", /required capabilities: tool:lint/);
     assert.deepEqual(final.agents[0]?.requires, ["tool:lint"]);
-    assert.equal(codex.requests.length, 0, "replay never dispatches a replacement without the original capability ceiling");
+    assert.equal(
+      codex.requests.length,
+      0,
+      "replay never dispatches a replacement without the original capability ceiling",
+    );
   } finally {
     await workflows.shutdown(200).catch(() => undefined);
     await jobs.shutdown(200).catch(() => undefined);
@@ -161,6 +221,7 @@ test("queued continuation revalidates readiness and capabilities at scheduler ad
       availability,
       checkout: new StaticWorkflowCheckout(),
     });
+
     try {
       const started = await workflows.start({
         sessionId: "session-1",
@@ -177,22 +238,34 @@ test("queued continuation revalidates readiness and capabilities at scheduler ad
       const primary = claude.starts[0]!;
       const blocker = jobs.spawn({ name: "direct blocker", task: "hold slot", cwd, trusted: true, harness: "codex" });
       claude.emit(primary, { type: "message", text: "progress" });
-      claude.fail(primary, "quota", { provider: "claude", kind: "quota", authoritative: true, detail: "quota after progress" });
+      claude.fail(primary, "quota", {
+        provider: "claude",
+        kind: "quota",
+        authoritative: true,
+        detail: "quota after progress",
+      });
       await codex.waitForStart();
       assert.equal(codex.starts[0], blocker.id);
-      await waitFor(() => jobs.list().some((job) => job.workflow?.runId === started.snapshot.runId && job.status === "queued"), "queued replacement");
+      await waitFor(
+        () => jobs.list().some((job) => job.workflow?.runId === started.snapshot.runId && job.status === "queued"),
+        "queued replacement",
+      );
 
       if (stale === "readiness") {
         availability.states.set("codex", availabilityFixture("codex", { ready: false, authenticated: false }));
       } else {
         codexProbe.setCapabilities([]);
       }
+
       codex.complete(blocker.id, "release");
 
       const final = await started.completion;
       const outcome = final.result as { ok: boolean; error?: string };
       assert.equal(outcome.ok, false);
-      assert.match(outcome.error ?? "", stale === "readiness" ? /codex.*unauthenticated|not ready|login/i : /required capabilities: tool:lint/i);
+      assert.match(
+        outcome.error ?? "",
+        stale === "readiness" ? /codex.*unauthenticated|not ready|login/i : /required capabilities: tool:lint/i,
+      );
       assert.equal(codex.requests.length, 1, `${stale} proof fails before replacement backend startup`);
       assert.equal(final.agents[0]?.continuation?.state, "failed");
     } finally {
@@ -218,10 +291,15 @@ test("a workflow agent revalidates the resolved harness at dispatch and records 
     codex: { version: "1.2.3" },
   });
   const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1", router, availability });
+
   try {
     // Explicit unauthenticated harness fails closed without dispatch and never reroutes.
     const explicit = await workflows.start({
-      sessionId: "session-1", name: "explicit", cwd, trusted: true, defaultHarness: "codex",
+      sessionId: "session-1",
+      name: "explicit",
+      cwd,
+      trusted: true,
+      defaultHarness: "codex",
       script: `export default async () => agent("do the thing", { name: "worker", harness: "claude" });`,
     });
     const explicitFinal = await explicit.completion;
@@ -238,7 +316,11 @@ test("a workflow agent revalidates the resolved harness at dispatch and records 
 
     // harness:auto excludes the unauthenticated claude and dispatches to ready codex.
     const auto = await workflows.start({
-      sessionId: "session-1", name: "auto", cwd, trusted: true, defaultHarness: "codex",
+      sessionId: "session-1",
+      name: "auto",
+      cwd,
+      trusted: true,
+      defaultHarness: "codex",
       script: `export default async () => agent("do the thing", { name: "worker", harness: "auto" });`,
     });
     const autoFinal = await auto.completion;
@@ -248,11 +330,18 @@ test("a workflow agent revalidates the resolved harness at dispatch and records 
     assert.equal(autoAgent.requestedHarness, "auto");
     assert.equal(autoAgent.availability, "ready", "the resolved auto route records its observed availability");
     assert.equal(autoAgent.executableVersion, "1.2.3");
-    assert.match(autoAgent.capabilityRevision ?? "", /^sha256:/, "the selected live capability catalog is fingerprinted");
-    assert.deepEqual(autoAgent.availabilityChecks?.map((check) => [check.harness, check.status]), [
-      ["claude", "unauthenticated"],
-      ["codex", "ready"],
-    ]);
+    assert.match(
+      autoAgent.capabilityRevision ?? "",
+      /^sha256:/,
+      "the selected live capability catalog is fingerprinted",
+    );
+    assert.deepEqual(
+      autoAgent.availabilityChecks?.map((check) => [check.harness, check.status]),
+      [
+        ["claude", "unauthenticated"],
+        ["codex", "ready"],
+      ],
+    );
     assert.equal(claude.requests.length, 0);
     assert.equal(codex.requests.length, 1);
     const autoJournal = await loadWorkflowJournal(artifactRoot, autoFinal.runId);
@@ -261,30 +350,45 @@ test("a workflow agent revalidates the resolved harness at dispatch and records 
     assert.equal(resolvedRoute?.harness, "codex");
     assert.equal(resolvedRoute?.executableVersion, "1.2.3");
     assert.match(resolvedRoute?.capabilityRevision ?? "", /^sha256:/);
-    assert.deepEqual(resolvedRoute?.availabilityChecks?.map((check) => [check.harness, check.status]), [
-      ["claude", "unauthenticated"],
-      ["codex", "ready"],
-    ]);
+    assert.deepEqual(
+      resolvedRoute?.availabilityChecks?.map((check) => [check.harness, check.status]),
+      [
+        ["claude", "unauthenticated"],
+        ["codex", "ready"],
+      ],
+    );
 
     // When every auto candidate becomes unavailable, the failed journal route
     // still carries normalized evidence for each exclusion.
-    availability.states.set("codex", availabilityFixture("codex", {
-      authenticated: false,
-      ready: false,
-      detail: "Codex is not logged in",
-    }));
+    availability.states.set(
+      "codex",
+      availabilityFixture("codex", {
+        authenticated: false,
+        ready: false,
+        detail: "Codex is not logged in",
+      }),
+    );
     const failedAuto = await workflows.start({
-      sessionId: "session-1", name: "auto failure", cwd, trusted: true, defaultHarness: "codex",
+      sessionId: "session-1",
+      name: "auto failure",
+      cwd,
+      trusted: true,
+      defaultHarness: "codex",
       script: `export default async () => agent("do the thing", { name: "worker", harness: "auto" });`,
     });
     const failedAutoFinal = await failedAuto.completion;
     assert.equal((failedAutoFinal.result as { ok: boolean }).ok, false);
     const failedAutoJournal = await loadWorkflowJournal(artifactRoot, failedAutoFinal.runId);
-    const failedAutoRoute = failedAutoJournal.map((record) => record.route).find((route) => route?.availabilityChecks?.length);
-    assert.deepEqual(failedAutoRoute?.availabilityChecks?.map((check) => [check.harness, check.status]), [
-      ["claude", "unauthenticated"],
-      ["codex", "unauthenticated"],
-    ]);
+    const failedAutoRoute = failedAutoJournal
+      .map((record) => record.route)
+      .find((route) => route?.availabilityChecks?.length);
+    assert.deepEqual(
+      failedAutoRoute?.availabilityChecks?.map((check) => [check.harness, check.status]),
+      [
+        ["claude", "unauthenticated"],
+        ["codex", "unauthenticated"],
+      ],
+    );
   } finally {
     await workflows.shutdown(200).catch(() => undefined);
     await jobs.shutdown(200).catch(() => undefined);
@@ -309,10 +413,18 @@ test("providerFallback uses only authoritative explicit-route readiness states a
     const jobs = new JobManager({ backends: [codex, claude] });
     const router = new CapabilityService({ backends: [codex, claude], fingerprint: () => "stable" });
     const availability = new ScriptedHarnessAvailability({
-      claude: { harness: "claude", status, detected: status !== "missing", ready: false, reason: status, checkedAt: 1_000 },
+      claude: {
+        harness: "claude",
+        status,
+        detected: status !== "missing",
+        ready: false,
+        reason: status,
+        checkedAt: 1_000,
+      },
       codex: availabilityFixture("codex", { version: "2.0.0" }),
     });
     const workflows = new WorkflowManager({ jobs, artifactRoot, sessionId: "session-1", router, availability });
+
     try {
       const started = await workflows.start({
         sessionId: "session-1",
@@ -326,10 +438,14 @@ test("providerFallback uses only authoritative explicit-route readiness states a
       assert.equal(codex.requests.length, eligible ? 1 : 0, status);
       assert.equal(claude.requests.length, 0, status);
       assert.equal(final.agents[0]?.attempts?.[0]?.trigger?.status, eligible ? status : undefined, status);
+
       if (eligible) {
         assert.equal(final.agents[0]?.harness, "codex");
         assert.equal(final.agents[0]?.availability, "ready");
-        assert.deepEqual(availability.asked.map((entry) => entry.harness), ["claude", "codex"]);
+        assert.deepEqual(
+          availability.asked.map((entry) => entry.harness),
+          ["claude", "codex"],
+        );
       }
     } finally {
       await workflows.shutdown(200).catch(() => undefined);
@@ -346,9 +462,14 @@ test("workflow agent() with requires but no router configured fails that call in
   const codex = new DiscoverableBackend("codex", []);
   const jobs = new JobManager({ backends: [codex] });
   const workflows = new WorkflowManager({ jobs, artifactRoot: join(parent, "artifacts"), sessionId: "session-1" });
+
   try {
     const started = await workflows.start({
-      sessionId: "session-1", name: "no router", cwd, trusted: true, defaultHarness: "codex",
+      sessionId: "session-1",
+      name: "no router",
+      cwd,
+      trusted: true,
+      defaultHarness: "codex",
       script: `export default async () => agent("needs a capability", { harness: "codex", requires: ["tool:lint"] });`,
     });
     const final = await started.completion;

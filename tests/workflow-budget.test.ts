@@ -35,7 +35,10 @@ test("agentTokens tolerates agents with missing or partial usage", () => {
 });
 
 test("formatWorkflowBudget always returns a string, never undefined, for an open budget", () => {
-  const open: string = formatWorkflowBudget({ budget: undefined, agents: [] }, { input: 0, output: 0, cost: 0, turns: 0 });
+  const open: string = formatWorkflowBudget(
+    { budget: undefined, agents: [] },
+    { input: 0, output: 0, cost: 0, turns: 0 },
+  );
   assert.equal(open, "open");
 });
 
@@ -69,17 +72,17 @@ test("workflowBudgetHealth distinctly names hard call and spend exhaustion as ab
     budget: { maxAgents: 2 },
     agents: [{ state: "completed" }, { state: "completed" }],
   } as Pick<WorkflowSnapshot, "budget" | "agents">;
-  assert.deepEqual(
-    workflowBudgetHealth(agentsExhausted, { input: 0, output: 0, cost: 0, turns: 0 }),
-    { text: "budget reached (agents)", abnormal: true },
-  );
+  assert.deepEqual(workflowBudgetHealth(agentsExhausted, { input: 0, output: 0, cost: 0, turns: 0 }), {
+    text: "budget reached (agents)",
+    abnormal: true,
+  });
 
   const spendExhausted = {
     budget: { maxTokens: 10, maxTurns: 2, maxCost: 1 },
     agents: [{ state: "completed" }],
   } as Pick<WorkflowSnapshot, "budget" | "agents">;
-  assert.deepEqual(
-    workflowBudgetHealth(spendExhausted, { input: 8, output: 5, cost: 1.5, turns: 3 }),
-    { text: "budget reached (tokens, turns, cost)", abnormal: true },
-  );
+  assert.deepEqual(workflowBudgetHealth(spendExhausted, { input: 8, output: 5, cost: 1.5, turns: 3 }), {
+    text: "budget reached (tokens, turns, cost)",
+    abnormal: true,
+  });
 });

@@ -27,15 +27,17 @@ function piCatalog(sources: CapabilitySourceStatus[], warnings: string[] = []) {
 }
 
 test("claude auth status yields masked account metadata and subscription-only readiness", () => {
-  const facts = parseClaudeAuthStatus(JSON.stringify({
-    loggedIn: true,
-    authMethod: "claude.ai",
-    email: "engineer@example.com",
-    subscriptionType: "max",
-    organization: { name: "Acme Engineering", uuid: "org-123" },
-    accessToken: "sk-ant-oat-super-secret",
-    oauthAccount: { refreshToken: "refresh-super-secret" },
-  }));
+  const facts = parseClaudeAuthStatus(
+    JSON.stringify({
+      loggedIn: true,
+      authMethod: "claude.ai",
+      email: "engineer@example.com",
+      subscriptionType: "max",
+      organization: { name: "Acme Engineering", uuid: "org-123" },
+      accessToken: "sk-ant-oat-super-secret",
+      oauthAccount: { refreshToken: "refresh-super-secret" },
+    }),
+  );
   const status = claudeStatus(facts, 5_000);
   assert.equal(status.ready, true);
   assert.equal(status.authenticated, true);
@@ -51,14 +53,32 @@ test("claude auth status yields masked account metadata and subscription-only re
   assert.ok(!/secret|accessToken|refreshToken/i.test(serialized), "credential fields are dropped by the parser");
 
   // Shape emitted by the installed CLI: a flat record with orgId/orgName.
-  const flat = claudeStatus(parseClaudeAuthStatus(JSON.stringify({
-    loggedIn: true, authMethod: "claude.ai", apiProvider: "anthropic",
-    email: "pilot@example.org", orgId: "org-abc", orgName: "Acme", subscriptionType: "pro",
-  })), 5_000);
-  assert.deepEqual(flat.account, { email: "p***@example.org", plan: "pro", authMethod: "claude.ai", organization: "Acme" });
+  const flat = claudeStatus(
+    parseClaudeAuthStatus(
+      JSON.stringify({
+        loggedIn: true,
+        authMethod: "claude.ai",
+        apiProvider: "anthropic",
+        email: "pilot@example.org",
+        orgId: "org-abc",
+        orgName: "Acme",
+        subscriptionType: "pro",
+      }),
+    ),
+    5_000,
+  );
+  assert.deepEqual(flat.account, {
+    email: "p***@example.org",
+    plan: "pro",
+    authMethod: "claude.ai",
+    organization: "Acme",
+  });
   assert.ok(!JSON.stringify(flat).includes("org-abc"), "opaque account identifiers are not displayed");
 
-  const apiKey = claudeStatus(parseClaudeAuthStatus(JSON.stringify({ loggedIn: true, authMethod: "apiKey", email: "b@c.io" })), 5_000);
+  const apiKey = claudeStatus(
+    parseClaudeAuthStatus(JSON.stringify({ loggedIn: true, authMethod: "apiKey", email: "b@c.io" })),
+    5_000,
+  );
   assert.equal(apiKey.authenticated, true, "an API-key login is still an authenticated CLI");
   assert.equal(apiKey.ready, false, "subagents require the claude.ai subscription route");
   assert.match(apiKey.detail ?? "", /claude\.ai subscription login/);
@@ -74,9 +94,12 @@ test("claude auth status yields masked account metadata and subscription-only re
 });
 
 test("codex account/read yields account type and plan without credentials", () => {
-  const status = codexStatus(parseCodexAccount({
-    account: { type: "chatgpt", email: "pilot@openai.com", planType: "pro", tokens: { idToken: "secret" } },
-  }), 7_000);
+  const status = codexStatus(
+    parseCodexAccount({
+      account: { type: "chatgpt", email: "pilot@openai.com", planType: "pro", tokens: { idToken: "secret" } },
+    }),
+    7_000,
+  );
   assert.equal(status.ready, true);
   assert.deepEqual(status.account, { email: "p***@openai.com", plan: "pro", authMethod: "chatgpt" });
   assert.ok(!JSON.stringify(status).includes("secret"), "token payloads never reach the status");
@@ -92,27 +115,37 @@ test("codex account/read yields account type and plan without credentials", () =
 });
 
 test("pi readiness reuses the zero-turn catalog and never invents an account", () => {
-  const ready = piStatusFromCatalog(piCatalog([
-    { source: "pi-parent", health: "healthy" },
-    { source: "pi-child", health: "healthy" },
-    { source: "pi-model", health: "healthy", detail: "anthropic/claude-opus-5" },
-  ]), 9_000);
+  const ready = piStatusFromCatalog(
+    piCatalog([
+      { source: "pi-parent", health: "healthy" },
+      { source: "pi-child", health: "healthy" },
+      { source: "pi-model", health: "healthy", detail: "anthropic/claude-opus-5" },
+    ]),
+    9_000,
+  );
   assert.deepEqual([ready.installed, ready.authenticated, ready.ready], [true, true, true]);
   assert.equal(ready.model, "anthropic/claude-opus-5");
   assert.equal(ready.account?.email, undefined);
   assert.match(ready.account?.unavailable ?? "", /does not expose an account email/);
 
-  const unauthenticated = piStatusFromCatalog(piCatalog([
-    { source: "pi-child", health: "healthy" },
-    { source: "pi-model", health: "unavailable", detail: "Pi has no selected authenticated model" },
-  ]), 9_000);
-  assert.deepEqual([unauthenticated.installed, unauthenticated.authenticated, unauthenticated.ready], [true, false, false]);
+  const unauthenticated = piStatusFromCatalog(
+    piCatalog([
+      { source: "pi-child", health: "healthy" },
+      { source: "pi-model", health: "unavailable", detail: "Pi has no selected authenticated model" },
+    ]),
+    9_000,
+  );
+  assert.deepEqual(
+    [unauthenticated.installed, unauthenticated.authenticated, unauthenticated.ready],
+    [true, false, false],
+  );
   assert.equal(unauthenticated.model, undefined, "an unusable model is never reported as selected and ready");
   assert.match(unauthenticated.detail ?? "", /no selected authenticated model/);
 
-  const missing = piStatusFromCatalog(piCatalog([
-    { source: "pi-child", health: "unavailable", detail: "spawn pi ENOENT" },
-  ]), 9_000);
+  const missing = piStatusFromCatalog(
+    piCatalog([{ source: "pi-child", health: "unavailable", detail: "spawn pi ENOENT" }]),
+    9_000,
+  );
   assert.deepEqual([missing.installed, missing.authenticated, missing.ready], [false, false, false]);
 });
 
@@ -125,21 +158,32 @@ test("the service caches statuses, refreshes on demand, and turns probe failures
     piReadiness: {
       async catalog() {
         calls.pi++;
+
         return piCatalog([{ source: "pi-model", health: "healthy", detail: "anthropic/claude-opus-5" }]);
       },
     },
     readClaudeAuth: async () => {
       calls.claude++;
-      return JSON.stringify({ loggedIn: true, authMethod: "claude.ai", email: "engineer@example.com", subscriptionType: "max" });
+
+      return JSON.stringify({
+        loggedIn: true,
+        authMethod: "claude.ai",
+        email: "engineer@example.com",
+        subscriptionType: "max",
+      });
     },
     readCodexAccount: async () => {
       calls.codex++;
+
       return { account: { type: "chatgpt", email: "pilot@openai.com", planType: "pro" } };
     },
   });
 
   const first = await service.statuses({ cwd: "/proj" });
-  assert.deepEqual(first.map((status) => status.harness), ["pi", "claude", "codex"]);
+  assert.deepEqual(
+    first.map((status) => status.harness),
+    ["pi", "claude", "codex"],
+  );
   assert.ok(first.every((status) => status.ready));
 
   await service.statuses({ cwd: "/proj" });
@@ -150,7 +194,11 @@ test("the service caches statuses, refreshes on demand, and turns probe failures
 
   now += 60_000;
   await service.statuses({ cwd: "/proj", harnesses: ["claude"] });
-  assert.deepEqual(calls, { claude: 3, codex: 2, pi: 2 }, "an expired entry is reprobed for the requested harness only");
+  assert.deepEqual(
+    calls,
+    { claude: 3, codex: 2, pi: 2 },
+    "an expired entry is reprobed for the requested harness only",
+  );
 });
 
 test("a slow probe that settles after a refresh cannot restore the older status", async () => {
@@ -180,9 +228,17 @@ test("a missing CLI and a failing probe stay distinguishable and never reject", 
   const missing = Object.assign(new Error("spawn claude ENOENT"), { code: "ENOENT" });
   const service = new ProviderStatusService({
     now: () => 2_000,
-    piReadiness: { async catalog() { throw new Error("pi probe crashed"); } },
-    readClaudeAuth: async () => { throw missing; },
-    readCodexAccount: async () => { throw new Error("JSON-RPC request timed out: account/read"); },
+    piReadiness: {
+      async catalog() {
+        throw new Error("pi probe crashed");
+      },
+    },
+    readClaudeAuth: async () => {
+      throw missing;
+    },
+    readCodexAccount: async () => {
+      throw new Error("JSON-RPC request timed out: account/read");
+    },
   });
   const [pi, claude, codex] = await service.statuses({ cwd: "/proj" });
   assert.deepEqual([claude.installed, claude.authenticated, claude.ready], [false, false, false]);
@@ -206,20 +262,26 @@ test("an aborted request fails the probe instead of hanging", async () => {
 
 test("addresses embedded in free-text provider fields are masked too", () => {
   // A personal Claude account names its org after the full login address.
-  const status = claudeStatus(parseClaudeAuthStatus(JSON.stringify({
-    loggedIn: true,
-    authMethod: "claude.ai",
-    email: "engineer@example.com",
-    orgName: "engineer@example.com's Organization",
-    subscriptionType: "pro",
-  })), 1_000);
+  const status = claudeStatus(
+    parseClaudeAuthStatus(
+      JSON.stringify({
+        loggedIn: true,
+        authMethod: "claude.ai",
+        email: "engineer@example.com",
+        orgName: "engineer@example.com's Organization",
+        subscriptionType: "pro",
+      }),
+    ),
+    1_000,
+  );
   assert.equal(status.account?.organization, "e***@example.com's Organization");
   const rendered = `${JSON.stringify(status)}${formatProviderStatusReport([status], 1_000)}`;
   assert.ok(!rendered.includes("engineer@example.com"), "no retained or rendered field carries the full address");
 
-  const failed = piStatusFromCatalog(piCatalog(
-    [{ source: "pi-child", health: "unavailable", detail: "pi is not logged in as engineer@example.com" }],
-  ), 1_000);
+  const failed = piStatusFromCatalog(
+    piCatalog([{ source: "pi-child", health: "unavailable", detail: "pi is not logged in as engineer@example.com" }]),
+    1_000,
+  );
   assert.match(failed.detail ?? "", /e\*\*\*@example\.com/);
   assert.equal(maskEmbeddedEmails("plain text without an address"), "plain text without an address");
 });
@@ -235,8 +297,21 @@ test("email masking keeps the domain and hides the address", () => {
 
 test("the report states the readiness stages without claiming a model request", () => {
   const statuses: ProviderStatus[] = [
-    piStatusFromCatalog(piCatalog([{ source: "pi-model", health: "healthy", detail: "anthropic/claude-opus-5" }]), 1_000),
-    claudeStatus(parseClaudeAuthStatus(JSON.stringify({ loggedIn: true, authMethod: "claude.ai", email: "engineer@example.com", subscriptionType: "max" })), 1_000),
+    piStatusFromCatalog(
+      piCatalog([{ source: "pi-model", health: "healthy", detail: "anthropic/claude-opus-5" }]),
+      1_000,
+    ),
+    claudeStatus(
+      parseClaudeAuthStatus(
+        JSON.stringify({
+          loggedIn: true,
+          authMethod: "claude.ai",
+          email: "engineer@example.com",
+          subscriptionType: "max",
+        }),
+      ),
+      1_000,
+    ),
     codexStatus(parseCodexAccount({ account: { type: "apikey" } }), 1_000),
   ];
   const report = formatProviderStatusReport(statuses, 4_000);

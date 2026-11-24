@@ -55,7 +55,11 @@ function errorMessage(error: unknown): string {
 async function ensurePrivateDirectory(path: string): Promise<void> {
   await mkdir(path, { recursive: true, mode: 0o700 });
   const info = await lstat(path);
-  if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`Workflow retention path is not a private directory: ${path}`);
+
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error(`Workflow retention path is not a private directory: ${path}`);
+  }
+
   await chmod(path, 0o700);
 }
 
@@ -66,6 +70,7 @@ function retentionStateDirectory(root: string): string {
 async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   const temporary = join(dirname(path), `.${basename(path)}.${randomBytes(8).toString("hex")}.tmp`);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
+
   try {
     handle = await open(temporary, "wx", 0o600);
     await handle.writeFile(JSON.stringify(value), "utf8");
@@ -78,14 +83,19 @@ async function atomicWriteJson(path: string, value: unknown): Promise<void> {
   } catch (error) {
     await handle?.close().catch(() => undefined);
     await rm(temporary, { force: true }).catch(() => undefined);
+
     throw error;
   }
 }
 
 function processIsAlive(pid: number): boolean {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  if (!Number.isSafeInteger(pid) || pid <= 0) {
+    return false;
+  }
+
   try {
     process.kill(pid, 0);
+
     return true;
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === "EPERM";
@@ -94,16 +104,24 @@ function processIsAlive(pid: number): boolean {
 
 function parseRetentionLockOwner(serialized: string): RetentionLockOwner | undefined {
   let owner: RetentionLockOwner;
+
   try {
     owner = JSON.parse(serialized) as RetentionLockOwner;
   } catch {
     return undefined;
   }
+
   if (
-    !Number.isSafeInteger(owner.pid) || owner.pid <= 0
-    || typeof owner.token !== "string" || owner.token.length === 0
-    || !Number.isSafeInteger(owner.createdAt) || owner.createdAt <= 0
-  ) return undefined;
+    !Number.isSafeInteger(owner.pid) ||
+    owner.pid <= 0 ||
+    typeof owner.token !== "string" ||
+    owner.token.length === 0 ||
+    !Number.isSafeInteger(owner.createdAt) ||
+    owner.createdAt <= 0
+  ) {
+    return undefined;
+  }
+
   return owner;
 }
 
@@ -112,7 +130,10 @@ function currentBootStartedAt(): number {
 }
 
 function retentionLockOwnerIsAlive(owner: RetentionLockOwner): boolean {
-  if (owner.createdAt < currentBootStartedAt() - BOOT_TIME_TOLERANCE_MS) return false;
+  if (owner.createdAt < currentBootStartedAt() - BOOT_TIME_TOLERANCE_MS) {
+    return false;
+  }
+
   return processIsAlive(owner.pid);
 }
 
@@ -120,12 +141,16 @@ async function readRetentionLockOwners(lockPath: string): Promise<RetentionLockO
   try {
     const serialized = await readFile(join(lockPath, RETENTION_LOCK_OWNER_NAME), "utf8");
     const owner = parseRetentionLockOwner(serialized);
+
     return owner ? [owner] : [];
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") return [];
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      return [];
+    }
   }
 
   let entries;
+
   try {
     entries = await readdir(lockPath, { withFileTypes: true });
   } catch {
@@ -133,32 +158,47 @@ async function readRetentionLockOwners(lockPath: string): Promise<RetentionLockO
   }
 
   const owners: RetentionLockOwner[] = [];
+
   for (const entry of entries) {
-    if (!entry.isFile() || !RETENTION_LOCK_OWNER_TEMP_PATTERN.test(entry.name)) continue;
+    if (!entry.isFile() || !RETENTION_LOCK_OWNER_TEMP_PATTERN.test(entry.name)) {
+      continue;
+    }
+
     try {
       const owner = parseRetentionLockOwner(await readFile(join(lockPath, entry.name), "utf8"));
-      if (owner) owners.push(owner);
+
+      if (owner) {
+        owners.push(owner);
+      }
     } catch {
       // A concurrent owner may still be writing its temporary file.
     }
   }
+
   return owners;
 }
 
 async function reclaimDeadRetentionLock(lockPath: string): Promise<boolean> {
   const owners = await readRetentionLockOwners(lockPath);
-  if (owners.some(retentionLockOwnerIsAlive)) return false;
+
+  if (owners.some(retentionLockOwnerIsAlive)) {
+    return false;
+  }
 
   if (owners.length === 0) {
     try {
       const info = await lstat(lockPath);
-      if (info.mtimeMs >= currentBootStartedAt() - BOOT_TIME_TOLERANCE_MS) return false;
+
+      if (info.mtimeMs >= currentBootStartedAt() - BOOT_TIME_TOLERANCE_MS) {
+        return false;
+      }
     } catch (error) {
       return (error as NodeJS.ErrnoException).code === "ENOENT";
     }
   }
 
   await rm(lockPath, { recursive: true, force: true });
+
   return true;
 }
 
@@ -169,8 +209,10 @@ async function acquireRetentionLock(root: string): Promise<() => Promise<void>> 
   await ensurePrivateDirectory(stateDirectory);
   const lockPath = join(stateDirectory, RETENTION_LOCK_NAME);
   const deadline = Date.now() + RETENTION_LOCK_TIMEOUT_MS;
+
   for (;;) {
     let created = false;
+
     try {
       await mkdir(lockPath, { mode: 0o700 });
       created = true;
@@ -180,21 +222,36 @@ async function acquireRetentionLock(root: string): Promise<() => Promise<void>> 
         createdAt: Date.now(),
       } satisfies RetentionLockOwner);
       let released = false;
+
       return async () => {
-        if (released) return;
+        if (released) {
+          return;
+        }
+
         released = true;
         await rm(lockPath, { recursive: true, force: true });
       };
     } catch (error) {
       if (created) {
         await rm(lockPath, { recursive: true, force: true }).catch(() => undefined);
+
         throw error;
       }
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (await reclaimDeadRetentionLock(lockPath)) continue;
-      if (Date.now() >= deadline) throw new Error(`Timed out waiting for workflow retention lock: ${normalizedRoot}`);
-      await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, RETENTION_LOCK_RETRY_MS));
+
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+        throw error;
+      }
     }
+
+    if (await reclaimDeadRetentionLock(lockPath)) {
+      continue;
+    }
+
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for workflow retention lock: ${normalizedRoot}`);
+    }
+
+    await new Promise<void>((resolveDelay) => setTimeout(resolveDelay, RETENTION_LOCK_RETRY_MS));
   }
 }
 
@@ -202,6 +259,7 @@ async function acquireRetentionLock(root: string): Promise<() => Promise<void>> 
  * share the same machine-global artifact root. */
 export async function withWorkflowRetentionLock<T>(root: string, action: () => Promise<T>): Promise<T> {
   const release = await acquireRetentionLock(root);
+
   try {
     return await action();
   } finally {
@@ -212,6 +270,7 @@ export async function withWorkflowRetentionLock<T>(root: string, action: () => P
 async function ensureLeaseDirectory(root: string): Promise<string> {
   const directory = join(retentionStateDirectory(root), LEASE_DIRECTORY_NAME);
   await ensurePrivateDirectory(directory);
+
   return directory;
 }
 
@@ -220,47 +279,78 @@ function leasePath(root: string, token: string): string {
 }
 
 function leaseRunIds(state: DurableWorkflowLease): string[] {
-  if (state.version !== 1 || typeof state.sessionId !== "string"
-      || !Number.isSafeInteger(state.pid) || state.pid <= 0 || typeof state.token !== "string"
-      || !Number.isSafeInteger(state.createdAt) || !Number.isSafeInteger(state.heartbeatAt)
-      || !Array.isArray(state.runIds) || state.runIds.some((runId) => typeof runId !== "string" || !/^wf_[a-f0-9]+$/.test(runId))) {
+  if (
+    state.version !== 1 ||
+    typeof state.sessionId !== "string" ||
+    !Number.isSafeInteger(state.pid) ||
+    state.pid <= 0 ||
+    typeof state.token !== "string" ||
+    !Number.isSafeInteger(state.createdAt) ||
+    !Number.isSafeInteger(state.heartbeatAt) ||
+    !Array.isArray(state.runIds) ||
+    state.runIds.some((runId) => typeof runId !== "string" || !/^wf_[a-f0-9]+$/.test(runId))
+  ) {
     throw new Error("Workflow session lease is invalid");
   }
+
   return state.runIds;
 }
 
 async function activeLeaseRunIds(root: string): Promise<Set<string>> {
   const directory = join(retentionStateDirectory(root), LEASE_DIRECTORY_NAME);
   let entries;
+
   try {
     const info = await lstat(directory);
-    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error(`Workflow lease path is not a private directory: ${directory}`);
+
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new Error(`Workflow lease path is not a private directory: ${directory}`);
+    }
+
     entries = await readdir(directory, { withFileTypes: true });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return new Set();
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return new Set();
+    }
+
     throw error;
   }
 
   const runIds = new Set<string>();
   const stale: string[] = [];
+
   for (const entry of entries) {
-    if (!entry.name.endsWith(".json")) continue;
-    if (!entry.isFile()) throw new Error(`Workflow session lease is not a regular file: ${entry.name}`);
+    if (!entry.name.endsWith(".json")) {
+      continue;
+    }
+
+    if (!entry.isFile()) {
+      throw new Error(`Workflow session lease is not a regular file: ${entry.name}`);
+    }
+
     const path = join(directory, entry.name);
     let state: DurableWorkflowLease;
+
     try {
       state = JSON.parse(await readFile(path, "utf8")) as DurableWorkflowLease;
       leaseRunIds(state);
     } catch (error) {
       throw new Error(`Could not read workflow session lease ${entry.name}: ${errorMessage(error)}`);
     }
+
     if (processIsAlive(state.pid)) {
-      for (const runId of state.runIds) runIds.add(runId);
+      for (const runId of state.runIds) {
+        runIds.add(runId);
+      }
     } else {
       stale.push(path);
     }
   }
-  for (const path of stale) await rm(path, { force: true });
+
+  for (const path of stale) {
+    await rm(path, { force: true });
+  }
+
   return runIds;
 }
 
@@ -297,20 +387,36 @@ export async function openWorkflowSessionLease(root: string, sessionId: string):
   let mutationChain: Promise<void> = Promise.resolve();
   const writeStateWhileLocked = async (runIds: Iterable<string>): Promise<void> => {
     const next = [...new Set(runIds)];
-    if (next.some((runId) => !/^wf_[a-f0-9]+$/.test(runId))) throw new Error("Workflow session lease contains an invalid run ID");
+
+    if (next.some((runId) => !/^wf_[a-f0-9]+$/.test(runId))) {
+      throw new Error("Workflow session lease contains an invalid run ID");
+    }
+
     state.runIds = next;
     state.heartbeatAt = Date.now();
     await atomicWriteJson(path, state);
   };
+
   const enqueueMutation = <T>(action: () => Promise<T>): Promise<T> => {
     const next = mutationChain.catch(() => undefined).then(action);
-    mutationChain = next.then(() => undefined, () => undefined);
+    mutationChain = next.then(
+      () => undefined,
+      () => undefined,
+    );
+
     return next;
   };
+
   const heartbeat = setInterval(() => {
-    if (closed) return;
+    if (closed) {
+      return;
+    }
+
     void enqueueMutation(async () => {
-      if (closed) return;
+      if (closed) {
+        return;
+      }
+
       await withWorkflowRetentionLock(normalizedRoot, () => writeStateWhileLocked(state.runIds));
     }).catch(() => undefined);
   }, LEASE_HEARTBEAT_MS);
@@ -321,23 +427,37 @@ export async function openWorkflowSessionLease(root: string, sessionId: string):
     async claim(runIds) {
       const requested = [...runIds];
       await enqueueMutation(async () => {
-        if (closed) throw new Error("Workflow session lease is closed");
+        if (closed) {
+          throw new Error("Workflow session lease is closed");
+        }
+
         const next = [...new Set([...state.runIds, ...requested])];
         await withWorkflowRetentionLock(normalizedRoot, () => writeStateWhileLocked(next));
       });
     },
     async claimWhileLocked(runIds) {
-      if (closed) throw new Error("Workflow session lease is closed");
+      if (closed) {
+        throw new Error("Workflow session lease is closed");
+      }
+
       await writeStateWhileLocked([...new Set([...state.runIds, ...runIds])]);
     },
     async release(runId) {
       await enqueueMutation(async () => {
-        if (closed) return;
-        await withWorkflowRetentionLock(normalizedRoot, () => writeStateWhileLocked(state.runIds.filter((candidate) => candidate !== runId)));
+        if (closed) {
+          return;
+        }
+
+        await withWorkflowRetentionLock(normalizedRoot, () =>
+          writeStateWhileLocked(state.runIds.filter((candidate) => candidate !== runId)),
+        );
       });
     },
     async close() {
-      if (closed) return;
+      if (closed) {
+        return;
+      }
+
       closed = true;
       clearInterval(heartbeat);
       await mutationChain;
@@ -401,17 +521,30 @@ async function protectedWorktreesForRun(
 ): Promise<WorkflowProtectedWorktree[]> {
   const results: WorkflowProtectedWorktree[] = [];
   const recorded = new Set<number>();
+
   for (const agent of snapshot?.agents ?? []) {
     const isolation = agent.isolation;
-    if (!isolation) continue;
-    if (isolation.state === "removed") continue;
+
+    if (!isolation) {
+      continue;
+    }
+
+    if (isolation.state === "removed") {
+      continue;
+    }
+
     if (isolation.state !== "preserved" && isolation.state !== "orphaned") {
       throw new Error(`Workflow agent ${agent.index} has an unknown worktree state`);
     }
+
     if (!Number.isSafeInteger(agent.index) || agent.index < 0 || agent.index >= 32) {
       throw new Error(`Workflow agent has an invalid worktree index: ${agent.index}`);
     }
-    if (recorded.has(agent.index)) throw new Error(`Workflow has duplicate protected worktree index: ${agent.index}`);
+
+    if (recorded.has(agent.index)) {
+      throw new Error(`Workflow has duplicate protected worktree index: ${agent.index}`);
+    }
+
     recorded.add(agent.index);
     results.push({
       runId,
@@ -424,28 +557,54 @@ async function protectedWorktreesForRun(
       unrecorded: false,
     });
   }
+
   let entries;
   const worktreesDirectory = workflowWorktreeDirectory(artifactDir);
+
   try {
     const directoryInfo = await lstat(worktreesDirectory);
+
     if (directoryInfo.isSymbolicLink() || !directoryInfo.isDirectory()) {
       throw new Error(`Workflow worktrees path is not a private directory: ${worktreesDirectory}`);
     }
+
     entries = await readdir(worktreesDirectory, { withFileTypes: true });
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return results;
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return results;
+    }
+
     throw error;
   }
+
   const active = snapshot?.status === "running" || snapshot?.status === "paused";
+
   for (const entry of entries) {
     const match = AGENT_DIRECTORY_PATTERN.exec(entry.name);
-    if (!match) throw new Error(`Unrecognized entry under workflow worktrees directory: ${entry.name}`);
-    if (!entry.isDirectory()) throw new Error(`Workflow worktree entry is not a directory: ${entry.name}`);
+
+    if (!match) {
+      throw new Error(`Unrecognized entry under workflow worktrees directory: ${entry.name}`);
+    }
+
+    if (!entry.isDirectory()) {
+      throw new Error(`Workflow worktree entry is not a directory: ${entry.name}`);
+    }
+
     const agentIndex = Number(match[1]);
-    if (!Number.isSafeInteger(agentIndex) || agentIndex < 0 || agentIndex >= 32 || `agent-${agentIndex}` !== entry.name) {
+
+    if (
+      !Number.isSafeInteger(agentIndex) ||
+      agentIndex < 0 ||
+      agentIndex >= 32 ||
+      `agent-${agentIndex}` !== entry.name
+    ) {
       throw new Error(`Ambiguous workflow worktree directory entry: ${entry.name}`);
     }
-    if (recorded.has(agentIndex)) continue;
+
+    if (recorded.has(agentIndex)) {
+      continue;
+    }
+
     results.push({
       runId,
       agentIndex,
@@ -456,6 +615,7 @@ async function protectedWorktreesForRun(
       unrecorded: true,
     });
   }
+
   return results;
 }
 
@@ -466,17 +626,23 @@ export async function listWorkflowRunRetentionRecords(root: string): Promise<Wor
   const normalizedRoot = resolve(root);
   const runIds = await listWorkflowRunIds(normalizedRoot);
   const records: WorkflowRunRetentionRecord[] = [];
+
   for (const runId of runIds) {
     const artifactDir = workflowRunDirectory(normalizedRoot, runId);
     const snapshot = await readWorkflowRunSummary(normalizedRoot, runId);
     let worktrees: WorkflowProtectedWorktree[] = [];
     let scanError: string | undefined;
+
     try {
       worktrees = await protectedWorktreesForRun(runId, snapshot, artifactDir);
     } catch (error) {
       scanError = `Could not inspect workflow worktrees: ${errorMessage(error)}`;
     }
-    if (!snapshot) scanError = scanError ? `${scanError}; workflow summary is unreadable` : "Workflow summary is unreadable";
+
+    if (!snapshot) {
+      scanError = scanError ? `${scanError}; workflow summary is unreadable` : "Workflow summary is unreadable";
+    }
+
     records.push({
       runId,
       artifactDir,
@@ -488,6 +654,7 @@ export async function listWorkflowRunRetentionRecords(root: string): Promise<Wor
       scanError,
     });
   }
+
   return records;
 }
 
@@ -511,21 +678,32 @@ export function planWorkflowRetention(
 
   const remove: string[] = [];
   const keep: string[] = [];
+
   for (const record of records) {
-    if (!record.readable || record.scanError || protectRunIds.has(record.runId) || withinWindow.has(record.runId) || record.worktrees.length > 0) {
+    if (
+      !record.readable ||
+      record.scanError ||
+      protectRunIds.has(record.runId) ||
+      withinWindow.has(record.runId) ||
+      record.worktrees.length > 0
+    ) {
       keep.push(record.runId);
       continue;
     }
+
     const active = record.status === "running" || record.status === "paused";
     // staleAfterMs=0 mirrors abortStaleWorkflow's no-resume mode: any active
     // checkpoint is treated as stale rather than immortal.
     const stale = active && (staleAfterMs === 0 || now - record.updatedAt > staleAfterMs);
+
     if (!isTerminal(record.status) && !stale) {
       keep.push(record.runId);
       continue;
     }
+
     remove.push(record.runId);
   }
+
   return { remove, keep };
 }
 
@@ -536,18 +714,27 @@ export async function applyWorkflowRetention(
   options: WorkflowRetentionOptions = {},
 ): Promise<WorkflowRetentionReport> {
   const normalizedRoot = resolve(root);
+
   try {
     return await withWorkflowRetentionLock(normalizedRoot, async () => {
       let records: WorkflowRunRetentionRecord[];
+
       try {
         records = await listWorkflowRunRetentionRecords(normalizedRoot);
       } catch (error) {
-        return { scanned: 0, removed: [], retained: 0, failed: [{ runId: "<artifact-root>", error: errorMessage(error) }] };
+        return {
+          scanned: 0,
+          removed: [],
+          retained: 0,
+          failed: [{ runId: "<artifact-root>", error: errorMessage(error) }],
+        };
       }
+
       const failed: Array<{ runId: string; error: string }> = records
         .filter((record) => record.scanError)
         .map((record) => ({ runId: record.runId, error: record.scanError! }));
       let leasedRunIds: Set<string>;
+
       try {
         leasedRunIds = await activeLeaseRunIds(normalizedRoot);
       } catch (error) {
@@ -558,10 +745,16 @@ export async function applyWorkflowRetention(
           failed: [...failed, { runId: "<session-leases>", error: errorMessage(error) }],
         };
       }
+
       const protectedRunIds = new Set(options.protectRunIds ?? []);
-      for (const runId of leasedRunIds) protectedRunIds.add(runId);
+
+      for (const runId of leasedRunIds) {
+        protectedRunIds.add(runId);
+      }
+
       const { remove } = planWorkflowRetention(records, { ...options, protectRunIds: protectedRunIds });
       const removed: string[] = [];
+
       for (const runId of remove) {
         try {
           await removeWorkflowRun(normalizedRoot, runId);
@@ -570,6 +763,7 @@ export async function applyWorkflowRetention(
           failed.push({ runId, error: errorMessage(error) });
         }
       }
+
       return { scanned: records.length, removed, retained: records.length - removed.length, failed };
     });
   } catch (error) {
@@ -584,15 +778,28 @@ export async function listWorkflowProtectedWorktrees(
   options: { cwd?: string } = {},
 ): Promise<WorkflowProtectedWorktree[]> {
   const records = await listWorkflowRunRetentionRecords(resolve(root));
-  const scanErrors = records.filter((record) => record.scanError).map((record) => `${record.runId}: ${record.scanError}`);
-  if (scanErrors.length) throw new Error(`Could not inspect protected worktrees: ${scanErrors.join("; ")}`);
+  const scanErrors = records
+    .filter((record) => record.scanError)
+    .map((record) => `${record.runId}: ${record.scanError}`);
+
+  if (scanErrors.length) {
+    throw new Error(`Could not inspect protected worktrees: ${scanErrors.join("; ")}`);
+  }
+
   const worktrees = records.flatMap((record) => record.worktrees);
-  if (!options.cwd) return worktrees;
+
+  if (!options.cwd) {
+    return worktrees;
+  }
+
   const cwd = options.cwd;
-  return Promise.all(worktrees.map(async (worktree) => ({
-    ...worktree,
-    git: await inspectWorkflowWorktree({ cwd, path: worktree.worktreePath, branch: worktree.branch }),
-  })));
+
+  return Promise.all(
+    worktrees.map(async (worktree) => ({
+      ...worktree,
+      git: await inspectWorkflowWorktree({ cwd, path: worktree.worktreePath, branch: worktree.branch }),
+    })),
+  );
 }
 
 /** Same as {@link listWorkflowProtectedWorktrees}, scoped to one run so a
@@ -606,10 +813,17 @@ export async function listWorkflowRunProtectedWorktrees(
   const artifactDir = workflowRunDirectory(normalizedRoot, runId);
   const snapshot = await readWorkflowRunSummary(normalizedRoot, runId);
   const worktrees = await protectedWorktreesForRun(runId, snapshot, artifactDir);
-  if (!options.cwd) return worktrees;
+
+  if (!options.cwd) {
+    return worktrees;
+  }
+
   const cwd = options.cwd;
-  return Promise.all(worktrees.map(async (worktree) => ({
-    ...worktree,
-    git: await inspectWorkflowWorktree({ cwd, path: worktree.worktreePath, branch: worktree.branch }),
-  })));
+
+  return Promise.all(
+    worktrees.map(async (worktree) => ({
+      ...worktree,
+      git: await inspectWorkflowWorktree({ cwd, path: worktree.worktreePath, branch: worktree.branch }),
+    })),
+  );
 }

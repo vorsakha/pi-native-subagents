@@ -2,7 +2,7 @@ import { writeWorkflowFixture } from "./helpers.ts";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { tempDir } from "./helpers.ts";
-import { mkdtemp, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { readFile, readdir, stat } from "node:fs/promises";
 import { join } from "node:path";
 import {
   checkpointWorkflow,
@@ -22,42 +22,53 @@ function snapshot(sessionId: string, now = Date.now()): Omit<WorkflowSnapshot, "
     status: "running",
     timestamps: { createdAt: now, startedAt: now, updatedAt: now },
     currentPhase: 0,
-    phases: [{
-      index: 0,
-      name: "review",
-      status: "running",
-      timestamps: { createdAt: now, startedAt: now, updatedAt: now },
-      agents: [0],
-    }],
-    agents: [{
-      index: 0,
-      name: "security",
-      access: "readOnly",
-      profile: "reviewer",
-      independent: false,
-      phase: 0,
-      jobId: "job-1",
-      state: "running",
-      timestamps: { createdAt: now, startedAt: now, updatedAt: now },
-      harness: "codex",
-      model: "review-model",
-      speed: "fast",
-      effectiveSpeed: "fast",
-      context: { effectiveSpeed: "fast" },
-      preview: "working",
-      transcript: [
-        { kind: "user", text: "inspect" },
-        { kind: "tool", phase: "start", toolId: "read-1", name: "read", args: { path: "src/index.ts" } },
-        { kind: "tool", phase: "end", toolId: "read-1", name: "read", result: { content: [{ type: "text", text: "source" }], isError: false } },
-        { kind: "assistant", text: "working" },
-      ],
-      usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
-    }],
+    phases: [
+      {
+        index: 0,
+        name: "review",
+        status: "running",
+        timestamps: { createdAt: now, startedAt: now, updatedAt: now },
+        agents: [0],
+      },
+    ],
+    agents: [
+      {
+        index: 0,
+        name: "security",
+        access: "readOnly",
+        profile: "reviewer",
+        independent: false,
+        phase: 0,
+        jobId: "job-1",
+        state: "running",
+        timestamps: { createdAt: now, startedAt: now, updatedAt: now },
+        harness: "codex",
+        model: "review-model",
+        speed: "fast",
+        effectiveSpeed: "fast",
+        context: { effectiveSpeed: "fast" },
+        preview: "working",
+        transcript: [
+          { kind: "user", text: "inspect" },
+          { kind: "tool", phase: "start", toolId: "read-1", name: "read", args: { path: "src/index.ts" } },
+          {
+            kind: "tool",
+            phase: "end",
+            toolId: "read-1",
+            name: "read",
+            result: { content: [{ type: "text", text: "source" }], isError: false },
+          },
+          { kind: "assistant", text: "working" },
+        ],
+        usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 1 },
+      },
+    ],
   };
 }
 
 async function fixture() {
   const parent = await tempDir("workflow-artifacts");
+
   return { root: join(parent, "workflows-equivalent") };
 }
 
@@ -77,7 +88,14 @@ test("creates private workflow artifacts and redacts environment/auth values", a
   assert.match(created.runId, /^wf_[a-f0-9]+$/);
   assert.equal(created.artifactDir, join(root, created.runId));
   assert.deepEqual((await readdir(created.artifactDir)).sort(), [
-    ".ownership", ".ownership.runtime", "args.json", "result.json", "runtime.sqlite", "script.js", "transcripts.json", "workflow.json",
+    ".ownership",
+    ".ownership.runtime",
+    "args.json",
+    "result.json",
+    "runtime.sqlite",
+    "script.js",
+    "transcripts.json",
+    "workflow.json",
   ]);
   const persisted = await readFile(join(created.artifactDir, "args.json"), "utf8");
   assert.match(persisted, /safe/);
@@ -86,6 +104,7 @@ test("creates private workflow artifacts and redacts environment/auth values", a
   if (process.platform !== "win32") {
     assert.equal((await stat(root)).mode & 0o777, 0o700);
     assert.equal((await stat(created.artifactDir)).mode & 0o777, 0o700);
+
     for (const name of await readdir(created.artifactDir)) {
       const entry = await stat(join(created.artifactDir, name));
       assert.equal(entry.mode & 0o777, entry.isDirectory() ? 0o700 : 0o600);
@@ -101,21 +120,26 @@ test("checkpoints and result writes remain atomic under concurrent updates", asy
     snapshot: snapshot("session-a"),
   });
 
-  await Promise.all(Array.from({ length: 20 }, async (_, index) => {
-    const next: WorkflowSnapshot = {
-      ...created,
-      description: `checkpoint-${index}`,
-      timestamps: { ...created.timestamps, updatedAt: created.timestamps.updatedAt + index + 1 },
-    };
-    await checkpointWorkflow(root, next);
-    await writeWorkflowResult(root, created.runId, { index });
-  }));
+  await Promise.all(
+    Array.from({ length: 20 }, async (_, index) => {
+      const next: WorkflowSnapshot = {
+        ...created,
+        description: `checkpoint-${index}`,
+        timestamps: { ...created.timestamps, updatedAt: created.timestamps.updatedAt + index + 1 },
+      };
+      await checkpointWorkflow(root, next);
+      await writeWorkflowResult(root, created.runId, { index });
+    }),
+  );
 
   const workflow = JSON.parse(await readFile(join(created.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
   const result = JSON.parse(await readFile(join(created.artifactDir, "result.json"), "utf8")) as { index: number };
   assert.match(workflow.description, /^checkpoint-\d+$/);
   assert.equal(typeof result.index, "number");
-  assert.deepEqual((await readdir(created.artifactDir)).filter((name) => name.includes(".tmp")), []);
+  assert.deepEqual(
+    (await readdir(created.artifactDir)).filter((name) => name.includes(".tmp")),
+    [],
+  );
 });
 
 test("loads session summaries, ignores corrupt files, and durably aborts stale runs", async () => {
@@ -154,7 +178,10 @@ test("loads session summaries, ignores corrupt files, and durably aborts stale r
   const transcript = summaries[0]?.agents[0]?.transcript ?? [];
   assert.equal(transcript.at(-1)?.kind, "assistant");
   const toolEntries = transcript.filter((entry) => entry.kind === "tool");
-  assert.deepEqual(toolEntries.map((entry) => entry.phase), ["start", "end"]);
+  assert.deepEqual(
+    toolEntries.map((entry) => entry.phase),
+    ["start", "end"],
+  );
   assert.equal(toolEntries[0]?.args?.path, "src/index.ts");
   assert.equal(toolEntries[1]?.result?.content[0]?.text, "source");
 });
@@ -194,9 +221,17 @@ test("no-resume loading aborts paused future checkpoints plus queued agents and 
   assert.equal(loaded[0]?.status, "aborted");
   assert.equal(loaded[0]?.phases[0]?.status, "aborted");
   assert.equal(loaded[0]?.agents[0]?.state, "aborted");
-  assert.equal(loaded[0]?.agents[0]?.waitingOn, undefined, "a restored run cannot keep advertising an unanswerable question");
+  assert.equal(
+    loaded[0]?.agents[0]?.waitingOn,
+    undefined,
+    "a restored run cannot keep advertising an unanswerable question",
+  );
   assert.equal(loaded[0]?.agents[0]?.answering, undefined);
-  assert.equal(loaded[0]?.interactions?.[0]?.state, "cancelled", "the durable audit trail records how the stale wait ended");
+  assert.equal(
+    loaded[0]?.interactions?.[0]?.state,
+    "cancelled",
+    "the durable audit trail records how the stale wait ended",
+  );
   assert.equal(loaded[0]?.interactions?.[0]?.answeredAt, 1);
   assert.equal(loaded[0]?.plannedPhaseCount, 1, "the declared total survives stale restoration");
 });
@@ -230,14 +265,23 @@ test("stale declared restoration aborts the active phase and preserves future ph
   assert.equal(restored.status, "aborted");
   assert.equal(restored.plannedPhaseCount, 4);
   assert.equal(restored.currentPhase, 20);
-  assert.deepEqual(restored.phases.map((phase) => [phase.name, phase.status]), [
-    ["Prepare", "completed"], ["Active", "aborted"], ["Verify", "pending"], ["Publish", "pending"],
-  ]);
+  assert.deepEqual(
+    restored.phases.map((phase) => [phase.name, phase.status]),
+    [
+      ["Prepare", "completed"],
+      ["Active", "aborted"],
+      ["Verify", "pending"],
+      ["Publish", "pending"],
+    ],
+  );
 
   const saved = JSON.parse(await readFile(join(created.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
   assert.equal(saved.plannedPhaseCount, 4);
   assert.equal(saved.currentPhase, 20);
-  assert.deepEqual(saved.phases.map((phase) => phase.status), ["completed", "aborted", "pending", "pending"]);
+  assert.deepEqual(
+    saved.phases.map((phase) => phase.status),
+    ["completed", "aborted", "pending", "pending"],
+  );
 
   await writeWorkflowReport(root, restored);
   const report = await readFile(join(created.artifactDir, "report.md"), "utf8");
@@ -245,11 +289,18 @@ test("stale declared restoration aborts the active phase and preserves future ph
   assert.match(report, /- Verify: pending/);
   assert.match(report, /- Publish: pending/);
 
-  const [reloaded] = await loadWorkflowSummaries(root, { sessionId: "declared-stale", now: 11_000, staleAfterMs: 5_000 });
+  const [reloaded] = await loadWorkflowSummaries(root, {
+    sessionId: "declared-stale",
+    now: 11_000,
+    staleAfterMs: 5_000,
+  });
   assert.ok(reloaded);
   assert.equal(reloaded.plannedPhaseCount, 4);
   assert.equal(reloaded.currentPhase, 20);
-  assert.deepEqual(reloaded.phases.map((phase) => phase.status), ["completed", "aborted", "pending", "pending"]);
+  assert.deepEqual(
+    reloaded.phases.map((phase) => phase.status),
+    ["completed", "aborted", "pending", "pending"],
+  );
 });
 
 test("stale declared restoration with no activation keeps every planned phase pending", async () => {
@@ -280,12 +331,18 @@ test("stale declared restoration with no activation keeps every planned phase pe
   assert.equal(restored.status, "aborted");
   assert.equal(restored.plannedPhaseCount, 3);
   assert.equal(restored.currentPhase, null);
-  assert.deepEqual(restored.phases.map((phase) => phase.status), ["pending", "pending", "pending"]);
+  assert.deepEqual(
+    restored.phases.map((phase) => phase.status),
+    ["pending", "pending", "pending"],
+  );
 
   const saved = JSON.parse(await readFile(join(created.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
   assert.equal(saved.plannedPhaseCount, 3);
   assert.equal(saved.currentPhase, null);
-  assert.deepEqual(saved.phases.map((phase) => phase.status), ["pending", "pending", "pending"]);
+  assert.deepEqual(
+    saved.phases.map((phase) => phase.status),
+    ["pending", "pending", "pending"],
+  );
 
   await writeWorkflowReport(root, restored);
   const report = await readFile(join(created.artifactDir, "report.md"), "utf8");
@@ -293,11 +350,18 @@ test("stale declared restoration with no activation keeps every planned phase pe
   assert.match(report, /- Verify: pending/);
   assert.match(report, /- Publish: pending/);
 
-  const [reloaded] = await loadWorkflowSummaries(root, { sessionId: "declared-no-activation", now: 11_000, staleAfterMs: 5_000 });
+  const [reloaded] = await loadWorkflowSummaries(root, {
+    sessionId: "declared-no-activation",
+    now: 11_000,
+    staleAfterMs: 5_000,
+  });
   assert.ok(reloaded);
   assert.equal(reloaded.plannedPhaseCount, 3);
   assert.equal(reloaded.currentPhase, null);
-  assert.deepEqual(reloaded.phases.map((phase) => phase.status), ["pending", "pending", "pending"]);
+  assert.deepEqual(
+    reloaded.phases.map((phase) => phase.status),
+    ["pending", "pending", "pending"],
+  );
 });
 
 test("persists declared phase totals and rejects inconsistent declared snapshots", async () => {
@@ -313,7 +377,11 @@ test("persists declared phase totals and rejects inconsistent declared snapshots
   const persisted = JSON.parse(await readFile(join(created.artifactDir, "workflow.json"), "utf8")) as WorkflowSnapshot;
   persisted.plannedPhaseCount = 2;
   await writeWorkflowFixture(join(created.artifactDir, "workflow.json"), JSON.stringify(persisted), { mode: 0o600 });
-  assert.deepEqual(await loadWorkflowSummaries(root, { sessionId: "planned-session" }), [], "a count/phase mismatch is not restored");
+  assert.deepEqual(
+    await loadWorkflowSummaries(root, { sessionId: "planned-session" }),
+    [],
+    "a count/phase mismatch is not restored",
+  );
 });
 
 test("loads old completed snapshots and derives task outcome from the authoritative result artifact", async () => {
@@ -346,7 +414,12 @@ test("durable reports include task outcome only for completed workflows", async 
     snapshot: snapshot("report-outcome"),
   });
 
-  await writeWorkflowReport(root, { ...created, status: "completed", taskOutcome: "unsuccessful", result: { ok: false } });
+  await writeWorkflowReport(root, {
+    ...created,
+    status: "completed",
+    taskOutcome: "unsuccessful",
+    result: { ok: false },
+  });
   assert.match(await readFile(join(created.artifactDir, "report.md"), "utf8"), /Task outcome: \*\*unsuccessful\*\*/);
 
   for (const status of ["failed", "aborted"] as const) {
@@ -359,7 +432,11 @@ test("durable reports include task outcome only for completed workflows", async 
 test("convergence state is bounded on the way to disk, restores unchanged, and stays optional", async () => {
   const f = await fixture();
   const now = Date.now();
-  const created = await createWorkflowArtifacts(f.root, { script: "export default async () => 'ok';\n", args: null, snapshot: snapshot("session-1", now) });
+  const created = await createWorkflowArtifacts(f.root, {
+    script: "export default async () => 'ok';\n",
+    args: null,
+    snapshot: snapshot("session-1", now),
+  });
   const rounds = Array.from({ length: 16 }, (_, index) => ({
     round: index + 1,
     verdict: "request_changes" as const,
@@ -399,7 +476,11 @@ test("convergence state is bounded on the way to disk, restores unchanged, and s
   assert.match(report, /- State: \*\*stalled\*\*/);
   assert.match(report, /- Rounds: 16\/16/);
 
-  const other = await createWorkflowArtifacts(f.root, { script: "export default async () => 'ok';\n", args: null, snapshot: snapshot("session-2", now) });
+  const other = await createWorkflowArtifacts(f.root, {
+    script: "export default async () => 'ok';\n",
+    args: null,
+    snapshot: snapshot("session-2", now),
+  });
   await checkpointWorkflow(f.root, { ...other, status: "completed" });
   const legacyPath = join(other.artifactDir, "workflow.json");
   const legacyRaw = JSON.parse(await readFile(legacyPath, "utf8")) as WorkflowSnapshot;
@@ -433,11 +514,20 @@ test("convergence state is bounded on the way to disk, restores unchanged, and s
     { ...validConvergence, state: "stalled" },
     { ...validConvergence, state: "running" },
     { ...validConvergence, rounds: [{ round: 1, verdict: "approve", actionableCount: 0, fingerprint: "" }] },
-    { ...validConvergence, rounds: [{ round: 1, verdict: "request_changes", actionableCount: 0, fingerprint: "fp-1" }], verdict: "request_changes" },
+    {
+      ...validConvergence,
+      rounds: [{ round: 1, verdict: "request_changes", actionableCount: 0, fingerprint: "fp-1" }],
+      verdict: "request_changes",
+    },
   ];
+
   for (const convergenceRecord of invalidRecords) {
     await writeWorkflowFixture(corrupted, JSON.stringify({ ...raw, convergence: convergenceRecord }), "utf8");
     const remaining = await loadWorkflowSummaries(f.root, { sessionId: "session-2" });
-    assert.deepEqual(remaining, [], `an incoherent convergence record is rejected: ${JSON.stringify(convergenceRecord)}`);
+    assert.deepEqual(
+      remaining,
+      [],
+      `an incoherent convergence record is rejected: ${JSON.stringify(convergenceRecord)}`,
+    );
   }
 });

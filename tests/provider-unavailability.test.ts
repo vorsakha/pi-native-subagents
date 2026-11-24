@@ -59,7 +59,10 @@ test("waitDecision refuses to wait when the unavailability is not authoritative"
     remainingWaitMs: 10 * 60_000,
   });
   assert.equal(decision.wait, false);
-  if (!decision.wait) assert.match(decision.reason, /authoritative retry time/);
+
+  if (!decision.wait) {
+    assert.match(decision.reason, /authoritative retry time/);
+  }
 });
 
 test("waitDecision refuses once attempts are exhausted", () => {
@@ -71,7 +74,10 @@ test("waitDecision refuses once attempts are exhausted", () => {
     remainingWaitMs: 10 * 60_000,
   });
   assert.equal(decision.wait, false);
-  if (!decision.wait) assert.match(decision.reason, /attempt 2\/2/);
+
+  if (!decision.wait) {
+    assert.match(decision.reason, /attempt 2\/2/);
+  }
 });
 
 test("waitDecision refuses when the retry window exceeds the remaining wait budget", () => {
@@ -83,7 +89,10 @@ test("waitDecision refuses when the retry window exceeds the remaining wait budg
     remainingWaitMs: 60_000,
   });
   assert.equal(decision.wait, false);
-  if (!decision.wait) assert.match(decision.reason, /maxWaitMs allowance/);
+
+  if (!decision.wait) {
+    assert.match(decision.reason, /maxWaitMs allowance/);
+  }
 });
 
 test("waitDecision approves an authoritative, in-budget, non-exhausted wait", () => {

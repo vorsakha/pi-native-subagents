@@ -14,8 +14,11 @@ import {
 } from "../src/workflows/retention.ts";
 import type { WorkflowSnapshot } from "../src/workflows/types.ts";
 
-function snapshot(overrides: Partial<Omit<WorkflowSnapshot, "runId" | "artifactDir">> = {}): Omit<WorkflowSnapshot, "runId" | "artifactDir"> {
+function snapshot(
+  overrides: Partial<Omit<WorkflowSnapshot, "runId" | "artifactDir">> = {},
+): Omit<WorkflowSnapshot, "runId" | "artifactDir"> {
   const now = overrides.timestamps?.updatedAt ?? Date.now();
+
   return {
     sessionId: "session-a",
     name: "retention fixture",
@@ -32,6 +35,7 @@ function snapshot(overrides: Partial<Omit<WorkflowSnapshot, "runId" | "artifactD
 
 async function fixture() {
   const parent = await tempDir("workflow-retention");
+
   return { root: join(parent, "workflows") };
 }
 
@@ -48,13 +52,18 @@ test("recovers an interrupted retention lock with only a temporary owner record"
   const stateDirectory = `${root}.runtime`;
   const lockPath = join(stateDirectory, ".retention.lock");
   await mkdir(lockPath, { recursive: true });
-  await writeFile(join(lockPath, ".owner.json.deadcafe.tmp"), JSON.stringify({
-    pid: 2_147_483_647,
-    token: "interrupted-owner",
-    createdAt: Date.now(),
-  }), "utf8");
+  await writeFile(
+    join(lockPath, ".owner.json.deadcafe.tmp"),
+    JSON.stringify({
+      pid: 2_147_483_647,
+      token: "interrupted-owner",
+      createdAt: Date.now(),
+    }),
+    "utf8",
+  );
 
   const lease = await openWorkflowSessionLease(root, "replacement-session");
+
   try {
     assert.ok(!(await readdir(stateDirectory)).includes(".retention.lock"));
   } finally {
@@ -67,13 +76,18 @@ test("recovers a retention lock whose reused owner pid predates this boot", { ti
   const stateDirectory = `${root}.runtime`;
   const lockPath = join(stateDirectory, ".retention.lock");
   await mkdir(lockPath, { recursive: true });
-  await writeFile(join(lockPath, "owner.json"), JSON.stringify({
-    pid: process.pid,
-    token: "previous-boot-owner",
-    createdAt: 1,
-  }), "utf8");
+  await writeFile(
+    join(lockPath, "owner.json"),
+    JSON.stringify({
+      pid: process.pid,
+      token: "previous-boot-owner",
+      createdAt: 1,
+    }),
+    "utf8",
+  );
 
   const lease = await openWorkflowSessionLease(root, "replacement-session");
+
   try {
     assert.ok(!(await readdir(stateDirectory)).includes(".retention.lock"));
   } finally {
@@ -85,16 +99,19 @@ test("bounds repeated eligible terminal runs to maxRuns and stays bounded on rep
   const { root } = await fixture();
   const maxRuns = 5;
   const runIds: string[] = [];
+
   for (let index = 0; index < maxRuns + 5; index++) {
     const created = await makeRun(root, { timestamps: { createdAt: index, updatedAt: index } });
     runIds.push(created.runId);
   }
+
   for (let pass = 0; pass < 3; pass++) {
     const report = await applyWorkflowRetention(root, { maxRuns });
     assert.deepEqual(report.failed, []);
     const remaining = await readdir(root);
     assert.equal(remaining.length, maxRuns, `pass ${pass} stays bounded`);
   }
+
   const remaining = new Set(await readdir(root));
   const newestExpected = new Set(runIds.slice(-maxRuns));
   assert.deepEqual(remaining, newestExpected);
@@ -107,9 +124,13 @@ test("never reclaims active runs: fresh checkpoints, protected ids, and old-but-
   const staleAfterMs = 10_000;
   const stale = await makeRun(root, { status: "running", timestamps: { createdAt: 0, updatedAt: 0 } });
   const protectedById = await makeRun(root, { status: "completed", timestamps: { createdAt: 0, updatedAt: 0 } });
+
   // Pad past the retained window so position alone would otherwise reclaim every run above.
   for (let index = 0; index < DEFAULT_WORKFLOW_RETAINED_RUNS; index++) {
-    await makeRun(root, { status: "completed", timestamps: { createdAt: now + index + 1, updatedAt: now + index + 1 } });
+    await makeRun(root, {
+      status: "completed",
+      timestamps: { createdAt: now + index + 1, updatedAt: now + index + 1 },
+    });
   }
 
   const report = await applyWorkflowRetention(root, {
@@ -120,7 +141,10 @@ test("never reclaims active runs: fresh checkpoints, protected ids, and old-but-
   });
 
   assert.ok(!report.removed.includes(fresh.runId), "a fresh running checkpoint is never reclaimed");
-  assert.ok(!report.removed.includes(protectedById.runId), "an explicitly protected run is never reclaimed regardless of position");
+  assert.ok(
+    !report.removed.includes(protectedById.runId),
+    "an explicitly protected run is never reclaimed regardless of position",
+  );
   assert.ok(report.removed.includes(stale.runId), "a running checkpoint stale beyond the window is reclaimable");
 });
 
@@ -146,29 +170,58 @@ test("preserved, orphaned, and unrecorded worktrees block reclamation; removing 
   const preserved = await makeRun(root, {
     status: "completed",
     timestamps: { createdAt: 0, updatedAt: 0 },
-    agents: [{
-      index: 0, name: "worker", access: "full", independent: false, phase: 0,
-      state: "completed", timestamps: { createdAt: 0, updatedAt: 0 },
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-      isolation: { type: "worktree", state: "preserved", branch: `pi-workflow/wf_x/0`, changed: true, patchArtifact: "agent-0.patch" },
-    }],
+    agents: [
+      {
+        index: 0,
+        name: "worker",
+        access: "full",
+        independent: false,
+        phase: 0,
+        state: "completed",
+        timestamps: { createdAt: 0, updatedAt: 0 },
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        isolation: {
+          type: "worktree",
+          state: "preserved",
+          branch: `pi-workflow/wf_x/0`,
+          changed: true,
+          patchArtifact: "agent-0.patch",
+        },
+      },
+    ],
   });
   const orphaned = await makeRun(root, {
     status: "failed",
     timestamps: { createdAt: 0, updatedAt: 0 },
-    agents: [{
-      index: 0, name: "worker", access: "full", independent: false, phase: 0,
-      state: "failed", timestamps: { createdAt: 0, updatedAt: 0 },
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-      isolation: { type: "worktree", state: "orphaned", branch: `pi-workflow/wf_y/0`, changed: true, error: "crashed" },
-    }],
+    agents: [
+      {
+        index: 0,
+        name: "worker",
+        access: "full",
+        independent: false,
+        phase: 0,
+        state: "failed",
+        timestamps: { createdAt: 0, updatedAt: 0 },
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        isolation: {
+          type: "worktree",
+          state: "orphaned",
+          branch: `pi-workflow/wf_y/0`,
+          changed: true,
+          error: "crashed",
+        },
+      },
+    ],
   });
   // Crash before finalization recorded any isolation: only the on-disk checkout exists.
   const unrecorded = await makeRun(root, { status: "aborted", timestamps: { createdAt: 0, updatedAt: 0 } });
   await mkdir(join(unrecorded.artifactDir, "worktrees", "agent-0"), { recursive: true });
 
   for (let index = 0; index < DEFAULT_WORKFLOW_RETAINED_RUNS; index++) {
-    await makeRun(root, { status: "completed", timestamps: { createdAt: now + index + 1, updatedAt: now + index + 1 } });
+    await makeRun(root, {
+      status: "completed",
+      timestamps: { createdAt: now + index + 1, updatedAt: now + index + 1 },
+    });
   }
 
   const first = await applyWorkflowRetention(root, { maxRuns: DEFAULT_WORKFLOW_RETAINED_RUNS, now });
@@ -184,27 +237,44 @@ test("preserved, orphaned, and unrecorded worktrees block reclamation; removing 
     args: {},
     snapshot: {
       ...snapshot({ status: "completed", timestamps: { createdAt: 0, updatedAt: 0 } }),
-      agents: [{
-        index: 0, name: "worker", access: "full", independent: false, phase: 0,
-        state: "completed", timestamps: { createdAt: 0, updatedAt: 0 },
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-        isolation: { type: "worktree", state: "removed", branch: `pi-workflow/wf_z/0`, changed: false },
-      }],
+      agents: [
+        {
+          index: 0,
+          name: "worker",
+          access: "full",
+          independent: false,
+          phase: 0,
+          state: "completed",
+          timestamps: { createdAt: 0, updatedAt: 0 },
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+          isolation: { type: "worktree", state: "removed", branch: `pi-workflow/wf_z/0`, changed: false },
+        },
+      ],
     },
   });
   const second = await applyWorkflowRetention(root, { maxRuns: DEFAULT_WORKFLOW_RETAINED_RUNS, now });
-  assert.ok(second.removed.includes(cleared.runId), "a run whose worktrees are all removed, with no worktrees/ directory, is reclaimable");
+  assert.ok(
+    second.removed.includes(cleared.runId),
+    "a run whose worktrees are all removed, with no worktrees/ directory, is reclaimable",
+  );
 });
 
 test("lists protected worktrees with run id, agent index, state, branch, path, patch, and error", async () => {
   const { root } = await fixture();
   const created = await makeRun(root, {
-    agents: [{
-      index: 2, name: "worker", access: "full", independent: false, phase: 0,
-      state: "failed", timestamps: { createdAt: 0, updatedAt: 0 },
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
-      isolation: { type: "worktree", state: "orphaned", branch: "pi-workflow/wf_x/2", changed: true, error: "boom" },
-    }],
+    agents: [
+      {
+        index: 2,
+        name: "worker",
+        access: "full",
+        independent: false,
+        phase: 0,
+        state: "failed",
+        timestamps: { createdAt: 0, updatedAt: 0 },
+        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
+        isolation: { type: "worktree", state: "orphaned", branch: "pi-workflow/wf_x/2", changed: true, error: "boom" },
+      },
+    ],
   });
   const worktrees = await listWorkflowProtectedWorktrees(root);
   assert.equal(worktrees.length, 1);
@@ -235,7 +305,10 @@ test("leaves unreadable and non-run directories untouched and reports them as fa
   assert.deepEqual(remove, [], "an unreadable run is never planned for removal, even outside the window");
 
   const report = await applyWorkflowRetention(root, { maxRuns: 0 });
-  assert.ok(report.failed.some((failure) => failure.runId === "wf_deadcafe"), "an unreadable run is reported to the retention caller");
+  assert.ok(
+    report.failed.some((failure) => failure.runId === "wf_deadcafe"),
+    "an unreadable run is reported to the retention caller",
+  );
   assert.deepEqual((await readdir(root)).sort(), ["not-a-run-id", "wf_deadcafe"]);
 });
 
@@ -249,7 +322,10 @@ test("a non-ENOENT worktree scan failure keeps the run and is reported", async (
   await assert.rejects(listWorkflowProtectedWorktrees(root), /Could not inspect protected worktrees/);
   const report = await applyWorkflowRetention(root, { maxRuns: 0 });
   assert.ok(!report.removed.includes(run.runId), "a failed worktree scan cannot fail open into deletion");
-  assert.ok(report.failed.some((failure) => failure.runId === run.runId), "the scan failure is reported with its run ID");
+  assert.ok(
+    report.failed.some((failure) => failure.runId === run.runId),
+    "the scan failure is reported with its run ID",
+  );
   assert.ok((await readdir(root)).includes(run.runId));
 });
 
@@ -271,6 +347,7 @@ test("a live session lease protects an old terminal run across retention passes"
   const held = await makeRun(root, { timestamps: { createdAt: 0, updatedAt: 0 } });
   const alsoHeld = await makeRun(root, { timestamps: { createdAt: 0, updatedAt: 0 } });
   const lease = await openWorkflowSessionLease(root, "open-session");
+
   try {
     await Promise.all([lease.claim([held.runId]), lease.claim([alsoHeld.runId])]);
     const report = await applyWorkflowRetention(root, { maxRuns: 0 });
@@ -280,6 +357,7 @@ test("a live session lease protects an old terminal run across retention passes"
   } finally {
     await lease.close();
   }
+
   const afterClose = await applyWorkflowRetention(root, { maxRuns: 0 });
   assert.ok(afterClose.removed.includes(held.runId), "closing the session lease releases the run for retention");
 });

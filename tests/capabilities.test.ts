@@ -36,9 +36,17 @@ test("capabilityId normalizes name into a stable, bounded slug", () => {
 });
 
 test("capabilityDenial enforces the orchestration/interactivity ceiling by name pattern and kind", () => {
-  assert.equal(capabilityDenial("agent", "anything")?.reason, "nested agent orchestration is denied", "every agent-kind capability is denied regardless of name");
+  assert.equal(
+    capabilityDenial("agent", "anything")?.reason,
+    "nested agent orchestration is denied",
+    "every agent-kind capability is denied regardless of name",
+  );
   assert.equal(capabilityDenial("tool", "Task")?.effect, "delegation");
-  assert.equal(capabilityDenial("tool", "task_list")?.effect, "delegation", "a word-boundary-delimited task name is denied");
+  assert.equal(
+    capabilityDenial("tool", "task_list")?.effect,
+    "delegation",
+    "a word-boundary-delimited task name is denied",
+  );
   assert.equal(capabilityDenial("tool", "sub_agent")?.reason, "nested agent orchestration is denied");
   assert.equal(capabilityDenial("command", "workflow-start")?.reason, "nested workflow orchestration is denied");
   assert.equal(capabilityDenial("tool", "session-peer-fork")?.reason, "session-peer forking is denied");
@@ -53,17 +61,29 @@ test("capabilityDenial enforces the orchestration/interactivity ceiling by name 
   assert.equal(capabilityDenial("tool", "login")?.reason, "authentication flows are denied");
   assert.equal(capabilityDenial("tool", "ExitPlanMode")?.reason, "unattended children must not request plan approval");
   assert.equal(capabilityDenial("tool", "Read"), undefined, "an ordinary read tool is not denied");
-  assert.equal(capabilityDenial("tool", "loginTimeout"), undefined, "a substring match must still respect word boundaries");
+  assert.equal(
+    capabilityDenial("tool", "loginTimeout"),
+    undefined,
+    "a substring match must still respect word boundaries",
+  );
 });
 
 test("classifyEffect prefers denial, then a declared effect, then the built-in tool/kind tables", () => {
   assert.equal(classifyEffect("tool", "Task", "inspect"), "delegation", "denial always wins over a declared effect");
-  assert.equal(classifyEffect("tool", "custom-thing", "external-read"), "external-read", "a declared effect is honored when there is no denial");
+  assert.equal(
+    classifyEffect("tool", "custom-thing", "external-read"),
+    "external-read",
+    "a declared effect is honored when there is no denial",
+  );
   assert.equal(classifyEffect("tool", "Read"), "inspect");
   assert.equal(classifyEffect("tool", "grep"), "inspect");
   assert.equal(classifyEffect("tool", "WebSearch"), "external-read");
   assert.equal(classifyEffect("tool", "Bash"), "workspace-write");
-  assert.equal(classifyEffect("tool", "mcp__server__thing"), "unknown", "MCP-namespaced tools fail closed without a declared effect");
+  assert.equal(
+    classifyEffect("tool", "mcp__server__thing"),
+    "unknown",
+    "MCP-namespaced tools fail closed without a declared effect",
+  );
   assert.equal(classifyEffect("tool", "some-unknown-tool"), "unknown");
   assert.equal(classifyEffect("skill", "anything"), "inspect");
   assert.equal(classifyEffect("command", "anything"), "inspect");
@@ -130,7 +150,10 @@ test("buildCatalog deduplicates by id, truncates at the bounded catalog size, an
     cwd: "/proj",
     access: "full",
     discoveredAt: 1_000,
-    capabilities: [{ kind: "tool", name: "Read" }, { kind: "tool", name: "read" }],
+    capabilities: [
+      { kind: "tool", name: "Read" },
+      { kind: "tool", name: "read" },
+    ],
     sources: [{ source: "codex-app-server", health: "healthy" }],
   });
   assert.equal(deduped.capabilities.length, 1, "capabilities normalize and dedupe to the same id");
@@ -167,7 +190,11 @@ test("catalogRevision is a stable order-independent hash over identity, health, 
   assert.match(revisionAB, /^sha256:[0-9a-f]{32}$/);
 
   const changedHealth = { ...b, health: "degraded" as const };
-  assert.notEqual(catalogRevision([a, b]), catalogRevision([a, changedHealth]), "revision changes when a capability's health changes");
+  assert.notEqual(
+    catalogRevision([a, b]),
+    catalogRevision([a, changedHealth]),
+    "revision changes when a capability's health changes",
+  );
 });
 
 test("capabilityAvailability denies by policy, disablement, unavailability, and the read-only ceiling", () => {
@@ -181,33 +208,70 @@ test("capabilityAvailability denies by policy, disablement, unavailability, and 
   assert.equal(access(disabledCapability, "full").available, false);
   assert.match(access(disabledCapability, "full").reason ?? "", /disabled in the native harness/);
 
-  const unavailableCapability = normalizeCapability("codex", { kind: "mcp", name: "server", health: "unavailable", detail: "spawn failed" });
+  const unavailableCapability = normalizeCapability("codex", {
+    kind: "mcp",
+    name: "server",
+    health: "unavailable",
+    detail: "spawn failed",
+  });
   assert.equal(access(unavailableCapability, "full").available, false);
   assert.match(access(unavailableCapability, "full").reason ?? "", /unavailable: spawn failed/);
 
   const writeTool = normalizeCapability("claude", { kind: "tool", name: "Write" });
   assert.equal(access(writeTool, "full").available, true);
   assert.equal(access(writeTool, "readOnly").available, false);
-  assert.match(access(writeTool, "readOnly").reason ?? "", /read-only children cannot use workspace-write capabilities/);
+  assert.match(
+    access(writeTool, "readOnly").reason ?? "",
+    /read-only children cannot use workspace-write capabilities/,
+  );
 
   const unknownEffect = normalizeCapability("claude", { kind: "tool", name: "mcp__server__thing" });
   assert.equal(access(unknownEffect, "full").available, true);
   assert.equal(access(unknownEffect, "readOnly").available, false);
-  assert.match(access(unknownEffect, "readOnly").reason ?? "", /unclassified effect fails closed under read-only access/);
+  assert.match(
+    access(unknownEffect, "readOnly").reason ?? "",
+    /unclassified effect fails closed under read-only access/,
+  );
 
   const hook = normalizeCapability("codex", { kind: "hook", name: "post-edit" });
   assert.equal(access(hook, "full").available, true);
-  assert.equal(access(hook, "readOnly").available, false, "hooks never execute in read-only children even though the effect is only workspace-write");
+  assert.equal(
+    access(hook, "readOnly").available,
+    false,
+    "hooks never execute in read-only children even though the effect is only workspace-write",
+  );
 
-  const declaredDelegation = normalizeCapability("codex", { kind: "tool", name: "orchestra-runner", effect: "delegation" });
-  assert.equal(access(declaredDelegation, "full").available, false, "adapter-declared delegation is denied even when its name avoids the deny patterns");
-  const declaredInteractive = normalizeCapability("codex", { kind: "tool", name: "dialog", effect: "interactive" });
-  assert.equal(access(declaredInteractive, "full").available, false, "adapter-declared interactivity is denied in full access too");
-  const describedDelegation = normalizeCapability("claude", {
-    kind: "command", name: "batch", description: "Execute work in parallel across isolated worktree agents",
+  const declaredDelegation = normalizeCapability("codex", {
+    kind: "tool",
+    name: "orchestra-runner",
+    effect: "delegation",
   });
-  assert.equal(access(describedDelegation, "full").available, false, "described nested orchestration is denied even when the command name is generic");
-  const adminCommand = normalizeCapability("claude", { kind: "command", name: "config", description: "Set a setting by key" });
+  assert.equal(
+    access(declaredDelegation, "full").available,
+    false,
+    "adapter-declared delegation is denied even when its name avoids the deny patterns",
+  );
+  const declaredInteractive = normalizeCapability("codex", { kind: "tool", name: "dialog", effect: "interactive" });
+  assert.equal(
+    access(declaredInteractive, "full").available,
+    false,
+    "adapter-declared interactivity is denied in full access too",
+  );
+  const describedDelegation = normalizeCapability("claude", {
+    kind: "command",
+    name: "batch",
+    description: "Execute work in parallel across isolated worktree agents",
+  });
+  assert.equal(
+    access(describedDelegation, "full").available,
+    false,
+    "described nested orchestration is denied even when the command name is generic",
+  );
+  const adminCommand = normalizeCapability("claude", {
+    kind: "command",
+    name: "config",
+    description: "Set a setting by key",
+  });
   assert.equal(access(adminCommand, "full").available, false, "harness administration commands are denied");
 
   const readTool = normalizeCapability("claude", { kind: "tool", name: "Read" });
@@ -237,7 +301,10 @@ test("availableCapabilities filters by the catalog's own access mode", () => {
       normalizeCapability("claude", { kind: "tool", name: "Write" }),
     ],
   });
-  assert.deepEqual(availableCapabilities(readOnlyCatalog).map((capability) => capability.name), ["Read"]);
+  assert.deepEqual(
+    availableCapabilities(readOnlyCatalog).map((capability) => capability.name),
+    ["Read"],
+  );
 });
 
 test("searchCapabilities filters by harness/kind/effect/health/query and text, then sorts available-first by id", () => {
@@ -269,12 +336,19 @@ test("searchCapabilities filters by harness/kind/effect/health/query and text, t
   assert.equal(byQuery.matches[0]!.capability.name, "code-review");
 
   const excludesUnavailable = searchCapabilities([claudeCatalog], {});
-  assert.ok(!excludesUnavailable.matches.some((match) => match.capability.name === "Task"), "denied capabilities are excluded by default");
+  assert.ok(
+    !excludesUnavailable.matches.some((match) => match.capability.name === "Task"),
+    "denied capabilities are excluded by default",
+  );
 
   const includesUnavailable = searchCapabilities([claudeCatalog], { includeUnavailable: true });
   assert.equal(includesUnavailable.total, 3);
   assert.ok(includesUnavailable.matches.some((match) => match.capability.name === "Task" && match.available === false));
-  assert.equal(includesUnavailable.matches[includesUnavailable.matches.length - 1]!.capability.name, "Task", "unavailable matches sort after available ones");
+  assert.equal(
+    includesUnavailable.matches[includesUnavailable.matches.length - 1]!.capability.name,
+    "Task",
+    "unavailable matches sort after available ones",
+  );
 
   const limited = searchCapabilities([claudeCatalog], { includeUnavailable: true, limit: 1 });
   assert.equal(limited.matches.length, 1);
@@ -286,13 +360,20 @@ test("normalizeRequirements validates array shape, trims, dedupes, and bounds le
   assert.throws(() => normalizeRequirements("nope"), /requires must be an array/);
   assert.throws(() => normalizeRequirements([1, 2]), /requires must contain capability ID strings/);
   assert.throws(() => normalizeRequirements([""]), new RegExp(`1–${MAX_REQUIREMENT_LENGTH}`));
-  assert.throws(() => normalizeRequirements(["a".repeat(MAX_REQUIREMENT_LENGTH + 1)]), new RegExp(`1–${MAX_REQUIREMENT_LENGTH}`));
+  assert.throws(
+    () => normalizeRequirements(["a".repeat(MAX_REQUIREMENT_LENGTH + 1)]),
+    new RegExp(`1–${MAX_REQUIREMENT_LENGTH}`),
+  );
   assert.deepEqual(normalizeRequirements([" a ", "a", "b"]), ["a", "b"], "requirements are trimmed and deduplicated");
   assert.throws(
     () => normalizeRequirements(Array.from({ length: MAX_REQUIREMENTS + 1 }, (_, index) => `req-${index}`)),
     new RegExp(`At most ${MAX_REQUIREMENTS}`),
   );
-  assert.equal(normalizeRequirements([])?.length ?? 0, 0, "an empty array normalizes to undefined-equivalent (no requirements)");
+  assert.equal(
+    normalizeRequirements([])?.length ?? 0,
+    0,
+    "an empty array normalizes to undefined-equivalent (no requirements)",
+  );
 });
 
 test("findCapability resolves a full ID, a kind:name pair, or a bare native name, preferring an available match", () => {
@@ -304,7 +385,11 @@ test("findCapability resolves a full ID, a kind:name pair, or a bare native name
     ],
   });
   assert.equal(findCapability(readOnlyCatalog, "claude:tool:read")?.name, "Read", "full capability ID matches exactly");
-  assert.equal(findCapability(readOnlyCatalog, "tool:write")?.name, "Write", "kind:name matches without the harness prefix");
+  assert.equal(
+    findCapability(readOnlyCatalog, "tool:write")?.name,
+    "Write",
+    "kind:name matches without the harness prefix",
+  );
   assert.equal(findCapability(readOnlyCatalog, "Read")?.name, "Read", "a bare native name resolves by slug");
   assert.equal(findCapability(readOnlyCatalog, "missing"), undefined);
 
@@ -316,7 +401,11 @@ test("findCapability resolves a full ID, a kind:name pair, or a bare native name
     ],
   });
   const resolved = findCapability(bothNamesake, "search");
-  assert.equal(resolved?.kind, "tool", "an available match (the read-only usable tool) is preferred over a same-named blocked MCP server");
+  assert.equal(
+    resolved?.kind,
+    "tool",
+    "an available match (the read-only usable tool) is preferred over a same-named blocked MCP server",
+  );
 });
 
 test("resolveRequirements / requirementsSatisfied / describeResolution classify missing vs. blocked requirements", () => {
@@ -327,7 +416,11 @@ test("resolveRequirements / requirementsSatisfied / describeResolution classify 
       normalizeCapability("claude", { kind: "tool", name: "Write" }),
     ],
   });
-  const resolution = resolveRequirements(readOnlyCatalog, ["claude:tool:read", "claude:tool:write", "claude:tool:nonexistent"]);
+  const resolution = resolveRequirements(readOnlyCatalog, [
+    "claude:tool:read",
+    "claude:tool:write",
+    "claude:tool:nonexistent",
+  ]);
   assert.equal(resolution.satisfied.length, 1);
   assert.equal(resolution.satisfied[0]!.name, "Read");
   assert.equal(resolution.missing.length, 1);
@@ -348,7 +441,13 @@ test("resolveRequirements / requirementsSatisfied / describeResolution classify 
 test("formatFreshness/formatCapabilityLine/formatCatalogSummary render bounded, human-legible text", () => {
   const now = 5_000 + 125_000;
   const readTool = normalizeCapability("claude", { kind: "tool", name: "Read", description: "read files" });
-  const claudeCatalog = catalog({ harness: "claude", access: "full", discoveredAt: 5_000, capabilities: [readTool], nativeVersion: "1.2.3" });
+  const claudeCatalog = catalog({
+    harness: "claude",
+    access: "full",
+    discoveredAt: 5_000,
+    capabilities: [readTool],
+    nativeVersion: "1.2.3",
+  });
 
   assert.equal(formatFreshness(claudeCatalog, 5_100), "just now");
   assert.equal(formatFreshness(claudeCatalog, 5_000 + 30_000), "30s ago");
@@ -359,5 +458,8 @@ test("formatFreshness/formatCapabilityLine/formatCatalogSummary render bounded, 
   assert.match(line, /^claude:tool:read \[inspect\] \(2m ago\) — read files$/);
 
   const summary = formatCatalogSummary(claudeCatalog, now);
-  assert.match(summary, /^claude 1\.2\.3: 1\/1 usable under full · health healthy · discovered 2m ago · revision fixture$/);
+  assert.match(
+    summary,
+    /^claude 1\.2\.3: 1\/1 usable under full · health healthy · discovered 2m ago · revision fixture$/,
+  );
 });

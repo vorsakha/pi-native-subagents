@@ -61,11 +61,16 @@ function project(jobs: JobSnapshot[], workflows: WorkflowSnapshot[]): NativeSuba
 }
 
 test("V1 presentation strings reject unsafe input while projection sanitizes manager text", () => {
-  const projected = project([jobSnapshot({
-    id: "job-\u001b[31mred",
-    name: "worker\u001b]0;owned\u0007 safe\u202E",
-    model: "model \uD800safe",
-  })], []);
+  const projected = project(
+    [
+      jobSnapshot({
+        id: "job-\u001b[31mred",
+        name: "worker\u001b]0;owned\u0007 safe\u202E",
+        model: "model \uD800safe",
+      }),
+    ],
+    [],
+  );
   assert.equal(validateNativeSubagentsStateV1(projected), true);
   assert.equal(projected.jobs[0]!.id, "job-red");
   assert.equal(projected.jobs[0]!.name, "worker safe");
@@ -73,17 +78,52 @@ test("V1 presentation strings reject unsafe input while projection sanitizes man
 
   const boundary = project([jobSnapshot({ name: `${"x".repeat(159)} suffix` })], []);
   assert.equal(boundary.jobs[0]!.name, "x".repeat(159));
-  assert.equal(validateNativeSubagentsStateV1(boundary), true, "truncation cannot leave schema-invalid trailing whitespace");
+  assert.equal(
+    validateNativeSubagentsStateV1(boundary),
+    true,
+    "truncation cannot leave schema-invalid trailing whitespace",
+  );
 
   const valid = project([jobSnapshot({ id: "job-safe", status: "queued" })], []);
   const cases: Array<{ label: string; mutate(state: NativeSubagentsStateV1): void }> = [
-    { label: "ESC identifier", mutate: (state) => { state.jobs[0]!.id = "job-\u001b[31mred"; } },
-    { label: "OSC name", mutate: (state) => { state.jobs[0]!.name = "worker\u001b]0;owned\u0007"; } },
-    { label: "C1 CSI model", mutate: (state) => { state.jobs[0]!.route.model = "model\u009B31m"; } },
-    { label: "bidi summary", mutate: (state) => { state.jobs[0]!.waitingSummary = "waiting \u202Ehidden"; } },
-    { label: "invalid surrogate", mutate: (state) => { state.session.id = "session-\uD800"; } },
-    { label: "unnormalized whitespace", mutate: (state) => { state.jobs[0]!.waitingSummary = "two  spaces"; } },
+    {
+      label: "ESC identifier",
+      mutate: (state) => {
+        state.jobs[0]!.id = "job-\u001b[31mred";
+      },
+    },
+    {
+      label: "OSC name",
+      mutate: (state) => {
+        state.jobs[0]!.name = "worker\u001b]0;owned\u0007";
+      },
+    },
+    {
+      label: "C1 CSI model",
+      mutate: (state) => {
+        state.jobs[0]!.route.model = "model\u009B31m";
+      },
+    },
+    {
+      label: "bidi summary",
+      mutate: (state) => {
+        state.jobs[0]!.waitingSummary = "waiting \u202Ehidden";
+      },
+    },
+    {
+      label: "invalid surrogate",
+      mutate: (state) => {
+        state.session.id = "session-\uD800";
+      },
+    },
+    {
+      label: "unnormalized whitespace",
+      mutate: (state) => {
+        state.jobs[0]!.waitingSummary = "two  spaces";
+      },
+    },
   ];
+
   for (const entry of cases) {
     const candidate = structuredClone(valid);
     entry.mutate(candidate);
@@ -119,6 +159,7 @@ test("V1 provider-wait summaries allow only known providers and valid retry meta
     { field: "maxAttempts", value: Number.NaN },
     { field: "maxAttempts", value: 1 },
   ];
+
   for (const { field, value } of invalidValues) {
     const restored = structuredClone(waiting);
     Object.assign(restored.agents[1]!.providerWait!, { [field]: value });
@@ -183,21 +224,23 @@ test("V1 projection has the exact bounded allowlist, relationships, ordering, us
   workflow.logs = [{ index: 0, message: PRIVATE, at: 1 }];
   workflow.result = { secret: PRIVATE };
   workflow.artifactDir = `/private/${PRIVATE}`;
-  workflow.interactions = [{
-    ordinal: 0,
-    requestId: "request-1",
-    target: "peer",
-    sourceAgentIndex: 1,
-    sourceName: PRIVATE,
-    targetAgentIndex: 0,
-    targetName: PRIVATE,
-    question: PRIVATE,
-    context: PRIVATE,
-    answer: PRIVATE,
-    error: PRIVATE,
-    state: "answered",
-    createdAt: 1,
-  }];
+  workflow.interactions = [
+    {
+      ordinal: 0,
+      requestId: "request-1",
+      target: "peer",
+      sourceAgentIndex: 1,
+      sourceName: PRIVATE,
+      targetAgentIndex: 0,
+      targetName: PRIVATE,
+      question: PRIVATE,
+      context: PRIVATE,
+      answer: PRIVATE,
+      error: PRIVATE,
+      state: "answered",
+      createdAt: 1,
+    },
+  ];
   workflow.replay = { sourceRunId: "run-source", matchedCalls: 1 };
   workflow.replacementOf = {
     sourceRunId: "run-old",
@@ -236,15 +279,35 @@ test("V1 projection has the exact bounded allowlist, relationships, ordering, us
   const state = project([hostileResult, failed, queued, completed], [workflow]);
   assert.equal(validateNativeSubagentsStateV1(state), true);
   assert.deepEqual(Object.keys(state), [
-    "schemaVersion", "producer", "sequence", "emittedAt", "cause", "session", "truncation", "jobs", "workflows",
+    "schemaVersion",
+    "producer",
+    "sequence",
+    "emittedAt",
+    "cause",
+    "session",
+    "truncation",
+    "jobs",
+    "workflows",
   ]);
   assert.deepEqual(state.producer, { name: NATIVE_SUBAGENTS_PRODUCER_NAME, version: "0.1.0", instanceId: "runtime-1" });
-  assert.deepEqual(state.jobs.map((job) => job.id), ["job-z", "job-a", "job-result", "job-hostile-result"]);
+  assert.deepEqual(
+    state.jobs.map((job) => job.id),
+    ["job-z", "job-a", "job-result", "job-hostile-result"],
+  );
   assert.equal(state.jobs[0]!.status, "queued", "JobManager status is preserved while waiting");
   assert.equal(state.jobs[0]!.waitingSummary, "Waiting for host input.");
   assert.equal(state.jobs[0]!.name.length, MAX_NATIVE_SUBAGENTS_STATE_V1_NAME_CHARS);
   assert.deepEqual(Object.keys(state.jobs[1]!), [
-    "id", "name", "kind", "status", "generation", "timestamps", "route", "relationships", "usage", "errorSummary",
+    "id",
+    "name",
+    "kind",
+    "status",
+    "generation",
+    "timestamps",
+    "route",
+    "relationships",
+    "usage",
+    "errorSummary",
   ]);
   assert.deepEqual(state.jobs[1]!.relationships, {
     workflow: { runId: "run-1", agentIndex: 0, phase: "build" },
@@ -259,9 +322,15 @@ test("V1 projection has the exact bounded allowlist, relationships, ordering, us
     replayedFrom: { runId: "run-source" },
     replacementOf: { runId: "run-old", agentIndex: 4 },
   });
-  assert.deepEqual(publicWorkflow.usage, { input: 300, output: 60, cacheRead: 10, cacheWrite: 0, cost: 0.03, turns: 3 });
-  assert.deepEqual(publicWorkflow.agents[0]!.relationships, {
+  assert.deepEqual(publicWorkflow.usage, {
+    input: 300,
+    output: 60,
+    cacheRead: 10,
+    cacheWrite: 0,
+    cost: 0.03,
+    turns: 3,
   });
+  assert.deepEqual(publicWorkflow.agents[0]!.relationships, {});
   assert.equal(publicWorkflow.agents[0]!.phaseIndex, 0);
   assert.equal(publicWorkflow.agents[0]!.jobId, "tests-job-0002");
   assert.deepEqual(publicWorkflow.agents[1]!.relationships, {
@@ -278,6 +347,7 @@ test("V1 projection has the exact bounded allowlist, relationships, ordering, us
   assert.deepEqual(Object.keys(publicWorkflow.phases[0]!), ["index", "name", "status", "timestamps", "agentIndexes"]);
   assert.equal(state.truncation.summariesTruncated, 0);
   const serializedState = JSON.stringify(state);
+
   for (const canary of [PRIVATE, UNLABELED_STDERR_OUTPUT, UNLABELED_PROVIDER_MESSAGE, RAW_RESULT_CANARY]) {
     assert.equal(serializedState.includes(canary), false);
   }
@@ -307,8 +377,9 @@ test("V1 projection has the exact bounded allowlist, relationships, ordering, us
   (invalidEnum.jobs[0] as { status: string }).status = "waiting";
   assert.equal(validateNativeSubagentsStateV1(invalidEnum), false);
   const invalidReplayRelationship = structuredClone(state);
-  invalidReplayRelationship.workflows[0]!.relationships.replayedFrom!.runId =
-    "r".repeat(MAX_NATIVE_SUBAGENTS_STATE_V1_ID_CHARS + 1);
+  invalidReplayRelationship.workflows[0]!.relationships.replayedFrom!.runId = "r".repeat(
+    MAX_NATIVE_SUBAGENTS_STATE_V1_ID_CHARS + 1,
+  );
   assert.equal(validateNativeSubagentsStateV1(invalidReplayRelationship), false);
   const overlong = structuredClone(state);
   overlong.jobs[0]!.id = "i".repeat(MAX_NATIVE_SUBAGENTS_STATE_V1_ID_CHARS + 1);
@@ -332,10 +403,10 @@ test("V1 projection has the exact bounded allowlist, relationships, ordering, us
   );
   assert.equal(validateNativeSubagentsStateV1(tooManyNested), false);
   tooManyNested.workflows[0]!.agents = [];
-  tooManyNested.workflows[0]!.phases = Array.from(
-    { length: MAX_NATIVE_SUBAGENTS_STATE_V1_PHASES + 1 },
-    (_, index) => ({ ...structuredClone(state.workflows[0]!.phases[0]!), index }),
-  );
+  tooManyNested.workflows[0]!.phases = Array.from({ length: MAX_NATIVE_SUBAGENTS_STATE_V1_PHASES + 1 }, (_, index) => ({
+    ...structuredClone(state.workflows[0]!.phases[0]!),
+    index,
+  }));
   assert.equal(validateNativeSubagentsStateV1(tooManyNested), false);
 
   const oversized: NativeSubagentsStateV1 = {
@@ -378,12 +449,14 @@ test("V1 limits and deterministic truncation remove low-priority summaries and r
   assert.equal(MAX_NATIVE_SUBAGENTS_STATE_V1_SUMMARY_CHARS, 2_000);
   assert.equal(MAX_NATIVE_SUBAGENTS_STATE_V1_BYTES, 512 * 1024);
 
-  const jobs = Array.from({ length: 101 }, (_, index) => jobSnapshot({
-    id: `job-${String(index).padStart(3, "0")}`,
-    status: index === 100 ? "running" : "completed",
-    createdAt: index,
-    endedAt: index === 100 ? undefined : index,
-  }));
+  const jobs = Array.from({ length: 101 }, (_, index) =>
+    jobSnapshot({
+      id: `job-${String(index).padStart(3, "0")}`,
+      status: index === 100 ? "running" : "completed",
+      createdAt: index,
+      endedAt: index === 100 ? undefined : index,
+    }),
+  );
   const workflows = Array.from({ length: 65 }, (_, workflowIndex) => {
     const workflow = workflowSnapshotFixture(`run-${String(workflowIndex).padStart(3, "0")}`, "failed");
     workflow.timestamps = { createdAt: workflowIndex, updatedAt: workflowIndex, endedAt: workflowIndex };
@@ -410,6 +483,7 @@ test("V1 limits and deterministic truncation remove low-priority summaries and r
       agents: workflow.agents.map((agent) => agent.index),
       timestamps: { createdAt: workflowIndex, updatedAt: workflowIndex, endedAt: workflowIndex },
     }));
+
     return workflow;
   });
 
@@ -425,6 +499,7 @@ test("V1 limits and deterministic truncation remove low-priority summaries and r
     state.truncation.workflowAgentsOmitted,
     state.workflows.reduce((total, retained) => {
       const source = workflows.find((workflow) => workflow.runId === retained.id)!;
+
       return total + source.agents.length - retained.agents.length;
     }, 0),
   );
@@ -432,16 +507,19 @@ test("V1 limits and deterministic truncation remove low-priority summaries and r
     state.truncation.phasesOmitted,
     state.workflows.reduce((total, retained) => {
       const source = workflows.find((workflow) => workflow.runId === retained.id)!;
+
       return total + source.phases.length - retained.phases.length;
     }, 0),
   );
   assert.equal(
     state.truncation.summariesTruncated,
-    state.workflows.reduce((total, workflow) => total + 1 + workflow.agents.length, 0)
-      + state.jobs.filter((job) => job.status === "completed" && job.resultSummary === undefined).length,
+    state.workflows.reduce((total, workflow) => total + 1 + workflow.agents.length, 0) +
+      state.jobs.filter((job) => job.status === "completed" && job.resultSummary === undefined).length,
   );
   assert.ok(state.workflows.length < MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOWS, "the byte ceiling omits actual records");
-  assert.ok(state.workflows.every((workflow) => workflow.agents.length <= MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOW_AGENTS));
+  assert.ok(
+    state.workflows.every((workflow) => workflow.agents.length <= MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOW_AGENTS),
+  );
   assert.ok(state.workflows.every((workflow) => workflow.phases.length <= MAX_NATIVE_SUBAGENTS_STATE_V1_PHASES));
 });
 
@@ -462,7 +540,11 @@ test("V1 byte pressure preserves numeric agent priority within a bounded runtime
       model: "m".repeat(MAX_NATIVE_SUBAGENTS_STATE_V1_NAME_CHARS),
       independentOf: longId(`independent-${workflowIndex}-${agentIndex}`, "i"),
       replayedFrom: { runId: longId(`replay-${workflowIndex}-${agentIndex}`, "r"), callIndex: agentIndex },
-      replacedBy: { replacementRunId: longId(`replacement-${workflowIndex}-${agentIndex}`, "b"), reason: PRIVATE, at: 2_000 },
+      replacedBy: {
+        replacementRunId: longId(`replacement-${workflowIndex}-${agentIndex}`, "b"),
+        reason: PRIVATE,
+        at: 2_000,
+      },
       continuation: {
         state: "running" as const,
         fromHarness: "claude" as const,
@@ -471,7 +553,12 @@ test("V1 byte pressure preserves numeric agent priority within a bounded runtime
         replacementJobId: longId(`next-${workflowIndex}-${agentIndex}`, "q"),
         checkpointAt: 2_000,
         checkoutDigest: PRIVATE,
-        trigger: { source: "continuation" as const, provider: "claude" as const, kind: "quota" as const, detail: PRIVATE },
+        trigger: {
+          source: "continuation" as const,
+          provider: "claude" as const,
+          kind: "quota" as const,
+          detail: PRIVATE,
+        },
         warning: PRIVATE,
       },
     }));
@@ -484,6 +571,7 @@ test("V1 byte pressure preserves numeric agent priority within a bounded runtime
       agents: [],
       timestamps: { createdAt: 0, updatedAt: 0 },
     }));
+
     return workflow;
   });
 
@@ -496,13 +584,16 @@ test("V1 byte pressure preserves numeric agent priority within a bounded runtime
   assert.ok(state.truncation.workflowAgentsOmitted > 0, "the fixture must exercise record omission");
   assert.equal(
     state.truncation.workflowAgentsOmitted,
-    workflows.length * MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOW_AGENTS
-      - state.workflows.reduce((total, workflow) => total + workflow.agents.length, 0),
+    workflows.length * MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOW_AGENTS -
+      state.workflows.reduce((total, workflow) => total + workflow.agents.length, 0),
   );
-  assert.ok(state.workflows.some(
-    (workflow) => workflow.agents.length > 0
-      && workflow.agents.length < MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOW_AGENTS,
-  ));
+  assert.ok(
+    state.workflows.some(
+      (workflow) =>
+        workflow.agents.length > 0 && workflow.agents.length < MAX_NATIVE_SUBAGENTS_STATE_V1_WORKFLOW_AGENTS,
+    ),
+  );
+
   for (const workflow of state.workflows) {
     assert.deepEqual(
       workflow.agents.map(({ index }) => index),
@@ -510,6 +601,7 @@ test("V1 byte pressure preserves numeric agent priority within a bounded runtime
       `${workflow.id} retains the lowest numeric indexes`,
     );
   }
+
   assert.ok(elapsedMs < 10_000, `bounded pressure projection took ${elapsedMs.toFixed(1)}ms`);
 });
 
@@ -525,14 +617,25 @@ test("publisher rebuilds authoritative lists, suppresses only true public no-ops
     instanceId: "instance",
     producerVersion: "test",
     now: () => now++,
-    listJobs: () => { jobLists++; return jobs; },
-    listWorkflows: () => { workflowLists++; return []; },
+    listJobs: () => {
+      jobLists++;
+
+      return jobs;
+    },
+    listWorkflows: () => {
+      workflowLists++;
+
+      return [];
+    },
     emit: (_event, state) => states.push(state),
     reportError: (message) => diagnostics.push(message),
   });
 
   publisher.start();
-  assert.deepEqual(states.map((state) => [state.sequence, state.cause]), [[1, "startup"]]);
+  assert.deepEqual(
+    states.map((state) => [state.sequence, state.cause]),
+    [[1, "startup"]],
+  );
   publisher.changed();
   await tick();
   assert.equal(states.length, 1);
@@ -542,7 +645,10 @@ test("publisher rebuilds authoritative lists, suppresses only true public no-ops
   jobs = [jobSnapshot({ id: "job-1", output: PRIVATE })];
   publisher.changed();
   await tick();
-  assert.deepEqual(states.map((state) => state.sequence), [1, 2]);
+  assert.deepEqual(
+    states.map((state) => state.sequence),
+    [1, 2],
+  );
   jobs = [jobSnapshot({ id: "job-1", output: `${PRIVATE}-changed` })];
   publisher.changed();
   await tick();
@@ -550,7 +656,10 @@ test("publisher rebuilds authoritative lists, suppresses only true public no-ops
   jobs[0]!.usage.input = 4;
   publisher.changed();
   await tick();
-  assert.deepEqual(states.map((state) => state.sequence), [1, 2, 3]);
+  assert.deepEqual(
+    states.map((state) => state.sequence),
+    [1, 2, 3],
+  );
 
   jobs[0]!.usage.input = Number.NaN;
   publisher.changed();
@@ -562,13 +671,16 @@ test("publisher rebuilds authoritative lists, suppresses only true public no-ops
   await tick();
   publisher.suspend();
   publisher.stop(jobs, []);
-  assert.deepEqual(states.map((state) => [state.sequence, state.cause, state.session.lifecycle]), [
-    [1, "startup", "active"],
-    [2, "update", "active"],
-    [3, "update", "active"],
-    [4, "update", "active"],
-    [5, "shutdown", "closed"],
-  ]);
+  assert.deepEqual(
+    states.map((state) => [state.sequence, state.cause, state.session.lifecycle]),
+    [
+      [1, "startup", "active"],
+      [2, "update", "active"],
+      [3, "update", "active"],
+      [4, "update", "active"],
+      [5, "shutdown", "closed"],
+    ],
+  );
 
   const metadataOnly = structuredClone(states[4]!);
   metadataOnly.sequence++;
@@ -584,7 +696,9 @@ test("publisher rebuilds authoritative lists, suppresses only true public no-ops
   const hostileDiagnostics: string[] = [];
   createNativeSubagentsStatePublisher({
     sessionId: "hostile-session",
-    listJobs: () => { throw hostileError; },
+    listJobs: () => {
+      throw hostileError;
+    },
     listWorkflows: () => [],
     emit: () => assert.fail("invalid projection must not emit"),
     reportError: (message) => hostileDiagnostics.push(message),
@@ -602,7 +716,9 @@ test("extension lifecycle publishes restored startup, workflow-only terminal upd
   const eventBus = createEventBus();
   const states: NativeSubagentsStateV1[] = [];
   const originalConsoleError = console.error;
-  t.after(() => { console.error = originalConsoleError; });
+  t.after(() => {
+    console.error = originalConsoleError;
+  });
   console.error = () => undefined;
   const removeThrowingListener = eventBus.on(NATIVE_SUBAGENTS_STATE_EVENT_V1, () => {
     throw new Error("consumer failed");
@@ -628,13 +744,9 @@ test("extension lifecycle publishes restored startup, workflow-only terminal upd
   assert.equal(states[0]!.cause, "startup");
   assert.deepEqual(states[0]!.jobs, []);
 
-  const spawned = await first.tools.get("subagent_spawn").execute(
-    "direct",
-    { task: "direct work" },
-    undefined,
-    undefined,
-    session.ctx,
-  );
+  const spawned = await first.tools
+    .get("subagent_spawn")
+    .execute("direct", { task: "direct work" }, undefined, undefined, session.ctx);
   await backend.waitForStart();
   await waitFor(
     () => states.at(-1)?.jobs.some((job) => job.id === spawned.details.job.id && job.status === "running") === true,
@@ -654,14 +766,23 @@ test("extension lifecycle publishes restored startup, workflow-only terminal upd
   );
   const completedWorkflow = await workflowPromise;
   await waitFor(
-    () => states.slice(beforeWorkflow).some((state) => state.workflows.some(
-      (workflow) => workflow.id === completedWorkflow.details.workflow.runId && workflow.status === "completed",
-    )),
+    () =>
+      states
+        .slice(beforeWorkflow)
+        .some((state) =>
+          state.workflows.some(
+            (workflow) => workflow.id === completedWorkflow.details.workflow.runId && workflow.status === "completed",
+          ),
+        ),
     "workflow-only terminal update",
   );
-  const workflowOnlyUpdate = states.slice(beforeWorkflow).find((state) => state.workflows.some(
-    (workflow) => workflow.id === completedWorkflow.details.workflow.runId && workflow.status === "completed",
-  ))!;
+  const workflowOnlyUpdate = states
+    .slice(beforeWorkflow)
+    .find((state) =>
+      state.workflows.some(
+        (workflow) => workflow.id === completedWorkflow.details.workflow.runId && workflow.status === "completed",
+      ),
+    )!;
   assert.equal(workflowOnlyUpdate.cause, "update", "terminal workflow state is published before shutdown");
   assert.deepEqual(workflowOnlyUpdate.jobs, jobsBeforeWorkflow, "workflow onSnapshot publishes without a job update");
   const beforeShutdown = states.length;
@@ -718,6 +839,7 @@ test("extension lifecycle publishes restored startup, workflow-only terminal upd
   assert.equal(producerFirstStates[0]!.cause, "startup");
   assert.equal(producerFirstStates[0]!.sequence, 1);
   await producerFirst.handlers.get("session_shutdown")?.();
+
   for (const state of [...states, ...producerFirstStates]) {
     assert.equal(validateNativeSubagentsStateV1(state), true);
   }
@@ -731,7 +853,9 @@ test("shutdown releases every resource when workflow shutdown and final reads fa
   const backend = new ControlledBackend("pi");
   const first = fakePi();
   const published: unknown[] = [];
-  first.eventBus.on(NATIVE_SUBAGENTS_STATE_EVENT_V1, (value) => { published.push(value); });
+  first.eventBus.on(NATIVE_SUBAGENTS_STATE_EVENT_V1, (value) => {
+    published.push(value);
+  });
   registerNativeSubagents(first.api, {
     registry,
     legacyRoot: false,
@@ -743,19 +867,14 @@ test("shutdown releases every resource when workflow shutdown and final reads fa
   });
   const session = context({ sessionId: "failing-shutdown", cwd: root });
   first.handlers.get("session_start")?.({}, session.ctx);
-  const spawned = await first.tools.get("subagent_spawn").execute(
-    "shutdown-job",
-    { task: "remain active until shutdown" },
-    undefined,
-    undefined,
-    session.ctx,
-  );
+  const spawned = await first.tools
+    .get("subagent_spawn")
+    .execute("shutdown-job", { task: "remain active until shutdown" }, undefined, undefined, session.ctx);
   await backend.waitForStart();
 
-  await assert.rejects(
-    first.handlers.get("session_shutdown")?.(),
-    (error) => error === workflows.shutdownError,
-  );
+  const shutdown = first.handlers.get("session_shutdown")?.();
+  assert.ok(shutdown instanceof Promise);
+  await assert.rejects(shutdown, (error) => error === workflows.shutdownError);
   assert.deepEqual(backend.cancels, [{ jobId: spawned.details.job.id, reason: "Session shutdown" }]);
   assert.equal(workflows.sessionShutdowns, 1);
   assert.equal(workflows.sessionCloses, 1, "workflow close is attempted even after final reads fail");
@@ -767,13 +886,17 @@ test("shutdown releases every resource when workflow shutdown and final reads fa
   );
 
   const replacement = fakePi();
-  assert.doesNotThrow(() => registerNativeSubagents(replacement.api, {
-    registry,
-    legacyRoot: false,
-    backends: [new ImmediateBackend("pi")],
-    workflowArtifactRoot: join(root, "replacement-runs"),
-    globalProfilesDir: join(root, "replacement-profiles"),
-    providerStatus: readyProviderStatusReader(),
-  }), "a throwing workflow close cannot retain the install claim");
+  assert.doesNotThrow(
+    () =>
+      registerNativeSubagents(replacement.api, {
+        registry,
+        legacyRoot: false,
+        backends: [new ImmediateBackend("pi")],
+        workflowArtifactRoot: join(root, "replacement-runs"),
+        globalProfilesDir: join(root, "replacement-profiles"),
+        providerStatus: readyProviderStatusReader(),
+      }),
+    "a throwing workflow close cannot retain the install claim",
+  );
   await replacement.handlers.get("session_shutdown")?.();
 });

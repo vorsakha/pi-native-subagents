@@ -35,8 +35,5 @@ test("JSONL framer accepts a valid 1.1 MB record at the default bound and still 
   const records = new JsonlFramer().push(`${"x".repeat(1_100_000)}\n`);
   assert.equal(records.length, 1);
   assert.equal(records[0]!.length, 1_100_000);
-  assert.throws(
-    () => new JsonlFramer().push(`${"x".repeat(MAX_JSONL_FRAME_BYTES + 1)}\n`),
-    /JSONL frame exceeds/,
-  );
+  assert.throws(() => new JsonlFramer().push(`${"x".repeat(MAX_JSONL_FRAME_BYTES + 1)}\n`), /JSONL frame exceeds/);
 });

@@ -55,7 +55,10 @@ interface PiBackendOptions {
  * fully stripped launch.
  */
 export function piResourceArgs(policy: Pick<BackendPolicy, "customization" | "access">): string[] {
-  if (policy.customization !== "native") return ["--no-skills", "--no-prompt-templates", "--no-extensions"];
+  if (policy.customization !== "native") {
+    return ["--no-skills", "--no-prompt-templates", "--no-extensions"];
+  }
+
   return policy.access === "readOnly" ? ["--no-extensions"] : [];
 }
 
@@ -112,6 +115,7 @@ export class PiRpcBackend implements Backend {
     if (this.#parentInventory) {
       try {
         const inventory = this.#parentInventory();
+
         for (const tool of inventory.tools ?? []) {
           const nativeBuiltin = tool.source === "builtin" || tool.source === "sdk";
           capabilities.push({
@@ -126,6 +130,7 @@ export class PiRpcBackend implements Backend {
             effect: request.access === "readOnly" && !nativeBuiltin ? "unknown" : undefined,
           });
         }
+
         for (const command of inventory.commands ?? []) {
           capabilities.push({
             kind: command.source === "skill" ? "skill" : "command",
@@ -134,6 +139,7 @@ export class PiRpcBackend implements Backend {
             origin: command.source ?? "parent",
           });
         }
+
         sources.push({ source: "pi-parent", health: "healthy" });
       } catch (error) {
         sources.push({ source: "pi-parent", health: "unknown", detail: message(error) });
@@ -146,6 +152,7 @@ export class PiRpcBackend implements Backend {
 
     try {
       const inventory = await this.#childInventory(request);
+
       for (const command of inventory.commands) {
         capabilities.push({
           kind: command.source === "skill" ? "skill" : "command",
@@ -154,14 +161,19 @@ export class PiRpcBackend implements Backend {
           origin: command.source ? `child:${command.source}` : "child",
         });
       }
+
       if (inventory.commandError) {
         sources.push({ source: "pi-child", health: "unknown", detail: inventory.commandError });
         warnings.push(`Pi child command inventory unavailable: ${inventory.commandError}`);
       } else {
         sources.push({ source: "pi-child", health: "healthy" });
       }
+
       const selected = inventory.selectedModel;
-      const ready = selected && inventory.availableModels.some((model) => model.provider === selected.provider && model.id === selected.id);
+      const ready =
+        selected &&
+        inventory.availableModels.some((model) => model.provider === selected.provider && model.id === selected.id);
+
       if (ready) {
         sources.push({ source: "pi-model", health: "healthy", detail: `${selected.provider}/${selected.id}` });
       } else {
@@ -175,20 +187,29 @@ export class PiRpcBackend implements Backend {
       sources.push({ source: "pi-child", health: "unavailable", detail: message(error) });
       warnings.unshift(`Pi child readiness probe unavailable: ${message(error)}`);
     }
+
     return { capabilities, sources, warnings };
   }
 
   async #childInventory(request: DiscoveryRequest): Promise<PiChildInventory> {
     request.signal.throwIfAborted();
     const args = [
-      "--mode", "rpc", "--approve",
+      "--mode",
+      "rpc",
+      "--approve",
       ...piResourceArgs({ customization: request.customization, access: request.access }),
-      "--name", "subagent-capability-probe",
+      "--name",
+      "subagent-capability-probe",
       "--no-tools",
     ];
-    if (request.model) args.push("--model", request.model);
+
+    if (request.model) {
+      args.push("--model", request.model);
+    }
+
     const managed = spawnManaged(this.#command, args, { cwd: request.cwd, env: piChildEnv(request.env) });
     const framer = new JsonlFramer();
+
     try {
       return await new Promise<PiChildInventory>((resolveInventory, reject) => {
         const ids = {
@@ -205,62 +226,109 @@ export class PiRpcBackend implements Backend {
         let settled = false;
         const model = (value: unknown): PiModelRecord | undefined => {
           const record = asObject(value);
+
           return typeof record.provider === "string" && record.provider && typeof record.id === "string" && record.id
             ? { provider: record.provider, id: record.id }
             : undefined;
         };
+
         const settle = (fn: () => void) => {
-          if (settled) return;
+          if (settled) {
+            return;
+          }
+
           settled = true;
           cleanup();
           fn();
         };
-        const onAbort = () => settle(() => reject(request.signal.reason ?? new Error("Pi capability discovery aborted")));
+
+        const onAbort = () =>
+          settle(() => reject(request.signal.reason ?? new Error("Pi capability discovery aborted")));
         const cleanup = () => {
           request.signal.removeEventListener("abort", onAbort);
           clearTimeout(timer);
         };
-        const timer = setTimeout(() => settle(() => reject(new Error("Pi readiness probe timed out"))), this.#requestTimeoutMs);
+
+        const timer = setTimeout(
+          () => settle(() => reject(new Error("Pi readiness probe timed out"))),
+          this.#requestTimeoutMs,
+        );
         const maybeResolve = () => {
-          if (!stateReceived || availableModels === undefined || commands === undefined) return;
-          settle(() => resolveInventory({ selectedModel, availableModels: availableModels!, commands: commands!, commandError }));
+          if (!stateReceived || availableModels === undefined || commands === undefined) {
+            return;
+          }
+
+          settle(() =>
+            resolveInventory({ selectedModel, availableModels: availableModels!, commands: commands!, commandError }),
+          );
         };
+
         const handle = (record: string) => {
           const event = parseJsonRecord(record);
-          if (!event || event.type !== "response" || !knownIds.has(String(event.id))) return;
+
+          if (!event || event.type !== "response" || !knownIds.has(String(event.id))) {
+            return;
+          }
+
           if (event.success === false) {
             const detail = String(event.error ?? `Pi rejected ${event.command ?? "readiness probe"}`);
+
             if (event.id === ids.commands) {
               commandError = detail;
               commands = [];
               maybeResolve();
+
               return;
             }
+
             return settle(() => reject(new Error(detail)));
           }
+
           const data = asObject(event.data);
+
           if (event.id === ids.state) {
             stateReceived = true;
             selectedModel = model(data.model);
           }
-          if (event.id === ids.models) availableModels = (Array.isArray(data.models) ? data.models : []).map(model).filter((item): item is PiModelRecord => !!item);
-          if (event.id === ids.commands) commands = (Array.isArray(data.commands) ? data.commands : []).map((item) => {
-            const command = asObject(item);
-            return {
-              name: String(command.name ?? ""),
-              description: typeof command.description === "string" ? command.description : undefined,
-              source: typeof command.source === "string" ? command.source : undefined,
-            };
-          }).filter((command) => command.name);
+
+          if (event.id === ids.models) {
+            availableModels = (Array.isArray(data.models) ? data.models : [])
+              .map(model)
+              .filter((item): item is PiModelRecord => !!item);
+          }
+
+          if (event.id === ids.commands) {
+            commands = (Array.isArray(data.commands) ? data.commands : [])
+              .map((item) => {
+                const command = asObject(item);
+
+                return {
+                  name: String(command.name ?? ""),
+                  description: typeof command.description === "string" ? command.description : undefined,
+                  source: typeof command.source === "string" ? command.source : undefined,
+                };
+              })
+              .filter((command) => command.name);
+          }
+
           maybeResolve();
         };
+
         managed.child.stdout.on("data", (chunk: Buffer) => {
-          try { for (const record of framer.push(chunk)) handle(record); }
-          catch (error) { settle(() => reject(error instanceof Error ? error : new Error(String(error)))); }
+          try {
+            for (const record of framer.push(chunk)) {
+              handle(record);
+            }
+          } catch (error) {
+            settle(() => reject(error instanceof Error ? error : new Error(String(error))));
+          }
         });
         managed.child.on("error", (error) => settle(() => reject(error)));
-        managed.child.on("close", (code, signal) => settle(() => reject(new Error(`Pi capability probe exited (${code ?? signal ?? "signal"})`))));
+        managed.child.on("close", (code, signal) =>
+          settle(() => reject(new Error(`Pi capability probe exited (${code ?? signal ?? "signal"})`))),
+        );
         request.signal.addEventListener("abort", onAbort, { once: true });
+
         try {
           managed.child.stdin.write(`${JSON.stringify({ id: ids.state, type: "get_state" })}\n`);
           managed.child.stdin.write(`${JSON.stringify({ id: ids.models, type: "get_available_models" })}\n`);
@@ -276,21 +344,38 @@ export class PiRpcBackend implements Backend {
 
   async start(request: BackendRequest, emit: (event: BackendEvent) => void): Promise<BackendRun> {
     request.signal.throwIfAborted();
-    if (request.policy.structuredOutput) throw new Error("Pi does not support native structured results");
+
+    if (request.policy.structuredOutput) {
+      throw new Error("Pi does not support native structured results");
+    }
+
     const args = [
-      "--mode", "rpc", "--approve",
+      "--mode",
+      "rpc",
+      "--approve",
       ...piResourceArgs(request.policy),
-      "--name", `subagent-${request.name}-${request.jobId.slice(0, 8)}`,
+      "--name",
+      `subagent-${request.name}-${request.jobId.slice(0, 8)}`,
     ];
     let parentThreadDir: string | undefined;
     let childResourcesCleaned = false;
     let bridge: InteractionBridge | undefined;
     const cleanupParentThread = async () => {
-      if (childResourcesCleaned) return;
+      if (childResourcesCleaned) {
+        return;
+      }
+
       childResourcesCleaned = true;
-      if (bridge) await bridge.close().catch(() => undefined);
-      if (parentThreadDir) await rm(parentThreadDir, { recursive: true, force: true });
+
+      if (bridge) {
+        await bridge.close().catch(() => undefined);
+      }
+
+      if (parentThreadDir) {
+        await rm(parentThreadDir, { recursive: true, force: true });
+      }
     };
+
     // The Pi child runs in its own process, so its ask tool cannot call the
     // host callback directly. The bridge is a live authenticated loopback
     // channel opened only for this job; the watchdog handle is bound after the
@@ -298,6 +383,7 @@ export class PiRpcBackend implements Backend {
     // in-process adapters suspend.
     const park = { suspend: () => {}, resume: () => {} };
     let childEnv = piChildEnv(request.env);
+
     try {
       if (request.parentThread) {
         parentThreadDir = await mkdtemp(join(tmpdir(), "pi-parent-thread-"));
@@ -306,13 +392,18 @@ export class PiRpcBackend implements Backend {
         childEnv = { ...childEnv, [PI_PARENT_THREAD_FILE]: snapshotPath };
         args.push("--extension", CHILD_EXTENSION_PATH);
       }
+
       if (request.interactions) {
         const handler = request.interactions;
         bridge = await this.#openBridge(request.jobId, {
           ask: async (input) => {
             park.suspend();
-            try { return await handler.ask(input); }
-            finally { park.resume(); }
+
+            try {
+              return await handler.ask(input);
+            } finally {
+              park.resume();
+            }
           },
         });
         childEnv = {
@@ -325,25 +416,37 @@ export class PiRpcBackend implements Backend {
       }
     } catch (error) {
       await cleanupParentThread();
+
       throw error;
     }
-    if (request.resumeSessionFile) args.push("--session", request.resumeSessionFile);
-    if (request.policy.model) args.push("--model", request.policy.model);
-    args.push(
-      "--thinking", request.policy.thinking,
-      "--append-system-prompt", request.systemPrompt,
-    );
-    if (request.policy.piTools.length > 0) args.push("--tools", request.policy.piTools.join(","));
-    else args.push("--no-tools");
+
+    if (request.resumeSessionFile) {
+      args.push("--session", request.resumeSessionFile);
+    }
+
+    if (request.policy.model) {
+      args.push("--model", request.policy.model);
+    }
+
+    args.push("--thinking", request.policy.thinking, "--append-system-prompt", request.systemPrompt);
+
+    if (request.policy.piTools.length > 0) {
+      args.push("--tools", request.policy.piTools.join(","));
+    } else {
+      args.push("--no-tools");
+    }
 
     let managed;
+
     try {
       request.signal.throwIfAborted();
       managed = spawnManaged(this.#command, args, { cwd: request.cwd, env: childEnv });
     } catch (error) {
       await cleanupParentThread();
+
       throw error;
     }
+
     const pending = new Map<string, PendingCommand>();
     let commandSequence = 0;
     let output = "";
@@ -354,7 +457,9 @@ export class PiRpcBackend implements Backend {
     let closed = false;
     let tearingDown = false;
     let resolveCompleted!: () => void;
-    const completed = new Promise<void>((resolve) => { resolveCompleted = resolve; });
+    const completed = new Promise<void>((resolve) => {
+      resolveCompleted = resolve;
+    });
     const watchdog = createActivityWatchdog(this.#inactivityTimeoutMs, () => {
       closed = true;
       tearingDown = true;
@@ -369,30 +474,50 @@ export class PiRpcBackend implements Backend {
         clearTimeout(item.timer);
         item.reject(error);
       }
+
       pending.clear();
     };
+
     const finish = (event: BackendEvent) => {
-      if (settled) return;
+      if (settled) {
+        return;
+      }
+
       settled = true;
       watchdog.clear();
       emit(event);
       resolveCompleted();
     };
+
     const write = (value: Record<string, unknown>) => {
-      if (closed || managed.child.stdin.destroyed || !managed.child.stdin.writable) throw new Error("Pi RPC process is closed");
+      if (closed || managed.child.stdin.destroyed || !managed.child.stdin.writable) {
+        throw new Error("Pi RPC process is closed");
+      }
+
       managed.child.stdin.write(`${JSON.stringify(value)}\n`);
     };
-    const command = (type: string, fields: Record<string, unknown> = {}, timeoutMs = this.#requestTimeoutMs): Promise<void> => {
-      if (closed) return Promise.reject(new Error("Pi RPC process is closed"));
+
+    const command = (
+      type: string,
+      fields: Record<string, unknown> = {},
+      timeoutMs = this.#requestTimeoutMs,
+    ): Promise<void> => {
+      if (closed) {
+        return Promise.reject(new Error("Pi RPC process is closed"));
+      }
+
       const id = `${request.jobId}:${++commandSequence}`;
+
       return new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id);
           reject(new Error(`Pi RPC command timed out: ${type}`));
         }, timeoutMs);
         pending.set(id, { command: type, resolve, reject, timer });
-        try { write({ id, type, ...fields }); }
-        catch (error) {
+
+        try {
+          write({ id, type, ...fields });
+        } catch (error) {
           clearTimeout(timer);
           pending.delete(id);
           reject(error instanceof Error ? error : new Error(String(error)));
@@ -403,61 +528,109 @@ export class PiRpcBackend implements Backend {
     const framer = new JsonlFramer();
     const handle = (record: string) => {
       const event = parseJsonRecord(record);
+
       if (!event) {
-        if (record.trim()) throw new Error("invalid JSON object");
+        if (record.trim()) {
+          throw new Error("invalid JSON object");
+        }
+
         return;
       }
+
       watchdog.touch();
+
       if (event.type === "response" && typeof event.id === "string") {
         const item = pending.get(event.id);
+
         if (item) {
           pending.delete(event.id);
           clearTimeout(item.timer);
-          if (event.success === false) item.reject(new Error(String(event.error ?? `Pi rejected ${item.command}`)));
-          else item.resolve();
+
+          if (event.success === false) {
+            item.reject(new Error(String(event.error ?? `Pi rejected ${item.command}`)));
+          } else {
+            item.resolve();
+          }
         }
+
         return;
       }
+
       if (event.type === "message_update") {
         const delta = asObject(event.assistantMessageEvent);
-        if (delta.type === "text_delta") emit({ type: "text_delta", text: String(delta.delta ?? "") });
-        else if (delta.type === "thinking_delta") emit({ type: "thinking_delta", text: String(delta.delta ?? "") });
-        else if (delta.type === "error") {
-          terminalProblem = assistantProblem(asObject(delta.error ?? delta.message ?? delta.partial), "Pi assistant stream failed");
+
+        if (delta.type === "text_delta") {
+          emit({ type: "text_delta", text: String(delta.delta ?? "") });
+        } else if (delta.type === "thinking_delta") {
+          emit({ type: "thinking_delta", text: String(delta.delta ?? "") });
+        } else if (delta.type === "error") {
+          terminalProblem = assistantProblem(
+            asObject(delta.error ?? delta.message ?? delta.partial),
+            "Pi assistant stream failed",
+          );
           retryableAssistantProblem = terminalProblem.type === "failed";
         }
       } else if (event.type === "message_end") {
         const message = asObject(event.message);
+
         if (message.role === "assistant") {
           output = bound(textContent(message.content) || output);
           const thinking = thinkingContent(message.content);
-          if (thinking) emit({ type: "thinking_message", text: thinking });
-          if (output) emit({ type: "message", text: output });
+
+          if (thinking) {
+            emit({ type: "thinking_message", text: thinking });
+          }
+
+          if (output) {
+            emit({ type: "message", text: output });
+          }
+
           const stopReason = String(message.stopReason ?? "");
+
           if (stopReason === "error" || stopReason === "aborted") {
-            terminalProblem = assistantProblem(message, stopReason === "aborted" ? "Pi assistant aborted" : "Pi assistant failed");
+            terminalProblem = assistantProblem(
+              message,
+              stopReason === "aborted" ? "Pi assistant aborted" : "Pi assistant failed",
+            );
             retryableAssistantProblem = stopReason === "error";
           } else if (retryableAssistantProblem) {
             terminalProblem = undefined;
             retryableAssistantProblem = false;
           }
+
           const usage = asObject(message.usage);
-          emit({ type: "usage", usage: {
-            input: number(usage.input), output: number(usage.output), cacheRead: number(usage.cacheRead),
-            cacheWrite: number(usage.cacheWrite), cost: number(asObject(usage.cost).total), turns: 1,
-          } });
+          emit({
+            type: "usage",
+            usage: {
+              input: number(usage.input),
+              output: number(usage.output),
+              cacheRead: number(usage.cacheRead),
+              cacheWrite: number(usage.cacheWrite),
+              cost: number(asObject(usage.cost).total),
+              turns: 1,
+            },
+          });
           // responseModel, when present, is the concrete model that served the request; message.model is only the requested/configured model and is never a substitute.
-          const servingModel = typeof message.responseModel === "string" && message.responseModel ? message.responseModel : undefined;
-          const contextTokens = typeof usage.totalTokens === "number" && Number.isFinite(usage.totalTokens) ? usage.totalTokens : undefined;
+          const servingModel =
+            typeof message.responseModel === "string" && message.responseModel ? message.responseModel : undefined;
+          const contextTokens =
+            typeof usage.totalTokens === "number" && Number.isFinite(usage.totalTokens) ? usage.totalTokens : undefined;
+
           if (servingModel !== undefined || contextTokens !== undefined) {
-            emit({ type: "context", context: {
-              ...(servingModel !== undefined ? { servingModel } : {}),
-              ...(contextTokens !== undefined ? { tokens: contextTokens } : {}),
-            } });
+            emit({
+              type: "context",
+              context: {
+                ...(servingModel !== undefined ? { servingModel } : {}),
+                ...(contextTokens !== undefined ? { tokens: contextTokens } : {}),
+              },
+            });
           }
         } else if (message.role === "user") {
           const text = textContent(message.content);
-          if (text) emit({ type: "user_message", text });
+
+          if (text) {
+            emit({ type: "user_message", text });
+          }
         }
       } else if (event.type === "tool_execution_start") {
         const args = asObject(event.args);
@@ -481,17 +654,23 @@ export class PiRpcBackend implements Backend {
       } else if (event.type === "queue_update") {
         const steering = Array.isArray(event.steering) ? event.steering : [];
         const followUp = Array.isArray(event.followUp) ? event.followUp : [];
-        emit({ type: "queue_changed", messages: [
-          ...steering.map((text) => ({ text: String(text), behavior: "steer" as const })),
-          ...followUp.map((text) => ({ text: String(text), behavior: "followUp" as const })),
-        ] });
+        emit({
+          type: "queue_changed",
+          messages: [
+            ...steering.map((text) => ({ text: String(text), behavior: "steer" as const })),
+            ...followUp.map((text) => ({ text: String(text), behavior: "followUp" as const })),
+          ],
+        });
       } else if (event.type === "extension_ui_request" && typeof event.id === "string") {
         // Native extensions may ask the host user questions. Generic children
         // are unattended, so decline immediately instead of parking the RPC
         // process until the inactivity watchdog fires.
         write({ type: "extension_ui_response", id: event.id, cancelled: true });
       } else if (event.type === "extension_error") {
-        terminalProblem = { type: "failed", error: `Pi extension error: ${errorText(event.error, String(event.extensionPath ?? "unknown extension"))}` };
+        terminalProblem = {
+          type: "failed",
+          error: `Pi extension error: ${errorText(event.error, String(event.extensionPath ?? "unknown extension"))}`,
+        };
         retryableAssistantProblem = false;
       } else if (event.type === "auto_retry_end") {
         if (event.success === false) {
@@ -506,7 +685,12 @@ export class PiRpcBackend implements Backend {
       }
     };
 
-    const receive = (lines: string[]) => { for (const line of lines) handle(line); };
+    const receive = (lines: string[]) => {
+      for (const line of lines) {
+        handle(line);
+      }
+    };
+
     const framingFailure = (error: unknown) => {
       closed = true;
       const message = `Pi RPC framing failed: ${error instanceof Error ? error.message : String(error)}`;
@@ -514,9 +698,24 @@ export class PiRpcBackend implements Backend {
       finish({ type: "failed", error: message });
       void managed.terminate().catch(() => undefined);
     };
-    managed.child.stdout.on("data", (chunk: Buffer) => { try { receive(framer.push(chunk)); } catch (error) { framingFailure(error); } });
-    managed.child.stdout.on("end", () => { try { receive(framer.end()); } catch (error) { framingFailure(error); } });
-    managed.child.stderr.on("data", (chunk: Buffer) => { stderr = (stderr + chunk.toString()).slice(-16_384); });
+
+    managed.child.stdout.on("data", (chunk: Buffer) => {
+      try {
+        receive(framer.push(chunk));
+      } catch (error) {
+        framingFailure(error);
+      }
+    });
+    managed.child.stdout.on("end", () => {
+      try {
+        receive(framer.end());
+      } catch (error) {
+        framingFailure(error);
+      }
+    });
+    managed.child.stderr.on("data", (chunk: Buffer) => {
+      stderr = (stderr + chunk.toString()).slice(-16_384);
+    });
     managed.child.stdin.on("error", (error) => {
       closed = true;
       rejectPending(new Error(`Pi RPC stdin failed: ${error.message}`));
@@ -532,7 +731,10 @@ export class PiRpcBackend implements Backend {
       void cleanupParentThread();
       const detail = `Pi RPC exited (${code ?? signal ?? "signal"})${stderr.trim() ? `: ${stderr.trim()}` : ""}`;
       rejectPending(new Error(detail));
-      if (!settled && !tearingDown) finish({ type: "failed", error: detail });
+
+      if (!settled && !tearingDown) {
+        finish({ type: "failed", error: detail });
+      }
     });
 
     let startupAbortTeardown: Promise<void> | undefined;
@@ -541,23 +743,38 @@ export class PiRpcBackend implements Backend {
       watchdog.clear();
       startupAbortTeardown ??= managed.terminate(0);
     };
+
     request.signal.addEventListener("abort", abortStartup, { once: true });
 
     const initialMessage = request.rawInitialMessage ? request.task : `Task: ${request.task}`;
     emit({ type: "user_message", text: initialMessage });
     void command("prompt", { message: initialMessage })
       .then(() => {
-        if (!settled) watchdog.arm();
+        if (!settled) {
+          watchdog.arm();
+        }
+
         emit({ type: "started" });
       })
       .catch((error) => {
-        if (!request.signal.aborted) finish({ type: "failed", error: error instanceof Error ? error.message : String(error) });
+        if (!request.signal.aborted) {
+          finish({ type: "failed", error: error instanceof Error ? error.message : String(error) });
+        }
       });
 
     const send = async (message: string, behavior: SendBehavior = "steer") => {
-      if (closed) throw new Error("Pi RPC process is closed");
+      if (closed) {
+        throw new Error("Pi RPC process is closed");
+      }
+
       const restarting = settled;
-      if (!restarting) watchdog.touch();
+
+      if (!restarting) {
+        watchdog.touch();
+      }
+
+      let commandType: "prompt" | "steer" | "follow_up";
+
       if (restarting) {
         settled = false;
         output = "";
@@ -565,9 +782,17 @@ export class PiRpcBackend implements Backend {
         retryableAssistantProblem = false;
         emit({ type: "started" });
         behavior = "followUp";
+        commandType = "prompt";
+      } else {
+        commandType = behavior === "steer" ? "steer" : "follow_up";
       }
-      await command(restarting ? "prompt" : behavior === "steer" ? "steer" : "follow_up", { message });
-      if (restarting && !settled) watchdog.arm();
+
+      await command(commandType, { message });
+
+      if (restarting && !settled) {
+        watchdog.arm();
+      }
+
       emit({ type: "queue_changed", messages: [{ text: message, behavior }] });
     };
 
@@ -577,7 +802,11 @@ export class PiRpcBackend implements Backend {
       async cancel(reason = "Cancelled") {
         tearingDown = true;
         watchdog.clear();
-        if (!settled) await command("abort", {}, 5_000).catch(() => undefined);
+
+        if (!settled) {
+          await command("abort", {}, 5_000).catch(() => undefined);
+        }
+
         closed = true;
         rejectPending(new Error(reason));
         await managed.terminate();
@@ -585,7 +814,10 @@ export class PiRpcBackend implements Backend {
         finish({ type: "cancelled", reason });
       },
       async close() {
-        if (closed && managed.child.exitCode !== null) return;
+        if (closed && managed.child.exitCode !== null) {
+          return;
+        }
+
         closed = true;
         tearingDown = true;
         watchdog.clear();
@@ -608,6 +840,7 @@ export class PiRpcBackend implements Backend {
     // startup before ownership of the live process transfers to the caller.
     await Promise.resolve();
     request.signal.removeEventListener("abort", abortStartup);
+
     if (request.signal.aborted) {
       closed = true;
       tearingDown = true;
@@ -615,8 +848,10 @@ export class PiRpcBackend implements Backend {
       rejectPending(new Error("Pi RPC startup aborted"));
       await startupAbortTeardown;
       finish({ type: "cancelled", reason: "Pi RPC startup aborted" });
+
       throw request.signal.reason;
     }
+
     return run;
   }
 }
@@ -624,57 +859,116 @@ export class PiRpcBackend implements Backend {
 function bound(value: string): string {
   return boundedAppend("", value).text;
 }
+
 function asObject(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 }
-function number(value: unknown): number { return typeof value === "number" && Number.isFinite(value) ? value : 0; }
+
+function number(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
 function textContent(value: unknown): string {
-  if (typeof value === "string") return value;
-  if (!Array.isArray(value)) return "";
-  return value.map((part) => asObject(part)).filter((part) => part.type === "text").map((part) => String(part.text ?? "")).join("\n");
+  if (typeof value === "string") {
+    return value;
+  }
+
+  if (!Array.isArray(value)) {
+    return "";
+  }
+
+  return value
+    .map((part) => asObject(part))
+    .filter((part) => part.type === "text")
+    .map((part) => String(part.text ?? ""))
+    .join("\n");
 }
+
 function thinkingContent(value: unknown): string {
-  if (!Array.isArray(value)) return "";
-  return value.map((part) => asObject(part)).filter((part) => part.type === "thinking" && part.redacted !== true).map((part) => String(part.thinking ?? part.text ?? "")).join("\n");
+  if (!Array.isArray(value)) {
+    return "";
+  }
+
+  return value
+    .map((part) => asObject(part))
+    .filter((part) => part.type === "thinking" && part.redacted !== true)
+    .map((part) => String(part.thinking ?? part.text ?? ""))
+    .join("\n");
 }
+
 function resultPreview(value: unknown): string {
-  if (typeof value === "string") return value.slice(0, 4_096);
+  if (typeof value === "string") {
+    return value.slice(0, 4_096);
+  }
+
   const record = asObject(value);
   const content = textContent(record.content);
-  if (content) return content.slice(0, 4_096);
-  try { return JSON.stringify(value).slice(0, 4_096); } catch { return ""; }
+
+  if (content) {
+    return content.slice(0, 4_096);
+  }
+
+  try {
+    return JSON.stringify(value).slice(0, 4_096);
+  } catch {
+    return "";
+  }
 }
+
 function toolResultSnapshot(value: unknown, isError: boolean): ToolResultSnapshot {
   if (typeof value === "string") {
     return { content: [{ type: "text", text: value }], isError };
   }
+
   const record = asObject(value);
   const content = Array.isArray(record.content)
-    ? record.content.map((item) => asObject(item)).map((item) => ({
-        type: String(item.type ?? "text"),
-        text: typeof item.text === "string" ? item.text : undefined,
-        data: typeof item.data === "string" ? item.data : undefined,
-        mimeType: typeof item.mimeType === "string" ? item.mimeType : undefined,
-      }))
+    ? record.content
+        .map((item) => asObject(item))
+        .map((item) => ({
+          type: String(item.type ?? "text"),
+          text: typeof item.text === "string" ? item.text : undefined,
+          data: typeof item.data === "string" ? item.data : undefined,
+          mimeType: typeof item.mimeType === "string" ? item.mimeType : undefined,
+        }))
     : [{ type: "text", text: resultPreview(value) }];
+
   return { content, details: record.details, isError };
 }
+
 function summarize(args: Record<string, unknown>): string {
   const value = args.path ?? args.command ?? args.query ?? args.url ?? "";
+
   return String(value).replace(/\s+/g, " ").slice(0, 160);
 }
+
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+
 function errorText(value: unknown, fallback: string): string {
-  if (typeof value === "string" && value.trim()) return value;
+  if (typeof value === "string" && value.trim()) {
+    return value;
+  }
+
   const record = asObject(value);
-  if (typeof record.message === "string" && record.message.trim()) return record.message;
-  if (typeof record.errorMessage === "string" && record.errorMessage.trim()) return record.errorMessage;
+
+  if (typeof record.message === "string" && record.message.trim()) {
+    return record.message;
+  }
+
+  if (typeof record.errorMessage === "string" && record.errorMessage.trim()) {
+    return record.errorMessage;
+  }
+
   return fallback;
 }
-function assistantProblem(message: Record<string, unknown>, fallback: string): Extract<BackendEvent, { type: "failed" | "cancelled" }> {
+
+function assistantProblem(
+  message: Record<string, unknown>,
+  fallback: string,
+): Extract<BackendEvent, { type: "failed" | "cancelled" }> {
   const stopReason = String(message.stopReason ?? asObject(message.partial).stopReason ?? "");
   const text = errorText(message, fallback);
+
   return stopReason === "aborted" ? { type: "cancelled", reason: text } : { type: "failed", error: text };
 }

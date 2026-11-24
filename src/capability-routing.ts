@@ -64,61 +64,100 @@ export async function routeCapabilities(
   const { request } = input;
   const auto = request.harness === "auto";
   const requires = normalizeRequirements(request.requires);
-  if (auto && request.model) throw new Error("harness:auto cannot use a harness-local model override; omit model or choose an explicit harness");
+
+  if (auto && request.model) {
+    throw new Error("harness:auto cannot use a harness-local model override; omit model or choose an explicit harness");
+  }
 
   const explicit = auto
     ? undefined
-    : selectHarness({ ...request, harness: request.harness as HarnessName | undefined }, input.profile, input.independentOfProvider);
+    : selectHarness(
+        { ...request, harness: request.harness as HarnessName | undefined },
+        input.profile,
+        input.independentOfProvider,
+      );
 
   // Resolve profile/default/independence policy before probing, then revalidate
   // that exact route. This covers implicit defaults as well as caller-named
   // harnesses. Every non-ready state, including unknown, fails closed.
   let explicitAvailability: HarnessAvailability | undefined;
+
   if (input.requireAvailability && !auto && explicit && !input.availability) {
     throw new Error(`Live availability validation is required for explicit ${explicit} dispatch`);
   }
+
   if (input.availability && !auto && explicit) {
-    explicitAvailability = await input.availability.availability(explicit, { cwd: request.cwd, refresh: true, signal: input.signal });
-    if (explicitBlocked(explicitAvailability.status)) throw new HarnessUnavailableError(explicitAvailability);
+    explicitAvailability = await input.availability.availability(explicit, {
+      cwd: request.cwd,
+      refresh: true,
+      signal: input.signal,
+    });
+
+    if (explicitBlocked(explicitAvailability.status)) {
+      throw new HarnessUnavailableError(explicitAvailability);
+    }
   }
 
-  if (!auto && !requires) return explicitAvailability ? { harness: explicit, availability: explicitAvailability } : {};
-  if (!router) throw new Error("Capability requirements are unavailable in this session (capability routing is unavailable)");
+  if (!auto && !requires) {
+    return explicitAvailability ? { harness: explicit, availability: explicitAvailability } : {};
+  }
+
+  if (!router) {
+    throw new Error("Capability requirements are unavailable in this session (capability routing is unavailable)");
+  }
 
   const independenceTarget = input.independentOfProvider ?? request.parentProvider;
   // independentOf only constrains routing after its provider has been resolved;
   // unknown/evicted/Pi targets fail closed later in JobManager rather than
   // arbitrarily excluding a capable harness during catalog selection.
-  const independent = request.independent === true || input.independentOfProvider !== undefined || input.profile?.independent === true;
-  let candidates: HarnessName[] | undefined = auto && independent
-    ? independenceTarget === "claude" ? ["codex"]
-      : independenceTarget === "codex" ? ["claude"]
-      : ["claude", "codex"]
-    : undefined;
+  const independent =
+    request.independent === true || input.independentOfProvider !== undefined || input.profile?.independent === true;
+  let candidates: HarnessName[] | undefined;
+
+  if (auto && independent) {
+    const nativeHarnesses: HarnessName[] = ["claude", "codex"];
+    candidates = nativeHarnesses.filter((harness) => harness !== independenceTarget);
+  }
+
   if (auto && input.profile?.lockedHarness) {
     candidates = candidates
       ? candidates.filter((harness) => harness === input.profile!.lockedHarness)
       : [input.profile.lockedHarness];
   }
+
   // `harness: "auto"` considers only active harnesses: exclude every candidate a
   // live probe does not report as ready before the capability router narrows the
   // remainder by required capabilities and provider independence. `unknown`,
   // `unhealthy`, `missing`, `unauthenticated`, and `incompatible` are all
   // non-ready and therefore not active.
   const probedByHarness = new Map<HarnessName, HarnessAvailability>();
+
   if (auto && input.availability) {
     const base = candidates ?? input.availability.harnesses;
-    if (!base.length) throw new Error("harness:auto found no eligible harness after policy filtering");
+
+    if (!base.length) {
+      throw new Error("harness:auto found no eligible harness after policy filtering");
+    }
+
     const probed = await Promise.all(
-      base.map((harness) => input.availability!.availability(harness, { cwd: request.cwd, refresh: true, signal: input.signal })),
+      base.map((harness) =>
+        input.availability!.availability(harness, { cwd: request.cwd, refresh: true, signal: input.signal }),
+      ),
     );
-    for (const availability of probed) probedByHarness.set(availability.harness, availability);
+
+    for (const availability of probed) {
+      probedByHarness.set(availability.harness, availability);
+    }
+
     const ready = probed.filter((availability) => availability.ready).map((availability) => availability.harness);
+
     if (!ready.length) {
       throw new HarnessAutoUnavailableError(probed);
     }
+
     candidates = ready;
   }
+
   const routed = await router.route({
     cwd: request.cwd,
     access: selectAccess({ ...request, harness: undefined }, input.profile),
@@ -130,6 +169,7 @@ export async function routeCapabilities(
     candidates,
     signal: input.signal,
   });
+
   return {
     harness: routed.harness,
     requires,

@@ -13,10 +13,12 @@ import { ControlledBackend, ControlledInteractionClock, GatedWrite, interactionS
 function setup(concurrency = 4, interactionTimeoutMs?: number, interactionClock?: ControlledInteractionClock) {
   const backend = new ControlledBackend();
   const manager = new JobManager({ backends: [backend], concurrency, interactionTimeoutMs, interactionClock });
+
   return { backend, manager };
 }
 
 const base = { name: "worker", cwd: "/tmp", trusted: true, harness: "codex" as const };
+
 function askable(task: string, extra: Record<string, unknown> = {}) {
   return { ...base, task, interaction: { orchestrator: "allow" as const }, ...extra };
 }
@@ -47,14 +49,23 @@ async function startPeerAcceptance(interactionClock?: ControlledInteractionClock
   let abortEvents = 0;
   manager.setPeerInteractionRouter(async (request) => {
     signal = request.signal;
-    request.signal.addEventListener("abort", () => { abortEvents++; });
+    request.signal.addEventListener("abort", () => {
+      abortEvents++;
+    });
     await provisionalWrite.persist();
-    if (request.signal.aborted) throw request.signal.reason;
+
+    if (request.signal.aborted) {
+      throw request.signal.reason;
+    }
+
     return { answer: "durably accepted answer", commitAcceptance: acceptanceWrite.persist };
   });
   const terminalStates: string[] = [];
   manager.subscribe((job, event) => {
-    if (job.id !== caller.id || event.type !== "interaction") return;
+    if (job.id !== caller.id || event.type !== "interaction") {
+      return;
+    }
+
     if (event.interaction.state === "expired" || event.interaction.state === "cancelled") {
       terminalStates.push(event.interaction.state);
     }
@@ -66,6 +77,7 @@ async function startPeerAcceptance(interactionClock?: ControlledInteractionClock
   });
   await provisionalWrite.waitUntilReached();
   assert.ok(signal);
+
   return {
     backend,
     manager,
@@ -129,14 +141,27 @@ test("four parked callers all reacquire a slot instead of deadlocking the schedu
   assert.equal(backend.starts.length, 5, "a parked caller does not hold an inference slot");
 
   let resumed = 0;
-  for (const ask of asks) void ask.then(() => { resumed++; });
-  for (const pending of manager.pendingInteractions()) manager.answerInteraction(pending.requestId, "answered");
+
+  for (const ask of asks) {
+    void ask.then(() => {
+      resumed++;
+    });
+  }
+
+  for (const pending of manager.pendingInteractions()) {
+    manager.answerInteraction(pending.requestId, "answered");
+  }
+
   await tick();
   assert.equal(resumed, 3, "the extra active turn leaves room for only three reacquired caller leases");
   backend.complete(extra.id);
   const answers = await Promise.all(asks);
   assert.equal(answers.length, 4);
-  for (const job of jobs) backend.complete(job.id);
+
+  for (const job of jobs) {
+    backend.complete(job.id);
+  }
+
   await manager.shutdown();
 });
 
@@ -158,7 +183,9 @@ test("a workflow caller's queued reacquisition does not bypass direct-job priori
   const direct = manager.spawn({ ...base, task: "direct work" });
   manager.answerInteraction(manager.pendingInteractions()[0]!.requestId, "keep it");
   let callerResumed = false;
-  void asked.then(() => { callerResumed = true; });
+  void asked.then(() => {
+    callerResumed = true;
+  });
 
   backend.complete(workflowSibling.id);
   await tick();
@@ -269,36 +296,75 @@ test("peer targets are refused when they are unauthorized, self-directed, or for
     interaction: { peers: true },
     workflow: { runId: "wf_a", agentIndex: 1, label: "implementer" },
   });
-  const foreign = manager.spawn({ ...base, task: "other run", workflow: { runId: "wf_b", agentIndex: 0, label: "outsider" } });
+  const foreign = manager.spawn({
+    ...base,
+    task: "other run",
+    workflow: { runId: "wf_b", agentIndex: 0, label: "outsider" },
+  });
   const sibling = manager.spawn({ ...base, task: "planner", workflow });
   const direct = manager.spawn({ ...base, task: "direct target" });
   await tick();
 
-  await assert.rejects(backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: caller.id } }), /cannot target the asking agent/);
-  await assert.rejects(backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: foreign.id } }), /same workflow run/);
-  await assert.rejects(backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: direct.id } }), /same workflow run/);
-  await assert.rejects(backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: sibling.id } }), /is running; only a completed agent/);
-  await assert.rejects(backend.ask(caller.id, { question: "q", target: { type: "orchestrator" } }), /not authorized to ask the parent orchestrator/);
+  await assert.rejects(
+    backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: caller.id } }),
+    /cannot target the asking agent/,
+  );
+  await assert.rejects(
+    backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: foreign.id } }),
+    /same workflow run/,
+  );
+  await assert.rejects(
+    backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: direct.id } }),
+    /same workflow run/,
+  );
+  await assert.rejects(
+    backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: sibling.id } }),
+    /is running; only a completed agent/,
+  );
+  await assert.rejects(
+    backend.ask(caller.id, { question: "q", target: { type: "orchestrator" } }),
+    /not authorized to ask the parent orchestrator/,
+  );
 
   backend.complete(direct.id);
-  const failed = manager.spawn({ ...base, task: "failed peer", workflow: { runId: "wf_a", agentIndex: 2, label: "failed" } });
+  const failed = manager.spawn({
+    ...base,
+    task: "failed peer",
+    workflow: { runId: "wf_a", agentIndex: 2, label: "failed" },
+  });
   await tick();
   backend.fail(failed.id, "failed before question");
   await tick();
-  await assert.rejects(backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: failed.id } }), /is failed/);
+  await assert.rejects(
+    backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: failed.id } }),
+    /is failed/,
+  );
 
-  const cancelled = manager.spawn({ ...base, task: "cancelled peer", workflow: { runId: "wf_a", agentIndex: 3, label: "cancelled" } });
+  const cancelled = manager.spawn({
+    ...base,
+    task: "cancelled peer",
+    workflow: { runId: "wf_a", agentIndex: 3, label: "cancelled" },
+  });
   await tick();
   await manager.cancel(cancelled.id);
-  await assert.rejects(backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: cancelled.id } }), /is cancelled/);
+  await assert.rejects(
+    backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: cancelled.id } }),
+    /is cancelled/,
+  );
 
   backend.complete(sibling.id);
   await tick();
   // A completed, retained target is generically eligible; without a workflow
   // runtime installed there is still nothing authorized to answer it.
-  await assert.rejects(backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: sibling.id } }), /require an active workflow run/);
+  await assert.rejects(
+    backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: sibling.id } }),
+    /require an active workflow run/,
+  );
   await manager.releaseRun(sibling.id);
-  await assert.rejects(backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: sibling.id } }), /no longer retains a native session/);
+  await assert.rejects(
+    backend.ask(caller.id, { question: "q", target: { type: "agent", jobId: sibling.id } }),
+    /no longer retains a native session/,
+  );
   backend.complete(caller.id);
   backend.complete(foreign.id);
   await manager.shutdown();
@@ -308,8 +374,18 @@ test("a peer-answer turn cannot ask another agent or the orchestrator", async ()
   const backend = new ControlledBackend();
   const manager = new JobManager({ backends: [backend], concurrency: 4 });
   const workflow = (agentIndex: number, label: string) => ({ runId: "wf_c", agentIndex, label });
-  const target = manager.spawn({ ...base, task: "planner", interaction: { orchestrator: "allow", peers: true }, workflow: workflow(0, "planner") });
-  const caller = manager.spawn({ ...base, task: "implementer", interaction: { peers: true }, workflow: workflow(1, "implementer") });
+  const target = manager.spawn({
+    ...base,
+    task: "planner",
+    interaction: { orchestrator: "allow", peers: true },
+    workflow: workflow(0, "planner"),
+  });
+  const caller = manager.spawn({
+    ...base,
+    task: "implementer",
+    interaction: { peers: true },
+    workflow: workflow(1, "implementer"),
+  });
   await tick();
   backend.complete(target.id);
   await tick();
@@ -322,6 +398,7 @@ test("a peer-answer turn cannot ask another agent or the orchestrator", async ()
       /peer-answer turn cannot ask another agent or the orchestrator/,
     );
     answers.push({ answer: "the retained plan says keep it" });
+
     return { answer: "the retained plan says keep it" };
   });
 
@@ -455,10 +532,7 @@ test("successful caller settlement schedules one acceptance append without waiti
   assert.deepEqual(f.terminalStates, []);
   assert.equal(f.manager.pendingInteractions().length, 0);
   assert.equal(f.manager.check(f.caller.id).interaction, undefined);
-  assert.throws(
-    () => f.manager.dismissInteraction(requestId, "too late"),
-    /Unknown or already-resolved question/,
-  );
+  assert.throws(() => f.manager.dismissInteraction(requestId, "too late"), /Unknown or already-resolved question/);
 
   f.acceptanceWrite.release();
   f.backend.complete(f.caller.id);
@@ -470,21 +544,32 @@ test("cancelling a completed target during peer routing cancels the correlated q
   const manager = new JobManager({ backends: [backend], concurrency: 2 });
   const workflow = (agentIndex: number, label: string) => ({ runId: "wf_cancel_target", agentIndex, label });
   const target = manager.spawn({ ...base, task: "planner", workflow: workflow(0, "planner") });
-  const caller = manager.spawn({ ...base, task: "implementer", workflow: workflow(1, "implementer"), interaction: { peers: true } });
+  const caller = manager.spawn({
+    ...base,
+    task: "implementer",
+    workflow: workflow(1, "implementer"),
+    interaction: { peers: true },
+  });
   await tick();
   backend.complete(target.id, "plan");
   await tick();
 
   let releaseRouter!: () => void;
-  const routerGate = new Promise<void>((resolve) => { releaseRouter = resolve; });
+  const routerGate = new Promise<void>((resolve) => {
+    releaseRouter = resolve;
+  });
   manager.setPeerInteractionRouter(async () => {
     await routerGate;
+
     return { answer: "late answer" };
   });
   const asked = backend.ask(caller.id, { question: "which plan?", target: { type: "agent", jobId: target.id } });
   await tick();
   assert.equal(manager.check(target.id).status, "completed");
-  assert.ok(manager.check(target.id).answeringInteraction, "the completed lineage is already committed to this request");
+  assert.ok(
+    manager.check(target.id).answeringInteraction,
+    "the completed lineage is already committed to this request",
+  );
 
   await manager.cancel(target.id, "operator cancelled target answer");
   await assert.rejects(asked, /operator cancelled target answer/);

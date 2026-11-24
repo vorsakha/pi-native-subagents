@@ -44,14 +44,18 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node scripts/test.mjs",
     "pack:check": "npm pack --dry-run",
-    "check": "npm run typecheck && npm test && npm run pack:check",
+    "check": "npm run format:check && npm run lint && npm run typecheck && npm test && npm run pack:check",
     "smoke": "node scripts/live-smoke.mjs",
     "smoke:pi": "node scripts/live-smoke.mjs pi",
     "smoke:claude": "node scripts/live-smoke.mjs claude",
     "smoke:codex": "node scripts/live-smoke.mjs codex",
     "smoke:access": "node scripts/live-smoke.mjs access",
     "smoke:access:claude": "node scripts/live-smoke.mjs access claude",
-    "smoke:access:codex": "node scripts/live-smoke.mjs access codex"
+    "smoke:access:codex": "node scripts/live-smoke.mjs access codex",
+    "format": "prettier --write src extensions tests scripts eslint.config.js",
+    "format:check": "prettier --check src extensions tests scripts eslint.config.js",
+    "lint": "eslint src extensions tests scripts eslint.config.js --max-warnings=0",
+    "lint:fix": "eslint src extensions tests scripts eslint.config.js --fix"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.210",
@@ -88,9 +92,15 @@
     "@earendil-works/pi-ai": "0.84.3",
     "@earendil-works/pi-coding-agent": "0.84.3",
     "@earendil-works/pi-tui": "0.84.3",
+    "@eslint/js": "^10.0.1",
+    "@stylistic/eslint-plugin": "^6.0.1",
     "@types/node": "^24.0.0",
+    "eslint": "^10.15.0",
+    "globals": "^17.14.0",
+    "prettier": "~3.10.1",
     "typebox": "1.1.38",
-    "typescript": "^5.8.3"
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.74.0"
   },
   "engines": {
     "node": ">=22.19.0"

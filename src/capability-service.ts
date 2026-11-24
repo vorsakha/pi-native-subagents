@@ -12,7 +12,14 @@ import {
   type CapabilityMatch,
   type RequirementResolution,
 } from "./capabilities.ts";
-import type { AccessMode, Backend, CustomizationMode, HarnessName, JobCapabilityRoute, StructuredOutputSupport } from "./types.ts";
+import type {
+  AccessMode,
+  Backend,
+  CustomizationMode,
+  HarnessName,
+  JobCapabilityRoute,
+  StructuredOutputSupport,
+} from "./types.ts";
 
 const DEFAULT_TTL_MS = 60_000;
 const DEFAULT_DISCOVERY_TIMEOUT_MS = 20_000;
@@ -117,10 +124,21 @@ export class CapabilityService {
     if (!harness) {
       this.#cache.clear();
       this.#structuredCache.clear();
+
       return;
     }
-    for (const [key, entry] of this.#cache) if (entry.catalog.harness === harness) this.#cache.delete(key);
-    for (const key of this.#structuredCache.keys()) if (key.startsWith(`${harness}|`)) this.#structuredCache.delete(key);
+
+    for (const [key, entry] of this.#cache) {
+      if (entry.catalog.harness === harness) {
+        this.#cache.delete(key);
+      }
+    }
+
+    for (const key of this.#structuredCache.keys()) {
+      if (key.startsWith(`${harness}|`)) {
+        this.#structuredCache.delete(key);
+      }
+    }
   }
 
   /**
@@ -134,32 +152,57 @@ export class CapabilityService {
     const key = `${harness}|${request.cwd}|${request.access}|${customization}|${request.model ?? "default"}`;
     const fingerprint = this.#fingerprint(harness, request.cwd);
     const cached = this.#structuredCache.get(key);
-    if (!request.refresh && cached && cached.fingerprint === fingerprint && this.#now() - cached.discoveredAt < this.#ttlMs) {
+
+    if (
+      !request.refresh &&
+      cached &&
+      cached.fingerprint === fingerprint &&
+      this.#now() - cached.discoveredAt < this.#ttlMs
+    ) {
       return cached.support;
     }
+
     const pending = this.#structuredInflight.get(key);
-    if (pending && !request.refresh) return pending;
+
+    if (pending && !request.refresh) {
+      return pending;
+    }
+
     const probe = this.#probeStructuredOutput(harness, request, customization)
       .then((support) => {
         this.#structuredCache.set(key, { fingerprint, discoveredAt: this.#now(), support });
+
         return support;
       })
       .finally(() => {
-        if (this.#structuredInflight.get(key) === probe) this.#structuredInflight.delete(key);
+        if (this.#structuredInflight.get(key) === probe) {
+          this.#structuredInflight.delete(key);
+        }
       });
     this.#structuredInflight.set(key, probe);
+
     return probe;
   }
 
-  async #probeStructuredOutput(harness: HarnessName, request: CapabilityRequest, customization: CustomizationMode): Promise<StructuredOutputSupport> {
+  async #probeStructuredOutput(
+    harness: HarnessName,
+    request: CapabilityRequest,
+    customization: CustomizationMode,
+  ): Promise<StructuredOutputSupport> {
     const backend = this.#backends.get(harness);
+
     if (!backend?.structuredOutputSupport) {
       return { supported: false, detail: `${harness} does not expose native structured-result detection` };
     }
+
     const controller = new AbortController();
     const abort = () => controller.abort(request.signal?.reason ?? new Error("Structured output discovery aborted"));
     request.signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => controller.abort(new Error(`${harness} structured output discovery timed out after ${this.#timeoutMs}ms`)), this.#timeoutMs);
+    const timer = setTimeout(
+      () => controller.abort(new Error(`${harness} structured output discovery timed out after ${this.#timeoutMs}ms`)),
+      this.#timeoutMs,
+    );
+
     try {
       return await backend.structuredOutputSupport({
         cwd: request.cwd,
@@ -183,31 +226,52 @@ export class CapabilityService {
     const key = `${harness}|${request.cwd}|${request.access}|${customization}|${request.model ?? "default"}`;
     const fingerprint = this.#fingerprint(harness, request.cwd);
     const cached = this.#cache.get(key);
-    if (!request.refresh && cached && cached.fingerprint === fingerprint && this.#now() - cached.catalog.discoveredAt < this.#ttlMs) {
+
+    if (
+      !request.refresh &&
+      cached &&
+      cached.fingerprint === fingerprint &&
+      this.#now() - cached.catalog.discoveredAt < this.#ttlMs
+    ) {
       return cached.catalog;
     }
+
     const pending = this.#inflight.get(key);
-    if (pending && !request.refresh) return pending;
+
+    if (pending && !request.refresh) {
+      return pending;
+    }
+
     const generation = ++this.#generation;
     const discovery = this.#discover(harness, request, customization)
       .then((catalog) => {
         const existing = this.#cache.get(key);
-        if (!existing || existing.generation <= generation) this.#cache.set(key, { key, generation, fingerprint, catalog });
+
+        if (!existing || existing.generation <= generation) {
+          this.#cache.set(key, { key, generation, fingerprint, catalog });
+        }
+
         return catalog;
       })
       .finally(() => {
-        if (this.#inflight.get(key) === discovery) this.#inflight.delete(key);
+        if (this.#inflight.get(key) === discovery) {
+          this.#inflight.delete(key);
+        }
       });
     this.#inflight.set(key, discovery);
+
     return discovery;
   }
 
   async catalogs(request: CapabilityRequest & { harnesses?: HarnessName[] }): Promise<CapabilityCatalog[]> {
     const wanted = request.harnesses?.filter((harness) => this.#backends.has(harness)) ?? this.harnesses;
+
     return Promise.all(wanted.map((harness) => this.catalog(harness, request)));
   }
 
-  async search(request: CapabilityRequest & CapabilityQuery): Promise<{ matches: CapabilityMatch[]; total: number; catalogs: CapabilityCatalog[] }> {
+  async search(
+    request: CapabilityRequest & CapabilityQuery,
+  ): Promise<{ matches: CapabilityMatch[]; total: number; catalogs: CapabilityCatalog[] }> {
     const catalogs = await this.catalogs({
       cwd: request.cwd,
       access: request.access,
@@ -218,6 +282,7 @@ export class CapabilityService {
       harnesses: request.harness ? [request.harness] : undefined,
     });
     const { matches, total } = searchCapabilities(catalogs, request);
+
     return { matches, total, catalogs };
   }
 
@@ -229,29 +294,45 @@ export class CapabilityService {
   async resolveRoute(request: CapabilityRouteRequest): Promise<CapabilityRouteResult> {
     const requires = request.requires ?? [];
     const auto = request.harness === "auto";
-    const explicit: HarnessName | undefined = auto ? undefined : request.harness as HarnessName | undefined;
+    const explicit: HarnessName | undefined = auto ? undefined : (request.harness as HarnessName | undefined);
+
     if (explicit && !this.#backends.has(explicit)) {
       throw new Error(`Harness is unavailable: ${explicit}`);
     }
-    if (!auto && !explicit) throw new Error("Capability routing requires an explicit harness or harness auto");
+
+    if (!auto && !explicit) {
+      throw new Error("Capability routing requires an explicit harness or harness auto");
+    }
+
     const candidates = auto
-      ? orderCandidates(request.candidates ?? this.harnesses, request.preference ?? [])
-        .filter((harness) => this.#backends.has(harness))
+      ? orderCandidates(request.candidates ?? this.harnesses, request.preference ?? []).filter((harness) =>
+          this.#backends.has(harness),
+        )
       : [explicit as HarnessName];
-    if (!candidates.length) throw new Error("No harness candidate remains after policy filtering");
+
+    if (!candidates.length) {
+      throw new Error("No harness candidate remains after policy filtering");
+    }
 
     const failures: string[] = [];
+
     for (const harness of candidates) {
       const catalog = await this.catalog(harness, request);
+
       if (catalog.health === "unavailable") {
-        failures.push(`${harness} capability discovery is unavailable${catalog.warnings[0] ? `: ${catalog.warnings[0]}` : ""}`);
+        failures.push(
+          `${harness} capability discovery is unavailable${catalog.warnings[0] ? `: ${catalog.warnings[0]}` : ""}`,
+        );
         continue;
       }
+
       const resolution = resolveRequirements(catalog, requires);
+
       if (!requirementsSatisfied(resolution)) {
         failures.push(describeResolution(harness, resolution));
         continue;
       }
+
       return {
         harness,
         auto,
@@ -267,11 +348,14 @@ export class CapabilityService {
         },
       };
     }
-    const alternatives = requires.length && !request.refresh ? await this.#alternatives(request, requires, candidates) : [];
+
+    const alternatives =
+      requires.length && !request.refresh ? await this.#alternatives(request, requires, candidates) : [];
+
     throw new Error(
-      `${auto ? "No harness satisfies" : "Selected harness cannot satisfy"} the required capabilities: ${requires.join(", ")}`
-      + (failures.length ? ` — ${failures.join("; ")}` : "")
-      + (alternatives.length ? `; available on: ${alternatives.join(", ")}` : ""),
+      `${auto ? "No harness satisfies" : "Selected harness cannot satisfy"} the required capabilities: ${requires.join(", ")}` +
+        (failures.length ? ` — ${failures.join("; ")}` : "") +
+        (alternatives.length ? `; available on: ${alternatives.join(", ")}` : ""),
     );
   }
 
@@ -287,47 +371,77 @@ export class CapabilityService {
    */
   async route(request: CapabilityRouteRequest): Promise<CapabilityRouteResult> {
     let chosen = await this.resolveRoute(request);
-    if (request.refresh) return chosen;
+
+    if (request.refresh) {
+      return chosen;
+    }
+
     const excluded = new Set<HarnessName>();
     let lastError: unknown;
+
     for (let attempt = 0; attempt <= this.harnesses.length; attempt++) {
       try {
         const live = await this.revalidate({ ...request, harness: chosen.harness });
+
         return chosen.auto ? { ...live, auto: true, route: { ...live.route, auto: true } } : live;
       } catch (error) {
-        if (request.signal?.aborted) throw error;
+        if (request.signal?.aborted) {
+          throw error;
+        }
+
         lastError = error;
+
         // A cached browse result can become invalid between selection and the
         // authoritative pre-dispatch check (most commonly auth expiry). For
         // auto routes, refresh the remaining candidate set and exclude every
         // provider that already failed live validation so an auth failure does
         // not immediately retry the same provider. Explicit routes retain
         // fail-closed semantics.
-        if (!chosen.auto) throw error;
+        if (!chosen.auto) {
+          throw error;
+        }
+
         excluded.add(chosen.harness);
         const remaining = (request.candidates ?? this.harnesses).filter((harness) => !excluded.has(harness));
-        if (!remaining.length) break;
+
+        if (!remaining.length) {
+          break;
+        }
+
         chosen = await this.resolveRoute({ ...request, refresh: true, candidates: remaining });
       }
     }
+
     throw lastError instanceof Error ? lastError : new Error(String(lastError ?? "No healthy harness remains"));
   }
 
   async #alternatives(request: CapabilityRequest, requires: string[], tried: HarnessName[]): Promise<HarnessName[]> {
     const others = this.harnesses.filter((harness) => !tried.includes(harness));
     const capable: HarnessName[] = [];
+
     for (const harness of others) {
       try {
         const catalog = await this.catalog(harness, request);
-        if (requirementsSatisfied(resolveRequirements(catalog, requires))) capable.push(harness);
-      } catch { /* alternatives are advisory */ }
+
+        if (requirementsSatisfied(resolveRequirements(catalog, requires))) {
+          capable.push(harness);
+        }
+      } catch {
+        /* alternatives are advisory */
+      }
     }
+
     return capable;
   }
 
-  async #discover(harness: HarnessName, request: CapabilityRequest, customization: CustomizationMode): Promise<CapabilityCatalog> {
+  async #discover(
+    harness: HarnessName,
+    request: CapabilityRequest,
+    customization: CustomizationMode,
+  ): Promise<CapabilityCatalog> {
     const backend = this.#backends.get(harness);
     const discoveredAt = this.#now();
+
     if (!backend?.discover) {
       return buildCatalog({
         harness,
@@ -335,14 +449,21 @@ export class CapabilityService {
         access: request.access,
         discoveredAt,
         capabilities: [],
-        sources: [{ source: harness, health: "unknown", detail: "this harness adapter does not support capability discovery" }],
+        sources: [
+          { source: harness, health: "unknown", detail: "this harness adapter does not support capability discovery" },
+        ],
         warnings: [`${harness} does not expose a capability inventory; requirements cannot be verified`],
       });
     }
+
     const controller = new AbortController();
     const abort = () => controller.abort(request.signal?.reason ?? new Error("Capability discovery aborted"));
     request.signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => controller.abort(new Error(`${harness} capability discovery timed out after ${this.#timeoutMs}ms`)), this.#timeoutMs);
+    const timer = setTimeout(
+      () => controller.abort(new Error(`${harness} capability discovery timed out after ${this.#timeoutMs}ms`)),
+      this.#timeoutMs,
+    );
+
     try {
       const result = await backend.discover({
         cwd: request.cwd,
@@ -353,6 +474,7 @@ export class CapabilityService {
         signal: controller.signal,
         refresh: request.refresh === true,
       });
+
       return buildCatalog({
         harness,
         cwd: request.cwd,
@@ -365,6 +487,7 @@ export class CapabilityService {
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
+
       return buildCatalog({
         harness,
         cwd: request.cwd,
@@ -383,9 +506,13 @@ export class CapabilityService {
 
 function orderCandidates(candidates: HarnessName[], preference: HarnessName[]): HarnessName[] {
   const ordered: HarnessName[] = [];
+
   for (const harness of [...preference, ...candidates]) {
-    if (candidates.includes(harness) && !ordered.includes(harness)) ordered.push(harness);
+    if (candidates.includes(harness) && !ordered.includes(harness)) {
+      ordered.push(harness);
+    }
   }
+
   return ordered;
 }
 
@@ -396,17 +523,41 @@ function orderCandidates(candidates: HarnessName[], preference: HarnessName[]): 
  */
 export function configFingerprint(harness: HarnessName, cwd: string, env: NodeJS.ProcessEnv = process.env): string {
   const home = env.HOME ?? env.USERPROFILE ?? homedir();
-  const roots = harness === "claude"
-    ? [resolve(home, ".claude"), resolve(home, ".claude/settings.json"), resolve(home, ".claude/skills"), resolve(cwd, ".claude"), resolve(cwd, ".mcp.json")]
-    : harness === "codex"
-      ? [resolve(home, ".codex"), resolve(home, ".codex", "config.toml"), resolve(cwd, ".codex"), resolve(cwd, ".agents")]
-      : [resolve(home, ".pi"), resolve(home, ".pi/agent/skills"), resolve(home, ".pi/agent/extensions"), resolve(cwd, ".pi")];
-  return roots.map((root) => {
-    try {
-      const stat = statSync(root);
-      return `${root}:${Math.round(stat.mtimeMs)}:${stat.size}`;
-    } catch {
-      return `${root}:absent`;
-    }
-  }).join("|");
+  let roots: string[];
+
+  if (harness === "claude") {
+    roots = [
+      resolve(home, ".claude"),
+      resolve(home, ".claude/settings.json"),
+      resolve(home, ".claude/skills"),
+      resolve(cwd, ".claude"),
+      resolve(cwd, ".mcp.json"),
+    ];
+  } else if (harness === "codex") {
+    roots = [
+      resolve(home, ".codex"),
+      resolve(home, ".codex", "config.toml"),
+      resolve(cwd, ".codex"),
+      resolve(cwd, ".agents"),
+    ];
+  } else {
+    roots = [
+      resolve(home, ".pi"),
+      resolve(home, ".pi/agent/skills"),
+      resolve(home, ".pi/agent/extensions"),
+      resolve(cwd, ".pi"),
+    ];
+  }
+
+  return roots
+    .map((root) => {
+      try {
+        const stat = statSync(root);
+
+        return `${root}:${Math.round(stat.mtimeMs)}:${stat.size}`;
+      } catch {
+        return `${root}:absent`;
+      }
+    })
+    .join("|");
 }

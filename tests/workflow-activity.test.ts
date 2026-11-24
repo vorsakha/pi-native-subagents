@@ -9,7 +9,11 @@ import type {
   WorkflowStatus,
   WorkflowTaskOutcome,
 } from "../src/workflows/types.ts";
-import { renderWorkflowActivity, workflowActivityRow, WorkflowActivityStore } from "../extensions/workflows/activity.ts";
+import {
+  renderWorkflowActivity,
+  workflowActivityRow,
+  WorkflowActivityStore,
+} from "../extensions/workflows/activity.ts";
 import { theme } from "./helpers.ts";
 
 interface WorkflowFixtureOptions {
@@ -25,7 +29,8 @@ interface WorkflowFixtureOptions {
 
 function workflowFixture(options: WorkflowFixtureOptions): WorkflowSnapshot {
   const status = options.status ?? "running";
-  const agentState = options.agentState ?? (status === "completed" ? "completed" : status === "failed" ? "failed" : "running");
+  const defaultAgentState = status === "completed" || status === "failed" ? status : "running";
+  const agentState = options.agentState ?? defaultAgentState;
   const updatedAt = options.updatedAt ?? 1;
   const timestamps = { createdAt: 1, updatedAt, startedAt: 1 };
   const phase: WorkflowPhase = {
@@ -50,6 +55,7 @@ function workflowFixture(options: WorkflowFixtureOptions): WorkflowSnapshot {
     activity: options.preview ? { kind: "responding", at: updatedAt } : undefined,
     usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 },
   };
+
   return {
     runId: options.runId,
     sessionId: "session",
@@ -75,7 +81,10 @@ test("concurrent workflow insertion is aggregated once and lifecycle updates pre
   store.observe(workflowFixture({ runId: "wf_a", name: "stale first", updatedAt: 1 }));
 
   const activity = store.snapshot(10);
-  assert.deepEqual(activity.rows.map((row) => row.runId), ["wf_a", "wf_b"]);
+  assert.deepEqual(
+    activity.rows.map((row) => row.runId),
+    ["wf_a", "wf_b"],
+  );
   assert.equal(activity.rows.length, 2);
   assert.equal(activity.rows[0]?.name, "first revised");
   assert.equal(activity.rows[0]?.phase, "reviewing 1/1");
@@ -86,18 +95,41 @@ test("completed workflows remain until delivery, then leave without disturbing a
   const store = new WorkflowActivityStore();
   store.observe(workflowFixture({ runId: "wf_done", name: "done", updatedAt: 1 }));
   store.observe(workflowFixture({ runId: "wf_live", name: "live", updatedAt: 1 }));
-  store.observe(workflowFixture({ runId: "wf_done", name: "done", updatedAt: 2, status: "completed", agentState: "completed", taskOutcome: "successful" }));
+  store.observe(
+    workflowFixture({
+      runId: "wf_done",
+      name: "done",
+      updatedAt: 2,
+      status: "completed",
+      agentState: "completed",
+      taskOutcome: "successful",
+    }),
+  );
 
   let activity = store.snapshot(10);
-  assert.deepEqual(activity.rows.map((row) => row.runId), ["wf_done", "wf_live"]);
+  assert.deepEqual(
+    activity.rows.map((row) => row.runId),
+    ["wf_done", "wf_live"],
+  );
   assert.equal(activity.finishing, 1);
   assert.equal(activity.active, 1);
 
   assert.equal(store.markDelivered("wf_done"), true);
   assert.equal(store.markDelivered("wf_done"), false);
-  store.observe(workflowFixture({ runId: "wf_done", name: "late terminal update", updatedAt: 3, status: "completed", agentState: "completed" }));
+  store.observe(
+    workflowFixture({
+      runId: "wf_done",
+      name: "late terminal update",
+      updatedAt: 3,
+      status: "completed",
+      agentState: "completed",
+    }),
+  );
   activity = store.snapshot(10);
-  assert.deepEqual(activity.rows.map((row) => row.runId), ["wf_live"]);
+  assert.deepEqual(
+    activity.rows.map((row) => row.runId),
+    ["wf_live"],
+  );
   assert.equal(activity.active, 1);
   assert.equal(activity.finishing, 0);
 });
@@ -109,17 +141,22 @@ test("reset clears old session identity and permits the next session to reuse it
   assert.deepEqual(store.snapshot().rows, []);
 
   store.observe(workflowFixture({ runId: "wf_old", name: "new session" }));
-  assert.deepEqual(store.snapshot().rows.map((row) => row.name), ["new session"]);
+  assert.deepEqual(
+    store.snapshot().rows.map((row) => row.name),
+    ["new session"],
+  );
 });
 
 test("workflow activity keeps textual status and never exceeds narrow terminal widths", () => {
   const store = new WorkflowActivityStore();
-  store.observe(workflowFixture({
-    runId: "wf_narrow",
-    name: "a deliberately long workflow name",
-    phaseName: "availability discovery",
-    preview: "checking the selected route and gathering useful live activity",
-  }));
+  store.observe(
+    workflowFixture({
+      runId: "wf_narrow",
+      name: "a deliberately long workflow name",
+      phaseName: "availability discovery",
+      preview: "checking the selected route and gathering useful live activity",
+    }),
+  );
   const activity = store.snapshot(10);
   const wide = renderWorkflowActivity(activity, theme, 200, { openHint: "Ctrl+Shift+F" }).join("\n");
   assert.match(wide, /Workflows · 1 active/);
@@ -167,13 +204,24 @@ test("workflow editor rows treat provider waiting as authoritative over stale er
   const active = run.agents[0]!;
   active.state = "waiting";
   active.error = "legacy token=sk-agent-secret at /outside/workspace/provider.log";
-  active.providerWait = { provider: "codex", kind: "quota", detail: "limit", retryAt: 66_000, attempt: 1, maxAttempts: 3 };
+  active.providerWait = {
+    provider: "codex",
+    kind: "quota",
+    detail: "limit",
+    retryAt: 66_000,
+    attempt: 1,
+    maxAttempts: 3,
+  };
 
   const row = workflowActivityRow(run, 6_000);
   assert.equal(row.state, "waiting");
   assert.equal(row.attention, false);
   assert.equal(row.activity, "builder: waiting for codex quota · retry in 1m · attempt 1/3");
-  const rendered = renderWorkflowActivity({ rows: [row], active: 1, finishing: 0, attention: 0, key: "provider-wait" }, theme, 160).join("\n");
+  const rendered = renderWorkflowActivity(
+    { rows: [row], active: 1, finishing: 0, attention: 0, key: "provider-wait" },
+    theme,
+    160,
+  ).join("\n");
   assert.match(rendered, /waiting for codex quota/);
   assert.doesNotMatch(rendered, /sk-(?:run|agent)-secret|outside\/workspace/);
 });

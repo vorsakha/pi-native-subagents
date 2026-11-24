@@ -75,12 +75,17 @@ export function serializeWorkflowArgs(args: unknown): string {
   try {
     const serialized = JSON.stringify(args);
     const normalized = serialized === undefined ? "null" : serialized;
+
     if (byteLength(normalized) > MAX_WORKFLOW_ARGS_BYTES) {
       throw new RangeError("Workflow args exceed the 256 KiB limit");
     }
+
     return normalized;
   } catch (error) {
-    if (error instanceof RangeError) throw error;
+    if (error instanceof RangeError) {
+      throw error;
+    }
+
     throw new TypeError(`Workflow args must be JSON-serializable: ${errorMessage(error)}`);
   }
 }
@@ -92,11 +97,20 @@ function errorMessage(error: unknown): string {
 function abortError(): Error {
   const error = new Error("Workflow sandbox aborted");
   error.name = "AbortError";
+
   return error;
 }
 
-const CONVERGENCE_STATES: ReadonlySet<string> = new Set(["running", "approved", "blocked", "limit-reached", "stalled", "failed"]);
+const CONVERGENCE_STATES: ReadonlySet<string> = new Set([
+  "running",
+  "approved",
+  "blocked",
+  "limit-reached",
+  "stalled",
+  "failed",
+]);
 const CONVERGENCE_VERDICTS: ReadonlySet<string> = new Set(["approve", "request_changes", "blocked"]);
+
 function boundedString(value: unknown, max: number): string | undefined {
   return typeof value === "string" && value.length <= max ? value : undefined;
 }
@@ -108,32 +122,72 @@ function boundedString(value: unknown, max: number): string | undefined {
  * optional free text is truncated rather than rejecting the whole frame.
  */
 function normalizeConvergenceProgress(value: unknown): WorkflowConvergenceProgress | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return undefined;
+  }
+
   const raw = value as Record<string, unknown>;
   const integer = (item: unknown, min: number, max: number): number | undefined =>
     typeof item === "number" && Number.isSafeInteger(item) && item >= min && item <= max ? item : undefined;
   const round = integer(raw.round, 0, MAX_CONVERGENCE_ROUNDS);
   const maxRounds = integer(raw.maxRounds, 1, MAX_CONVERGENCE_ROUNDS);
   const state = typeof raw.state === "string" && CONVERGENCE_STATES.has(raw.state) ? raw.state : undefined;
-  if (round === undefined || maxRounds === undefined || state === undefined || !Array.isArray(raw.rounds)) return undefined;
-  if (raw.rounds.length > MAX_CONVERGENCE_ROUNDS) return undefined;
+
+  if (round === undefined || maxRounds === undefined || state === undefined || !Array.isArray(raw.rounds)) {
+    return undefined;
+  }
+
+  if (raw.rounds.length > MAX_CONVERGENCE_ROUNDS) {
+    return undefined;
+  }
+
   const rounds: WorkflowConvergenceProgress["rounds"] = [];
+
   for (const item of raw.rounds) {
-    if (!item || typeof item !== "object" || Array.isArray(item)) return undefined;
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      return undefined;
+    }
+
     const entry = item as Record<string, unknown>;
     const index = integer(entry.round, 1, MAX_CONVERGENCE_ROUNDS);
     const actionableCount = integer(entry.actionableCount, 0, 1_000);
     const fingerprint = boundedString(entry.fingerprint, 64);
-    if (index === undefined || actionableCount === undefined || fingerprint === undefined) return undefined;
-    if (typeof entry.verdict !== "string" || !CONVERGENCE_VERDICTS.has(entry.verdict)) return undefined;
-    rounds.push({ round: index, verdict: entry.verdict as WorkflowConvergenceProgress["rounds"][number]["verdict"], actionableCount, fingerprint });
+
+    if (index === undefined || actionableCount === undefined || fingerprint === undefined) {
+      return undefined;
+    }
+
+    if (typeof entry.verdict !== "string" || !CONVERGENCE_VERDICTS.has(entry.verdict)) {
+      return undefined;
+    }
+
+    rounds.push({
+      round: index,
+      verdict: entry.verdict as WorkflowConvergenceProgress["rounds"][number]["verdict"],
+      actionableCount,
+      fingerprint,
+    });
   }
+
   const optional = (item: unknown, max: number): string | undefined =>
     typeof item === "string" ? item.slice(0, max) : undefined;
-  if ([raw.name, raw.stoppingReason, raw.fingerprint, raw.pendingFindings, raw.implementerJobId, raw.reviewerJobId]
-    .some((item) => item !== undefined && typeof item !== "string")) return undefined;
-  if (raw.verdict !== undefined && (typeof raw.verdict !== "string" || !CONVERGENCE_VERDICTS.has(raw.verdict))) return undefined;
-  if (raw.actionableCount !== undefined && integer(raw.actionableCount, 0, 1_000) === undefined) return undefined;
+
+  if (
+    [raw.name, raw.stoppingReason, raw.fingerprint, raw.pendingFindings, raw.implementerJobId, raw.reviewerJobId].some(
+      (item) => item !== undefined && typeof item !== "string",
+    )
+  ) {
+    return undefined;
+  }
+
+  if (raw.verdict !== undefined && (typeof raw.verdict !== "string" || !CONVERGENCE_VERDICTS.has(raw.verdict))) {
+    return undefined;
+  }
+
+  if (raw.actionableCount !== undefined && integer(raw.actionableCount, 0, 1_000) === undefined) {
+    return undefined;
+  }
+
   const progress: WorkflowConvergenceProgress = {
     name: optional(raw.name, 200),
     round,
@@ -148,20 +202,32 @@ function normalizeConvergenceProgress(value: unknown): WorkflowConvergenceProgre
     reviewerJobId: optional(raw.reviewerJobId, 200),
     rounds,
   };
+
   return isWorkflowConvergence(progress) ? progress : undefined;
 }
 
-
 export async function runWorkflowSandbox(options: WorkflowSandboxOptions): Promise<WorkflowSandboxResult> {
-  if (typeof options.source !== "string") throw new TypeError("Workflow source must be a string");
-  if (byteLength(options.source) > MAX_SOURCE_BYTES) throw new RangeError("Workflow source exceeds the 512 KiB limit");
+  if (typeof options.source !== "string") {
+    throw new TypeError("Workflow source must be a string");
+  }
+
+  if (byteLength(options.source) > MAX_SOURCE_BYTES) {
+    throw new RangeError("Workflow source exceeds the 512 KiB limit");
+  }
+
   const argsJson = serializeWorkflowArgs(options.args);
   const maxAgentCalls = options.maxAgentCalls ?? MAX_AGENT_CALLS;
+
   if (!Number.isSafeInteger(maxAgentCalls) || maxAgentCalls < 1 || maxAgentCalls > MAX_AGENT_CALLS) {
     throw new RangeError(`Workflow maxAgentCalls must be an integer from 1 to ${MAX_AGENT_CALLS}`);
   }
-  if (options.signal.aborted) throw abortError();
+
+  if (options.signal.aborted) {
+    throw abortError();
+  }
+
   const runtime = await openWorkflowRuntime(options, normalizeConvergenceProgress);
+
   try {
     return await runtime.run(workflowCode(options.source, argsJson, maxAgentCalls));
   } finally {

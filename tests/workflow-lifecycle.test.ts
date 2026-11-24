@@ -9,7 +9,10 @@ for (const outcome of ["success", "failure"] as const) {
   test(`workflow restoration ignores a replaced context after ${outcome}`, async (t) => {
     let resolve!: () => void;
     let reject!: (error: Error) => void;
-    const restoring = new Promise<void>((yes, no) => { resolve = yes; reject = no; });
+    const restoring = new Promise<void>((yes, no) => {
+      resolve = yes;
+      reject = no;
+    });
     t.mock.method(WorkflowManager.prototype, "initialize", () => restoring);
     const pi = fakePi();
     const jobs = new JobManager({ backends: [] });
@@ -17,7 +20,9 @@ for (const outcome of ["success", "failure"] as const) {
     let initialized = 0;
     const workflows = registerWorkflows(pi.api, {
       artifactRoot: await tempDir("workflow-stale"),
-      onInitialized: () => { initialized++; },
+      onInitialized: () => {
+        initialized++;
+      },
     });
     t.after(async () => {
       await workflows.sessionShutdown();
@@ -27,8 +32,13 @@ for (const outcome of ["success", "failure"] as const) {
 
     workflows.sessionStart(session.ctx, jobs);
     session.invalidate();
-    if (outcome === "success") resolve();
-    else reject(new Error("restoration failed"));
+
+    if (outcome === "success") {
+      resolve();
+    } else {
+      reject(new Error("restoration failed"));
+    }
+
     await ticks(3);
 
     assert.equal(initialized, 0, "a replaced runtime cannot publish startup state");
@@ -38,14 +48,18 @@ for (const outcome of ["success", "failure"] as const) {
 }
 
 test("active workflow restoration failures still notify and settle initialization", async (t) => {
-  t.mock.method(WorkflowManager.prototype, "initialize", async () => { throw new Error("history unavailable"); });
+  t.mock.method(WorkflowManager.prototype, "initialize", async () => {
+    throw new Error("history unavailable");
+  });
   const pi = fakePi();
   const jobs = new JobManager({ backends: [] });
   const session = replaceableContext({ hasUI: true });
   let initialized = 0;
   const workflows = registerWorkflows(pi.api, {
     artifactRoot: await tempDir("workflow-restoration-error"),
-    onInitialized: () => { initialized++; },
+    onInitialized: () => {
+      initialized++;
+    },
   });
   t.after(async () => {
     await workflows.sessionShutdown();
@@ -63,15 +77,21 @@ test("active workflow restoration failures still notify and settle initializatio
 });
 
 test("workflow restoration error reporting cannot reject its background task", async (t) => {
-  t.mock.method(WorkflowManager.prototype, "initialize", async () => { throw new Error("history unavailable"); });
+  t.mock.method(WorkflowManager.prototype, "initialize", async () => {
+    throw new Error("history unavailable");
+  });
   const pi = fakePi();
   const jobs = new JobManager({ backends: [] });
   const session = replaceableContext({ hasUI: true });
-  t.mock.method(session.ctx.ui, "notify", () => { throw new Error("UI unavailable"); });
+  t.mock.method(session.ctx.ui, "notify", () => {
+    throw new Error("UI unavailable");
+  });
   let initialized = 0;
   const workflows = registerWorkflows(pi.api, {
     artifactRoot: await tempDir("workflow-notification-error"),
-    onInitialized: () => { initialized++; },
+    onInitialized: () => {
+      initialized++;
+    },
   });
   t.after(async () => {
     await workflows.sessionShutdown();
@@ -94,11 +114,14 @@ test("workflow shutdown releases its UI before awaiting manager cleanup", async 
   await ticks(3);
 
   let release!: () => void;
-  const cleanup = new Promise<void>((resolve) => { release = resolve; });
+  const cleanup = new Promise<void>((resolve) => {
+    release = resolve;
+  });
   const shutdown = t.mock.method(WorkflowManager.prototype, "shutdown", () => cleanup);
   const closing = workflows.sessionShutdown();
   session.invalidate();
   release();
+
   try {
     await assert.doesNotReject(closing);
     assert.equal(session.statuses.get("native-workflows"), undefined);
@@ -114,13 +137,18 @@ test("an approval from a replaced workflow session cannot dispatch a mutation", 
   const backend = new ImmediateBackend("pi");
   const jobs = new JobManager({ backends: [backend] });
   let confirm!: (approved: boolean) => void;
-  const approval = new Promise<boolean>((resolve) => { confirm = resolve; });
+  const approval = new Promise<boolean>((resolve) => {
+    confirm = resolve;
+  });
   let showConfirmation!: () => void;
-  const confirming = new Promise<void>((resolve) => { showConfirmation = resolve; });
+  const confirming = new Promise<void>((resolve) => {
+    showConfirmation = resolve;
+  });
   const session = replaceableContext({
     hasUI: true,
     confirm: () => {
       showConfirmation();
+
       return approval;
     },
   });
@@ -132,11 +160,17 @@ test("an approval from a replaced workflow session cannot dispatch a mutation", 
     await jobs.shutdown();
   });
   workflows.sessionStart(session.ctx, jobs);
-  const result = pi.tools.get("workflow").execute("approval", {
-    name: "stale approval",
-    script: 'export default async () => agent("mutate", {})',
-    approval: "onMutate",
-  }, undefined, undefined, session.ctx);
+  const result = pi.tools.get("workflow").execute(
+    "approval",
+    {
+      name: "stale approval",
+      script: 'export default async () => agent("mutate", {})',
+      approval: "onMutate",
+    },
+    undefined,
+    undefined,
+    session.ctx,
+  );
   await confirming;
   session.invalidate();
   confirm(true);

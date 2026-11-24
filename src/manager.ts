@@ -1,6 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { compilePolicy } from "./policy.ts";
-import { assertSupportedSpendBudget, firstReachedSpendWarning, reachedSpendWarning, spendBudgetMetrics, validateSpendBudget, type SpendBudget, type SpendMetric } from "./budget.ts";
+import {
+  assertSupportedSpendBudget,
+  firstReachedSpendWarning,
+  reachedSpendWarning,
+  spendBudgetMetrics,
+  validateSpendBudget,
+  type SpendBudget,
+  type SpendMetric,
+} from "./budget.ts";
 import { emptyUsage, reduceJob } from "./reducer.ts";
 import {
   DEFAULT_INTERACTION_TIMEOUT_MS,
@@ -18,7 +26,17 @@ import {
   type InteractionTargetKind,
   type PendingInteraction,
 } from "./interactions.ts";
-import type { Backend, BackendEvent, BackendRun, HarnessName, JobSnapshot, ProfileDefinition, ProviderFamily, SendBehavior, SpawnRequest } from "./types.ts";
+import type {
+  Backend,
+  BackendEvent,
+  BackendRun,
+  HarnessName,
+  JobSnapshot,
+  ProfileDefinition,
+  ProviderFamily,
+  SendBehavior,
+  SpawnRequest,
+} from "./types.ts";
 
 const GENERIC_SYSTEM_PROMPT = `You are an isolated, task-driven subagent. Work only on the supplied task and return a concise, evidence-based result. You do not have access to parent conversation context beyond the task. Before recommending structural changes, inspect applicable repository instructions, scripts, CI, and nearby conventions. Distinguish acceptance failures, convention violations, verification gaps, and optional improvements; do not prescribe an implementation mechanism that the acceptance wording does not require. Treat absent tests as a defect only when repository convention or concrete regression risk justifies it. Do not spawn subagents or workflows.`;
 
@@ -64,7 +82,11 @@ interface InternalInteraction {
   record: PendingInteraction;
   /** Physical retained target after same-run logical-lineage resolution. */
   resolvedTargetJobId?: string;
-  settle(outcome: { answer: string; route: InteractionRoute; targetGeneration?: number; label?: string } | { error: Error; state: PendingInteraction["state"] }): void;
+  settle(
+    outcome:
+      | { answer: string; route: InteractionRoute; targetGeneration?: number; label?: string }
+      | { error: Error; state: PendingInteraction["state"] },
+  ): void;
   cancelDeadline?: () => void;
   controller: AbortController;
   settled: boolean;
@@ -83,34 +105,54 @@ const DEFAULT_INTERACTION_CLOCK: InteractionDeadlineClock = {
   schedule(callback, delayMs) {
     const timer = setTimeout(callback, Math.max(0, delayMs));
     timer.unref?.();
+
     return () => clearTimeout(timer);
   },
 };
 
 function clone(snapshot: JobSnapshot, previous?: { source: JobSnapshot; value: JobSnapshot }): JobSnapshot {
+  let warnings: JobSnapshot["warnings"];
+
+  if (previous && previous.source.warnings === snapshot.warnings) {
+    warnings = previous.value.warnings;
+  } else if (snapshot.warnings) {
+    warnings = [...snapshot.warnings];
+  }
+
   return {
     ...snapshot,
     usage: previous?.source.usage === snapshot.usage ? previous.value.usage : { ...snapshot.usage },
     budget: snapshot.budget ? { ...snapshot.budget } : undefined,
     context: snapshot.context ? { ...snapshot.context } : undefined,
     activity: snapshot.activity ? { ...snapshot.activity } : undefined,
-    tools: previous?.source.tools === snapshot.tools ? previous.value.tools : snapshot.tools.map((tool) => ({ ...tool })),
-    transcript: previous?.source.transcript === snapshot.transcript
-      ? previous.value.transcript
-      : snapshot.transcript.map((entry) => ({ ...entry })),
-    queuedMessages: previous?.source.queuedMessages === snapshot.queuedMessages
-      ? previous.value.queuedMessages
-      : snapshot.queuedMessages.map((message) => ({ ...message })),
+    tools:
+      previous?.source.tools === snapshot.tools ? previous.value.tools : snapshot.tools.map((tool) => ({ ...tool })),
+    transcript:
+      previous?.source.transcript === snapshot.transcript
+        ? previous.value.transcript
+        : snapshot.transcript.map((entry) => ({ ...entry })),
+    queuedMessages:
+      previous?.source.queuedMessages === snapshot.queuedMessages
+        ? previous.value.queuedMessages
+        : snapshot.queuedMessages.map((message) => ({ ...message })),
     workflow: snapshot.workflow ? { ...snapshot.workflow } : undefined,
     peer: snapshot.peer ? { ...snapshot.peer } : undefined,
     requires: snapshot.requires ? [...snapshot.requires] : undefined,
     capabilities: snapshot.capabilities
-      ? { ...snapshot.capabilities, matched: [...snapshot.capabilities.matched], warnings: snapshot.capabilities.warnings ? [...snapshot.capabilities.warnings] : undefined }
+      ? {
+          ...snapshot.capabilities,
+          matched: [...snapshot.capabilities.matched],
+          warnings: snapshot.capabilities.warnings ? [...snapshot.capabilities.warnings] : undefined,
+        }
       : undefined,
-    warnings: previous && previous.source.warnings === snapshot.warnings ? previous.value.warnings : snapshot.warnings ? [...snapshot.warnings] : undefined,
+    warnings,
     unavailable: snapshot.unavailable ? { ...snapshot.unavailable } : undefined,
     interaction: snapshot.interaction
-      ? { ...snapshot.interaction, target: { ...snapshot.interaction.target }, workflow: snapshot.interaction.workflow ? { ...snapshot.interaction.workflow } : undefined }
+      ? {
+          ...snapshot.interaction,
+          target: { ...snapshot.interaction.target },
+          workflow: snapshot.interaction.workflow ? { ...snapshot.interaction.workflow } : undefined,
+        }
       : undefined,
     answeringInteraction: snapshot.answeringInteraction ? { ...snapshot.answeringInteraction } : undefined,
   };
@@ -146,16 +188,26 @@ class ActiveTurnLease {
 
   /** Gives the slot back without invalidating the lease. Safe to call twice. */
   park(): void {
-    if (this.#state !== "held") return;
+    if (this.#state !== "held") {
+      return;
+    }
+
     this.#state = "parked";
     this.#hooks.release();
   }
 
   /** Queues for a slot again. Rejects if the lease was released or shut down. */
   reacquire(): Promise<void> {
-    if (this.#state === "held") return Promise.resolve();
-    if (this.#state !== "parked") return Promise.reject(new Error("Scheduler lease is no longer valid"));
+    if (this.#state === "held") {
+      return Promise.resolve();
+    }
+
+    if (this.#state !== "parked") {
+      return Promise.reject(new Error("Scheduler lease is no longer valid"));
+    }
+
     this.#state = "waiting";
+
     return new Promise<void>((resolve, reject) => {
       this.#waiter = { resolve, reject };
       this.#hooks.enqueue(this);
@@ -164,7 +216,10 @@ class ActiveTurnLease {
 
   /** Scheduler-side grant; the caller has already accounted for the slot. */
   grant(): void {
-    if (this.#state !== "waiting") return;
+    if (this.#state !== "waiting") {
+      return;
+    }
+
     this.#state = "held";
     const waiter = this.#waiter;
     this.#waiter = undefined;
@@ -173,11 +228,16 @@ class ActiveTurnLease {
 
   /** Permanently gives up the slot and fails any queued reacquisition. Idempotent. */
   release(reason = "Scheduler lease was released"): void {
-    if (this.#state === "released") return;
+    if (this.#state === "released") {
+      return;
+    }
+
     const previous = this.#state;
     this.#state = "released";
-    if (previous === "held") this.#hooks.release();
-    else if (previous === "waiting") {
+
+    if (previous === "held") {
+      this.#hooks.release();
+    } else if (previous === "waiting") {
       this.#hooks.dequeue(this);
       const waiter = this.#waiter;
       this.#waiter = undefined;
@@ -216,10 +276,7 @@ export type PeerInteractionTargetResolver = (source: JobSnapshot, targetJobId: s
 
 /** Target kinds this job's grant actually allows, for accurate tool description. */
 function interactionTargetKinds(policy: { orchestrator?: string; peers?: boolean }): InteractionTargetKind[] {
-  return [
-    ...(policy.orchestrator ? ["orchestrator" as const] : []),
-    ...(policy.peers ? ["agent" as const] : []),
-  ];
+  return [...(policy.orchestrator ? ["orchestrator" as const] : []), ...(policy.peers ? ["agent" as const] : [])];
 }
 
 function cloneInteraction(record: PendingInteraction): PendingInteraction {
@@ -238,15 +295,21 @@ class OperationDeadlineError extends Error {}
 
 async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
+
   try {
     return await Promise.race([
       promise,
       new Promise<T>((_resolve, reject) => {
-        timer = setTimeout(() => reject(new OperationDeadlineError(`${label} timed out after ${timeoutMs}ms`)), Math.max(0, timeoutMs));
+        timer = setTimeout(
+          () => reject(new OperationDeadlineError(`${label} timed out after ${timeoutMs}ms`)),
+          Math.max(0, timeoutMs),
+        );
       }),
     ]);
   } finally {
-    if (timer) clearTimeout(timer);
+    if (timer) {
+      clearTimeout(timer);
+    }
   }
 }
 
@@ -298,29 +361,59 @@ export class JobManager {
   }
 
   spawn(request: SpawnRequest): JobSnapshot {
-    if (this.#closed) throw new Error("Job manager is closed");
-    if (!request.task.trim()) throw new Error("Task must not be empty");
+    if (this.#closed) {
+      throw new Error("Job manager is closed");
+    }
+
+    if (!request.task.trim()) {
+      throw new Error("Task must not be empty");
+    }
+
     const profileName = request.profile?.trim();
-    if (request.profile !== undefined && !profileName) throw new Error("Profile must be a non-empty string");
+
+    if (request.profile !== undefined && !profileName) {
+      throw new Error("Profile must be a non-empty string");
+    }
+
     const independentOf = request.independentOf?.trim();
+
     if (request.independentOf !== undefined && (!independentOf || independentOf.length > 200)) {
       throw new Error("independentOf must be a job ID containing 1–200 characters");
     }
+
     const profile = profileName ? this.#profiles.get(profileName) : undefined;
-    if (profileName && !profile) throw new Error(`Unknown subagent profile: ${profileName}`);
+
+    if (profileName && !profile) {
+      throw new Error(`Unknown subagent profile: ${profileName}`);
+    }
+
     const independentOfProvider = this.#independenceProvider(request, independentOf);
     const compiled = compilePolicy(request, profile, independentOfProvider);
-    if (!this.#backends.has(compiled.policy.harness)) throw new Error(`Harness is unavailable: ${compiled.policy.harness}`);
+
+    if (!this.#backends.has(compiled.policy.harness)) {
+      throw new Error(`Harness is unavailable: ${compiled.policy.harness}`);
+    }
+
     const budget = validateSpendBudget(request.budget, "Subagent budget");
     assertSupportedSpendBudget(budget, compiled.policy.harness);
+
     // A recorded route is only evidence for the harness it was validated against.
     if (request.capabilityRoute && request.capabilityRoute.harness !== compiled.policy.harness) {
-      throw new Error(`Capability route was validated for ${request.capabilityRoute.harness} but this job routes to ${compiled.policy.harness}`);
+      throw new Error(
+        `Capability route was validated for ${request.capabilityRoute.harness} but this job routes to ${compiled.policy.harness}`,
+      );
     }
+
     if (request.peer) {
-      if (compiled.policy.harness !== "pi") throw new Error("Session peers require the pi harness");
-      if (compiled.independent) throw new Error("Session peers cannot be independent");
+      if (compiled.policy.harness !== "pi") {
+        throw new Error("Session peers require the pi harness");
+      }
+
+      if (compiled.independent) {
+        throw new Error("Session peers cannot be independent");
+      }
     }
+
     // Session peers are clarification-only: force read-only access and strip every tool,
     // regardless of what the generic readOnly policy would otherwise grant.
     const policy = request.peer ? { ...compiled.policy, access: "readOnly" as const, piTools: [] } : compiled.policy;
@@ -356,7 +449,11 @@ export class JobManager {
       workflow: request.workflow ? { ...request.workflow } : undefined,
       sessionFile: request.peer?.sessionFile,
       peer: request.peer
-        ? { sourceSessionId: request.peer.sourceSessionId, sourceCwd: request.peer.sourceCwd, sourceName: request.peer.sourceName }
+        ? {
+            sourceSessionId: request.peer.sourceSessionId,
+            sourceCwd: request.peer.sourceCwd,
+            sourceName: request.peer.sourceName,
+          }
         : undefined,
       requires: policy.requires ? [...policy.requires] : undefined,
       capabilities: request.capabilityRoute ? { ...request.capabilityRoute } : undefined,
@@ -368,6 +465,7 @@ export class JobManager {
     // full scheduler budget otherwise reaches no `#emit`/`#publish` call at all.
     this.#publish(job, { type: "queued" });
     this.#pump();
+
     return clone(snapshot);
   }
 
@@ -375,9 +473,14 @@ export class JobManager {
   resolveHarness(request: SpawnRequest): HarnessName {
     const profileName = request.profile?.trim();
     const profile = profileName ? this.#profiles.get(profileName) : undefined;
-    if (profileName && !profile) throw new Error(`Unknown subagent profile: ${profileName}`);
+
+    if (profileName && !profile) {
+      throw new Error(`Unknown subagent profile: ${profileName}`);
+    }
+
     const independentOf = request.independentOf?.trim();
     const independentOfProvider = this.#independenceProvider(request, independentOf);
+
     return compilePolicy(request, profile, independentOfProvider).policy.harness;
   }
 
@@ -387,7 +490,11 @@ export class JobManager {
 
   check(id: string): JobSnapshot {
     const job = this.#jobs.get(id);
-    if (!job) throw new Error(`Unknown job: ${id}`);
+
+    if (!job) {
+      throw new Error(`Unknown job: ${id}`);
+    }
+
     return clone(job.snapshot);
   }
 
@@ -397,46 +504,79 @@ export class JobManager {
 
   subscribe(listener: (job: JobSnapshot, event: BackendEvent) => void): () => void {
     this.#listeners.add(listener);
+
     return () => this.#listeners.delete(listener);
   }
 
   async send(id: string, message: string, behavior: SendBehavior = "steer"): Promise<JobSnapshot> {
-    if (!message.trim()) throw new Error("Subagent message must not be empty");
-    const job = this.#jobs.get(id);
-    if (!job) throw new Error(`Unknown job: ${id}`);
-    if (job.snapshot.workflow) {
-      throw new Error(`Cannot send to ${id}: workflow-owned agents are controlled by their workflow; inspect or cancel them instead`);
+    if (!message.trim()) {
+      throw new Error("Subagent message must not be empty");
     }
+
+    const job = this.#jobs.get(id);
+
+    if (!job) {
+      throw new Error(`Unknown job: ${id}`);
+    }
+
+    if (job.snapshot.workflow) {
+      throw new Error(
+        `Cannot send to ${id}: workflow-owned agents are controlled by their workflow; inspect or cancel them instead`,
+      );
+    }
+
     if (job.snapshot.status === "failed" || job.snapshot.status === "cancelled") {
       throw new Error(`Cannot reuse ${id}: job is ${job.snapshot.status}`);
     }
+
     if (job.snapshot.status === "queued" && job.pendingRestart) {
       throw new Error(`Cannot send to ${id}: a follow-up is waiting for an available slot`);
     }
+
     if (job.interaction && !job.interaction.settled) {
       throw new Error(`Cannot send to ${id}: the job is parked on a pending question; answer or dismiss it first`);
     }
+
     if (job.answeringInteraction) {
       throw new Error(`Cannot send to ${id}: the job is answering a peer question`);
     }
+
     if (behavior === "followUp" && !isTerminal(job.snapshot.status)) {
       await this.wait(id);
+
       return this.send(id, message, "followUp");
     }
-    if (job.snapshot.status === "completed") return this.#queueFollowUp(job, message);
-    const run = job.run ?? await new Promise<BackendRun | undefined>((resolve) => {
-      const waiters = job.runWaiters ??= new Set();
-      const ready = (value?: BackendRun) => { clearTimeout(timer); waiters.delete(ready); resolve(value); };
-      const timer = setTimeout(() => ready(undefined), 30_000);
-      waiters.add(ready);
-    });
-    if (!run) throw new Error(`Cannot send to ${id}: harness did not become ready`);
+
+    if (job.snapshot.status === "completed") {
+      return this.#queueFollowUp(job, message);
+    }
+
+    const run =
+      job.run ??
+      (await new Promise<BackendRun | undefined>((resolve) => {
+        const waiters = (job.runWaiters ??= new Set());
+        const ready = (value?: BackendRun) => {
+          clearTimeout(timer);
+          waiters.delete(ready);
+          resolve(value);
+        };
+
+        const timer = setTimeout(() => ready(undefined), 30_000);
+        waiters.add(ready);
+      }));
+
+    if (!run) {
+      throw new Error(`Cannot send to ${id}: harness did not become ready`);
+    }
+
     await this.#serialize(job, async () => {
       if (job.cancelRequested || isTerminal(job.snapshot.status) || job.run !== run) {
         throw new Error(`Cannot send to ${id}: job is cancelling or settled`);
       }
+
       await run.send(message, behavior);
     });
+
     return clone(job.snapshot);
   }
 
@@ -448,11 +588,24 @@ export class JobManager {
    * session) so a workflow cannot resurrect a session it does not own.
    */
   async continueWorkflowJob(id: string, message: string): Promise<JobSnapshot> {
-    if (!message.trim()) throw new Error("Follow-up prompt must not be empty");
+    if (!message.trim()) {
+      throw new Error("Follow-up prompt must not be empty");
+    }
+
     const job = this.#jobs.get(id);
-    if (!job) throw new Error(`Unknown job: ${id}`);
-    if (!job.snapshot.workflow) throw new Error(`Cannot continue ${id}: job is not workflow-owned`);
-    if (job.snapshot.status !== "completed") throw new Error(`Cannot continue ${id}: job is ${job.snapshot.status}`);
+
+    if (!job) {
+      throw new Error(`Unknown job: ${id}`);
+    }
+
+    if (!job.snapshot.workflow) {
+      throw new Error(`Cannot continue ${id}: job is not workflow-owned`);
+    }
+
+    if (job.snapshot.status !== "completed") {
+      throw new Error(`Cannot continue ${id}: job is ${job.snapshot.status}`);
+    }
+
     return this.#queueFollowUp(job, message);
   }
 
@@ -463,14 +616,24 @@ export class JobManager {
    */
   async releaseRun(id: string): Promise<void> {
     const job = this.#jobs.get(id);
-    if (!job || !job.run) return;
+
+    if (!job || !job.run) {
+      return;
+    }
+
     // Strict workflow settlement already surfaced this cleanup failure. Do
     // not queue ordinary release behind the same stuck operation and prevent
     // the containing workflow from reaching its fail-closed terminal state.
-    if (job.cleanupError) return;
+    if (job.cleanupError) {
+      return;
+    }
+
     const run = job.run;
     await this.#serialize(job, async () => {
-      if (job.run !== run) return;
+      if (job.run !== run) {
+        return;
+      }
+
       job.run = undefined;
       job.pendingRestart = undefined;
       await run.close();
@@ -484,58 +647,110 @@ export class JobManager {
    */
   async settleFailedWorkflowJob(id: string): Promise<JobSnapshot> {
     const job = this.#jobs.get(id);
-    if (!job) throw new Error(`Unknown job: ${id}`);
-    if (!job.snapshot.workflow) throw new Error(`Cannot settle ${id}: job is not workflow-owned`);
-    if (job.snapshot.status !== "failed") throw new Error(`Cannot settle ${id}: job is ${job.snapshot.status}`);
+
+    if (!job) {
+      throw new Error(`Unknown job: ${id}`);
+    }
+
+    if (!job.snapshot.workflow) {
+      throw new Error(`Cannot settle ${id}: job is not workflow-owned`);
+    }
+
+    if (job.snapshot.status !== "failed") {
+      throw new Error(`Cannot settle ${id}: job is ${job.snapshot.status}`);
+    }
+
     const run = job.run;
+
     if (!run) {
-      if (job.cleanupError) throw job.cleanupError;
+      if (job.cleanupError) {
+        throw job.cleanupError;
+      }
+
       return clone(job.snapshot);
     }
+
     const settlement = this.#serialize(job, async () => {
       if (job.run !== run) {
-        if (job.cleanupError) throw job.cleanupError;
+        if (job.cleanupError) {
+          throw job.cleanupError;
+        }
+
         return;
       }
+
       await Promise.all([run.close(), run.completed]);
       job.cleanupError = undefined;
-      if (job.run === run) job.run = undefined;
+
+      if (job.run === run) {
+        job.run = undefined;
+      }
     });
     const settlementTail = job.operation;
+
     try {
       await withDeadline(settlement, this.#operationTimeoutMs, "Harness settlement");
     } catch (error) {
       if (!(error instanceof OperationDeadlineError) || !run.forceClose) {
         job.cleanupError = error instanceof Error ? error : new Error(String(error));
+
         throw error;
       }
 
       let forceClosed = false;
+
       try {
-        await withDeadline((async () => {
-          await run.forceClose!();
-          forceClosed = true;
-          await run.completed;
-          await settlement;
-        })(), Math.min(1_000, this.#operationTimeoutMs), "Harness force-close");
+        await withDeadline(
+          (async () => {
+            await run.forceClose!();
+            forceClosed = true;
+            await run.completed;
+            await settlement;
+          })(),
+          Math.min(1_000, this.#operationTimeoutMs),
+          "Harness force-close",
+        );
       } catch (cleanupError) {
         job.cleanupError = cleanupError instanceof Error ? cleanupError : new Error(String(cleanupError));
+
         if (forceClosed) {
-          if (job.run === run) job.run = undefined;
-          if (job.operation === settlementTail) job.operation = undefined;
+          if (job.run === run) {
+            job.run = undefined;
+          }
+
+          if (job.operation === settlementTail) {
+            job.operation = undefined;
+          }
         }
+
         throw cleanupError;
       }
     }
+
     return clone(job.snapshot);
   }
 
   #queueFollowUp(job: InternalJob, message: string): JobSnapshot {
     const id = job.snapshot.id;
-    const boundary = firstReachedSpendWarning(job.snapshot.budget, job.snapshot.usage, job.snapshot.harness, "Subagent budget");
-    if (boundary) throw new Error(`Cannot reuse ${id}: ${boundary}`);
-    if (!job.run) throw new Error(`Cannot reuse ${id}: native session is no longer available`);
-    if (job.pendingRestart) throw new Error(`Cannot reuse ${id}: a follow-up is already queued`);
+    const boundary = firstReachedSpendWarning(
+      job.snapshot.budget,
+      job.snapshot.usage,
+      job.snapshot.harness,
+      "Subagent budget",
+    );
+
+    if (boundary) {
+      throw new Error(`Cannot reuse ${id}: ${boundary}`);
+    }
+
+    if (!job.run) {
+      throw new Error(`Cannot reuse ${id}: native session is no longer available`);
+    }
+
+    if (job.pendingRestart) {
+      throw new Error(`Cannot reuse ${id}: a follow-up is already queued`);
+    }
+
     job.pendingRestart = { message, behavior: "followUp" };
     job.snapshot = {
       ...job.snapshot,
@@ -559,50 +774,87 @@ export class JobManager {
     this.#queue.push(id);
     this.#publish(job, { type: "queue_changed", messages: job.snapshot.queuedMessages });
     this.#pump();
+
     return clone(job.snapshot);
   }
 
   async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<JobSnapshot> {
     const job = this.#jobs.get(id);
-    if (!job) throw new Error(`Unknown job: ${id}`);
-    if (isTerminal(job.snapshot.status) && !job.deferredStartupTerminal) return clone(job.snapshot);
+
+    if (!job) {
+      throw new Error(`Unknown job: ${id}`);
+    }
+
+    if (isTerminal(job.snapshot.status) && !job.deferredStartupTerminal) {
+      return clone(job.snapshot);
+    }
+
     return new Promise<JobSnapshot>((resolve, reject) => {
       let timer: NodeJS.Timeout | undefined;
       const finish = () => {
         cleanup();
         resolve(this.check(id));
       };
+
       const abort = () => {
         cleanup();
         reject(options.signal?.reason instanceof Error ? options.signal.reason : new Error("Wait aborted"));
       };
+
       const cleanup = () => {
-        if (timer) clearTimeout(timer);
+        if (timer) {
+          clearTimeout(timer);
+        }
+
         options.signal?.removeEventListener("abort", abort);
         this.#waiters.get(id)?.delete(finish);
       };
+
       const set = this.#waiters.get(id) ?? new Set<() => void>();
       set.add(finish);
       this.#waiters.set(id, set);
-      if (options.timeoutMs !== undefined) timer = setTimeout(() => { cleanup(); resolve(this.check(id)); }, options.timeoutMs);
-      if (options.signal?.aborted) abort();
-      else options.signal?.addEventListener("abort", abort, { once: true });
+
+      if (options.timeoutMs !== undefined) {
+        timer = setTimeout(() => {
+          cleanup();
+          resolve(this.check(id));
+        }, options.timeoutMs);
+      }
+
+      if (options.signal?.aborted) {
+        abort();
+      } else {
+        options.signal?.addEventListener("abort", abort, { once: true });
+      }
     });
   }
 
   async cancel(id: string, reason = "Cancelled by parent"): Promise<JobSnapshot> {
     const job = this.#jobs.get(id);
-    if (!job) throw new Error(`Unknown job: ${id}`);
+
+    if (!job) {
+      throw new Error(`Unknown job: ${id}`);
+    }
+
     // A completed target can already be marked as answering while its retained
     // follow-up is crossing the queue boundary. Cancel the interaction before
     // the ordinary terminal no-op so that race cannot orphan peer-answer work.
     this.#cancelJobInteractions(job, reason);
-    if (isTerminal(job.snapshot.status)) return clone(job.snapshot);
+
+    if (isTerminal(job.snapshot.status)) {
+      return clone(job.snapshot);
+    }
+
     if (job.snapshot.status === "queued" && !job.inFlight) {
       const index = this.#queue.indexOf(id);
-      if (index >= 0) this.#queue.splice(index, 1);
+
+      if (index >= 0) {
+        this.#queue.splice(index, 1);
+      }
+
       job.pendingRestart = undefined;
       this.#emit(job, { type: "cancelled", reason });
+
       if (job.run) {
         await this.#serialize(job, () => job.run!.close()).catch(() => undefined);
         job.run = undefined;
@@ -610,95 +862,179 @@ export class JobManager {
     } else {
       job.cancelRequested ??= reason;
       job.startupController?.abort(new Error(job.cancelRequested));
-      const run = job.run ?? await this.#waitForRun(job, this.#operationTimeoutMs);
+      const run = job.run ?? (await this.#waitForRun(job, this.#operationTimeoutMs));
+
       if (run) {
         try {
-          await withDeadline(this.#cancelRun(job, run, job.cancelRequested), this.#operationTimeoutMs, "Harness cancellation");
+          await withDeadline(
+            this.#cancelRun(job, run, job.cancelRequested),
+            this.#operationTimeoutMs,
+            "Harness cancellation",
+          );
         } catch (error) {
-          if (!(error instanceof OperationDeadlineError)) throw error;
-          await withDeadline(run.forceClose?.() ?? run.close(), Math.min(1_000, this.#operationTimeoutMs), "Harness force-close").catch(() => undefined);
-          if (!isTerminal(job.snapshot.status)) this.#emit(job, { type: "cancelled", reason: `${job.cancelRequested} (harness cancellation deadline exceeded)` });
+          if (!(error instanceof OperationDeadlineError)) {
+            throw error;
+          }
+
+          await withDeadline(
+            run.forceClose?.() ?? run.close(),
+            Math.min(1_000, this.#operationTimeoutMs),
+            "Harness force-close",
+          ).catch(() => undefined);
+
+          if (!isTerminal(job.snapshot.status)) {
+            this.#emit(job, {
+              type: "cancelled",
+              reason: `${job.cancelRequested} (harness cancellation deadline exceeded)`,
+            });
+          }
         }
       } else if (!isTerminal(job.snapshot.status)) {
-        this.#emit(job, { type: "cancelled", reason: `${job.cancelRequested} (harness startup cancellation deadline exceeded)` });
+        this.#emit(job, {
+          type: "cancelled",
+          reason: `${job.cancelRequested} (harness startup cancellation deadline exceeded)`,
+        });
       }
     }
+
     return clone(job.snapshot);
   }
 
   async shutdown(timeoutMs = 5_000): Promise<void> {
-    if (this.#closed) return;
+    if (this.#closed) {
+      return;
+    }
+
     this.#closed = true;
+
     // Session shutdown cancels session-local questions, matching the job
     // lifecycle: a parked tool callback must be rejected, and a queued
     // peer-answer follow-up must never dispatch afterwards.
-    for (const job of this.#jobs.values()) this.#cancelJobInteractions(job, "Session shutdown");
-    for (const lease of [...this.#leaseQueue]) lease.release("Session shutdown");
+    for (const job of this.#jobs.values()) {
+      this.#cancelJobInteractions(job, "Session shutdown");
+    }
+
+    for (const lease of [...this.#leaseQueue]) {
+      lease.release("Session shutdown");
+    }
+
     this.#leaseQueue.clear();
     this.#waitGraph.clear();
     this.#peerRouter = undefined;
     const operations: Promise<unknown>[] = [];
+
     for (const job of this.#jobs.values()) {
-      operations.push((async () => {
-        if (!isTerminal(job.snapshot.status)) await this.cancel(job.snapshot.id, "Session shutdown");
-        const run = job.run;
-        if (run) await this.#serialize(job, () => run.close());
-      })());
+      operations.push(
+        (async () => {
+          if (!isTerminal(job.snapshot.status)) {
+            await this.cancel(job.snapshot.id, "Session shutdown");
+          }
+
+          const run = job.run;
+
+          if (run) {
+            await this.#serialize(job, () => run.close());
+          }
+        })(),
+      );
     }
+
     operations.push(...this.#launches);
     let timer: NodeJS.Timeout | undefined;
     let deadlineHit = false;
     await Promise.race([
       Promise.allSettled(operations).then(() => undefined),
-      new Promise<void>((resolve) => { timer = setTimeout(() => { deadlineHit = true; resolve(); }, Math.max(0, timeoutMs)); }),
+      new Promise<void>((resolve) => {
+        timer = setTimeout(
+          () => {
+            deadlineHit = true;
+            resolve();
+          },
+          Math.max(0, timeoutMs),
+        );
+      }),
     ]);
-    if (timer) clearTimeout(timer);
+
+    if (timer) {
+      clearTimeout(timer);
+    }
+
     if (deadlineHit) {
-      const forced = [...this.#jobs.values()].map((job) => job.run?.forceClose?.()).filter((value): value is Promise<void> => value !== undefined);
+      const forced = [...this.#jobs.values()]
+        .map((job) => job.run?.forceClose?.())
+        .filter((value): value is Promise<void> => value !== undefined);
       let forceTimer: NodeJS.Timeout | undefined;
       await Promise.race([
         Promise.allSettled(forced).then(() => undefined),
-        new Promise<void>((resolve) => { forceTimer = setTimeout(resolve, 1_000); }),
+        new Promise<void>((resolve) => {
+          forceTimer = setTimeout(resolve, 1_000);
+        }),
       ]);
-      if (forceTimer) clearTimeout(forceTimer);
+
+      if (forceTimer) {
+        clearTimeout(forceTimer);
+      }
+
       for (const job of this.#jobs.values()) {
-        if (!isTerminal(job.snapshot.status)) this.#emit(job, { type: "cancelled", reason: "Session shutdown deadline exceeded" });
+        if (!isTerminal(job.snapshot.status)) {
+          this.#emit(job, { type: "cancelled", reason: "Session shutdown deadline exceeded" });
+        }
       }
     }
-    for (const job of this.#jobs.values()) this.#resolveRunWaiters(job);
+
+    for (const job of this.#jobs.values()) {
+      this.#resolveRunWaiters(job);
+    }
+
     this.#listeners.clear();
   }
 
   #waitForRun(job: InternalJob, timeoutMs: number): Promise<BackendRun | undefined> {
-    if (job.run) return Promise.resolve(job.run);
+    if (job.run) {
+      return Promise.resolve(job.run);
+    }
+
     return new Promise<BackendRun | undefined>((resolve) => {
-      const waiters = job.runWaiters ??= new Set();
+      const waiters = (job.runWaiters ??= new Set());
       const ready = (run?: BackendRun) => {
         clearTimeout(timer);
         waiters.delete(ready);
         resolve(run);
       };
+
       const timer = setTimeout(() => ready(undefined), Math.max(0, timeoutMs));
       waiters.add(ready);
     });
   }
 
   #evictOldJobs(): void {
-    if (this.#jobs.size < MAX_RETAINED_JOBS) return;
+    if (this.#jobs.size < MAX_RETAINED_JOBS) {
+      return;
+    }
+
     const terminal = [...this.#jobs.values()]
       .filter((job) => isTerminal(job.snapshot.status))
       .sort((a, b) => (a.snapshot.endedAt ?? a.snapshot.createdAt) - (b.snapshot.endedAt ?? b.snapshot.createdAt));
+
     while (this.#jobs.size >= MAX_RETAINED_JOBS && terminal.length > 0) {
       const job = terminal.shift()!;
-      if (job.run) void job.run.close().catch(() => undefined);
+
+      if (job.run) {
+        void job.run.close().catch(() => undefined);
+      }
+
       this.#jobs.delete(job.snapshot.id);
       this.#waiters.delete(job.snapshot.id);
     }
-    if (this.#jobs.size >= MAX_RETAINED_JOBS) throw new Error(`Job retention limit reached (${MAX_RETAINED_JOBS}); wait for or cancel existing jobs`);
+
+    if (this.#jobs.size >= MAX_RETAINED_JOBS) {
+      throw new Error(`Job retention limit reached (${MAX_RETAINED_JOBS}); wait for or cancel existing jobs`);
+    }
   }
 
   #createLease(job: InternalJob): ActiveTurnLease {
     this.#active++;
+
     return new ActiveTurnLease(!job.snapshot.workflow, {
       release: () => {
         this.#active--;
@@ -718,23 +1054,28 @@ export class JobManager {
       // Within that class it has already started a native turn, so resume it
       // before launching another direct process.
       const waitingDirect = [...this.#leaseQueue].find((lease) => lease.direct);
+
       if (waitingDirect) {
         this.#leaseQueue.delete(waitingDirect);
         this.#active++;
         waitingDirect.grant();
         continue;
       }
+
       // Interactive/direct work gets the next available slot instead of
       // sitting behind a workflow's fan-out or a workflow caller waiting to
       // resume after a question.
       const directIndex = this.#queue.findIndex((id) => {
         const candidate = this.#jobs.get(id);
+
         return candidate?.snapshot.status === "queued" && !candidate.inFlight && !candidate.snapshot.workflow;
       });
+
       if (directIndex < 0) {
         // With no direct work waiting, resume a workflow caller before launching
         // more workflow work. This prevents full-cap question deadlocks.
         const waiting = this.#leaseQueue.values().next().value as ActiveTurnLease | undefined;
+
         if (waiting) {
           this.#leaseQueue.delete(waiting);
           this.#active++;
@@ -742,19 +1083,34 @@ export class JobManager {
           continue;
         }
       }
-      const nextIndex = directIndex >= 0 ? directIndex : this.#queue.findIndex((id) => {
-        const candidate = this.#jobs.get(id);
-        return candidate?.snapshot.status === "queued" && !candidate.inFlight;
-      });
-      if (nextIndex < 0) break;
+
+      const nextIndex =
+        directIndex >= 0
+          ? directIndex
+          : this.#queue.findIndex((id) => {
+              const candidate = this.#jobs.get(id);
+
+              return candidate?.snapshot.status === "queued" && !candidate.inFlight;
+            });
+
+      if (nextIndex < 0) {
+        break;
+      }
+
       const [id] = this.#queue.splice(nextIndex, 1);
       const job = id ? this.#jobs.get(id) : undefined;
-      if (!job || job.snapshot.status !== "queued" || job.inFlight) continue;
+
+      if (!job || job.snapshot.status !== "queued" || job.inFlight) {
+        continue;
+      }
+
       const dispatchError = job.request.dispatchGate?.();
+
       if (dispatchError) {
         this.#emit(job, { type: "failed", error: dispatchError });
         continue;
       }
+
       job.inFlight = true;
       job.lease = this.#createLease(job);
       const launch = job.run && job.pendingRestart ? this.#restart(job) : this.#launch(job);
@@ -768,13 +1124,20 @@ export class JobManager {
     const backend = this.#backends.get(job.policy.harness)!;
     const startupController = new AbortController();
     job.startupController = startupController;
+
     try {
       const applyAdmission = (admission: Awaited<ReturnType<NonNullable<SpawnRequest["dispatchAdmission"]>>>) => {
-        if (admission?.error) throw new Error(admission.error);
+        if (admission?.error) {
+          throw new Error(admission.error);
+        }
+
         if (admission?.capabilityRoute) {
           if (admission.capabilityRoute.harness !== job.policy.harness) {
-            throw new Error(`Capability admission was validated for ${admission.capabilityRoute.harness} but this job routes to ${job.policy.harness}`);
+            throw new Error(
+              `Capability admission was validated for ${admission.capabilityRoute.harness} but this job routes to ${job.policy.harness}`,
+            );
           }
+
           job.request.capabilityRoute = {
             ...admission.capabilityRoute,
             matched: [...admission.capabilityRoute.matched],
@@ -787,76 +1150,109 @@ export class JobManager {
           };
         }
       };
+
       const startBackend = (): Promise<BackendRun> => {
         startupController.signal.throwIfAborted();
         this.#emit(job, { type: "started" });
-        const basePrompt = job.request.peer
-          ? PEER_SYSTEM_PROMPT
-          : job.request.parentThread ? HUMAN_SYSTEM_PROMPT : GENERIC_SYSTEM_PROMPT;
+        let basePrompt = GENERIC_SYSTEM_PROMPT;
+
+        if (job.request.peer) {
+          basePrompt = PEER_SYSTEM_PROMPT;
+        } else if (job.request.parentThread) {
+          basePrompt = HUMAN_SYSTEM_PROMPT;
+        }
+
         const capabilityPrompt = job.request.capabilityRoute?.matched.length
           ? `The parent live-verified these required native capabilities for this task: ${job.request.capabilityRoute.matched.join(", ")}. Use the relevant skill or tool when the task calls for it; do not substitute an unverified capability.`
           : undefined;
         const systemPrompt = [basePrompt, capabilityPrompt, job.profile?.systemPrompt].filter(Boolean).join("\n\n");
-        return backend.start({
-          jobId: job.snapshot.id,
-          name: job.snapshot.name,
-          task: job.request.task,
-          systemPrompt,
-          cwd: job.request.cwd,
-          policy: job.policy,
-          env: process.env,
-          signal: startupController.signal,
-          resumeSessionFile: job.request.peer?.sessionFile,
-          rawInitialMessage: job.request.peer ? true : undefined,
-          parentThread: job.request.parentThread,
-          interactions: job.request.interaction ? this.#interactionHandler(job) : undefined,
-          interactionTargets: job.request.interaction ? interactionTargetKinds(job.request.interaction) : undefined,
-        }, (event) => this.#handleBackendEvent(job, event));
+
+        return backend.start(
+          {
+            jobId: job.snapshot.id,
+            name: job.snapshot.name,
+            task: job.request.task,
+            systemPrompt,
+            cwd: job.request.cwd,
+            policy: job.policy,
+            env: process.env,
+            signal: startupController.signal,
+            resumeSessionFile: job.request.peer?.sessionFile,
+            rawInitialMessage: job.request.peer ? true : undefined,
+            parentThread: job.request.parentThread,
+            interactions: job.request.interaction ? this.#interactionHandler(job) : undefined,
+            interactionTargets: job.request.interaction ? interactionTargetKinds(job.request.interaction) : undefined,
+          },
+          (event) => this.#handleBackendEvent(job, event),
+        );
       };
+
       // Keep the common no-admission launch synchronous through backend.start;
       // only continuation admission adds an async pre-start boundary.
       const startup = job.request.dispatchAdmission
         ? (async () => {
-          applyAdmission(await job.request.dispatchAdmission!(startupController.signal));
-          return startBackend();
-        })()
+            applyAdmission(await job.request.dispatchAdmission!(startupController.signal));
+
+            return startBackend();
+          })()
         : startBackend();
       let startedRun: BackendRun;
+
       try {
         startedRun = await withDeadline(startup, this.#startupTimeoutMs, "Harness startup");
       } catch (error) {
         if (error instanceof OperationDeadlineError) {
           startupController.abort(error);
-          void startup.then((lateRun) => (lateRun.forceClose?.() ?? lateRun.close()).catch(() => undefined), () => undefined);
+          void startup.then(
+            (lateRun) => (lateRun.forceClose?.() ?? lateRun.close()).catch(() => undefined),
+            () => undefined,
+          );
         }
+
         throw error;
       }
+
       if (this.#closed || this.#jobs.get(job.snapshot.id) !== job) {
         await (startedRun.forceClose?.() ?? startedRun.close()).catch(() => undefined);
+
         return;
       }
+
       job.run = startedRun;
       job.cleanupError = undefined;
       job.startupController = undefined;
       this.#resolveRunWaiters(job, job.run);
       const deferredTerminal = job.deferredStartupTerminal;
       job.deferredStartupTerminal = undefined;
-      if (deferredTerminal) this.#publishSettlement(job, deferredTerminal.event, deferredTerminal.generation);
+
+      if (deferredTerminal) {
+        this.#publishSettlement(job, deferredTerminal.event, deferredTerminal.generation);
+      }
+
       if (job.cancelRequested && isTerminal(job.snapshot.status)) {
         await (job.run.forceClose?.() ?? job.run.close());
+
         return;
       }
-      if (job.cancelRequested) await this.#cancelRun(job, job.run, job.cancelRequested);
+
+      if (job.cancelRequested) {
+        await this.#cancelRun(job, job.run, job.cancelRequested);
+      }
+
       await job.run.completed;
+
       if (job.snapshot.generation === generation && !isTerminal(job.snapshot.status) && !job.cancelRequested) {
         this.#emit(job, { type: "completed" });
       }
     } catch (error) {
       if (job.snapshot.generation === generation && !isTerminal(job.snapshot.status)) {
         const startupTimedOut = startupController.signal.reason instanceof OperationDeadlineError;
-        if (job.cancelRequested || startupController.signal.aborted && !startupTimedOut) {
+
+        if (job.cancelRequested || (startupController.signal.aborted && !startupTimedOut)) {
           this.#emit(job, { type: "cancelled", reason: job.cancelRequested ?? "Harness startup aborted" });
-        } else this.#emit(job, { type: "failed", error: error instanceof Error ? error.message : String(error) });
+        } else {
+          this.#emit(job, { type: "failed", error: error instanceof Error ? error.message : String(error) });
+        }
       }
     } finally {
       job.startupController = undefined;
@@ -864,6 +1260,7 @@ export class JobManager {
       this.#resolveRunWaiters(job);
       const run = job.run;
       const advanced = job.snapshot.generation !== generation;
+
       if (!advanced && (job.snapshot.status !== "completed" || !run || job.cancelRequested)) {
         if (run) {
           await this.#serialize(job, async () => {
@@ -872,12 +1269,15 @@ export class JobManager {
               job.cleanupError = undefined;
             } catch (error) {
               job.cleanupError = error instanceof Error ? error : new Error(String(error));
+
               throw error;
             }
           }).catch(() => undefined);
         }
+
         job.run = undefined;
       }
+
       this.#releaseLease(job);
     }
   }
@@ -887,11 +1287,14 @@ export class JobManager {
     const run = job.run;
     const pending = job.pendingRestart;
     job.pendingRestart = undefined;
+
     if (!run || !pending) {
       this.#emit(job, { type: "failed", error: "Native session is no longer available" });
       this.#releaseLease(job);
+
       return;
     }
+
     try {
       this.#emit(job, { type: "started" });
       await this.#serialize(job, () => run.send(pending.message, pending.behavior));
@@ -902,6 +1305,7 @@ export class JobManager {
       }
     } finally {
       const advanced = job.snapshot.generation !== generation;
+
       if (!advanced && (job.snapshot.status !== "completed" || job.run !== run)) {
         await this.#serialize(job, async () => {
           try {
@@ -909,11 +1313,16 @@ export class JobManager {
             job.cleanupError = undefined;
           } catch (error) {
             job.cleanupError = error instanceof Error ? error : new Error(String(error));
+
             throw error;
           }
         }).catch(() => undefined);
-        if (job.run === run) job.run = undefined;
+
+        if (job.run === run) {
+          job.run = undefined;
+        }
       }
+
       this.#releaseLease(job);
     }
   }
@@ -943,8 +1352,12 @@ export class JobManager {
   ): () => void {
     this.#peerRouter = router;
     this.#peerTargetResolver = resolveTarget;
+
     return () => {
-      if (this.#peerRouter !== router) return;
+      if (this.#peerRouter !== router) {
+        return;
+      }
+
       this.#peerRouter = undefined;
       this.#peerTargetResolver = undefined;
     };
@@ -961,6 +1374,7 @@ export class JobManager {
 
   interaction(requestId: string): PendingInteraction | undefined {
     const record = this.#interactions.get(requestId)?.interaction?.record;
+
     return record ? cloneInteraction(record) : undefined;
   }
 
@@ -970,22 +1384,32 @@ export class JobManager {
    * this resolves a provider tool call that is already in progress. Late,
    * duplicate, dismissed, expired, and terminal-job answers all fail here.
    */
-  answerInteraction(requestId: string, answer: string, route: "orchestrator-model" | "human" = "orchestrator-model"): PendingInteraction {
+  answerInteraction(
+    requestId: string,
+    answer: string,
+    route: "orchestrator-model" | "human" = "orchestrator-model",
+  ): PendingInteraction {
     const job = this.#interactions.get(requestId);
     const pending = job?.interaction;
+
     if (!job || !pending || pending.record.requestId !== requestId) {
       throw new InteractionError(`Unknown or already-resolved question: ${requestId}`);
     }
+
     if (pending.settled || pending.record.state !== "pending") {
       throw new InteractionError(`Question ${requestId} is ${pending.record.state} and can no longer be answered`);
     }
+
     if (pending.record.target.kind !== "orchestrator") {
       throw new InteractionError(`Question ${requestId} is routed to a peer agent and is not answerable here`);
     }
+
     if (isTerminal(job.snapshot.status)) {
       throw new InteractionError(`Question ${requestId} belongs to a ${job.snapshot.status} job`);
     }
+
     pending.settle({ answer: normalizeAnswer(answer), route });
+
     return cloneInteraction(pending.record);
   }
 
@@ -993,9 +1417,17 @@ export class JobManager {
   dismissInteraction(requestId: string, reason = "Question dismissed"): PendingInteraction {
     const job = this.#interactions.get(requestId);
     const pending = job?.interaction;
-    if (!job || !pending) throw new InteractionError(`Unknown or already-resolved question: ${requestId}`);
-    if (pending.settled) throw new InteractionError(`Question ${requestId} is ${pending.record.state} and can no longer be dismissed`);
+
+    if (!job || !pending) {
+      throw new InteractionError(`Unknown or already-resolved question: ${requestId}`);
+    }
+
+    if (pending.settled) {
+      throw new InteractionError(`Question ${requestId} is ${pending.record.state} and can no longer be dismissed`);
+    }
+
     pending.settle({ error: new InteractionError(reason), state: "dismissed" });
+
     return cloneInteraction(pending.record);
   }
 
@@ -1005,33 +1437,68 @@ export class JobManager {
 
   async #ask(job: InternalJob, input: InteractionAskInput): Promise<InteractionAskResult> {
     const policy = job.request.interaction;
-    if (!policy) throw new InteractionError("This subagent is not authorized to ask routed questions");
-    if (this.#closed) throw new InteractionError("The Pi session is shutting down; the question was not routed");
+
+    if (!policy) {
+      throw new InteractionError("This subagent is not authorized to ask routed questions");
+    }
+
+    if (this.#closed) {
+      throw new InteractionError("The Pi session is shutting down; the question was not routed");
+    }
+
     // The recursion guard is checked before lifecycle: a job producing a peer
     // answer gets the accurate refusal, not an incidental status message.
     if (job.answeringInteraction) {
-      throw new InteractionError("A peer-answer turn cannot ask another agent or the orchestrator; answer the question you were given");
+      throw new InteractionError(
+        "A peer-answer turn cannot ask another agent or the orchestrator; answer the question you were given",
+      );
     }
-    if (isTerminal(job.snapshot.status)) throw new InteractionError("This job has already settled and cannot ask a question");
-    if (job.interaction) throw new InteractionError("This turn already has an outstanding question; wait for its answer before asking another");
+
+    if (isTerminal(job.snapshot.status)) {
+      throw new InteractionError("This job has already settled and cannot ask a question");
+    }
+
+    if (job.interaction) {
+      throw new InteractionError(
+        "This turn already has an outstanding question; wait for its answer before asking another",
+      );
+    }
 
     const gate = job.request.interactionGate?.(normalizeTarget(input.target).kind);
-    if (gate) throw new InteractionError(gate);
+
+    if (gate) {
+      throw new InteractionError(gate);
+    }
 
     const question = normalizeQuestion(input.question);
     const context = normalizeContext(input.context);
     const target = normalizeTarget(input.target);
+
     if (target.kind === "orchestrator") {
-      if (policy.orchestrator === undefined) throw new InteractionError("This subagent is not authorized to ask the parent orchestrator");
+      if (policy.orchestrator === undefined) {
+        throw new InteractionError("This subagent is not authorized to ask the parent orchestrator");
+      }
+
       if (policy.orchestrator === "foregroundDenied") {
-        throw new InteractionError("A foreground subagent cannot ask the parent orchestrator: the parent turn is already blocked awaiting this tool result and cannot start another turn. Ask the parent to re-run this work as a background subagent_spawn job, or proceed with a stated assumption.");
+        throw new InteractionError(
+          "A foreground subagent cannot ask the parent orchestrator: the parent turn is already blocked awaiting this tool result and cannot start another turn. Ask the parent to re-run this work as a background subagent_spawn job, or proceed with a stated assumption.",
+        );
       }
     }
+
     let resolvedTargetJobId: string | undefined;
+
     if (target.kind === "agent") {
-      if (!policy.peers) throw new InteractionError("This subagent is not authorized to ask peer agents");
+      if (!policy.peers) {
+        throw new InteractionError("This subagent is not authorized to ask peer agents");
+      }
+
       resolvedTargetJobId = this.#peerTargetResolver?.(clone(job.snapshot), target.jobId!) ?? target.jobId!;
-      if (!resolvedTargetJobId) throw new InteractionError(`Peer agent ${target.jobId} could not be resolved safely`);
+
+      if (!resolvedTargetJobId) {
+        throw new InteractionError(`Peer agent ${target.jobId} could not be resolved safely`);
+      }
+
       this.#assertPeerEligible(job, target.jobId!, resolvedTargetJobId);
     }
 
@@ -1055,37 +1522,57 @@ export class JobManager {
     let settle!: InternalInteraction["settle"];
     const answered = new Promise<PendingInteraction>((resolve, reject) => {
       settle = (outcome) => {
-        if (pending.settled) return;
+        if (pending.settled) {
+          return;
+        }
+
         pending.settled = true;
         pending.cancelDeadline?.();
         pending.cancelDeadline = undefined;
         record.answeredAt = this.#interactionClock.now();
+
         if ("error" in outcome) {
           record.state = outcome.state;
           record.error = outcome.error.message;
           controller.abort(outcome.error);
           this.#publishInteraction(job, record);
           reject(outcome.error);
+
           return;
         }
+
         record.state = "answered";
         record.route = outcome.route;
         record.answer = outcome.answer;
         record.targetGeneration = outcome.targetGeneration;
-        if (outcome.label) record.target = { ...record.target, label: outcome.label };
+
+        if (outcome.label) {
+          record.target = { ...record.target, label: outcome.label };
+        }
+
         this.#publishInteraction(job, record);
         resolve(record);
       };
     });
     const pending: InternalInteraction = { record, resolvedTargetJobId, settle, controller, settled: false };
     pending.cancelDeadline = this.#interactionClock.schedule(
-      () => settle({ error: new InteractionError(`Question ${record.requestId} expired after ${this.#interactionTimeoutMs}ms with no answer`), state: "expired" }),
+      () =>
+        settle({
+          error: new InteractionError(
+            `Question ${record.requestId} expired after ${this.#interactionTimeoutMs}ms with no answer`,
+          ),
+          state: "expired",
+        }),
       this.#interactionTimeoutMs,
     );
 
     job.interaction = pending;
     this.#interactions.set(record.requestId, job);
-    if (target.kind === "agent") this.#waitGraph.add(job.snapshot.id, resolvedTargetJobId!);
+
+    if (target.kind === "agent") {
+      this.#waitGraph.add(job.snapshot.id, resolvedTargetJobId!);
+    }
+
     this.#publishInteraction(job, record);
 
     // The provider has already entered this host tool callback, so the caller's
@@ -1095,27 +1582,39 @@ export class JobManager {
 
     try {
       let settled: PendingInteraction;
+
       if (target.kind === "agent") {
         const routed = this.#routePeerQuestion(job, pending);
         const interrupted = answered.then<never>(
-          () => { throw new InteractionError(`Question ${record.requestId} settled without its peer result`); },
-          (error: unknown) => { throw error; },
+          () => {
+            throw new InteractionError(`Question ${record.requestId} settled without its peer result`);
+          },
+          (error: unknown) => {
+            throw error;
+          },
         );
         const peerResult = await Promise.race([routed, interrupted]);
+
         // Keep lifecycle cancellation authoritative until the caller owns a slot
         // and can return the answer without another asynchronous gap.
         if (lease) {
-          try { await lease.reacquire(); }
-          catch (error) {
-            if (pending.controller.signal.aborted) throw pending.controller.signal.reason;
+          try {
+            await lease.reacquire();
+          } catch (error) {
+            if (pending.controller.signal.aborted) {
+              throw pending.controller.signal.reason;
+            }
+
             throw error;
           }
         }
+
         if (pending.settled || pending.controller.signal.aborted) {
           throw pending.controller.signal.reason instanceof Error
             ? pending.controller.signal.reason
             : new InteractionError(`Question ${record.requestId} can no longer accept an answer`);
         }
+
         pending.commitAcceptance = peerResult.commitAcceptance;
         pending.settle({
           answer: normalizeAnswer(peerResult.answer),
@@ -1126,29 +1625,42 @@ export class JobManager {
         settled = record;
       } else {
         settled = await answered;
+
         // Resolve the provider tool call only after the caller owns a slot again.
-        if (lease) await lease.reacquire();
+        if (lease) {
+          await lease.reacquire();
+        }
       }
+
       const result = {
         answer: renderInteractionAnswer(settled),
         requestId: settled.requestId,
         route: settled.route ?? "orchestrator-model",
-        answeredBy: settled.target.kind === "orchestrator" ? "orchestrator" : settled.target.label ?? settled.target.jobId ?? "peer",
+        answeredBy:
+          settled.target.kind === "orchestrator"
+            ? "orchestrator"
+            : (settled.target.label ?? settled.target.jobId ?? "peer"),
       };
       const commitAcceptance = pending.commitAcceptance;
       pending.commitAcceptance = undefined;
-      if (commitAcceptance) void commitAcceptance().catch(() => undefined);
+
+      if (commitAcceptance) {
+        void commitAcceptance().catch(() => undefined);
+      }
+
       return result;
     } catch (error) {
       // A dismissed, expired, or failed question returns a tool error and the
       // child may continue reasoning, so it still needs a slot first. A
       // cancelled or terminal generation is ending instead and must not queue
       // a pointless reacquisition behind unrelated work.
-      const continuing = record.state !== "cancelled"
-        && !this.#closed
-        && !job.cancelRequested
-        && !isTerminal(job.snapshot.status);
-      if (continuing && lease && !lease.held) await lease.reacquire().catch(() => undefined);
+      const continuing =
+        record.state !== "cancelled" && !this.#closed && !job.cancelRequested && !isTerminal(job.snapshot.status);
+
+      if (continuing && lease && !lease.held) {
+        await lease.reacquire().catch(() => undefined);
+      }
+
       throw error;
     } finally {
       this.#clearInteraction(job, record.requestId);
@@ -1166,28 +1678,56 @@ export class JobManager {
     if (targetId === job.snapshot.id || resolvedTargetId === job.snapshot.id) {
       throw new InteractionError("A peer question cannot target the asking agent");
     }
-    if (!job.snapshot.workflow) throw new InteractionError("Peer questions are limited to agents from the same workflow run");
+
+    if (!job.snapshot.workflow) {
+      throw new InteractionError("Peer questions are limited to agents from the same workflow run");
+    }
+
     if (this.#waitGraph.wouldCycle(job.snapshot.id, resolvedTargetId)) {
       throw new InteractionError(`Peer question from ${job.snapshot.id} to ${targetId} would create a wait cycle`);
     }
+
     const target = this.#jobs.get(resolvedTargetId);
-    if (!target) return undefined;
+
+    if (!target) {
+      return undefined;
+    }
+
     if (target.snapshot.workflow?.runId !== job.snapshot.workflow.runId) {
       // A live session owned by another run is never continued from here. The
       // caller's own run may still legitimately address this job ID after
       // replaying that lineage, so when a workflow runtime is installed the
       // membership decision — a recorded answer, or an actionable failure —
       // belongs to it. With no runtime installed nothing could claim it.
-      if (this.#peerRouter) return undefined;
+      if (this.#peerRouter) {
+        return undefined;
+      }
+
       throw new InteractionError("Peer questions are limited to agents from the same workflow run");
     }
+
     if (target.snapshot.status !== "completed") {
-      throw new InteractionError(`Peer agent ${targetId} is ${target.snapshot.status}; only a completed agent that still retains its native session can answer`);
+      throw new InteractionError(
+        `Peer agent ${targetId} is ${target.snapshot.status}; only a completed agent that still retains its native session can answer`,
+      );
     }
-    if (!target.run) throw new InteractionError(`Peer agent ${targetId} no longer retains a native session`);
-    if (target.pendingRestart || target.inFlight) throw new InteractionError(`Peer agent ${targetId} already has an active or queued follow-up`);
-    if (target.answeringInteraction) throw new InteractionError(`Peer agent ${targetId} is already answering another question`);
-    if (target.interaction && !target.interaction.settled) throw new InteractionError(`Peer agent ${targetId} has its own outstanding question`);
+
+    if (!target.run) {
+      throw new InteractionError(`Peer agent ${targetId} no longer retains a native session`);
+    }
+
+    if (target.pendingRestart || target.inFlight) {
+      throw new InteractionError(`Peer agent ${targetId} already has an active or queued follow-up`);
+    }
+
+    if (target.answeringInteraction) {
+      throw new InteractionError(`Peer agent ${targetId} is already answering another question`);
+    }
+
+    if (target.interaction && !target.interaction.settled) {
+      throw new InteractionError(`Peer agent ${targetId} has its own outstanding question`);
+    }
+
     return target;
   }
 
@@ -1197,22 +1737,35 @@ export class JobManager {
     const resolvedTargetId = pending.resolvedTargetJobId ?? targetId;
     const router = this.#peerRouter;
     let target: InternalJob | undefined;
+
     try {
       target = this.#assertPeerEligible(job, targetId, resolvedTargetId);
-      if (!router) throw new InteractionError("Peer questions require an active workflow run");
+
+      if (!router) {
+        throw new InteractionError("Peer questions require an active workflow run");
+      }
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
       pending.settle({ error: failure, state: "dismissed" });
+
       throw failure;
     }
+
     record.state = "answering";
+
     if (target) {
       record.target = { ...record.target, label: target.snapshot.name };
-      target.answeringInteraction = { requestId: record.requestId, sourceJobId: job.snapshot.id, sourceName: job.snapshot.name };
+      target.answeringInteraction = {
+        requestId: record.requestId,
+        sourceJobId: job.snapshot.id,
+        sourceName: job.snapshot.name,
+      };
       this.#publishAnswering(target);
     }
+
     this.#publishInteraction(job, record);
     const answering = target;
+
     try {
       const result = await router({
         requestId: record.requestId,
@@ -1223,6 +1776,7 @@ export class JobManager {
         context: record.context,
         signal: pending.controller.signal,
       });
+
       return {
         ...result,
         targetLabel: result.targetLabel ?? answering?.snapshot.name,
@@ -1230,22 +1784,29 @@ export class JobManager {
     } catch (error) {
       const failure = error instanceof Error ? error : new Error(String(error));
       pending.settle({ error: failure, state: "dismissed" });
+
       throw failure;
     }
   }
 
   #clearInteraction(job: InternalJob, requestId: string): void {
     const pending = job.interaction;
-    if (!pending || pending.record.requestId !== requestId) return;
+
+    if (!pending || pending.record.requestId !== requestId) {
+      return;
+    }
+
     pending.cancelDeadline?.();
     job.interaction = undefined;
     this.#interactions.delete(requestId);
     this.#waitGraph.remove(job.snapshot.id);
     const target = pending.resolvedTargetJobId ? this.#jobs.get(pending.resolvedTargetJobId) : undefined;
+
     if (target?.answeringInteraction?.requestId === requestId) {
       target.answeringInteraction = undefined;
       this.#publishAnswering(target);
     }
+
     this.#publishInteractionEvent(job, { type: "interaction_cleared", requestId });
   }
 
@@ -1256,7 +1817,10 @@ export class JobManager {
 
   /** Publishes the answering side's projection so dashboards can show the peer turn. */
   #publishAnswering(job: InternalJob): void {
-    this.#publishInteractionEvent(job, { type: "interaction_answering", answering: job.answeringInteraction ? { ...job.answeringInteraction } : undefined });
+    this.#publishInteractionEvent(job, {
+      type: "interaction_answering",
+      answering: job.answeringInteraction ? { ...job.answeringInteraction } : undefined,
+    });
   }
 
   /**
@@ -1285,15 +1849,22 @@ export class JobManager {
    */
   #cancelJobInteractions(job: InternalJob, reason: string): void {
     this.#failCallerInteraction(job, reason);
-    if (!job.answeringInteraction) return;
+
+    if (!job.answeringInteraction) {
+      return;
+    }
+
     const source = this.#interactions.get(job.answeringInteraction.requestId);
     source?.interaction?.settle({ error: new InteractionError(reason), state: "cancelled" });
   }
 
   #waitForGenerationTerminal(job: InternalJob, generation: number): Promise<void> {
-    if ((job.lastSettledGeneration ?? -1) >= generation) return Promise.resolve();
+    if ((job.lastSettledGeneration ?? -1) >= generation) {
+      return Promise.resolve();
+    }
+
     return new Promise((resolve) => {
-      const waiters = job.generationWaiters ??= new Map();
+      const waiters = (job.generationWaiters ??= new Map());
       const set = waiters.get(generation) ?? new Set<() => void>();
       set.add(resolve);
       waiters.set(generation, set);
@@ -1301,27 +1872,49 @@ export class JobManager {
   }
 
   #handleBackendEvent(job: InternalJob, event: BackendEvent): void {
-    if (job.cancelRequested && event.type === "completed") return;
-    if (job.cancelling && event.type === "cancelled") {
-      job.deferredCancellation = event;
+    if (job.cancelRequested && event.type === "completed") {
       return;
     }
-    if (job.startupController && !job.run && (event.type === "completed" || event.type === "failed" || event.type === "cancelled")) {
+
+    if (job.cancelling && event.type === "cancelled") {
+      job.deferredCancellation = event;
+
+      return;
+    }
+
+    if (
+      job.startupController &&
+      !job.run &&
+      (event.type === "completed" || event.type === "failed" || event.type === "cancelled")
+    ) {
       const generation = job.snapshot.generation;
       job.snapshot = reduceJob(job.snapshot, event);
       job.deferredStartupTerminal = { event, generation };
+
       return;
     }
+
     this.#emit(job, event);
-    if (event.type === "usage") this.#recordBudgetWarnings(job);
+
+    if (event.type === "usage") {
+      this.#recordBudgetWarnings(job);
+    }
   }
 
   #recordBudgetWarnings(job: InternalJob): void {
-    const reached = job.reachedBudgetWarnings ??= new Set();
+    const reached = (job.reachedBudgetWarnings ??= new Set());
+
     for (const metric of spendBudgetMetrics(job.snapshot.budget, job.snapshot.usage, job.snapshot.harness)) {
-      if (!metric.reached || !metric.supported || reached.has(metric.key)) continue;
+      if (!metric.reached || !metric.supported || reached.has(metric.key)) {
+        continue;
+      }
+
       const warning = reachedSpendWarning(metric, "Subagent budget");
-      if (!warning) continue;
+
+      if (!warning) {
+        continue;
+      }
+
       reached.add(metric.key);
       job.snapshot = { ...job.snapshot, warnings: [...(job.snapshot.warnings ?? []), warning].slice(-8) };
       this.#publish(job, { type: "degraded", source: "budget", detail: warning });
@@ -1331,81 +1924,141 @@ export class JobManager {
   #independenceProvider(request: SpawnRequest, independentOf: string | undefined): ProviderFamily | undefined {
     const independenceTarget = independentOf ? this.#jobs.get(independentOf) : undefined;
     const providerHint = request.independentOfProvider;
+
     if (providerHint !== undefined && providerHint !== "claude" && providerHint !== "codex") {
       throw new Error("independentOfProvider must identify native Claude or Codex");
     }
-    if (providerHint !== undefined && !independentOf) throw new Error("independentOfProvider requires independentOf");
-    if (independentOf && !independenceTarget && !providerHint) throw new Error(`Unknown independence target job: ${independentOf}`);
+
+    if (providerHint !== undefined && !independentOf) {
+      throw new Error("independentOfProvider requires independentOf");
+    }
+
+    if (independentOf && !independenceTarget && !providerHint) {
+      throw new Error(`Unknown independence target job: ${independentOf}`);
+    }
+
     const targetHarness = independenceTarget?.snapshot.harness;
-    if (targetHarness === "pi") throw new Error("independentOf requires a target job using the native Claude or Codex harness");
+
+    if (targetHarness === "pi") {
+      throw new Error("independentOf requires a target job using the native Claude or Codex harness");
+    }
+
     const retainedProvider = targetHarness === "claude" || targetHarness === "codex" ? targetHarness : undefined;
+
     if (retainedProvider && providerHint && retainedProvider !== providerHint) {
       throw new Error("independentOfProvider does not match the retained independence target");
     }
+
     return retainedProvider ?? providerHint;
   }
 
   async #cancelRun(job: InternalJob, run: BackendRun, reason: string): Promise<void> {
     await this.#serialize(job, async () => {
-      if (isTerminal(job.snapshot.status) || job.run !== run) return;
+      if (isTerminal(job.snapshot.status) || job.run !== run) {
+        return;
+      }
+
       job.cancelling = true;
+
       try {
         await run.cancel(reason);
       } catch (error) {
         job.deferredCancellation = undefined;
-        this.#emit(job, { type: "failed", error: `Harness cancellation failed: ${error instanceof Error ? error.message : String(error)}` });
+        this.#emit(job, {
+          type: "failed",
+          error: `Harness cancellation failed: ${error instanceof Error ? error.message : String(error)}`,
+        });
+
         throw error;
       } finally {
         job.cancelling = false;
       }
-      if (!isTerminal(job.snapshot.status)) this.#emit(job, job.deferredCancellation ?? { type: "cancelled", reason });
+
+      if (!isTerminal(job.snapshot.status)) {
+        this.#emit(job, job.deferredCancellation ?? { type: "cancelled", reason });
+      }
+
       job.deferredCancellation = undefined;
     });
   }
 
   #serialize<T>(job: InternalJob, operation: () => Promise<T>): Promise<T> {
     const current = (job.operation ?? Promise.resolve()).catch(() => undefined).then(operation);
-    job.operation = current.then(() => undefined, () => undefined);
+    job.operation = current.then(
+      () => undefined,
+      () => undefined,
+    );
+
     return current;
   }
 
   #emit(job: InternalJob, event: BackendEvent): void {
-    if (isTerminal(job.snapshot.status)) return;
+    if (isTerminal(job.snapshot.status)) {
+      return;
+    }
+
     const generation = job.snapshot.generation;
     job.snapshot = reduceJob(job.snapshot, event);
     const settled = isTerminal(job.snapshot.status);
-    if (settled) this.#publishSettlement(job, event, generation);
-    else this.#publish(job, event);
+
+    if (settled) {
+      this.#publishSettlement(job, event, generation);
+    } else {
+      this.#publish(job, event);
+    }
   }
 
   #publishSettlement(job: InternalJob, event: BackendEvent, generation: number): void {
     this.#publish(job, event);
     job.lastSettledGeneration = Math.max(job.lastSettledGeneration ?? -1, generation);
-    for (const waiter of job.generationWaiters?.get(generation) ?? []) waiter();
+
+    for (const waiter of job.generationWaiters?.get(generation) ?? []) {
+      waiter();
+    }
+
     job.generationWaiters?.delete(generation);
-    if (!isTerminal(job.snapshot.status)) return;
+
+    if (!isTerminal(job.snapshot.status)) {
+      return;
+    }
+
     // Only the caller side: a target settling here may be completing the very
     // peer answer this interaction is waiting for.
     this.#failCallerInteraction(job, `Job ${job.snapshot.status} before its question was answered`);
     this.#resolveRunWaiters(job);
-    for (const waiter of this.#waiters.get(job.snapshot.id) ?? []) waiter();
+
+    for (const waiter of this.#waiters.get(job.snapshot.id) ?? []) {
+      waiter();
+    }
+
     this.#waiters.delete(job.snapshot.id);
   }
 
   #publish(job: InternalJob, event: BackendEvent): void {
     const source = job.snapshot;
-    const snapshot = clone(source, job.publishedSource && job.publishedSnapshot
-      ? { source: job.publishedSource, value: job.publishedSnapshot }
-      : undefined);
+    const snapshot = clone(
+      source,
+      job.publishedSource && job.publishedSnapshot
+        ? { source: job.publishedSource, value: job.publishedSnapshot }
+        : undefined,
+    );
     job.publishedSource = source;
     job.publishedSnapshot = snapshot;
+
     for (const listener of this.#listeners) {
-      try { listener(snapshot, event); } catch { /* observers cannot break lifecycle */ }
+      try {
+        listener(snapshot, event);
+      } catch {
+        /* observers cannot break lifecycle */
+      }
     }
   }
 
   #resolveRunWaiters(job: InternalJob, run?: BackendRun): void {
-    for (const waiter of job.runWaiters ?? []) waiter(run);
+    for (const waiter of job.runWaiters ?? []) {
+      waiter(run);
+    }
+
     job.runWaiters?.clear();
   }
 }

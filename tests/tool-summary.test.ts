@@ -42,9 +42,19 @@ test("pairToolEntries resolves a self-settled phase-less entry as its own result
 
 test("start and end events resolve to one failed tool call", () => {
   const start = tool({ toolId: "bash-1", phase: "start", name: "bash" });
-  const end = tool({ toolId: "bash-1", phase: "end", name: "bash", result: { content: [], isError: true }, error: true });
+  const end = tool({
+    toolId: "bash-1",
+    phase: "end",
+    name: "bash",
+    result: { content: [], isError: true },
+    error: true,
+  });
   const states = toolCallStates([start, end]);
-  assert.equal(states.length, 1, "start and end merge into exactly one call, not a running call plus a separate failed one");
+  assert.equal(
+    states.length,
+    1,
+    "start and end merge into exactly one call, not a running call plus a separate failed one",
+  );
   assert.equal(states[0]?.status, "failed");
 });
 
@@ -74,11 +84,13 @@ test("the width ladder keeps the failure count once the row has room for it, and
     { name: "read", status: "completed" },
     { name: "bash", status: "failed" },
   ]);
+
   for (const width of [40, 20, 10, 7]) {
     const row = renderToolGroupRow(summary, theme, width);
     assert.ok(visibleWidth(row) <= width, `row must not exceed width ${width}`);
     assert.ok(row.includes("×1"), `width ${width} fits the minimal candidate and must keep the failure count`);
   }
+
   for (const width of [6, 3, 1, 0]) {
     assert.ok(visibleWidth(renderToolGroupRow(summary, theme, width)) <= width, `row must not exceed width ${width}`);
   }
@@ -89,11 +101,13 @@ test("an all-running group keeps a bounded running indicator down to the narrowe
     { name: "bash", status: "running" },
     { name: "read", status: "running" },
   ]);
+
   for (const width of [40, 20, 10, 8]) {
     const row = renderToolGroupRow(summary, theme, width);
     assert.ok(visibleWidth(row) <= width, `row must not exceed width ${width}`);
     assert.ok(row.includes("●2"), `width ${width} fits the minimal candidate and must keep the running count`);
   }
+
   for (const width of [7, 3, 1, 0]) {
     assert.ok(visibleWidth(renderToolGroupRow(summary, theme, width)) <= width, `row must not exceed width ${width}`);
   }

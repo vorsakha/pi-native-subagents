@@ -90,7 +90,10 @@ export type CodexAccountProbe = (context: ProbeContext) => Promise<unknown>;
 
 /** Zero-turn Pi readiness source; `CapabilityService` satisfies it structurally. */
 export interface PiReadinessSource {
-  catalog(harness: HarnessName, request: { cwd: string; access: AccessMode; refresh?: boolean; signal?: AbortSignal }): Promise<CapabilityCatalog>;
+  catalog(
+    harness: HarnessName,
+    request: { cwd: string; access: AccessMode; refresh?: boolean; signal?: AbortSignal },
+  ): Promise<CapabilityCatalog>;
 }
 
 export interface ProviderStatusOptions {
@@ -153,56 +156,84 @@ export class ProviderStatusService implements ProviderStatusReader {
     const wanted = request.harnesses?.length
       ? PROVIDER_ORDER.filter((harness) => request.harnesses!.includes(harness))
       : PROVIDER_ORDER;
+
     return Promise.all(wanted.map((harness) => this.status(harness, request)));
   }
 
   async status(harness: HarnessName, request: ProviderStatusRequest): Promise<ProviderStatus> {
     const key = `${harness}|${request.cwd}`;
     const cached = this.#cache.get(key);
-    if (!request.refresh && cached && this.#now() - cached.status.checkedAt < this.#ttlMs) return cached.status;
+
+    if (!request.refresh && cached && this.#now() - cached.status.checkedAt < this.#ttlMs) {
+      return cached.status;
+    }
+
     const pending = this.#inflight.get(key);
-    if (pending && !request.refresh) return pending;
+
+    if (pending && !request.refresh) {
+      return pending;
+    }
+
     // A refresh deliberately bypasses an in-flight probe, so a slower older
     // probe can still settle last. Generations keep the newest observation.
     const generation = ++this.#generation;
     const probe = this.#probe(harness, request)
       .then((status) => {
         const existing = this.#cache.get(key);
-        if (!existing || existing.generation <= generation) this.#cache.set(key, { generation, status });
+
+        if (!existing || existing.generation <= generation) {
+          this.#cache.set(key, { generation, status });
+        }
+
         return status;
       })
       .finally(() => {
-        if (this.#inflight.get(key) === probe) this.#inflight.delete(key);
+        if (this.#inflight.get(key) === probe) {
+          this.#inflight.delete(key);
+        }
       });
     this.#inflight.set(key, probe);
+
     return probe;
   }
 
   async #probe(harness: HarnessName, request: ProviderStatusRequest): Promise<ProviderStatus> {
-    if (harness === "pi") return this.#piStatus(request);
+    if (harness === "pi") {
+      return this.#piStatus(request);
+    }
+
     const checkedAt = this.#now();
     const probeName = harness === "claude" ? "claude auth status --json" : "codex app-server account/read";
+
     try {
       if (harness === "claude") {
-        const stdout = await this.#bounded(request, (signal) => this.#readClaudeAuth({
-          command: this.#claudeCommand,
-          cwd: request.cwd,
-          env: sanitizeSubscriptionEnv(this.#env, "claude"),
-          signal,
-          timeoutMs: this.#timeoutMs,
-        }));
+        const stdout = await this.#bounded(request, (signal) =>
+          this.#readClaudeAuth({
+            command: this.#claudeCommand,
+            cwd: request.cwd,
+            env: sanitizeSubscriptionEnv(this.#env, "claude"),
+            signal,
+            timeoutMs: this.#timeoutMs,
+          }),
+        );
+
         return claudeStatus(parseClaudeAuthStatus(stdout), checkedAt);
       }
-      const account = await this.#bounded(request, (signal) => this.#readCodexAccount({
-        command: this.#codexCommand,
-        cwd: request.cwd,
-        env: sanitizeSubscriptionEnv(this.#env, "codex"),
-        signal,
-        timeoutMs: this.#timeoutMs,
-      }));
+
+      const account = await this.#bounded(request, (signal) =>
+        this.#readCodexAccount({
+          command: this.#codexCommand,
+          cwd: request.cwd,
+          env: sanitizeSubscriptionEnv(this.#env, "codex"),
+          signal,
+          timeoutMs: this.#timeoutMs,
+        }),
+      );
+
       return codexStatus(parseCodexAccount(account), checkedAt);
     } catch (error) {
       const detail = maskEmbeddedEmails(errorMessage(error));
+
       return {
         harness,
         installed: !isMissingCommand(error),
@@ -221,6 +252,7 @@ export class ProviderStatusService implements ProviderStatusReader {
 
   async #piStatus(request: ProviderStatusRequest): Promise<ProviderStatus> {
     const checkedAt = this.#now();
+
     if (!this.#pi) {
       return {
         harness: "pi",
@@ -233,6 +265,7 @@ export class ProviderStatusService implements ProviderStatusReader {
         probe: "pi readiness",
       };
     }
+
     try {
       const catalog = await this.#pi.catalog("pi", {
         cwd: request.cwd,
@@ -240,6 +273,7 @@ export class ProviderStatusService implements ProviderStatusReader {
         refresh: request.refresh,
         signal: request.signal,
       });
+
       return piStatusFromCatalog(catalog, checkedAt);
     } catch (error) {
       return {
@@ -264,12 +298,17 @@ export class ProviderStatusService implements ProviderStatusReader {
   async #bounded<T>(request: ProviderStatusRequest, run: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const controller = new AbortController();
     const abort = () => controller.abort(request.signal?.reason ?? new Error("Provider status probe aborted"));
-    if (request.signal?.aborted) throw request.signal.reason ?? new Error("Provider status probe aborted");
+
+    if (request.signal?.aborted) {
+      throw request.signal.reason ?? new Error("Provider status probe aborted");
+    }
+
     request.signal?.addEventListener("abort", abort, { once: true });
     const timer = setTimeout(
       () => controller.abort(new Error(`provider status probe timed out after ${this.#timeoutMs * 2}ms`)),
       this.#timeoutMs * 2,
     );
+
     try {
       return await run(controller.signal);
     } finally {
@@ -300,11 +339,18 @@ export interface CodexAccountFacts {
  */
 export function parseClaudeAuthStatus(stdout: string): ClaudeAuthFacts {
   let parsed: unknown;
-  try { parsed = JSON.parse(stdout); } catch { throw new Error("claude auth status returned invalid JSON"); }
+
+  try {
+    parsed = JSON.parse(stdout);
+  } catch {
+    throw new Error("claude auth status returned invalid JSON");
+  }
+
   const record = asObject(parsed);
   const nested = asObject(record.account ?? record.user);
   const organization = asObject(record.organization ?? nested.organization);
   const authMethod = text(record.authMethod ?? nested.authMethod);
+
   return {
     loggedIn: record.loggedIn === true,
     authMethod,
@@ -321,6 +367,7 @@ export function parseClaudeAuthStatus(stdout: string): ClaudeAuthFacts {
 export function parseCodexAccount(result: unknown): CodexAccountFacts {
   const record = asObject(result);
   const account = asObject(record.account ?? record);
+
   return {
     type: text(account.type),
     account: {
@@ -335,38 +382,48 @@ export function claudeStatus(facts: ClaudeAuthFacts, checkedAt: number): Provide
   // Subscription OAuth is the only route this package launches Claude with, so a
   // valid API-key login is authenticated but still not ready for a subagent.
   const subscription = facts.authMethod === "claude.ai";
-  return {
+
+  const status: ProviderStatus = {
     harness: "claude",
     installed: true,
     authenticated: facts.loggedIn,
     ready: facts.loggedIn && subscription,
     account: facts.account,
-    detail: !facts.loggedIn
-      ? "Claude Code is not logged in"
-      : subscription
-        ? undefined
-        : `Claude reports auth method ${facts.authMethod ?? "unknown"}; subagents require a claude.ai subscription login`,
+    detail: undefined,
     checkedAt,
     probe: "claude auth status --json",
   };
+
+  if (!facts.loggedIn) {
+    status.detail = "Claude Code is not logged in";
+  } else if (!subscription) {
+    status.detail = `Claude reports auth method ${facts.authMethod ?? "unknown"}; subagents require a claude.ai subscription login`;
+  }
+
+  return status;
 }
 
 export function codexStatus(facts: CodexAccountFacts, checkedAt: number): ProviderStatus {
   const chatgpt = facts.type === "chatgpt";
-  return {
+
+  const status: ProviderStatus = {
     harness: "codex",
     installed: true,
     authenticated: !!facts.type && facts.type !== "none",
     ready: chatgpt,
     account: facts.account,
-    detail: !facts.type || facts.type === "none"
-      ? "Codex is not logged in"
-      : chatgpt
-        ? undefined
-        : `Codex reports account type ${facts.type}; subagents require a ChatGPT login`,
+    detail: undefined,
     checkedAt,
     probe: "codex app-server account/read",
   };
+
+  if (!facts.type || facts.type === "none") {
+    status.detail = "Codex is not logged in";
+  } else if (!chatgpt) {
+    status.detail = `Codex reports account type ${facts.type}; subagents require a ChatGPT login`;
+  }
+
+  return status;
 }
 
 /**
@@ -377,6 +434,7 @@ export function piStatusFromCatalog(catalog: CapabilityCatalog, checkedAt: numbe
   const model = catalog.sources.find((source) => source.source === "pi-model");
   const failure = catalog.sources.find((source) => source.health === "unavailable" && source.source !== "pi-model");
   const ready = model?.health === "healthy";
+
   return {
     harness: "pi",
     installed: !failure || !isMissingCommand(failure.detail),
@@ -384,7 +442,9 @@ export function piStatusFromCatalog(catalog: CapabilityCatalog, checkedAt: numbe
     ready,
     account: { unavailable: PI_ACCOUNT_UNAVAILABLE },
     model: ready ? text(model?.detail) : undefined,
-    detail: ready ? undefined : text(model?.detail ?? failure?.detail ?? catalog.warnings[0]) ?? "Pi readiness is unknown",
+    detail: ready
+      ? undefined
+      : (text(model?.detail ?? failure?.detail ?? catalog.warnings[0]) ?? "Pi readiness is unknown"),
     checkedAt,
     probe: "pi zero-turn readiness",
   };
@@ -396,11 +456,19 @@ export function piStatusFromCatalog(catalog: CapabilityCatalog, checkedAt: numbe
  * domain. Anything that is not an address is dropped.
  */
 export function maskEmail(value: string | undefined): string | undefined {
-  if (!value) return undefined;
+  if (!value) {
+    return undefined;
+  }
+
   const at = value.lastIndexOf("@");
-  if (at <= 0 || at === value.length - 1 || /\s/.test(value)) return undefined;
+
+  if (at <= 0 || at === value.length - 1 || /\s/.test(value)) {
+    return undefined;
+  }
+
   const local = value.slice(0, at);
   const domain = value.slice(at + 1);
+
   return `${local.length > 1 ? local[0] : ""}***@${domain}`;
 }
 
@@ -426,6 +494,7 @@ async function readClaudeAuthStatus(context: ProbeContext): Promise<string> {
     timeout: context.timeoutMs,
     signal: context.signal,
   });
+
   return stdout;
 }
 
@@ -439,13 +508,17 @@ async function readCodexAccount(context: ProbeContext): Promise<unknown> {
   const peer = new JsonRpcPeer({
     process: managed,
     // The probe is unattended: never answer an interactive server request.
-    onRequest: (_id, method) => { throw new Error(`Interactive request denied during provider status: ${method}`); },
+    onRequest: (_id, method) => {
+      throw new Error(`Interactive request denied during provider status: ${method}`);
+    },
   });
   const abort = () => void peer.close();
   context.signal.addEventListener("abort", abort, { once: true });
+
   try {
     await peer.request("initialize", { clientInfo: CODEX_CLIENT_INFO }, context.timeoutMs);
     peer.notify("initialized");
+
     return await peer.request("account/read", { refreshToken: false }, context.timeoutMs);
   } finally {
     context.signal.removeEventListener("abort", abort);
@@ -456,9 +529,18 @@ async function readCodexAccount(context: ProbeContext): Promise<unknown> {
 /* ── formatting ──────────────────────────────────────────────────────────── */
 
 export function providerStatusLabel(status: ProviderStatus): string {
-  if (status.ready) return "ready";
-  if (status.authenticated) return "authenticated, not ready";
-  if (status.installed) return "installed, not authenticated";
+  if (status.ready) {
+    return "ready";
+  }
+
+  if (status.authenticated) {
+    return "authenticated, not ready";
+  }
+
+  if (status.installed) {
+    return "installed, not authenticated";
+  }
+
   return "not installed";
 }
 
@@ -474,12 +556,14 @@ export function formatProviderStatus(status: ProviderStatus): string {
     !account.email && account.unavailable ? `account email unavailable (${account.unavailable})` : undefined,
     status.detail,
   ].filter(Boolean);
+
   return `${status.harness.padEnd(6)} ${providerStatusLabel(status)}${fields.length ? ` · ${fields.join(" · ")}` : ""}`;
 }
 
 /** Full `/subagents providers` report. Emails are masked; credentials are never read. */
 export function formatProviderStatusReport(statuses: ProviderStatus[], now: number): string {
   const oldest = statuses.reduce((value, status) => Math.min(value, status.checkedAt), now);
+
   return [
     "Native provider readiness (account and auth state only; no model request was made):",
     ...statuses.map(formatProviderStatus),
@@ -489,7 +573,11 @@ export function formatProviderStatusReport(statuses: ProviderStatus[], now: numb
 
 function formatAge(ageMs: number): string {
   const seconds = Math.round(ageMs / 1000);
-  if (seconds < 1) return "just now";
+
+  if (seconds < 1) {
+    return "just now";
+  }
+
   return seconds < 90 ? `${seconds}s ago` : `${Math.round(seconds / 60)}m ago`;
 }
 
@@ -497,8 +585,12 @@ function formatAge(ageMs: number): string {
 
 /** Bounded text with any embedded address masked, so no retained field can leak one. */
 function text(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
+  if (typeof value !== "string") {
+    return undefined;
+  }
+
   const trimmed = maskEmbeddedEmails(value.replace(/\s+/g, " ").trim());
+
   return trimmed ? trimmed.slice(0, 120) : undefined;
 }
 
@@ -508,10 +600,23 @@ function errorMessage(error: unknown): string {
 
 /** True when the failure means the CLI itself is absent rather than unauthenticated. */
 function isMissingCommand(error: unknown): boolean {
-  if (typeof error === "string") return /ENOENT|not found|not recognized/i.test(error);
-  if (!error || typeof error !== "object") return false;
+  if (typeof error === "string") {
+    return /ENOENT|not found|not recognized/i.test(error);
+  }
+
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
   const record = error as NodeJS.ErrnoException & { cause?: unknown };
-  if (record.code === "ENOENT") return true;
-  if (record.cause && record.cause !== error && isMissingCommand(record.cause)) return true;
+
+  if (record.code === "ENOENT") {
+    return true;
+  }
+
+  if (record.cause && record.cause !== error && isMissingCommand(record.cause)) {
+    return true;
+  }
+
   return typeof record.message === "string" && /ENOENT|not found|not recognized/i.test(record.message);
 }

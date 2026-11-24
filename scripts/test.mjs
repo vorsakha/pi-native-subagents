@@ -10,8 +10,17 @@ const isolated = tests.filter((file) => file.endsWith("workflow-sandbox.test.ts"
 const groups = [tests.filter((file) => !isolated.includes(file)), isolated];
 
 for (const files of groups) {
-  if (!files.length) continue;
+  if (!files.length) {
+    continue;
+  }
+
   const result = spawnSync(process.execPath, ["--test", "--test-concurrency=1", ...files], { stdio: "inherit" });
-  if (result.error) throw result.error;
-  if (result.status !== 0) process.exit(result.status ?? 1);
+
+  if (result.error) {
+    throw result.error;
+  }
+
+  if (result.status !== 0) {
+    process.exit(result.status ?? 1);
+  }
 }

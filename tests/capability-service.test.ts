@@ -13,7 +13,11 @@ class FakeBackend implements Backend {
   #hang = false;
   #abortedCalls = 0;
 
-  constructor(name: HarnessName, capabilities: DiscoveredCapability[] = [], options: { healthy?: boolean; hang?: boolean } = {}) {
+  constructor(
+    name: HarnessName,
+    capabilities: DiscoveredCapability[] = [],
+    options: { healthy?: boolean; hang?: boolean } = {},
+  ) {
     this.name = name;
     this.#capabilities = capabilities;
     this.#healthy = options.healthy ?? true;
@@ -27,12 +31,24 @@ class FakeBackend implements Backend {
   async discover(request: DiscoveryRequest): Promise<DiscoveryResult> {
     this.calls++;
     this.refreshFlags.push(request.refresh);
+
     if (this.#hang) {
       await new Promise<void>((_resolve, reject) => {
-        request.signal.addEventListener("abort", () => { this.#abortedCalls++; reject(request.signal.reason); }, { once: true });
+        request.signal.addEventListener(
+          "abort",
+          () => {
+            this.#abortedCalls++;
+            reject(request.signal.reason);
+          },
+          { once: true },
+        );
       });
     }
-    if (!this.#healthy) throw new Error("discovery backend exploded");
+
+    if (!this.#healthy) {
+      throw new Error("discovery backend exploded");
+    }
+
     return { capabilities: this.#capabilities, sources: [{ source: `${this.name}-fixture`, health: "healthy" }] };
   }
 
@@ -42,7 +58,7 @@ class FakeBackend implements Backend {
 }
 
 function request(overrides: Partial<{ cwd: string; access: "readOnly" | "full" }> = {}) {
-  return { cwd: overrides.cwd ?? "/proj", access: overrides.access ?? "full" as const };
+  return { cwd: overrides.cwd ?? "/proj", access: overrides.access ?? ("full" as const) };
 }
 
 test("catalog serves from cache within the TTL and refetches once the fingerprint changes", async () => {
@@ -63,7 +79,12 @@ test("catalog serves from cache within the TTL and refetches once the fingerprin
 test("catalog expires by TTL and refresh:true always bypasses the cache", async () => {
   const backend = new FakeBackend("codex", []);
   let now = 0;
-  const service = new CapabilityService({ backends: [backend], now: () => now, ttlMs: 1_000, fingerprint: () => "stable" });
+  const service = new CapabilityService({
+    backends: [backend],
+    now: () => now,
+    ttlMs: 1_000,
+    fingerprint: () => "stable",
+  });
   await service.catalog("codex", request());
   now = 500;
   await service.catalog("codex", request());
@@ -85,23 +106,34 @@ test("concurrent catalog calls for the same key share one in-flight discovery", 
 
 test("a slower stale discovery cannot overwrite a newer forced refresh", async () => {
   let releaseFirst!: () => void;
-  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  const firstGate = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
   let calls = 0;
   const backend: Backend = {
     name: "codex",
-    async start() { throw new Error("unused"); },
+    async start() {
+      throw new Error("unused");
+    },
     async discover() {
       calls++;
+
       if (calls === 1) {
         await firstGate;
+
         return { capabilities: [{ kind: "tool", name: "Old" }], sources: [{ source: "fixture", health: "healthy" }] };
       }
+
       return { capabilities: [{ kind: "tool", name: "New" }], sources: [{ source: "fixture", health: "healthy" }] };
     },
   };
   const service = new CapabilityService({ backends: [backend], fingerprint: () => "stable", ttlMs: 60_000 });
   const stale = service.catalog("codex", request());
-  while (calls < 1) await new Promise((resolve) => setImmediate(resolve));
+
+  while (calls < 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
   const fresh = await service.catalog("codex", { ...request(), refresh: true });
   releaseFirst();
   await stale;
@@ -130,7 +162,12 @@ test("invalidate clears one harness or the whole cache", async () => {
 });
 
 test("catalog degrades to an unknown, empty catalog with a warning when a backend has no discover()", async () => {
-  const backend: Backend = { name: "pi", async start() { throw new Error("unused"); } };
+  const backend: Backend = {
+    name: "pi",
+    async start() {
+      throw new Error("unused");
+    },
+  };
   const service = new CapabilityService({ backends: [backend] });
   const catalog = await service.catalog("pi", request());
   assert.equal(catalog.capabilities.length, 0);
@@ -148,7 +185,11 @@ test("catalog reports unavailable health and a warning when discovery throws", a
 
 test("discovery is bounded by an internal timeout that aborts the backend", async () => {
   const backend = new FakeBackend("codex", [], { hang: true });
-  const service = new CapabilityService({ backends: [backend], fingerprint: () => "stable", discoveryTimeoutMs: 1_000 });
+  const service = new CapabilityService({
+    backends: [backend],
+    fingerprint: () => "stable",
+    discoveryTimeoutMs: 1_000,
+  });
   const catalog = await service.catalog("codex", request());
   assert.equal(catalog.health, "unavailable");
   assert.match(catalog.warnings.join(" "), /timed out after 1000ms/);
@@ -162,7 +203,10 @@ test("catalogs() aggregates every configured backend or a requested subset", asy
   const all = await service.catalogs(request());
   assert.deepEqual(all.map((catalog) => catalog.harness).sort(), ["claude", "codex"]);
   const scoped = await service.catalogs({ ...request(), harnesses: ["claude"] });
-  assert.deepEqual(scoped.map((catalog) => catalog.harness), ["claude"]);
+  assert.deepEqual(
+    scoped.map((catalog) => catalog.harness),
+    ["claude"],
+  );
 });
 
 test("search() aggregates catalogs and defers filtering to searchCapabilities", async () => {
@@ -178,11 +222,17 @@ test("search() aggregates catalogs and defers filtering to searchCapabilities", 
 test("resolveRoute rejects unavailable explicit harnesses while allowing auth/health-based auto selection", async () => {
   const codex = new FakeBackend("codex", []);
   const service = new CapabilityService({ backends: [codex], fingerprint: () => "stable" });
-  await assert.rejects(service.resolveRoute({ ...request(), harness: "claude", requires: [] }), /Harness is unavailable: claude/);
+  await assert.rejects(
+    service.resolveRoute({ ...request(), harness: "claude", requires: [] }),
+    /Harness is unavailable: claude/,
+  );
   const auto = await service.resolveRoute({ ...request(), harness: "auto", requires: [] });
   assert.equal(auto.harness, "codex", "auto selection can use a healthy catalog even without a capability requirement");
   assert.equal(auto.auto, true);
-  await assert.rejects(service.resolveRoute({ ...request(), requires: ["codex:tool:read"] }), /explicit harness or harness auto/);
+  await assert.rejects(
+    service.resolveRoute({ ...request(), requires: ["codex:tool:read"] }),
+    /explicit harness or harness auto/,
+  );
 });
 
 test("resolveRoute on an explicit harness returns matched capabilities and fails closed with alternatives when unsatisfied", async () => {
@@ -207,12 +257,22 @@ test("resolveRoute with harness auto follows the preference order among capable,
   const claude = new FakeBackend("claude", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
   const service = new CapabilityService({ backends: [codex, claude], fingerprint: () => "stable" });
 
-  const preferClaude = await service.resolveRoute({ ...request(), harness: "auto", requires: ["tool:lint"], preference: ["claude"] });
+  const preferClaude = await service.resolveRoute({
+    ...request(),
+    harness: "auto",
+    requires: ["tool:lint"],
+    preference: ["claude"],
+  });
   assert.equal(preferClaude.harness, "claude");
   assert.equal(preferClaude.auto, true);
   assert.equal(preferClaude.route.auto, true);
 
-  const preferCodex = await service.resolveRoute({ ...request(), harness: "auto", requires: ["tool:lint"], preference: ["codex"] });
+  const preferCodex = await service.resolveRoute({
+    ...request(),
+    harness: "auto",
+    requires: ["tool:lint"],
+    preference: ["codex"],
+  });
   assert.equal(preferCodex.harness, "codex");
 });
 
@@ -220,7 +280,10 @@ test("resolveRoute with harness auto skips a candidate whose discovery is unavai
   const brokenCodex = new FakeBackend("codex", [], { healthy: false });
   const partialClaude = new FakeBackend("claude", [{ kind: "tool", name: "Read" }]);
   const capableCodexAlt = new FakeBackend("pi", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
-  const service = new CapabilityService({ backends: [brokenCodex, partialClaude, capableCodexAlt], fingerprint: () => "stable" });
+  const service = new CapabilityService({
+    backends: [brokenCodex, partialClaude, capableCodexAlt],
+    fingerprint: () => "stable",
+  });
   const routed = await service.resolveRoute({ ...request(), harness: "auto", requires: ["tool:lint"] });
   assert.equal(routed.harness, "pi");
 });
@@ -229,7 +292,12 @@ test("resolveRoute honors a restricted candidate list from independence/profile 
   const codex = new FakeBackend("codex", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
   const claude = new FakeBackend("claude", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
   const service = new CapabilityService({ backends: [codex, claude], fingerprint: () => "stable" });
-  const routed = await service.resolveRoute({ ...request(), harness: "auto", requires: ["tool:lint"], candidates: ["claude"] });
+  const routed = await service.resolveRoute({
+    ...request(),
+    harness: "auto",
+    requires: ["tool:lint"],
+    candidates: ["claude"],
+  });
   assert.equal(routed.harness, "claude");
   await assert.rejects(
     service.resolveRoute({ ...request(), harness: "auto", requires: ["tool:lint"], candidates: [] }),
@@ -251,7 +319,12 @@ test("route() compares candidates from the browse cache, then live-revalidates o
   const claude = new FakeBackend("claude", []);
   const codex = new FakeBackend("codex", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
   const service = new CapabilityService({ backends: [claude, codex], fingerprint: () => "stable" });
-  const routed = await service.route({ ...request(), harness: "auto", requires: ["tool:lint"], preference: ["claude", "codex"] });
+  const routed = await service.route({
+    ...request(),
+    harness: "auto",
+    requires: ["tool:lint"],
+    preference: ["claude", "codex"],
+  });
   assert.equal(routed.harness, "codex");
   assert.equal(claude.calls, 1, "the losing candidate ahead in preference order is only browsed, never revalidated");
   assert.equal(codex.calls, 2, "the winning candidate is browsed once and then revalidated live");
@@ -266,11 +339,21 @@ test("route() failover refreshes the candidate set when the preferred auto route
   const original = flaky.discover.bind(flaky);
   flaky.discover = async (req) => {
     calls++;
-    if (calls === 1) return original(req);
+
+    if (calls === 1) {
+      return original(req);
+    }
+
     throw new Error("authentication_failed");
   };
+
   const service = new CapabilityService({ backends: [flaky, fallback], fingerprint: () => "stable" });
-  const routed = await service.route({ ...request(), harness: "auto", requires: ["tool:lint"], preference: ["codex", "claude"] });
+  const routed = await service.route({
+    ...request(),
+    harness: "auto",
+    requires: ["tool:lint"],
+    preference: ["codex", "claude"],
+  });
   assert.equal(routed.harness, "claude");
   assert.equal(calls, 2, "the unhealthy preferred provider is refreshed once and then skipped");
   assert.equal(flaky.calls, 1, "the unhealthy preferred provider is not retried after live failure");
@@ -281,11 +364,19 @@ test("route() keeps explicit auth failures fail-closed", async () => {
   let discoveries = 0;
   const claude = new FakeBackend("claude", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
   const codex = new FakeBackend("codex", [{ kind: "tool", name: "Lint", effect: "inspect" }]);
-  codex.discover = async (request) => {
+  codex.discover = async () => {
     discoveries++;
-    if (discoveries > 1) throw new Error("authentication_failed");
-    return { capabilities: [{ kind: "tool", name: "Lint", effect: "inspect" }], sources: [{ source: "codex-fixture", health: "healthy" }] };
+
+    if (discoveries > 1) {
+      throw new Error("authentication_failed");
+    }
+
+    return {
+      capabilities: [{ kind: "tool", name: "Lint", effect: "inspect" }],
+      sources: [{ source: "codex-fixture", health: "healthy" }],
+    };
   };
+
   const service = new CapabilityService({ backends: [codex, claude], fingerprint: () => "stable" });
   await assert.rejects(
     service.route({ ...request(), harness: "codex", requires: ["tool:lint"] }),
@@ -298,11 +389,16 @@ test("route() failover also covers auto routing without explicit requirements", 
   let flakyDiscoveries = 0;
   const flaky = new FakeBackend("codex", []);
   const fallback = new FakeBackend("claude", []);
-  flaky.discover = async (request) => {
+  flaky.discover = async () => {
     flakyDiscoveries++;
-    if (flakyDiscoveries > 1) throw new Error("authentication_failed");
+
+    if (flakyDiscoveries > 1) {
+      throw new Error("authentication_failed");
+    }
+
     return { capabilities: [], sources: [{ source: "codex-fixture", health: "healthy" }] };
   };
+
   const service = new CapabilityService({ backends: [flaky, fallback], fingerprint: () => "stable" });
   const routed = await service.route({ ...request(), harness: "auto", preference: ["codex", "claude"] });
   assert.equal(routed.harness, "claude");
@@ -317,9 +413,14 @@ test("route() live-revalidation catches a capability that disappeared between br
   let call = 0;
   flaky.discover = async (req) => {
     call++;
-    if (call === 1) return original(req);
+
+    if (call === 1) {
+      return original(req);
+    }
+
     return { capabilities: [], sources: [{ source: "codex-fixture", health: "healthy" }] };
   };
+
   await assert.rejects(
     service.route({ ...request(), harness: "codex", requires: ["codex:tool:lint"] }),
     /Selected harness cannot satisfy the required capabilities/,
@@ -337,6 +438,7 @@ class StructuredOutputBackend extends FakeBackend {
 
   async structuredOutputSupport(): Promise<StructuredOutputSupport> {
     this.calls++;
+
     return this.#support;
   }
 }
@@ -356,7 +458,12 @@ test("structuredOutput serves from cache within the TTL and refetches once the f
 });
 
 test("structuredOutput reports unsupported without throwing when the backend has no probe, the probe throws, or it times out", async () => {
-  const noProbe: Backend = { name: "pi", async start() { throw new Error("unused"); } };
+  const noProbe: Backend = {
+    name: "pi",
+    async start() {
+      throw new Error("unused");
+    },
+  };
   const noProbeService = new CapabilityService({ backends: [noProbe], fingerprint: () => "stable" });
   const noProbeResult = await noProbeService.structuredOutput("pi", request());
   assert.equal(noProbeResult.supported, false);
@@ -364,8 +471,12 @@ test("structuredOutput reports unsupported without throwing when the backend has
 
   const throwing: Backend = {
     name: "codex",
-    async start() { throw new Error("unused"); },
-    async structuredOutputSupport() { throw new Error("probe exploded"); },
+    async start() {
+      throw new Error("unused");
+    },
+    async structuredOutputSupport() {
+      throw new Error("probe exploded");
+    },
   };
   const throwingService = new CapabilityService({ backends: [throwing], fingerprint: () => "stable" });
   const throwingResult = await throwingService.structuredOutput("codex", request());
@@ -374,14 +485,20 @@ test("structuredOutput reports unsupported without throwing when the backend has
 
   const hanging: Backend = {
     name: "claude",
-    async start() { throw new Error("unused"); },
+    async start() {
+      throw new Error("unused");
+    },
     async structuredOutputSupport(discoveryRequest) {
       return new Promise((_resolve, reject) => {
         discoveryRequest.signal.addEventListener("abort", () => reject(discoveryRequest.signal.reason), { once: true });
       });
     },
   };
-  const hangingService = new CapabilityService({ backends: [hanging], fingerprint: () => "stable", discoveryTimeoutMs: 1_000 });
+  const hangingService = new CapabilityService({
+    backends: [hanging],
+    fingerprint: () => "stable",
+    discoveryTimeoutMs: 1_000,
+  });
   const hangingResult = await hangingService.structuredOutput("claude", request());
   assert.equal(hangingResult.supported, false);
   assert.match(hangingResult.detail ?? "", /timed out after 1000ms/);
@@ -390,7 +507,10 @@ test("structuredOutput reports unsupported without throwing when the backend has
 test("structuredOutput de-duplicates concurrent probes for the same key and invalidate() clears its cache too", async () => {
   const backend = new StructuredOutputBackend("claude", { supported: true });
   const service = new CapabilityService({ backends: [backend], fingerprint: () => "stable" });
-  const [a, b] = await Promise.all([service.structuredOutput("claude", request()), service.structuredOutput("claude", request())]);
+  const [a, b] = await Promise.all([
+    service.structuredOutput("claude", request()),
+    service.structuredOutput("claude", request()),
+  ]);
   assert.equal(backend.calls, 1, "two concurrent probes for the same cache key share one call");
   assert.deepEqual(a, b);
 

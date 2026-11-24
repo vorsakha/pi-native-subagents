@@ -42,6 +42,7 @@ const MAX_ROW_NAME_WIDTH = 24;
 export function normalizeToolName(value: string): string {
   const clean = sanitizeInline(value) || "tool";
   const lower = clean.toLowerCase();
+
   return BUILT_IN_TOOL_NAMES.has(lower) ? lower : clean;
 }
 
@@ -50,12 +51,13 @@ export function toolCallState(call: ToolEntry, result: ToolEntry | undefined, tr
   const callName = call.name === "tool" ? "" : call.name;
   const resultName = result?.name === "tool" ? "" : result?.name;
   const name = normalizeToolName(callName || resultName || trace?.name || "tool");
-  const status: ToolCallState["status"] =
-    result?.error === true || result?.result?.isError === true || trace?.status === "failed"
-      ? "failed"
-      : result || trace?.status === "completed"
-        ? "completed"
-        : "running";
+
+  if (result?.error === true || result?.result?.isError === true || trace?.status === "failed") {
+    return { name, status: "failed" };
+  }
+
+  const status = result || trace?.status === "completed" ? "completed" : "running";
+
   return { name, status };
 }
 
@@ -81,24 +83,36 @@ export interface ToolPairing {
 export function pairToolEntries(entries: readonly ToolEntry[]): ToolPairing {
   const order: string[] = [];
   const pairs = new Map<string, { call: ToolEntry; result?: ToolEntry }>();
+
   for (const entry of entries) {
     const existing = pairs.get(entry.toolId);
+
     if (existing) {
-      if (entry.phase === "end" || entry.phase === undefined) existing.result = entry;
+      if (entry.phase === "end" || entry.phase === undefined) {
+        existing.result = entry;
+      }
+
       continue;
     }
+
     const isResult = entry.phase === "end" || isSelfSettled(entry);
     pairs.set(entry.toolId, { call: entry, result: isResult ? entry : undefined });
     order.push(entry.toolId);
   }
+
   return { order, pairs };
 }
 
 /** Pairs a run of tool events by id, then resolves each to one call state. */
-export function toolCallStates(entries: readonly ToolEntry[], traces?: ReadonlyMap<string, ToolTrace>): ToolCallState[] {
+export function toolCallStates(
+  entries: readonly ToolEntry[],
+  traces?: ReadonlyMap<string, ToolTrace>,
+): ToolCallState[] {
   const { order, pairs } = pairToolEntries(entries);
+
   return order.map((id) => {
     const pair = pairs.get(id)!;
+
     return toolCallState(pair.call, pair.result, traces?.get(id));
   });
 }
@@ -110,24 +124,38 @@ export function summarizeToolCalls(calls: readonly ToolCallState[]): ToolGroupSu
   const failedTools: string[] = [];
   const runningTools: string[] = [];
   const counts = new Map<string, { count: number; index: number }>();
+
   for (const call of calls) {
     if (call.status === "failed") {
       failed++;
-      if (failedTools.length < MAX_GROUP_FAILED_NAMES) failedTools.push(call.name);
+
+      if (failedTools.length < MAX_GROUP_FAILED_NAMES) {
+        failedTools.push(call.name);
+      }
     } else if (call.status === "running") {
       running++;
-      if (runningTools.length < MAX_GROUP_RUNNING_NAMES) runningTools.push(call.name);
+
+      if (runningTools.length < MAX_GROUP_RUNNING_NAMES) {
+        runningTools.push(call.name);
+      }
     } else {
       completed++;
     }
+
     const existing = counts.get(call.name);
-    if (existing) existing.count++;
-    else counts.set(call.name, { count: 1, index: counts.size });
+
+    if (existing) {
+      existing.count++;
+    } else {
+      counts.set(call.name, { count: 1, index: counts.size });
+    }
   }
+
   const sorted = [...counts.entries()]
     .map(([name, { count, index }]) => ({ name, count, index }))
     .sort((a, b) => b.count - a.count || a.index - b.index);
   const tools = sorted.slice(0, MAX_GROUP_TOOL_NAMES).map(({ name, count }) => ({ name, count }));
+
   return {
     total: calls.length,
     completed,
@@ -151,15 +179,24 @@ export function renderToolGroupRow(summary: ToolGroupSummary, theme: Theme, widt
   const countLabel = `${summary.total} tool call${summary.total === 1 ? "" : "s"}`;
 
   const statusParts: string[] = [];
-  if (summary.completed) statusParts.push(theme.fg(traceStatusMeta("completed").color, `✓${summary.completed}`));
-  if (summary.failed) statusParts.push(theme.fg(traceStatusMeta("failed").color, `×${summary.failed}`));
-  if (summary.running) statusParts.push(theme.fg(traceStatusMeta("running").color, `●${summary.running}`));
+
+  if (summary.completed) {
+    statusParts.push(theme.fg(traceStatusMeta("completed").color, `✓${summary.completed}`));
+  }
+
+  if (summary.failed) {
+    statusParts.push(theme.fg(traceStatusMeta("failed").color, `×${summary.failed}`));
+  }
+
+  if (summary.running) {
+    statusParts.push(theme.fg(traceStatusMeta("running").color, `●${summary.running}`));
+  }
 
   const failedNames = summary.failedTools.map(boundName).join(", ");
   const runningNames = summary.runningTools.map(boundName).join(", ");
-  const breakdown = summary.tools
-    .map(({ name, count }) => (count > 1 ? `${boundName(name)} ×${count}` : boundName(name)))
-    .join(", ") + (summary.omitted > 0 ? `, +${summary.omitted} more` : "");
+  const breakdown =
+    summary.tools.map(({ name, count }) => (count > 1 ? `${boundName(name)} ×${count}` : boundName(name))).join(", ") +
+    (summary.omitted > 0 ? `, +${summary.omitted} more` : "");
 
   const build = (segments: string[]): string => `${glyph} ${[countLabel, ...segments].join(" · ")}`;
 
@@ -175,17 +212,17 @@ export function renderToolGroupRow(summary: ToolGroupSummary, theme: Theme, widt
       ...(failedNames ? [`failed ${failedNames}`] : []),
       ...(runningNames ? [`running ${runningNames}`] : []),
     ]),
-    build([
-      ...(statusParts.length ? [statusParts.join(" ")] : []),
-      ...(failedNames ? [`failed ${failedNames}`] : []),
-    ]),
+    build([...(statusParts.length ? [statusParts.join(" ")] : []), ...(failedNames ? [`failed ${failedNames}`] : [])]),
     build(statusParts.length ? [statusParts.join(" ")] : []),
     `${glyph} ${summary.total}${summary.failed ? ` ×${summary.failed}` : ""}${summary.running ? ` ●${summary.running}` : ""}`,
   ];
 
   for (const candidate of candidates) {
-    if (visibleWidth(candidate) <= safeWidth) return candidate;
+    if (visibleWidth(candidate) <= safeWidth) {
+      return candidate;
+    }
   }
+
   return truncateToWidth(candidates[candidates.length - 1]!, safeWidth, "…");
 }
 
@@ -198,8 +235,7 @@ export function renderToolGroupRow(summary: ToolGroupSummary, theme: Theme, widt
  */
 
 export type TranscriptBlock =
-  | { kind: "entry"; entry: Exclude<TranscriptEntry, ToolEntry> }
-  | { kind: "tool"; call: ToolEntry; result?: ToolEntry };
+  { kind: "entry"; entry: Exclude<TranscriptEntry, ToolEntry> } | { kind: "tool"; call: ToolEntry; result?: ToolEntry };
 export type ToolLifecycleBlock = Extract<TranscriptBlock, { kind: "tool" }>;
 export type GroupedBlock = TranscriptBlock | { kind: "toolGroup"; calls: ToolLifecycleBlock[] };
 
@@ -207,6 +243,7 @@ export type GroupedBlock = TranscriptBlock | { kind: "toolGroup"; calls: ToolLif
 export function transcriptBlocks(entries: readonly TranscriptEntry[]): TranscriptBlock[] {
   const blocks: TranscriptBlock[] = [];
   const openTools = new Map<string, ToolLifecycleBlock>();
+
   for (const entry of entries) {
     if (entry.kind !== "tool") {
       blocks.push({ kind: "entry", entry });
@@ -214,12 +251,15 @@ export function transcriptBlocks(entries: readonly TranscriptEntry[]): Transcrip
     }
 
     const open = openTools.get(entry.toolId);
-    const isResult = entry.phase === "end" || (entry.phase === undefined && (open !== undefined || isSelfSettled(entry)));
+    const isResult =
+      entry.phase === "end" || (entry.phase === undefined && (open !== undefined || isSelfSettled(entry)));
+
     if (isResult && open) {
       open.result = entry;
       openTools.delete(entry.toolId);
       continue;
     }
+
     if (isResult) {
       blocks.push({ kind: "tool", call: entry, result: entry });
       continue;
@@ -229,6 +269,7 @@ export function transcriptBlocks(entries: readonly TranscriptEntry[]): Transcrip
     blocks.push(block);
     openTools.set(entry.toolId, block);
   }
+
   return blocks;
 }
 
@@ -237,19 +278,26 @@ export function groupToolBlocks(blocks: readonly TranscriptBlock[]): GroupedBloc
   const grouped: GroupedBlock[] = [];
   let run: ToolLifecycleBlock[] = [];
   const flush = () => {
-    if (!run.length) return;
+    if (!run.length) {
+      return;
+    }
+
     grouped.push({ kind: "toolGroup", calls: run });
     run = [];
   };
+
   for (const block of blocks) {
     if (block.kind === "tool") {
       run.push(block);
       continue;
     }
+
     flush();
     grouped.push(block);
   }
+
   flush();
+
   return grouped;
 }
 
@@ -268,11 +316,15 @@ export interface ToolRenderSnapshot {
 }
 
 function jsonRecord(value: string | undefined): Record<string, unknown> | undefined {
-  if (!value?.trim().startsWith("{")) return undefined;
+  if (!value?.trim().startsWith("{")) {
+    return undefined;
+  }
+
   try {
     const parsed = JSON.parse(value) as unknown;
+
     return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
+      ? (parsed as Record<string, unknown>)
       : undefined;
   } catch {
     return undefined;
@@ -281,32 +333,63 @@ function jsonRecord(value: string | undefined): Record<string, unknown> | undefi
 
 function legacyArgs(name: string, text: string | undefined): Record<string, unknown> {
   const parsed = jsonRecord(text);
-  if (parsed) return parsed;
+
+  if (parsed) {
+    return parsed;
+  }
+
   const value = sanitizeText(text ?? "").trim();
-  if (!value) return {};
+
+  if (!value) {
+    return {};
+  }
+
   const lower = name.toLowerCase();
-  if (lower === "bash") return { command: value };
-  if (["edit", "read", "write"].includes(lower)) return { path: value };
+
+  if (lower === "bash") {
+    return { command: value };
+  }
+
+  if (["edit", "read", "write"].includes(lower)) {
+    return { path: value };
+  }
+
   return { input: value };
 }
 
 /** Claude sometimes JSON-encodes textual tool output; expose the actual text. */
 function normalizeToolOutput(value: string | undefined): string {
   const clean = sanitizeText(value ?? "").trimEnd();
-  if (!clean) return "";
+
+  if (!clean) {
+    return "";
+  }
+
   try {
     const parsed = JSON.parse(clean) as unknown;
-    if (typeof parsed === "string") return sanitizeText(parsed).trimEnd();
+
+    if (typeof parsed === "string") {
+      return sanitizeText(parsed).trimEnd();
+    }
+
     if (Array.isArray(parsed)) {
       const text = parsed
-        .map((part) => part !== null && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string"
-          ? String((part as Record<string, unknown>).text)
-          : "")
+        .map((part) =>
+          part !== null && typeof part === "object" && typeof (part as Record<string, unknown>).text === "string"
+            ? String((part as Record<string, unknown>).text)
+            : "",
+        )
         .filter(Boolean)
         .join("\n");
-      if (text) return sanitizeText(text).trimEnd();
+
+      if (text) {
+        return sanitizeText(text).trimEnd();
+      }
     }
-  } catch { /* Truncated previews are intentionally rendered as received. */ }
+  } catch {
+    /* Truncated previews are intentionally rendered as received. */
+  }
+
   return clean;
 }
 
@@ -321,11 +404,15 @@ export function resolveToolRenderSnapshot(
   const { name, status } = toolCallState(call, result, trace);
   const args = call.args ?? trace?.args ?? legacyArgs(name, call.phase === "end" ? trace?.summary : call.text);
   const legacyOutput = normalizeToolOutput(result?.text ?? (call.phase === "end" ? call.text : undefined));
-  const toolResult = result?.result ?? trace?.result ?? (status === "running"
-    ? undefined
-    : {
-        content: legacyOutput ? [{ type: "text", text: legacyOutput }] : [],
-        isError: status === "failed",
-      });
+  const toolResult =
+    result?.result ??
+    trace?.result ??
+    (status === "running"
+      ? undefined
+      : {
+          content: legacyOutput ? [{ type: "text", text: legacyOutput }] : [],
+          isError: status === "failed",
+        });
+
   return { key, name, args, result: toolResult, status, cwd };
 }
