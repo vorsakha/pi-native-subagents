@@ -1919,7 +1919,7 @@ test("focusRunId selects the requested run on the first render", (t) => {
   assert.match(state.overlay.render(120).join("\n"), /Release focus-second/);
 });
 
-test("workflow agent pane toggles between compact groups and full tool rendering with t", (t) => {
+test("workflow agent pane toggles between compact groups and full tool rendering with t and Ctrl+T", (t) => {
   const current = workflow("toggle-tools", "completed");
   current.agents[0]!.transcript = [
     { kind: "tool", phase: "start", toolId: "r1", name: "read", args: { path: "a.ts" } },
@@ -1964,7 +1964,7 @@ test("workflow agent pane toggles between compact groups and full tool rendering
     "hint offers the toggle back to compact mode",
   );
 
-  overlay.handleInput("t");
+  overlay.handleInput(CTRL_T);
   const backToCompact = overlay.render(60);
   assertPanel(backToCompact, 60, 25);
   assert.deepEqual(
@@ -1972,41 +1972,6 @@ test("workflow agent pane toggles between compact groups and full tool rendering
     compact,
     "toggling twice reproduces identical compact output across both detail cache keys",
   );
-});
-
-test("workflow agent pane also toggles tool rendering with the primary Ctrl+T binding", (t) => {
-  const current = workflow("toggle-tools-ctrl", "completed");
-  current.agents[0]!.transcript = [
-    { kind: "tool", phase: "start", toolId: "r1", name: "read", args: { path: "a.ts" } },
-    {
-      kind: "tool",
-      phase: "end",
-      toolId: "r1",
-      name: "read",
-      result: { content: [{ type: "text", text: "contents" }], isError: false },
-    },
-  ];
-  const { overlay } = harness([current], 32, () => {}, { renderMarkdown: (text) => text.split("\n") });
-  t.after(() => overlay.dispose());
-
-  openAgentDetail(overlay, 60);
-  const compact = overlay.render(60);
-  assert.ok(
-    compact.some((line) => line.includes("1 tool call")),
-    "agent pane defaults to compact grouping",
-  );
-
-  overlay.handleInput(CTRL_T);
-  const full = overlay.render(60);
-  assert.ok(
-    full.some((line) => line.includes("read") && line.includes("a.ts")),
-    "Ctrl+T toggles to full mode, same as t",
-  );
-  assert.ok(!full.some((line) => line.includes("1 tool call")), "full mode does not show the compact group row");
-
-  overlay.handleInput(CTRL_T);
-  const backToCompact = overlay.render(60);
-  assert.deepEqual(backToCompact, compact, "a second Ctrl+T reproduces identical compact output");
 });
 
 test("a workflow tool call interrupted by an assistant entry resolves to one failed call, not a running and a completed group", () => {

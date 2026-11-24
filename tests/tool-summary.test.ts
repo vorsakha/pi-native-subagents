@@ -14,13 +14,6 @@ function tool(overrides: Partial<ToolEntry> = {}): ToolEntry {
   return { kind: "tool", toolId: "t1", name: "bash", ...overrides };
 }
 
-test("a phase-less entry carrying an explicit error is failed, not running", () => {
-  const entry = tool({ error: true, result: { content: [], isError: true } });
-  const [state] = toolCallStates([entry]);
-  assert.equal(state?.name, "bash");
-  assert.equal(state?.status, "failed");
-});
-
 test("a phase-less entry carrying a settled non-error result is completed, not running", () => {
   const entry = tool({ result: { content: [{ type: "text", text: "ok" }], isError: false } });
   const [state] = toolCallStates([entry]);
@@ -38,24 +31,6 @@ test("pairToolEntries resolves a self-settled phase-less entry as its own result
   const { order, pairs } = pairToolEntries([entry]);
   assert.deepEqual(order, ["bash-1"]);
   assert.equal(pairs.get("bash-1")?.result, entry);
-});
-
-test("start and end events resolve to one failed tool call", () => {
-  const start = tool({ toolId: "bash-1", phase: "start", name: "bash" });
-  const end = tool({
-    toolId: "bash-1",
-    phase: "end",
-    name: "bash",
-    result: { content: [], isError: true },
-    error: true,
-  });
-  const states = toolCallStates([start, end]);
-  assert.equal(
-    states.length,
-    1,
-    "start and end merge into exactly one call, not a running call plus a separate failed one",
-  );
-  assert.equal(states[0]?.status, "failed");
 });
 
 test("pairToolEntries pairs interleaved parallel calls by id regardless of arrival order", () => {

@@ -210,9 +210,12 @@ test("script console output stays private when reporting a workflow failure", as
 test("unawaited helper and direct native calls cannot commit success", async () => {
   const cwd = await tempDir("durable-unawaited");
 
-  for (const call of [
-    'agent("forgotten")',
-    'tools.workflow_agent({ operation: "agent", prompt: "forgotten", options: {}, callIndex: 0 })',
+  for (const { call, expectedError } of [
+    { call: 'agent("forgotten")', expectedError: /returned before 1 agent call settled/i },
+    {
+      call: 'tools.workflow_agent({ operation: "agent", prompt: "forgotten", options: {}, callIndex: 0 })',
+      expectedError: /returned before .*calls settled/i,
+    },
   ]) {
     let dispatched = 0;
     let cancelled = 0;
@@ -237,7 +240,7 @@ test("unawaited helper and direct native calls cannot commit success", async () 
           },
         }),
       ),
-      /await every|returned before/i,
+      expectedError,
     );
     assert.equal(cancelled, dispatched, "every dispatched call settles cancellation before close returns");
   }

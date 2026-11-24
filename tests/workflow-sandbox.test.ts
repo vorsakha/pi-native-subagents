@@ -206,7 +206,7 @@ test("terminates the sandbox when a host progress callback fails", async () => {
   const f = await fixture(
     `
     export const meta = { name: "callback-failure" };
-    export default async () => new Promise(() => {});
+    export default async () => "done";
   `,
     {
       onMeta: () => {
@@ -216,7 +216,7 @@ test("terminates the sandbox when a host progress callback fails", async () => {
   );
 
   try {
-    await assert.rejects(runWorkflowSandbox(f.options));
+    await assert.rejects(runWorkflowSandbox(f.options), /meta callback failed/);
   } finally {
     await cleanup(f.cwd);
   }
@@ -227,42 +227,6 @@ test("rejects a stalled script that cannot make further progress", async () => {
 
   try {
     await assert.rejects(runWorkflowSandbox(f.options), /pending|stalled|settle/i);
-  } finally {
-    await cleanup(f.cwd);
-  }
-});
-
-test("rejects workflows that return before all agent calls are awaited", async () => {
-  let aborted = false;
-  let dispatched = false;
-  const f = await fixture(
-    `
-    export default async () => {
-      void agent("forgotten", {});
-      return "premature";
-    }
-  `,
-    {
-      onAgent: async (_prompt, _options, signal) =>
-        new Promise((resolve) => {
-          dispatched = true;
-          const onAbort = () => {
-            aborted = true;
-            resolve({ ok: false, output: "", error: "aborted" });
-          };
-
-          if (signal.aborted) {
-            onAbort();
-          } else {
-            signal.addEventListener("abort", onAbort, { once: true });
-          }
-        }),
-    },
-  );
-
-  try {
-    await assert.rejects(runWorkflowSandbox(f.options), /returned before 1 agent call settled/i);
-    assert.ok(!dispatched || aborted, "unawaited work must be prevented or cancelled");
   } finally {
     await cleanup(f.cwd);
   }

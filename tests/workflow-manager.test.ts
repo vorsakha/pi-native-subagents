@@ -6272,75 +6272,40 @@ test("a budget reached after the source agent completes blocks the follow-up bef
   }
 });
 
-test("followUp cannot continue a worktree-isolated agent once its isolated worktree has been removed", async () => {
-  const f = await fixture();
+for (const finalState of ["removed", "preserved"] as const) {
+  test(`followUp rejects an isolated agent after its worktree is ${finalState}`, async () => {
+    const f = await fixture();
 
-  try {
-    await execFileAsync("git", ["init", "-q", f.cwd]);
-    await execFileAsync("git", ["-C", f.cwd, "config", "user.email", "tests@example.invalid"]);
-    await execFileAsync("git", ["-C", f.cwd, "config", "user.name", "Workflow Tests"]);
-    await writeFile(join(f.cwd, "base.txt"), "base\n");
-    await execFileAsync("git", ["-C", f.cwd, "add", "base.txt"]);
-    await execFileAsync("git", ["-C", f.cwd, "commit", "-qm", "base"]);
+    try {
+      await initializeGitCheckout(f.cwd);
+      const started = await f.workflows.start(
+        f.request(`
+          export default async () => {
+            const worker = await agent("isolated task", { name: "worker", isolation: "worktree" });
+            return followUp(worker.jobId, "second turn");
+          }
+        `),
+      );
+      await waitFor(() => f.backend.requests.length === 1, "isolated worker dispatched", 10_000);
 
-    const started = await f.workflows.start(
-      f.request(`
-      export default async () => {
-        const worker = await agent("isolated task", { name: "worker", isolation: "worktree" });
-        return followUp(worker.jobId, "second turn");
+      if (finalState === "preserved") {
+        await writeFile(join(f.backend.requests[0]!.cwd, "worker.txt"), "changed\n");
       }
-    `),
-    );
-    await waitFor(() => f.backend.requests.length === 1, "isolated worker dispatched", 10_000);
-    f.backend.completeTask("isolated task", "done");
 
-    const final = await started.completion;
-    assert.equal(final.status, "completed");
-    const result = final.result as { ok: boolean; error?: string };
-    assert.equal(result.ok, false);
-    assert.match(result.error ?? "", /isolated worktree that already finalized/);
-    assert.equal(final.agents[0]?.isolation?.state, "removed");
-    assert.equal(f.backend.sends.length, 0);
-  } finally {
-    await f.cleanup();
-  }
-});
+      f.backend.completeTask("isolated task", "done");
+      const final = await started.completion;
+      assert.equal(final.status, "completed");
+      assert.equal(final.agents[0]?.isolation?.state, finalState);
 
-test("followUp cannot continue a worktree-isolated agent once its isolated worktree has been preserved with changes", async () => {
-  const f = await fixture();
-
-  try {
-    await execFileAsync("git", ["init", "-q", f.cwd]);
-    await execFileAsync("git", ["-C", f.cwd, "config", "user.email", "tests@example.invalid"]);
-    await execFileAsync("git", ["-C", f.cwd, "config", "user.name", "Workflow Tests"]);
-    await writeFile(join(f.cwd, "base.txt"), "base\n");
-    await execFileAsync("git", ["-C", f.cwd, "add", "base.txt"]);
-    await execFileAsync("git", ["-C", f.cwd, "commit", "-qm", "base"]);
-
-    const started = await f.workflows.start(
-      f.request(`
-      export default async () => {
-        const worker = await agent("isolated task", { name: "worker", isolation: "worktree" });
-        return followUp(worker.jobId, "second turn");
-      }
-    `),
-    );
-    await waitFor(() => f.backend.requests.length === 1, "isolated worker dispatched", 10_000);
-    const request = f.backend.requests[0]!;
-    await writeFile(join(request.cwd, "worker.txt"), "changed\n");
-    f.backend.completeTask("isolated task", "done");
-
-    const final = await started.completion;
-    assert.equal(final.status, "completed");
-    const result = final.result as { ok: boolean; error?: string };
-    assert.equal(result.ok, false);
-    assert.match(result.error ?? "", /isolated worktree that already finalized/);
-    assert.equal(final.agents[0]?.isolation?.state, "preserved");
-    assert.equal(f.backend.sends.length, 0, "the rejected follow-up never dispatches an additional native turn");
-  } finally {
-    await f.cleanup();
-  }
-});
+      const result = final.result as { ok: boolean; error?: string };
+      assert.equal(result.ok, false);
+      assert.match(result.error ?? "", /isolated worktree that already finalized/);
+      assert.equal(f.backend.sends.length, 0, "the rejected follow-up never dispatches an additional native turn");
+    } finally {
+      await f.cleanup();
+    }
+  });
+}
 
 async function createFollowUpReplaySource(f: Awaited<ReturnType<typeof fixture>>, script: string) {
   const now = Date.now();
