@@ -66,14 +66,6 @@ export function configuredWorkflowsShortcut(env: NodeJS.ProcessEnv = process.env
   return normalizeWorkflowsShortcut(env[WORKFLOWS_SHORTCUT_ENV]) ?? DEFAULT_WORKFLOWS_SHORTCUT;
 }
 
-/** Title-cases a shortcut chord for display hints, e.g. `ctrl+alt+w` -> `Ctrl+Alt+W`. */
-export function formatWorkflowsShortcutHint(shortcut: string): string {
-  return shortcut
-    .split("+")
-    .map((part) => (part.length === 0 ? part : part.charAt(0).toUpperCase() + part.slice(1)))
-    .join("+");
-}
-
 export interface WorkflowRegistration {
   sessionStart(ctx: ExtensionContext, jobs: JobManager): void;
   sessionShutdown(): Promise<WorkflowSnapshot[]>;
@@ -85,8 +77,6 @@ export interface WorkflowRegistration {
   check(runId: string): WorkflowSnapshot | undefined;
   /** Effective keyboard shortcut registered for the `/workflows` surface. */
   readonly shortcut: KeyId;
-  /** Display hint for the effective shortcut, e.g. `Ctrl+Alt+W`. */
-  readonly shortcutHint: string;
 }
 
 export interface RegisterWorkflowOptions {
@@ -562,11 +552,17 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
 
     const workflows = getManager();
     await workflows.initialize();
-    await openWorkflowsDashboard(ctx, workflows);
+    const summary = await openWorkflowsDashboard(ctx, workflows);
+
+    if (summary) {
+      pi.sendMessage(
+        { customType: "native-workflow-list", content: summary, display: false },
+        { deliverAs: "followUp", triggerTurn: true },
+      );
+    }
   };
 
   const shortcut = options.shortcut ?? configuredWorkflowsShortcut();
-  const shortcutHint = formatWorkflowsShortcutHint(shortcut);
 
   pi.registerShortcut(shortcut, {
     description: "Open /workflows supervision",
@@ -905,7 +901,6 @@ export function registerWorkflows(pi: ExtensionAPI, options: RegisterWorkflowOpt
 
   return {
     shortcut,
-    shortcutHint,
     list() {
       return manager?.list() ?? [];
     },

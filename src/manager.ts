@@ -318,7 +318,7 @@ export class JobManager {
   readonly #profiles: Map<string, ProfileDefinition>;
   readonly #jobs = new Map<string, InternalJob>();
   readonly #queue: string[] = [];
-  readonly #waiters = new Map<string, Set<() => void>>();
+  readonly #waiters = new Map<string, Set<(reason: "settled" | "question") => void>>();
   readonly #listeners = new Set<(job: JobSnapshot, event: BackendEvent) => void>();
   readonly #launches = new Set<Promise<void>>();
   readonly #concurrency: number;
@@ -778,11 +778,20 @@ export class JobManager {
     return clone(job.snapshot);
   }
 
-  async wait(id: string, options: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<JobSnapshot> {
+  async wait(
+    id: string,
+    options: { timeoutMs?: number; signal?: AbortSignal; returnOnQuestion?: boolean } = {},
+  ): Promise<JobSnapshot> {
     const job = this.#jobs.get(id);
 
     if (!job) {
       throw new Error(`Unknown job: ${id}`);
+    }
+
+    const question = job.snapshot.interaction;
+
+    if (options.returnOnQuestion && question?.state === "pending" && question.target.kind === "orchestrator") {
+      return clone(job.snapshot);
     }
 
     if (isTerminal(job.snapshot.status) && !job.deferredStartupTerminal) {
@@ -791,7 +800,11 @@ export class JobManager {
 
     return new Promise<JobSnapshot>((resolve, reject) => {
       let timer: NodeJS.Timeout | undefined;
-      const finish = () => {
+      const finish = (reason: "settled" | "question") => {
+        if (reason === "question" && !options.returnOnQuestion) {
+          return;
+        }
+
         cleanup();
         resolve(this.check(id));
       };
@@ -810,7 +823,7 @@ export class JobManager {
         this.#waiters.get(id)?.delete(finish);
       };
 
-      const set = this.#waiters.get(id) ?? new Set<() => void>();
+      const set = this.#waiters.get(id) ?? new Set<typeof finish>();
       set.add(finish);
       this.#waiters.set(id, set);
 
@@ -1165,7 +1178,13 @@ export class JobManager {
         const capabilityPrompt = job.request.capabilityRoute?.matched.length
           ? `The parent live-verified these required native capabilities for this task: ${job.request.capabilityRoute.matched.join(", ")}. Use the relevant skill or tool when the task calls for it; do not substitute an unverified capability.`
           : undefined;
-        const systemPrompt = [basePrompt, capabilityPrompt, job.profile?.systemPrompt].filter(Boolean).join("\n\n");
+        const questionPrompt =
+          job.request.interaction?.orchestrator === "allow"
+            ? "When you need input from the parent or the user, call subagent_ask and continue with the answer. A final text reply completes your task."
+            : undefined;
+        const systemPrompt = [basePrompt, questionPrompt, capabilityPrompt, job.profile?.systemPrompt]
+          .filter(Boolean)
+          .join("\n\n");
 
         return backend.start(
           {
@@ -1813,6 +1832,12 @@ export class JobManager {
   /** Publishes one interaction transition on the asking side. */
   #publishInteraction(job: InternalJob, record: PendingInteraction): void {
     this.#publishInteractionEvent(job, { type: "interaction", interaction: cloneInteraction(record) });
+
+    if (record.state === "pending" && record.target.kind === "orchestrator") {
+      for (const waiter of this.#waiters.get(job.snapshot.id) ?? []) {
+        waiter("question");
+      }
+    }
   }
 
   /** Publishes the answering side's projection so dashboards can show the peer turn. */
@@ -2028,7 +2053,7 @@ export class JobManager {
     this.#resolveRunWaiters(job);
 
     for (const waiter of this.#waiters.get(job.snapshot.id) ?? []) {
-      waiter();
+      waiter("settled");
     }
 
     this.#waiters.delete(job.snapshot.id);

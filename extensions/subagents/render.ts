@@ -667,14 +667,7 @@ export function renderInteractionCard(
   }
 
   if (state === "pending") {
-    lines.push(
-      sectionLine(
-        theme,
-        "Reply",
-        `answer with subagent_answer({ requestId, answer }) · the child is parked until then`,
-        "dim",
-      ),
-    );
+    lines.push(sectionLine(theme, "Reply", `Answer in this conversation to resume the task.`, "dim"));
   }
 
   const budget = options.expanded ? MAX_EXPANDED_LINES : MAX_COLLAPSED_LINES;
@@ -932,12 +925,13 @@ export function truncatePreview(value: string, maxLength = 80): string {
 
 /** Restrained icon + title vocabulary shared by every `subagent_*` call/result renderer. */
 export type ToolCallTitle =
-  "Spawn" | "Inspect" | "Wait" | "Steer" | "Follow up" | "Cancel" | "List" | "Run" | "Workflow" | "Fork";
+  "Spawn" | "Inspect" | "Wait" | "Answer" | "Steer" | "Follow up" | "Cancel" | "List" | "Run" | "Workflow" | "Fork";
 
 const TOOL_CALL_ICON: Record<ToolCallTitle, string> = {
   Spawn: "◇",
   Inspect: "◌",
   Wait: "·",
+  Answer: "↳",
   Steer: "↝",
   "Follow up": "+",
   Cancel: "×",

@@ -302,7 +302,7 @@ export interface SpawnRequest {
   /** Internal configured fallback; not exposed as a model-facing tool field. */
   defaultHarness?: HarnessName;
   parentProvider?: ProviderFamily;
-  /** Internal TUI-only delivery marker for human-triggered background commands. */
+  /** True when the human started the job with /subagent. */
   humanVisible?: boolean;
   /** Permitted parent Pi tools inherited only by full-access human-triggered Pi jobs. */
   humanPiTools?: string[];

@@ -8,7 +8,6 @@ import {
   parseHumanSubagentCommand,
   permittedHumanPiToolNames,
   registerNativeSubagents,
-  summarizeSubagentActivity,
 } from "../extensions/subagents/index.ts";
 import { PI_CHILD_MARKER } from "../src/backends/pi-rpc.ts";
 import { PI_PARENT_THREAD_FILE } from "../src/parent-thread-context.ts";
@@ -161,9 +160,22 @@ test("the subagent extension surface", async (t) => {
     providerStatus,
   });
 
+  const legacyAnchor = {
+    type: "custom",
+    id: "old-start",
+    customType: "native-human-subagent",
+    data: { job: jobSnapshot() },
+  };
+  const legacyUpdate = {
+    ...legacyAnchor,
+    id: "old-result",
+    data: { kind: "update", job: jobSnapshot({ status: "completed", output: "Saved result." }) },
+  };
   const { ctx, notifications, statuses } = context({
     sessionId: "extension-session",
     branch: [
+      legacyAnchor,
+      legacyUpdate,
       { type: "message", message: { role: "user", content: "Discuss the parent-thread bridge", timestamp: 1_000 } },
       {
         type: "message",
@@ -272,7 +284,9 @@ test("the subagent extension surface", async (t) => {
     assert.ok(pi.messageRenderers.has("native-workflow-result"));
     assert.ok(pi.messageRenderers.has("native-subagent-result"));
     assert.ok(pi.messageRenderers.has("native-subagent-followthrough"));
-    assert.ok(pi.entryRenderers.has("native-human-subagent"));
+    const legacyRenderer = pi.entryRenderers.get("native-human-subagent")!;
+    assert.match(legacyRenderer(legacyAnchor, { expanded: true }, theme)!.render(100).join("\n"), /Saved result/);
+    assert.deepEqual(legacyRenderer(legacyUpdate, { expanded: true }, theme)!.render(100), []);
     assert.throws(
       () => registerNativeSubagents(fakePi().api, { registry, legacyRoot: false, backends }),
       /loaded more than once/,
@@ -405,30 +419,19 @@ test("the subagent extension surface", async (t) => {
     );
   });
 
-  await t.test("human jobs persist cards and receive a filtered parent snapshot", async () => {
-    const entriesBeforeHumanCommand = pi.entries.length;
+  await t.test("human jobs report progress in the conversation and receive a filtered parent snapshot", async () => {
     const messagesBeforeHumanCommand = pi.messages.length;
     await pi.commands
       .get("subagent")!
       .handler('--harness claude --model caller-model --name "human review" "human task"', ctx);
-    assert.equal(pi.messages.length, messagesBeforeHumanCommand, "human-triggered jobs do not notify the orchestrator");
-    assert.equal(
-      pi.entries.length,
-      entriesBeforeHumanCommand + 2,
-      "human jobs persist one card anchor and one hidden terminal update",
+    await tick();
+    await pi.handlers.get("agent_settled")?.();
+    const delivery = pi.messages.slice(messagesBeforeHumanCommand);
+    assert.deepEqual(
+      delivery.map((entry) => entry.message.customType),
+      ["native-subagent-start", "native-subagent-result"],
     );
-    const humanStart = pi.entries[entriesBeforeHumanCommand];
-    const humanResult = pi.entries[entriesBeforeHumanCommand + 1];
-    type HumanEntryData = { kind?: "anchor" | "update"; job: JobSnapshot };
-    const startData = humanStart.data as HumanEntryData;
-    const resultData = humanResult.data as HumanEntryData;
-    assert.equal(humanStart.customType, "native-human-subagent");
-    assert.equal(startData.kind, "anchor");
-    assert.equal(startData.job.status, "queued");
-    assert.equal(startData.job.humanVisible, true);
-    assert.equal(resultData.kind, "update");
-    assert.equal(resultData.job.status, "completed");
-    assert.equal(resultData.job.output, "claude-ok");
+    assert.match(String(delivery[1]?.message.content), /claude-ok/);
     const humanRequest = backends
       .find((backend) => backend.name === "claude")
       ?.starts.find((request) => request.task === "human task");
@@ -441,21 +444,11 @@ test("the subagent extension surface", async (t) => {
       ],
       "human jobs receive a filtered spawn-time snapshot without assistant thinking",
     );
-    const renderHumanEntry = pi.entryRenderers.get("native-human-subagent")!;
-    const humanCard = renderHumanEntry(humanStart, { expanded: true }, theme)!.render(120).join("\n");
-    assert.match(humanCard, /claude\/caller-model/);
-    assert.match(humanCard, /claude-ok/, "the original card settles with the terminal output");
-    assert.deepEqual(
-      renderHumanEntry(humanResult, { expanded: true }, theme)!.render(120),
-      [],
-      "the durable terminal update does not create a second visible card",
-    );
   });
 
   await t.test("human jobs inherit permitted parent tools, bounded by access", async () => {
-    const entriesBeforeDefaultHumanCommand = pi.entries.length;
     await pi.commands.get("subagent")!.handler("default human task", ctx);
-    assert.equal(pi.entries.length, entriesBeforeDefaultHumanCommand + 2);
+    await tick();
     const defaultHumanRequest = backends
       .find((backend) => backend.name === "pi")
       ?.starts.find((request) => request.task === "default human task");
@@ -471,6 +464,7 @@ test("the subagent extension surface", async (t) => {
     assert.ok(!defaultHumanRequest?.policy.piTools.includes("ask_user"));
 
     await pi.commands.get("subagent")!.handler("--access readOnly read-only human task", ctx);
+    await tick();
     const readOnlyHumanRequest = backends
       .find((backend) => backend.name === "pi")
       ?.starts.find((request) => request.task === "read-only human task");
@@ -482,6 +476,8 @@ test("the subagent extension surface", async (t) => {
   });
 
   await t.test("wait consumes delivery once per retained-session generation", async () => {
+    await pi.handlers.get("agent_settled")?.();
+    const messagesBeforeWait = pi.messages.length;
     const consumed = await pi.tools
       .get("subagent_spawn")
       .execute(
@@ -506,7 +502,7 @@ test("the subagent extension surface", async (t) => {
       .render(100);
     assert.deepEqual(waitReceipt, [], "successful completion stays on the original live job card");
     pi.handlers.get("agent_settled")?.();
-    assert.equal(pi.messages.length, 1, "wait consumes deferred delivery without duplication");
+    assert.equal(pi.messages.length, messagesBeforeWait, "wait consumes deferred delivery without duplication");
     const historicalContext = { args: {}, state: {}, invalidate() {} };
     const generationZero = pi.tools
       .get("subagent_spawn")
@@ -528,7 +524,7 @@ test("the subagent extension surface", async (t) => {
     pi.handlers.get("agent_settled")?.();
     assert.equal(
       pi.messages.length,
-      2,
+      messagesBeforeWait + 1,
       "consumption is scoped to one generation; reused-session output still delivers once",
     );
     const historicalAfterFollowUp = pi.tools
@@ -667,7 +663,7 @@ test("the subagent extension surface", async (t) => {
   await pi.handlers.get("session_shutdown")?.();
 });
 
-test("thread and human cards follow live job state without periodic rerenders", async () => {
+test("thread cards follow live job state without periodic rerenders", async () => {
   const blinkPi = fakePi({ allTools: PARENT_TOOLS });
   const blinkTimers = new Map<object, () => void>();
   let blinkDelay = 0;
@@ -753,80 +749,9 @@ test("thread and human cards follow live job state without periodic rerenders", 
     "thread card settles from remembered manager state",
   );
 
-  const humanEntryCount = blinkPi.entries.length;
-  await blinkPi.commands.get("subagent")!.handler('--name "human live card" "wait for cancellation"', blinkCtx);
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(blinkPi.entries.length, humanEntryCount + 1, "an active human job has only its visible anchor entry");
-  const humanAnchor = blinkPi.entries[humanEntryCount];
-  const renderHumanEntry = blinkPi.entryRenderers.get("native-human-subagent")!;
-  const humanLiveCard = renderHumanEntry(humanAnchor, { expanded: false }, theme)!;
-  assert.match(humanLiveCard.render(100).join("\n"), /running/);
-  const humanJobs: JobSnapshot[] = (await blinkPi.tools.get("subagent_list").execute()).details.jobs;
-  const humanJob = humanJobs.find((job) => job.humanVisible && job.name === "human live card");
-  assert.ok(humanJob, "the live card has a corresponding job");
-  await blinkPi.tools
-    .get("subagent_cancel")
-    .execute("cancel-human", { jobId: humanJob.id }, undefined, undefined, blinkCtx);
-  assert.equal(blinkPi.entries.length, humanEntryCount + 2, "settlement adds only a hidden durable update");
-  assert.match(humanLiveCard.render(100).join("\n"), /cancelled/, "the existing component settles in place");
-  const humanUpdate = blinkPi.entries[humanEntryCount + 1];
-  assert.deepEqual(renderHumanEntry(humanUpdate, { expanded: false }, theme)!.render(100), []);
+  await blinkPi.handlers.get("session_shutdown")?.();
 });
 
-test("summarizeSubagentActivity distinguishes direct and workflow-owned jobs", () => {
-  const workflowRef = { runId: "wf-1", agentIndex: 0, label: "build" };
-
-  const inactive = summarizeSubagentActivity([
-    jobSnapshot({ status: "completed" }),
-    jobSnapshot({ status: "failed" }),
-    jobSnapshot({ status: "cancelled" }),
-  ]);
-  assert.deepEqual(inactive.segments, []);
-  assert.deepEqual(inactive.pointers, []);
-
-  const directRunning = summarizeSubagentActivity([jobSnapshot({ status: "running" })]);
-  assert.equal(directRunning.segments[0].summary, "1 subagent running");
-  assert.equal(directRunning.segments[0].breakdown, "");
-  assert.deepEqual(directRunning.pointers, ["/subagents"]);
-
-  const directQueued = summarizeSubagentActivity([
-    jobSnapshot({ status: "queued" }),
-    jobSnapshot({ status: "queued" }),
-  ]);
-  assert.equal(directQueued.segments[0].summary, "2 subagents queued");
-  assert.deepEqual(directQueued.pointers, ["/subagents"]);
-
-  const directMixed = summarizeSubagentActivity([
-    jobSnapshot({ status: "running" }),
-    jobSnapshot({ status: "running" }),
-    jobSnapshot({ status: "queued" }),
-  ]);
-  assert.equal(directMixed.segments[0].summary, "3 subagents active");
-  assert.equal(directMixed.segments[0].breakdown, " · 2 running · 1 queued");
-  assert.deepEqual(directMixed.pointers, ["/subagents"]);
-
-  const workflowOnly = summarizeSubagentActivity([jobSnapshot({ status: "running", workflow: workflowRef })]);
-  assert.equal(workflowOnly.segments[0].summary, "1 workflow agent running");
-  assert.deepEqual(workflowOnly.pointers, ["/workflows"]);
-  assert.doesNotMatch(workflowOnly.text, /\/subagents/);
-
-  const mixed = summarizeSubagentActivity([
-    jobSnapshot({ status: "running" }),
-    jobSnapshot({ status: "running", workflow: workflowRef }),
-    jobSnapshot({ status: "queued", workflow: workflowRef }),
-  ]);
-  assert.equal(mixed.segments.length, 2);
-  assert.equal(mixed.segments[0].owner, "direct");
-  assert.equal(mixed.segments[0].summary, "1 subagent running");
-  assert.equal(mixed.segments[1].owner, "workflow");
-  assert.equal(mixed.segments[1].summary, "2 workflow agents active");
-  assert.equal(mixed.segments[1].breakdown, " (1 running · 1 queued)");
-  assert.deepEqual(mixed.pointers, ["/subagents", "/workflows"]);
-
-  const directKey = summarizeSubagentActivity([jobSnapshot({ status: "running" })]).key;
-  const workflowKey = summarizeSubagentActivity([jobSnapshot({ status: "running", workflow: workflowRef })]).key;
-  assert.notEqual(directKey, workflowKey, "ownership must be part of the widget dedup key");
-});
 test("routed questions wake the parent thread once and resolve through subagent_answer", async () => {
   const pi = fakePi({ allTools: PARENT_TOOLS });
   const backend = new ControlledBackend("pi");
@@ -1541,7 +1466,7 @@ test("evicting a terminal source drops its pending workflow checkpoint", async (
   await finalMessage;
 });
 
-test("a wait-consumed job still delivers its question, and human jobs keep theirs off the parent thread", async () => {
+test("a wait returns the pending question and a human-started job completes in the same conversation", async () => {
   const pi = fakePi({ allTools: PARENT_TOOLS });
   const backend = new ControlledBackend("pi");
   registerNativeSubagents(pi.api, {
@@ -1552,7 +1477,7 @@ test("a wait-consumed job still delivers its question, and human jobs keep their
     globalProfilesDir: join(await tempDir("extension-question2-profiles"), "profiles"),
     providerStatus: readyProviderStatusReader(),
   });
-  const { ctx } = context({ sessionId: "question-session-2", idle: true });
+  const { ctx } = context({ sessionId: "question-session-2", idle: false });
   pi.handlers.get("session_start")?.({}, ctx);
 
   const spawned = await pi.tools
@@ -1561,14 +1486,16 @@ test("a wait-consumed job still delivers its question, and human jobs keep their
   await tick();
   const waiting = pi.tools
     .get("subagent_wait")
-    .execute("w1", { jobId: spawned.details.job.id, timeoutMs: 5_000 }, undefined, undefined, ctx);
+    .execute("w1", { jobId: spawned.details.job.id }, AbortSignal.timeout(2000), undefined, ctx);
   const asked = backend.ask(spawned.details.job.id, { question: "Do we keep the old header?" });
-  await tick();
-  assert.equal(
-    pi.messages.filter((entry) => entry.message.customType === "native-subagent-question").length,
-    1,
-    "subagent_wait consumes the eventual result, never the question that unblocks it",
-  );
+  const waitingResult = await waiting;
+  assert.match(waitingResult.content[0].text, /Do we keep the old header/);
+  const requestId = waitingResult.details.job.interaction.requestId;
+  await pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.filter((entry) => entry.message.customType === "native-subagent-question").length, 0);
+  await pi.tools.get("subagent_answer").execute("a1", { requestId, answer: "yes, keep it" }, undefined, undefined, ctx);
+  assert.match((await asked).answer, /yes, keep it$/);
+  backend.complete(spawned.details.job.id, "finished");
 
   await pi.commands.get("subagent")!.handler('--name "human job" "human task"', ctx);
   await tick();
@@ -1577,30 +1504,16 @@ test("a wait-consumed job still delivers its question, and human jobs keep their
   assert.ok(humanJob, "the human job is listed");
   const humanAsk = backend.ask(humanJob.id, { question: "Which directory did you mean?" });
   await tick();
-  assert.equal(
-    pi.messages.filter((entry) => entry.message.customType === "native-subagent-question").length,
-    1,
-    "a human /subagent question stays in /subagents instead of notifying the orchestrator",
-  );
-  const updatedJobs: JobSnapshot[] = (await pi.tools.get("subagent_list").execute()).details.jobs;
-  const parked = updatedJobs.find((job) => job.id === humanJob.id);
-  assert.ok(parked?.interaction, "the human job has a pending interaction");
-  assert.equal(parked.interaction.humanVisible, true);
-  assert.equal(parked.interaction.state, "pending");
-
-  const requestId = (
-    pi.messages.find((entry) => entry.message.customType === "native-subagent-question")!.message.details as {
-      interaction: { requestId: string };
-    }
-  ).interaction.requestId;
-  await pi.tools.get("subagent_answer").execute("a1", { requestId, answer: "yes, keep it" }, undefined, undefined, ctx);
-  assert.match((await asked).answer, /yes, keep it/);
-  backend.complete(spawned.details.job.id, "finished");
-  await waiting;
-  const humanOutcome = humanAsk.then(
-    () => undefined,
-    (error: Error) => error.message,
-  );
+  await pi.handlers.get("agent_settled")?.();
+  const questions = pi.messages.filter((entry) => entry.message.customType === "native-subagent-question");
+  assert.equal(questions.length, 1);
+  const interaction = (questions[0].message.details as { interaction: { requestId: string } }).interaction;
+  await pi.tools
+    .get("subagent_answer")
+    .execute("a2", { requestId: interaction.requestId, answer: "src" }, undefined, undefined, ctx);
+  assert.match((await humanAsk).answer, /src$/);
+  backend.complete(humanJob.id, "Found the directory.");
+  await pi.handlers.get("agent_settled")?.();
+  assert.equal(pi.messages.filter((entry) => String(entry.message.content).includes("Found the directory.")).length, 1);
   await pi.handlers.get("session_shutdown")?.();
-  assert.match((await humanOutcome) ?? "", /Session shutdown/);
 });
