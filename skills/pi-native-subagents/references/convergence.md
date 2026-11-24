@@ -1,73 +1,29 @@
-# Bounded convergence with converge()
+# Bounded implementation and review
 
-Read this before calling `converge()`. It runs implement → review → fix inside one Durable workflow run: one mutating implementer and one read-only reviewer are started with `agent()`, then both retained sessions are continued across rounds with `followUp()`.
+Use `converge()` when a read-only reviewer can assess an implementation in the shared checkout and send actionable findings back to the same implementer. Use a single review for one-shot work or when a human must decide how to proceed.
 
 ```js
 export default async function () {
-  const result = await converge({
-    name: "issue 24",
+  return await converge({
     maxRounds: 3,
-    implement: {
-      prompt: "Implement the plan in docs/plan.md. Report what you changed and how you verified it.",
-      options: { name: "implementer" },
-    },
-    review: {
-      prompt: "Review the working tree against docs/plan.md. Return your structured verdict.",
-      options: { name: "reviewer" },
-    },
-    independentReview: true,
+    implement: "Implement the agreed changes in docs/plan.md. Report how you verified them.",
+    review: "Inspect the working tree against docs/plan.md. Cite actionable findings.",
   });
-
-  phase("summarize");
-  log(`convergence ${result.outcome} after ${result.roundsAttempted} round(s)`);
-  return result;
 }
 ```
 
-## When to use it
+One round runs implementation and review. Two or more rounds leave room for fixes. Both sessions are retained. Each fix and re-review consumes another workflow call. If omitted, `maxRounds` is derived from remaining calls at two per round, capped at 16. The helper checks capacity for both calls and both phases before mutation.
 
-Use bounded convergence when implementation is followed by a machine-verifiable review, findings can go back to the same retained implementer, and the reviewer can reassess the shared checkout without mutating it. Unless the caller explicitly asks for a one-shot review, give an implementation/review workflow at least one bounded fix round.
+## Configure the loop
 
-Prefer a single `agent()` call, or a plain loop, when the work is one-shot research or synthesis, when a human must judge between rounds, when each attempt needs a clean isolated worktree, when acceptance cannot be expressed as a bounded structured verdict, or when further work would touch production or another approval-gated surface.
+- Each step takes a prompt string or `{ prompt, options }` with ordinary `agent()` routing options. Keep the implementer able to mutate and the reviewer read-only. Omit per-step `schema`, `phase`, and `isolation`. The helper supplies the review schema, owns phase ordering, and needs both sessions to remain usable.
+- For a reviewer on a different provider, route the implementer to native Claude or Codex and set `independentReview: true`. The helper sets the reviewer's `independentOf` to the implementer's ID.
+- Use `fixInstructions` or `reviewInstructions` for standing guidance on later rounds (2,000 characters each). Set `includeSuggestions: true` only if suggestions must be resolved. `stallTolerance` allows 0–4 repeated rounds of the same actionable findings and defaults to 0.
+- With a declared phase plan, include `implement 1`, `review 1`, `fix 1`, `review 2`, and subsequent applicable names. Setting `name` prefixes each title with `<name> · `. Use `phases: false` to manage phases outside the loop.
+- A step may declare one eligible `continuationFallback` or explicitly opt into Codex Fast. The two are incompatible. Retained rounds inherit the original policy. A provider handoff carries the current round, pending findings, and effective schema.
 
-## Options
+## Judge the result
 
-`implement` and `review` each take a prompt string or a `{ prompt, options }` object, where `options` are ordinary `agent()` options. Other options:
+The reviewer returns `verdict`, `summary`, and up to 32 `findings` under `convergenceReviewSchema`. Give each finding a stable, unique `id`, a `severity` of `blocker`, `issue`, or `suggestion`, and a `body`. Include `filePath`, `startLine`, and `endLine` when available. A request for changes needs at least one actionable finding. Approval requires zero actionable findings. The helper sends the bounded findings and summary to the implementer.
 
-- `maxRounds` — an integer from 1 to 16. Omitted, it is derived from the run's remaining agent-call budget at two calls per round, capped at 16.
-- `stallTolerance` — 0–4; allows that many repeated rounds before stopping.
-- `includeSuggestions` — counts `suggestion` findings as actionable.
-- `independentReview` — makes the reviewer `independentOf` the implementer's job.
-- `fixInstructions` / `reviewInstructions` — bounded standing guidance (at most 2000 characters each) prepended to every fix and re-review prompt.
-- `phases: false` — suppresses the helper's own phase calls.
-- `name` — a non-empty string used to prefix the emitted phases.
-
-## Rejected before dispatch
-
-These are validated before any model call, and apply to **both** the `implement` and `review` steps unless stated otherwise:
-
-- `isolation` on either step — a worktree-isolated call is finalized when it returns and can never be continued by `followUp()`, so the loop could not run.
-- `phase` on either step — `converge()` owns the implement/review phase sequence so it can validate both activations before mutation.
-- `schema` on either step — an implement schema is refused outright, and the review verdict is always validated against `convergenceReviewSchema`, which cannot be replaced.
-- `access` on the review step when it is anything other than `readOnly`. The reviewer is always dispatched read-only.
-
-## Result and outcomes
-
-The result is `{ ok, outcome, roundsAttempted, maxRounds, implementerJobId, reviewerJobId, finalReview, implementationOutput, stoppingReason, rounds }`, where `outcome` is one of:
-
-- `approved` — the reviewer returned `approve`; the only `ok: true` outcome;
-- `blocked` — the reviewer reported an external or policy boundary;
-- `stalled` — a round repeated the previous round's actionable findings unchanged;
-- `limit-reached` — `maxRounds`, the 32-call ceiling, or a workflow budget stopped the loop; the last review is preserved;
-- `failed` — a call failed, or a review returned an unusable structured verdict.
-
-## Loop rules
-
-- Every review is validated against `convergenceReviewSchema`: `verdict` (`approve`, `request_changes`, or `blocked`), `summary`, and `findings[]` with a stable `id`, `severity` (`blocker`, `issue`, or `suggestion`), `body`, and optional `filePath`/`startLine`/`endLine`, capped at 32 findings. A missing, malformed, or duplicate-id verdict, `request_changes` without an actionable finding, or `approve` with actionable findings ends the loop as `failed`. Suggestions count as actionable for this check only when `includeSuggestions` is true.
-- Only bounded review evidence — the summary plus every actionable finding — is sent back to the implementer. The helper preserves every finding ID and bounded body evidence, including late findings, in continuation handoffs rather than relying on a truncated current prompt.
-- Every implementation and review turn is an ordinary agent call: it consumes a call ordinal, counts toward every workflow and per-agent budget, is journaled and replayable, and is cancelled with the run. Cancellation, pause, and shutdown stay lifecycle states and never become a convergence outcome.
-- Either initial step may explicitly declare `continuationFallback`. After eligible current-turn progress and provider unavailability, the bounded handoff keeps the current round, pending findings, and review schema when applicable. Later rounds target that lineage's replacement session; `independentReview` is opposite the replacement provider. A failed or unsafe handoff ends convergence as `failed`, never as a fresh round or provider loop.
-- Either initial step may explicitly use Codex `speed: "fast"`; every retained fix, review, and peer-answer turn inherits it. Fast cannot combine with `continuationFallback`.
-- Stall detection is deterministic and advisory: it compares normalized actionable finding IDs and bodies between consecutive rounds. It never spends a model call and never infers progress from prose or token counts.
-- The loop preflights both agent-call and phase capacity before each round's mutation, and returns `limit-reached` rather than starting a round it cannot finish. No workflow runs indefinitely because a reviewer keeps requesting another round.
-- The helper emits `implement 1`, `review 1`, `fix 1`, `review 2`, … phases, prefixed with `name` when given. With a declared `meta.phases` plan, either declare those names or pass `phases: false`.
+Read `outcome`, `stoppingReason`, and `finalReview` before reporting completion. Only `approved` has `ok: true`. Report the reviewer's external boundary for `blocked`, repeated unresolved findings for `stalled`, and the remaining review after `limit-reached`. A failed call or unusable verdict yields `failed`. Cancellation, pause, and shutdown remain workflow lifecycle states.

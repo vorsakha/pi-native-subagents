@@ -1,53 +1,28 @@
-# Supervision surfaces and telemetry
+# Supervise a job or workflow
 
-Read this for supervision and telemetry. Each `?` legend owns its bindings.
+Use `subagent_check({ jobId })` for a direct job's current status. In the terminal, open `/subagents` for direct jobs and `/workflows` for a workflow's runs, phases, and agents. When a workflow-owned job appears in `/subagents`, open its workflow to act on it. Outside the terminal, the commands return a session summary.
 
-## Surfaces
+Use `?` for the current pane's bindings and `i` for route, usage, context, isolation, and replay details. Enter or Right opens detail. Escape backs out. In a transcript, scrolling away from the tail pauses the viewport. Press `G` to return to the end.
 
-- `/subagents` has job-list, job-detail, and composer focus. Enter or Right inspects; `a`, `s`, and `f` answer, steer, and follow up. Escape backs out; `j/k` selects or scrolls. A routed question blocks draft submission. Cancellation requires the eligible job in the latest view.
-- `/workflows` has `runs`, `outline`, and `agent-detail` focus. Its bounded outline models every recorded or planned phase and expands the selected phase's filtered agents. Agent rows show lifecycle state and semantic progress; phase rows remain visible under filters. Control workflow agents through `/workflows`, not `/subagents`.
-- Direct-job and workflow-agent transcript labels show the visible line range. Scrolling away from the tail marks the viewport `paused`; press `G` to resume the live tail or a terminal transcript's end.
-- Ask for status in the conversation. In the terminal, open either dashboard for a closer look. Outside the terminal, the two commands return a session summary to the conversation.
-- Workflow calls keep durable transcript cards, run IDs, and artifact references.
-- Workflow jobs stay tagged in `/subagents`.
-- Inspectors default to state plus outline, transcript, or result. Press `i` for route/model, usage/budget, context, provenance, isolation, replay, and replacement telemetry. Errors, questions, waits, warnings, and recovery stay pinned. Previews omit full tool calls and result bodies.
-- Continued routes read `primary → replacement (continued)`. A durable handoff marks the declaration used. Detail shows trigger, checkout, attempts, and replacement history; it never calls a closed or persisted job retained.
-- Transcripts default to compact tool-call groups; full native rendering is a toggle. Selection survives refresh, filtering, reordering, replacement, and resize.
-- Wide dashboards use a rail; medium stacks the list; narrow shows one focus layer. No layout adds a permanent third column.
-- Phase rows, omission rows, headers, and filtered or hidden agents are never agent-action targets. Restart and agent cancellation require an eligible selected agent that survived the final rendered outline/detail viewport. Run cancellation remains a separate confirmed action.
-- Headers keep needs-input, active, and failed counts under width pressure. Very short panels expose only close and ignore hidden actions.
-- `/subagents providers` shows normalized state, reason, and active status. Email is masked. Refresh re-probes without model calls, installation, login, configuration changes, or credentials.
-- Versions appear only from safe probes. No harness runs a separate version command. Absence proves no compatibility state.
+## Decide who needs to act
 
-## Distinguishing waits
+| State | Action |
+| --- | --- |
+| **Needs input** | Inspect the question's target. Answer a human-started job in the conversation or with `a` in its inspector. For a model-owned parent question, call `subagent_answer` with the request ID. A peer question is routed automatically. |
+| **Waiting** | Read the provider, quota window, retry time, and attempt count. Retry is automatic. Cancelling a waiting agent fails that call while the workflow continues. |
+| **Paused** | An operator paused the workflow. Use `p` to resume it. |
+| **Queued** | The scheduler will dispatch the job when a slot opens. |
 
-Four non-failure states are reported separately and must not be summarized as failures or as each other:
+For an active direct job, use `s` to steer. Use `f` for another turn on a completed retained session. Answer a pending question before submitting a draft. Failed or cancelled direct sessions are closed. For an eligible selected workflow agent, `r` starts a replacement run from that agent. Only use actions offered for the visible selection. Restart cannot discard progressed or interrupted native work.
 
-- **needs input** — a job parked on a routed question. `/subagents` and `/workflows` pin the bounded question, elapsed wait, source, target, and one next action. For a human-started job, answer in the conversation or press `a` in the terminal dashboard. An orchestrator-owned question is answered from the parent thread with `subagent_answer`; steering is not an answer. A peer-owned question names the peer and requires no human action. A workflow-owned job shown in `/subagents` names its workflow and sends supervision to `/workflows`; it offers no answer, steer, takeover, or follow-up there. Cancellation remains available for a live caller.
-- **waiting** — a workflow agent waiting out a provider window. This state outranks stale legacy error fields. The preview names the agent, provider, window, retry countdown, and attempt count, and says retry is automatic; it never renders the failed attempt's raw error. No human action is required. This remains distinct from routed input, scheduler queueing, and pause. Cancelling a waiting agent fails that agent terminally while the run continues.
-- **paused** — an operator-paused run. Resume it with `p` in `/workflows`; human action is required.
-- **queued** — a scheduler-queued direct job or workflow agent with no slot yet. Dispatch is automatic when a slot opens; no human action is required.
+Use the workflow's `Now` line for live activity and `Context` for the phase or convergence round. A question, provider wait, queue, or failure takes precedence over routine activity. A replayed record has no live activity. When a provider reports activity without details, use the displayed status. Never infer an action from private reasoning, response text, raw commands, or credentials.
 
-## State previews and recovery
+## Interpret routing and usage
 
-- A running workflow agent pins `Now`, then `Context`. `Context` uses the recorded phase plus convergence role and round when present. Rows use the same compressed activity. Questions, failures, peer answers, provider waits, and scheduler queueing displace routine activity.
-- `Now` is live-only operational evidence. Reasoning and response events expose only `Reasoning · provider activity … ago` or `Drafting response · provider activity … ago`. Recognized file tools may show a bounded project-relative target, such as `Reading src/policy.ts · started … ago`; external targets become `[outside workspace]`. Completed and failed actions use fixed wording. With no evidence, show `Working · no describable activity reported yet`.
-- Never derive `Now` from thought text, response previews, transcript entries, tool summaries, raw commands, queries, results, credentials, or absolute machine paths. It is not journaled or replayed, clears between generations and attempts, and disappears at terminal settlement. Updates come from manager events without polling or provider turns.
-- Failed or cancelled direct sessions pin their error and offer no follow-up, restart, or takeover. Workflow-owned rows send recovery to `/workflows`.
-- Failed workflow runs pin their error and have no run restart action. Use `r` only on an agent that `/workflows` can restart in a replacement run.
-- Failed agents show `r` only when restart cannot discard progressed or interrupted native work. Replay preserves that refusal. Peer-answer progress does not block safe suffix restart. Progressed failures and continued agents require the handoff or manual recovery.
-- A completed entity shows one concise result preview. Use `f` for a retained direct session when more work is needed. Completed workflow runs and agents require no action; `r` on an eligible workflow agent starts a replacement run rather than continuing the completed session.
+- `/subagents providers` shows which harnesses are active and the reason for each readiness state. Use `/subagents providers refresh` to re-probe after a configuration change. Probes use no model turns and do not install or authenticate a provider. A missing version is inconclusive.
+- Report the **configured model** as routing intent. Report a **serving model** only when the provider observed it. A clean mid-turn Codex app-server exit is a job failure and does not establish that a required capability is missing.
+- Requested speed stays fixed across a lineage. Effective speed requires a served-tier receipt. Codex can accept Fast and still show effective speed unknown. Codex credits apply and monetary cost is unreported.
+- Usage is cumulative across retained turns. Context occupancy is the latest turn's gauge. Missing occupancy means unknown. Avoid summing gauges across turns.
+- A route marked `(continued)` identifies a progressed cross-provider handoff. Inspect its trigger, checkpoint, and attempt history. A recorded job ID alone does not establish a live session.
 
-## Telemetry concepts stay distinct
-
-- **Configured model** — routing intent recorded on the job at spawn time.
-- **Effective serving model** (`serving …`) — the model identity the native runtime itself reports for the current turn. Codex reports it only via `model`/`rerouted`; `thread/start`'s model field just echoes the requested or resolved routing intent, not observed serving behavior. Claude reports it on init, assistant, and refusal-fallback events. Pi reports it as `responseModel`, never its `model` alias. When the runtime does not report it, it is omitted — never guessed from the configured model.
-- **Requested speed** is fixed policy. Omitted means standard; Fast requires request-level Codex authorization. Profiles cannot opt in. **Effective speed** requires an authoritative served-tier receipt. Request acceptance and settings are not receipts. Codex emits none, so effective speed stays unknown.
-- **Aggregate usage** — cumulative across follow-ups and bound by budgets.
-- **Context occupancy** — the latest request/turn gauge. It is replaced rather than summed on each reading, cleared at the start of every retained follow-up so a prior generation's reading is never shown as current, and shown as `unknown` rather than zero when the runtime omits it.
-- Requested Fast shows `Codex credits apply · monetary cost unreported` before dispatch and while retained. Authoritative observed Fast shows the same warning. Requested and observed labels stay separate; no receipt renders as `effective speed unknown`.
-
-## Reporting rules
-
-- Report a failed route, `ok: false`, and its bounded `error` and job ID plainly. Do not hide a failed route behind a success-only summary.
-- Keep private transcripts and workflow artifacts out of Git. The extension's durable artifacts are for bounded inspection, not for copying into prompts wholesale.
+For completed work, report the task outcome and evidence. For failures, include the bounded error, route, and job or run ID. Keep private transcripts and artifact contents out of routine status reports.

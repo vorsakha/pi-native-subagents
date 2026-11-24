@@ -1,61 +1,28 @@
-# Public presentation state V1
+# Consume public presentation state V1
 
-Read this before subscribing to `native-subagents:state:v1` or interpreting its payload.
-
-## Subscribe and replace
-
-Import `NATIVE_SUBAGENTS_STATE_EVENT_V1`, the `NativeSubagentsStateV1` types, `validateNativeSubagentsStateV1`, and `NATIVE_SUBAGENTS_STATE_V1_LIMITS` from `@vorsakha/pi-native-subagents`.
-
-Subscribe in the consumer extension factory, before `session_start`:
+Subscribe to `native-subagents:state:v1` in the consumer extension factory before `session_start`. Use the event constant, validator, types, and limits exported by `@vorsakha/pi-native-subagents`.
 
 ```ts
 const dispose = pi.events.on(NATIVE_SUBAGENTS_STATE_EVENT_V1, (value) => {
-  if (!validateNativeSubagentsStateV1(value)) return;
-  currentState = value;
+  if (validateNativeSubagentsStateV1(value)) {
+    currentState = value;
+  }
 });
 ```
 
-Each event is a complete replacement snapshot freshly projected from `JobManager.list()` and `WorkflowManager.list()`. Replace the previous value. Do not fold events, read manager instances, or treat manager notifications as deltas. Dispose the consumer listener with its extension lifecycle.
+Replace the previous snapshot on each valid event. Dispose the listener with the consumer's lifecycle. The envelope includes `schemaVersion: 1`, producer and session identity, sequence, emission time, cause, truncation counts, jobs, and workflows.
 
-## Envelope and lifecycle
+## Track the session
 
-The envelope contains:
+Startup follows workflow restoration. Compare sequence numbers only within one `producer.instanceId`. Reload creates a new instance and restarts numbering at 1. Keep the last valid snapshot until the replacement publishes. A shutdown event marks the session closed and carries final record states as observed. If a final manager read fails, the event may be absent. Never synthesize terminal jobs from a missing event or closed session.
 
-- `schemaVersion: 1`;
-- `producer` with package name, package version, and an opaque runtime `instanceId`;
-- `sequence`, monotonic within that instance ID;
-- `emittedAt`, in epoch milliseconds;
-- `cause: "startup" | "update" | "shutdown"`;
-- `session` with its ID and `lifecycle: "active" | "closed"`;
-- all five truncation counters;
-- complete bounded `jobs` and `workflows` arrays.
+## Interpret the records
 
-Startup follows manager initialization and workflow restoration. Shutdown carries the managers' final authoritative snapshots and marks the session closed without synthesizing terminal record states. If either manager's final state cannot be read, the producer does not fabricate a closed snapshot; teardown still releases both managers, listeners, and the extension install claim. A reload creates a new instance ID and restarts sequence at 1. Compare sequences only within one instance. No-op comparison ignores only sequence, emission time, and cause. A listener failure cannot change job, workflow, or shutdown behavior.
+- Use `jobs` for top-level job counts. Each job carries its exact status, generation, route, timestamps, and relationships. Use `waitingSummary` for a job waiting on a slot or a question. Workflow agents can additionally have the explicit state `waiting` for a provider retry.
+- Use `workflows` for run status, task outcome, and aggregate usage. Use nested agents for a per-run breakdown. A top-level workflow-owned job and its nested agent describe the same execution. Summing usage across both counts it twice.
+- Follow `relationships.replayedFrom.runId` and `relationships.replacementOf` when showing replay or restart. Interrupted recovery keeps its run ID. Finished replay creates a replacement run. Restored records do not establish that a native session is still live.
+- Render names and bounded summaries as untrusted text. Public result summaries describe lifecycle and task outcome. Keep prompts, questions and answers, transcripts, raw tool output, structured results, paths, and credentials out of this surface.
 
-Restoration that settles after its Pi context is invalidated cannot publish startup or update state. Consumers wait for the replacement instance's startup event and keep the last valid snapshot until then.
+## Handle partial snapshots
 
-## Limits and priority
-
-`NATIVE_SUBAGENTS_STATE_V1_LIMITS` publishes these V1 bounds:
-
-- 100 jobs and 64 workflows;
-- 32 agents and 64 phases per workflow;
-- 200 characters per ID and 160 per display name;
-- 2,000 characters per waiting, result, or error summary;
-- 512 KiB for the serialized payload.
-
-All numeric values are finite and nonnegative, with the exported safe-integer maximum. Ordering keeps nonterminal records first, then uses the newest authoritative timestamp and stable ID or agent-index ties. Phases use phase-index order. Field bounds apply first. Payload pressure then removes optional summaries from the lowest-priority terminal records and omits low-priority records until the snapshot fits. Inspect the truncation counters before treating an empty or partial array as complete manager state.
-
-## Public allowlist
-
-Jobs retain their ID, name, kind, exact manager status, generation, lifecycle timestamps, route, workflow and independence relationships, optional cumulative usage, and optional waiting, result, and error summaries. Waiting for a slot, host input, or a peer stays in `waitingSummary`; it never changes the top-level job status.
-
-Workflows retain their ID, name, exact workflow status, task outcome, timestamps, current phase, phases, agents, replay and replacement lineage, optional aggregate usage, and summaries. `relationships.replayedFrom.runId` comes from the manager's workflow replay source. `relationships.replacementOf` keeps the source run and agent index. Phases retain index, name, exact status, timestamps, and bounded agent-index links. Agents retain index, name, exact state including `waiting`, timestamps, route, phase and job links, replay/replacement lineage, optional cumulative usage, and summaries. Restored Durable projections do not imply live jobs or retained native sessions. Interrupted recovery preserves run identity; finished replay creates a replacement.
-
-Provider-wait summaries expose only a known provider value, a nonnegative retry time, and positive attempt counts. Invalid restored metadata produces the fixed summary `Waiting to retry a provider.`
-
-The projection excludes tasks, prompts, objectives, questions and answers, transcripts, reasoning, queued messages, tools, raw output, structured or workflow results, agent previews, arbitrary JSON, stacks, parser dumps, provider bodies, paths, artifacts, environment and credentials, and manager internals. Result summaries use only allowlisted status and task-outcome metadata. They never inspect excluded execution text. Treat names and summaries as untrusted text and render summaries only as text.
-
-Dynamic IDs, names, models, and summaries are normalized single-line text. The runtime validator rejects terminal and C0/C1 controls, bidi controls, malformed surrogate sequences, and whitespace that the producer would normalize.
-
-Top-level `workflow-agent` jobs, nested workflow agents, and workflow totals overlap. They are linkable through IDs but are not additive. Use `jobs` for the top-level job count, `workflows` for run count and workflow aggregate usage, and nested agents only for per-run breakdowns. Never sum the same execution across these levels.
+Inspect the truncation counters before presenting counts as complete. `NATIVE_SUBAGENTS_STATE_V1_LIMITS` caps a snapshot at 100 jobs, 64 workflows, 32 agents and 64 phases per run, and 512 KiB overall. IDs are bounded to 200 characters, names to 160, and each summary to 2,000. Summaries and low-priority records may be omitted under the size limit. Nonterminal records take priority, followed by recent activity. Render missing optional values as unknown where the distinction matters.
