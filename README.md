@@ -142,30 +142,3 @@ Interrupted workflows can recover with `resumeFromRunId` and the original source
 ## Agent instructions
 
 Pi loads the bundled [package skill](skills/pi-native-subagents/SKILL.md), which contains the model-facing tool contract and workflow authoring rules.
-
-## Contributing
-
-Run the full local check before opening a pull request:
-
-```bash
-npm run check
-```
-
-Smoke tests verify provider authentication and access policy:
-
-```bash
-npm run smoke
-npm run smoke:pi
-npm run smoke:claude
-npm run smoke:codex
-npm run smoke:access:claude
-npm run smoke:access:codex
-```
-
-They spend model turns only when `PI_NATIVE_SUBAGENTS_LIVE=1` is set. The Pi smoke test uses your installed Pi CLI and its configured model. Set `PI_NATIVE_SUBAGENTS_SMOKE_PI_MODEL` to a Pi model ID to choose a model for the run.
-
-Contributor conventions are in [AGENTS.md](AGENTS.md). This project is experimental, so only claim compatibility you have tested.
-
-## License
-
-MIT
