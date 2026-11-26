@@ -3,7 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { ClaudeBackend } from "../src/backends/claude.ts";
 import { CodexAppServerBackend } from "../src/backends/codex.ts";
 import { PiRpcBackend } from "../src/backends/pi-rpc.ts";
@@ -16,7 +16,15 @@ const requested = accessMode ? process.argv[3] : process.argv[2];
 const defaultNames = accessMode ? ["claude", "codex"] : ["pi", "claude", "codex"];
 const names = requested ? [requested] : defaultNames;
 const live = process.env.PI_NATIVE_SUBAGENTS_LIVE === "1";
+const piModel = process.env.PI_NATIVE_SUBAGENTS_SMOKE_PI_MODEL;
+const localBin = join(import.meta.dirname, "..", "node_modules", ".bin");
 const root = mkdtempSync(join(tmpdir(), "pi-native-subagents-smoke-"));
+
+if (process.env.PATH) {
+  process.env.PATH = process.env.PATH.split(delimiter)
+    .filter((directory) => directory !== localBin)
+    .join(delimiter);
+}
 
 function available(command) {
   try {
@@ -66,6 +74,7 @@ function policy(name, access = "readOnly") {
 
   return {
     harness: name,
+    model: name === "pi" ? piModel : undefined,
     access,
     customization: "native",
     thinking: accessMode ? "medium" : "low",
